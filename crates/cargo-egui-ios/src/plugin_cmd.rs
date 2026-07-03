@@ -52,7 +52,9 @@ pub struct PluginBuildArgs {
 
 #[derive(Args)]
 pub struct PluginServeArgs {
-    /// Plugin crate directories to build, watch, and serve.
+    /// Plugin crate directories (or a directory of plugins) to build, watch, and serve.
+    /// A directory without a manifest.toml is expanded to every plugin crate it contains,
+    /// so pointing at the `plugins/` folder — or running from the repo root — serves them all.
     #[arg(default_value = ".")]
     paths: Vec<PathBuf>,
     /// Listen address.
@@ -191,10 +193,68 @@ struct Served {
 
 type ServeState = Arc<Mutex<HashMap<String, Served>>>;
 
+/// Expand each input path into concrete plugin crate directories (those with a `manifest.toml`).
+/// A path that is itself a plugin is used as-is; otherwise its immediate subdirectories — or a
+/// nested `plugins/` directory — are scanned, so pointing at a folder of plugins (or the repo
+/// root) serves them all. Duplicates are removed.
+fn expand_plugin_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push = |p: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.iter().any(|q| q == &p) {
+            out.push(p);
+        }
+    };
+    for path in paths {
+        if path.join("manifest.toml").is_file() {
+            push(path.clone(), &mut out);
+            continue;
+        }
+        let mut found = scan_plugin_children(path);
+        if found.is_empty() && path.join("plugins").is_dir() {
+            found = scan_plugin_children(&path.join("plugins"));
+        }
+        if found.is_empty() {
+            eprintln!("no plugin crates found under {}", path.display());
+        }
+        for f in found {
+            push(f, &mut out);
+        }
+    }
+    out
+}
+
+/// Immediate subdirectories of `dir` that are plugin crates (contain a `manifest.toml`), sorted.
+fn scan_plugin_children(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        children.sort();
+        for child in children {
+            if child.is_dir() && child.join("manifest.toml").is_file() {
+                found.push(child);
+            }
+        }
+    }
+    found
+}
+
 fn cmd_serve(args: &PluginServeArgs) -> Result<()> {
+    let paths = expand_plugin_dirs(&args.paths);
+    if paths.is_empty() {
+        bail!(
+            "no plugin crates (dirs with a manifest.toml) found under {:?}",
+            args.paths
+        );
+    }
+    let names: Vec<&str> = paths
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|s| s.to_str()))
+        .collect();
+    println!("serving {} plugin(s): {}", paths.len(), names.join(", "));
+
     let state: ServeState = Arc::new(Mutex::new(HashMap::new()));
 
-    for path in &args.paths {
+    for path in &paths {
         match build_plugin(path, args.debug) {
             Ok(b) => insert(&state, b),
             Err(e) => eprintln!("initial build failed for {}: {e:#}", path.display()),
@@ -202,7 +262,6 @@ fn cmd_serve(args: &PluginServeArgs) -> Result<()> {
     }
 
     {
-        let paths = args.paths.clone();
         let debug = args.debug;
         let state = Arc::clone(&state);
         std::thread::spawn(move || watch_loop(&paths, debug, &state));

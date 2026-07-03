@@ -1,9 +1,11 @@
 //! All ratatui drawing: bufferline, gutter, syntax-colored text, cursor, visual/search
 //! highlights, statusline, command/message line, touchbar, finder overlay, dashboard.
 
+use std::num::NonZeroU16;
+
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer as Grid;
+use ratatui::buffer::{Buffer as Grid, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
@@ -233,6 +235,15 @@ fn follow_scroll(buf: &mut EdBuffer, text_rows: u16, text_cols: u16) {
     buf.scroll = (top, left);
 }
 
+/// Set one cell's char and style; diff width pinned to 1 so wide chars keep cell-per-char.
+fn set_cell(g: &mut Grid, x: u16, y: u16, ch: char, style: Style) {
+    if let Some(cell) = g.cell_mut((x, y)) {
+        cell.set_char(ch);
+        cell.set_style(style);
+        cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+    }
+}
+
 /// Write `s` one char per cell starting at `x`, clipped at `max_x`; returns the next x.
 fn put_str(g: &mut Grid, x: u16, y: u16, s: &str, style: Style, max_x: u16) -> u16 {
     let mut x = x;
@@ -240,10 +251,7 @@ fn put_str(g: &mut Grid, x: u16, y: u16, s: &str, style: Style, max_x: u16) -> u
         if x >= max_x {
             break;
         }
-        if let Some(cell) = g.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_style(style);
-        }
+        set_cell(g, x, y, ch, style);
         x += 1;
     }
     x
@@ -367,10 +375,7 @@ fn draw_text(
             let (fg, bg) =
                 cell_colors(base_fg, cursor_line, in_bracket, search, in_visual(&sel, li, ci));
             let x = gutter_w + (ci - left) as u16;
-            if let Some(cell) = g.cell_mut((x, y)) {
-                cell.set_char(ch);
-                cell.set_style(Style::new().fg(fg).bg(bg));
-            }
+            set_cell(g, x, y, ch, Style::new().fg(fg).bg(bg));
         }
         // Linewise selection covers the text region past the line's last char too.
         if let Some((s, e, true)) = sel {
@@ -572,7 +577,7 @@ fn scroll_pct(top: usize, rows: usize, line_count: usize) -> String {
     }
 }
 
-fn draw_cmdline(g: &mut Grid, row: u16, cols: u16, st: &EditorState, vim: &VimEngine, blink_on: bool) {
+fn draw_cmdline(g: &mut Grid, row: u16, cols: u16, st: &EditorState, vim: &VimEngine, blink_on: bool, focused: bool) {
     if cols == 0 {
         return;
     }
@@ -580,19 +585,13 @@ fn draw_cmdline(g: &mut Grid, row: u16, cols: u16, st: &EditorState, vim: &VimEn
         let avail = cols.saturating_sub(1) as usize;
         // Window start keeping the char cursor visible.
         let start = if avail > 0 && cur >= avail { cur + 1 - avail } else { 0 };
-        if let Some(cell) = g.cell_mut((0, row)) {
-            cell.set_char(prefix);
-            cell.set_style(Style::new().fg(theme::TEXT));
-        }
+        set_cell(g, 0, row, prefix, Style::new().fg(theme::TEXT));
         let mut x = 1u16;
         for ch in text.chars().skip(start) {
             if x >= cols {
                 break;
             }
-            if let Some(cell) = g.cell_mut((x, row)) {
-                cell.set_char(ch);
-                cell.set_style(Style::new().fg(theme::TEXT));
-            }
+            set_cell(g, x, row, ch, Style::new().fg(theme::TEXT));
             x += 1;
         }
         if blink_on {
@@ -609,6 +608,8 @@ fn draw_cmdline(g: &mut Grid, row: u16, cols: u16, st: &EditorState, vim: &VimEn
             MsgKind::Info => theme::MUTED,
         };
         put_str(g, 0, row, &msg.text, Style::new().fg(fg), cols);
+    } else if !focused {
+        put_str(g, 0, row, "tap to type — :help for keys", Style::new().fg(theme::DIM), cols);
     }
 }
 
@@ -647,34 +648,22 @@ fn draw_finder(g: &mut Grid, vl: &VLayout, cols: u16, f: &FinderState) {
 
     for y in y0..=y1 {
         for x in x0..=x1 {
-            if let Some(cell) = g.cell_mut((x, y)) {
-                cell.set_char(' ');
-                cell.set_style(Style::new().fg(theme::TEXT).bg(theme::BG));
-            }
+            set_cell(g, x, y, ' ', Style::new().fg(theme::TEXT).bg(theme::BG));
         }
     }
     let border = Style::new().fg(theme::ACCENT).bg(theme::BG);
     for x in x0 + 1..x1 {
         for y in [y0, y1] {
-            if let Some(cell) = g.cell_mut((x, y)) {
-                cell.set_char('─');
-                cell.set_style(border);
-            }
+            set_cell(g, x, y, '─', border);
         }
     }
     for y in y0 + 1..y1 {
         for x in [x0, x1] {
-            if let Some(cell) = g.cell_mut((x, y)) {
-                cell.set_char('│');
-                cell.set_style(border);
-            }
+            set_cell(g, x, y, '│', border);
         }
     }
     for (x, y, ch) in [(x0, y0, '┌'), (x1, y0, '┐'), (x0, y1, '└'), (x1, y1, '┘')] {
-        if let Some(cell) = g.cell_mut((x, y)) {
-            cell.set_char(ch);
-            cell.set_style(border);
-        }
+        set_cell(g, x, y, ch, border);
     }
     put_str(g, x0 + 2, y0, " find file ", border, x1);
 
@@ -702,10 +691,7 @@ fn draw_finder(g: &mut Grid, vl: &VLayout, cols: u16, f: &FinderState) {
                 break;
             }
             let fg = if hits.contains(&ci) { theme::ACCENT } else { theme::TEXT };
-            if let Some(cell) = g.cell_mut((x, y)) {
-                cell.set_char(ch);
-                cell.set_style(Style::new().fg(fg).bg(bg));
-            }
+            set_cell(g, x, y, ch, Style::new().fg(fg).bg(bg));
             x += 1;
         }
     }
@@ -1021,19 +1007,21 @@ mod tests {
     fn finder_overlay_renders_prompt_and_results() {
         let mut st = mk_state("alpha");
         let mut f = FinderState::new(Vec::new());
-        f.query = "ma".into();
-        f.results = vec![("main.rs".into(), vec![0, 1]), ("lib.rs".into(), vec![])];
+        f.query = "wa".into();
+        f.results = vec![("walrus.rs".into(), vec![0, 1]), ("wing.rs".into(), vec![])];
         f.selected = 0;
         st.finder = Some(f);
         let (term, _) = render(&mut st, 40, 20, false);
         assert!(find_row(&term, " find file ").is_some());
-        let prompt_y = find_row(&term, "> ma").expect("prompt row");
-        let result_y = find_row(&term, "main.rs").expect("result row");
+        let prompt_y = find_row(&term, "> wa").expect("prompt row");
+        let result_y = find_row(&term, "walrus.rs").expect("result row");
         assert!(result_y > prompt_y);
+        assert!(find_row(&term, "wing.rs") > Some(result_y));
         let b = term.backend().buffer();
-        let x = row_text(&term, result_y).chars().position(|c| c == 'm').unwrap() as u16;
+        let x = row_text(&term, result_y).chars().position(|c| c == 'w').unwrap() as u16;
         assert_eq!(b[(x, result_y)].fg, theme::ACCENT);
         assert_eq!(b[(x, result_y)].bg, theme::SURFACE);
+        assert_eq!(b[(x + 2, result_y)].fg, theme::TEXT);
         assert!(row_text(&term, result_y).contains("▸"));
     }
 

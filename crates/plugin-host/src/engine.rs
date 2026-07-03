@@ -27,7 +27,19 @@ impl PluginEngine {
         config.epoch_interruption(true);
         // Explicit for clarity; wasmtime also auto-selects Pulley on iOS.
         #[cfg(target_os = "ios")]
-        config.target("pulley64").map_err(crate::wt_err)?;
+        {
+            config.target("pulley64").map_err(crate::wt_err)?;
+            // iOS caps a sandboxed app's address space. wasmtime's default reserves 4 GiB of
+            // virtual memory per linear memory (to elide bounds checks via guard pages), which
+            // fails once a few plugins load: `mmap failed to reserve 0x100000000 bytes`. Pulley
+            // bounds-checks in software, so give up the guard-page trick and allocate memory
+            // dynamically at its actual size instead — a few MiB per plugin, not 4 GiB.
+            config.memory_reservation(0);
+            config.memory_reservation_for_growth(4 << 20);
+            config.memory_may_move(true);
+            config.memory_guard_size(0);
+            config.guard_before_linear_memory(false);
+        }
 
         let engine = wasmtime::Engine::new(&config).map_err(crate::wt_err)?;
 

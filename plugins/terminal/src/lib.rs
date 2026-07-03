@@ -10,6 +10,7 @@ mod render;
 mod shell;
 mod sshmode;
 mod theme;
+mod toolbar;
 mod vt;
 
 use egui_ios_plugin_sdk::abi::{self, net};
@@ -23,6 +24,7 @@ use editor::LineEditor;
 use render::TerminalSurface;
 use shell::{Effect, OutLine};
 use sshmode::{Phase, SshClient};
+use toolbar::Act;
 
 /// Cap on retained scrollback lines.
 const SCROLLBACK_CAP: usize = 2000;
@@ -54,6 +56,7 @@ struct Terminal {
     display_cache: Vec<(String, Color)>,
     cache_key: Option<(u64, usize)>,
     mode: Mode,
+    toolbar_hidden: bool,
 }
 
 impl Terminal {
@@ -71,6 +74,7 @@ impl Terminal {
             display_cache: Vec::new(),
             cache_key: None,
             mode: Mode::Local,
+            toolbar_hidden: false,
         };
         term.push(OutLine_new("Terminal ready — tap to type, `help` for commands.", theme::ACCENT));
         term.push(OutLine_new("`ssh user@host` to connect · swipe to scroll · ↑/↓ history", theme::DIM));
@@ -303,22 +307,34 @@ impl Terminal {
         host.request_keyboard(self.focused);
         let (_cols, rows) = self.surface.fit(ui, avail);
 
-        if matches!(self.mode, Mode::Auth(_)) {
-            self.update_auth(ui, host);
-        } else {
-            self.handle_keys(ui, host);
-            let width = self.surface.grid().0 as usize;
-            let body_rows = (rows as usize).saturating_sub(2);
-            let max_off = self.ensure_display(width).saturating_sub(body_rows);
-            self.handle_scroll(ui, max_off);
-            let time = ui.input(|i| i.time);
-            let blink_on = self.blink(time);
-            self.draw(blink_on);
-        }
+        self.handle_keys(ui, host);
+        let width = self.surface.grid().0 as usize;
+        let body_rows = (rows as usize).saturating_sub(2);
+        let max_off = self.ensure_display(width).saturating_sub(body_rows);
+        self.handle_scroll(ui, max_off);
+        let time = ui.input(|i| i.time);
+        let blink_on = self.blink(time);
+        self.draw(blink_on);
         self.surface.paint(ui.painter(), rect);
     }
 
-    fn update_auth(&mut self, ui: &egui::Ui, host: &HostHandle) {
+    fn update_auth(&mut self, ui: &mut egui::Ui, host: &HostHandle) {
+        let full = ui.max_rect();
+        let result = toolbar::render(ui, full, self.focused, self.toolbar_hidden);
+        if result.toggle_hidden {
+            self.toolbar_hidden = !self.toolbar_hidden;
+        }
+        let content = result.content;
+        let resp = ui.allocate_rect(content, egui::Sense::click_and_drag());
+        if resp.clicked() {
+            self.focused = !self.focused;
+            if self.focused {
+                host.haptic(6);
+            }
+        }
+        host.request_keyboard(self.focused);
+        self.surface.fit(ui, content.size());
+
         let events = ui.input(|i| i.events.clone());
         let mut connect = false;
         let mut cancel = false;
@@ -341,10 +357,17 @@ impl Terminal {
                 }
             }
         }
+        for &act in &result.actions {
+            match act {
+                Act::Submit => connect = true,
+                Act::Cancel | Act::Disconnect => cancel = true,
+                Act::Bytes(_) => {}
+            }
+        }
+
         if cancel {
             self.push(OutLine_new("ssh: cancelled", theme::DIM));
             self.mode = Mode::Local;
-            self.draw(false);
             return;
         }
         if connect {
@@ -371,10 +394,10 @@ impl Terminal {
                     self.mode = Mode::Local;
                 }
             }
-            self.draw(false);
             return;
         }
         self.draw_auth();
+        self.surface.paint(ui.painter(), content);
     }
 
     fn draw_auth(&mut self) {
@@ -413,30 +436,13 @@ impl Terminal {
     // ── SSH session ──────────────────────────────────────────────────────────
 
     fn update_ssh(&mut self, ui: &mut egui::Ui, host: &HostHandle) {
-        let ready = matches!(&self.mode, Mode::Ssh(c) if matches!(c.phase, Phase::Ready));
-        let mut tb_bytes: Vec<u8> = Vec::new();
-        let mut disconnect = false;
-        ui.horizontal(|ui| {
-            let mut send = |ui: &mut egui::Ui, label: &str, bytes: &[u8]| {
-                if ui.add_enabled(ready, egui::Button::new(label).small()).clicked() {
-                    tb_bytes.extend_from_slice(bytes);
-                }
-            };
-            send(ui, "esc", b"\x1b");
-            send(ui, "tab", b"\t");
-            send(ui, "^C", b"\x03");
-            send(ui, "^D", b"\x04");
-            send(ui, "↑", b"\x1b[A");
-            send(ui, "↓", b"\x1b[B");
-            send(ui, "←", b"\x1b[D");
-            send(ui, "→", b"\x1b[C");
-            if ui.button("⏻").on_hover_text("Disconnect").clicked() {
-                disconnect = true;
-            }
-        });
-
-        let avail = ui.available_size();
-        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        let full = ui.max_rect();
+        let result = toolbar::render(ui, full, self.focused, self.toolbar_hidden);
+        if result.toggle_hidden {
+            self.toolbar_hidden = !self.toolbar_hidden;
+        }
+        let content = result.content;
+        let resp = ui.allocate_rect(content, egui::Sense::click_and_drag());
         if resp.clicked() {
             self.focused = !self.focused;
             if self.focused {
@@ -444,7 +450,7 @@ impl Terminal {
             }
         }
         host.request_keyboard(self.focused);
-        let (cols, rows) = self.surface.fit(ui, avail);
+        let (cols, rows) = self.surface.fit(ui, content.size());
         let vt_rows = rows.saturating_sub(1).max(1);
 
         if let Mode::Ssh(c) = &mut self.mode {
@@ -454,6 +460,18 @@ impl Terminal {
 
         let ready = matches!(&self.mode, Mode::Ssh(c) if matches!(c.phase, Phase::Ready));
         let ended = matches!(&self.mode, Mode::Ssh(c) if matches!(c.phase, Phase::Ended(_)));
+
+        // Toolbar keys → PTY bytes (or a disconnect).
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut disconnect = false;
+        for &act in &result.actions {
+            match act {
+                Act::Bytes(b) => bytes.extend_from_slice(b),
+                Act::Submit => bytes.push(b'\r'),
+                Act::Cancel => bytes.extend_from_slice(b"\x1b"),
+                Act::Disconnect => disconnect = true,
+            }
+        }
 
         if disconnect {
             if let Mode::Ssh(c) = &self.mode {
@@ -465,13 +483,14 @@ impl Terminal {
         }
 
         if ended {
-            // Once the session is over, any keypress or tap returns to the local shell.
-            let go = ui.input(|i| {
-                i.events.iter().any(|e| {
-                    matches!(e, egui::Event::Key { pressed: true, .. })
-                        || matches!(e, egui::Event::PointerButton { pressed: true, .. })
-                })
-            });
+            // Once the session is over, a toolbar key, keypress, or tap returns to local.
+            let go = !bytes.is_empty()
+                || ui.input(|i| {
+                    i.events.iter().any(|e| {
+                        matches!(e, egui::Event::Key { pressed: true, .. })
+                            || matches!(e, egui::Event::PointerButton { pressed: true, .. })
+                    })
+                });
             if go {
                 if let Mode::Ssh(c) = &self.mode {
                     c.close(host);
@@ -480,7 +499,6 @@ impl Terminal {
                 return;
             }
         } else if ready {
-            let mut bytes = tb_bytes;
             if self.focused {
                 bytes.extend(sshmode::input_bytes(ui));
             }
@@ -490,7 +508,7 @@ impl Terminal {
         }
 
         self.draw_ssh();
-        self.surface.paint(ui.painter(), rect);
+        self.surface.paint(ui.painter(), content);
     }
 
     fn draw_ssh(&mut self) {
@@ -531,17 +549,21 @@ fn OutLine_new(text: impl Into<String>, color: Color) -> OutLine {
 
 impl PluginApp for Terminal {
     fn update(&mut self, ui: &mut egui::Ui, host: &HostHandle) {
-        if matches!(self.mode, Mode::Ssh(_)) {
-            self.update_ssh(ui, host);
-        } else {
-            self.update_console(ui, host);
+        match self.mode {
+            Mode::Ssh(_) => self.update_ssh(ui, host),
+            Mode::Auth(_) => self.update_auth(ui, host),
+            Mode::Local => self.update_console(ui, host),
         }
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
     }
 
-    fn on_host_event(&mut self, topic: &str, payload: &[u8], _host: &HostHandle) {
+    fn on_host_event(&mut self, topic: &str, payload: &[u8], host: &HostHandle) {
         if topic == net::EVENT_SSH_OPEN {
             if let Ok(req) = abi::decode::<net::SshOpenRequest>(payload) {
+                // Close a live session first so a new hand-off doesn't orphan its host thread.
+                if let Mode::Ssh(c) = &self.mode {
+                    c.close(host);
+                }
                 let port = if req.port == 0 { 22 } else { req.port };
                 self.mode = Mode::Auth(AuthPrompt {
                     user: req.user,
