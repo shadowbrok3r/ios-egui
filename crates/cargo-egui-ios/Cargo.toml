@@ -1,0 +1,17 @@
+[package]
+name = "cargo-egui-ios"
+description = "Cargo subcommand to scaffold, cross-compile, and run native egui iOS apps via xtool."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+toml.workspace = true
+
+[[bin]]
+name = "cargo-egui-ios"
+path = "src/main.rs"

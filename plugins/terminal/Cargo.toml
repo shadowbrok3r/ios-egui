@@ -1,0 +1,20 @@
+[package]
+name = "terminal"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+egui-ios-plugin-sdk = { path = "../../crates/plugin-sdk" }
+ratatui = { version = "0.30.2", default-features = false }
+base64 = "0.22"
+sha2 = "0.10"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

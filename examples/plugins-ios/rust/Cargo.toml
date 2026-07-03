@@ -1,0 +1,12 @@
+[package]
+name = "plugins_ios"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+egui-ios = { path = "../../../crates/egui-ios", features = ["plugins"] }
+egui.workspace = true
+
+[lib]
+crate-type = ["staticlib"]

@@ -1,0 +1,4 @@
+version: 1
+bundleID: com.example.hello
+product: Hello
+infoPath: Info.override.plist

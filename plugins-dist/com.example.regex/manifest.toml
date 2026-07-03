@@ -1,0 +1,6 @@
+id = "com.example.regex"
+name = "Regex Tester"
+version = "0.1.0"
+abi_version = 1
+description = "Live regular-expression tester: matches highlighted inline as you type, with capture groups and flags."
+permissions = ["clipboard.set"]

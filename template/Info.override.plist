@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+    <key>NSCameraUsageDescription</key>
+    <string>{{display_name}} uses the camera for in-app capture.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>{{display_name}} uses the microphone for in-app audio.</string>
+</dict>
+</plist>

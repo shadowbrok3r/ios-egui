@@ -1,0 +1,7 @@
+id = "{{plugin_id}}"
+name = "{{display_name}}"
+version = "0.1.0"
+abi_version = 1
+description = "An egui-ios plugin."
+# Host ops this plugin may call; a permission also grants ops nested under it.
+permissions = ["haptic", "notify"]

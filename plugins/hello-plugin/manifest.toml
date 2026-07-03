@@ -1,0 +1,6 @@
+id = "com.example.hello"
+name = "Hello Plugin"
+version = "0.1.0"
+abi_version = 1
+description = "Exercises the plugin surface: UI, haptics, notify, state store, events, hot-reload state."
+permissions = ["haptic", "notify", "url.open", "clipboard.set"]

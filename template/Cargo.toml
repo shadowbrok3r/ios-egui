@@ -1,0 +1,17 @@
+[package]
+name = "{{project_name}}"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+# Published crate (preferred once released):
+#   egui-ios = "0.1"
+# Git (default):
+egui-ios = { git = "https://github.com/shadowbrok3r/egui-ios" }
+# Local checkout (uncomment for development against a local clone):
+#   egui-ios = { path = "../ios-egui/crates/egui-ios" }
+egui = "0.35"
+
+[lib]
+crate-type = ["staticlib"]

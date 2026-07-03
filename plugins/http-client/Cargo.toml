@@ -1,0 +1,19 @@
+[package]
+name = "http_client"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+egui-ios-plugin-sdk = { path = "../../crates/plugin-sdk" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

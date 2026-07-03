@@ -1,0 +1,4 @@
+version: 1
+bundleID: com.example.pluginsios
+product: PluginsIos
+infoPath: Info.override.plist

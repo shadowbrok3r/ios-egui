@@ -1,0 +1,18 @@
+[package]
+name = "regex_tester"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+egui-ios-plugin-sdk = { path = "../../crates/plugin-sdk" }
+regex = "1"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

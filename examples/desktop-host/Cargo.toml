@@ -1,0 +1,14 @@
+[package]
+name = "desktop-host"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+eframe = { workspace = true, features = ["wgpu"] }
+egui.workspace = true
+egui-ios-plugin-host.workspace = true
+egui-ios-plugin-abi.workspace = true
+postcard.workspace = true
+env_logger = "0.11"
+log.workspace = true

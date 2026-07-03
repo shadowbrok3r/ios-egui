@@ -1,0 +1,6 @@
+id = "com.example.json"
+name = "JSON Explorer"
+version = "0.1.0"
+abi_version = 1
+description = "Paste JSON to validate, pretty-print, and explore it as a collapsible tree; shows parse errors with line and column."
+permissions = ["clipboard.set"]

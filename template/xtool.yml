@@ -1,0 +1,6 @@
+version: 1
+bundleID: {{bundle_id}}
+product: {{project_name}}
+infoPath: Info.override.plist
+# Optional: 1024×1024 PNG for the app icon.
+# iconPath: Resources/AppIcon.png

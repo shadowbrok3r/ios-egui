@@ -1,0 +1,32 @@
+[package]
+name = "egui-ios-plugin-host"
+description = "Host runtime for egui-ios WASM plugins: wasmtime engine, viewport widget, hot reload."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+egui-ios-plugin-abi.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+postcard.workspace = true
+anyhow.workspace = true
+log.workspace = true
+toml.workspace = true
+serde.workspace = true
+serde_json = "1"
+ureq = { version = "2", optional = true }
+# `ring` backend (not the default aws-lc-rs, which needs cmake + a cross C toolchain for iOS).
+russh = { version = "0.54", optional = true, default-features = false, features = ["ring", "flate2", "rsa"] }
+tokio = { version = "1", optional = true, features = ["rt", "io-util", "net", "time", "sync", "macros"] }
+
+[features]
+# Native network ops (`net.http.*`, `ssh.*`) via `NetOps`. Pulls a TLS + SSH stack.
+net = ["dep:ureq", "dep:russh", "dep:tokio"]
+
+[dev-dependencies]
+tempfile = "3"

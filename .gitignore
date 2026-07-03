@@ -1,0 +1,9 @@
+/target
+**/target
+.build
+**/.build
+.swiftpm
+Package.resolved
+xtool
+*.ipa
+.DS_Store

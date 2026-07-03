@@ -1,0 +1,12 @@
+[package]
+name = "hello"
+edition.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+egui-ios = { path = "../../../crates/egui-ios" }
+egui.workspace = true
+
+[lib]
+crate-type = ["staticlib"]

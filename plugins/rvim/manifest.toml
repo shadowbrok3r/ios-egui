@@ -1,0 +1,6 @@
+id = "com.example.rvim"
+name = "rvim"
+version = "0.1.0"
+abi_version = 1
+description = "A Neovim-style modal code editor rendered with ratatui: full vim grammar (operators, counts, text objects, registers, marks, dot-repeat), Rust syntax highlighting, fuzzy file finder, persistent virtual files, and an iOS touchbar for Esc/Ctrl."
+permissions = ["haptic", "clipboard.set", "keyboard.set"]

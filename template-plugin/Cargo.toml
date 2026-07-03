@@ -1,0 +1,22 @@
+[package]
+name = "{{project_name}}"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+# Published crate (preferred once released):
+#   egui-ios-plugin-sdk = "0.1"
+# Git (default):
+egui-ios-plugin-sdk = { git = "https://github.com/shadowbrok3r/egui-ios" }
+# Local checkout (uncomment for development against a local clone):
+#   egui-ios-plugin-sdk = { path = "../ios-egui/crates/plugin-sdk" }
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

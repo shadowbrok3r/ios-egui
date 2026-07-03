@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/egui-ios",
+    "crates/cargo-egui-ios",
+    "crates/plugin-abi",
+    "crates/plugin-host",
+    "crates/plugin-sdk",
+    "examples/hello/rust",
+    "examples/desktop-host",
+    "examples/plugins-ios/rust",
+]
+exclude = ["template", "template-plugin", "plugins"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shadowbrok3r/egui-ios"
+
+[workspace.dependencies]
+egui = "0.35"
+egui-wgpu = "0.35"
+eframe = "0.35"
+wgpu = "29"
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+postcard = { version = "1", features = ["use-std"] }
+bytemuck = "1"
+wasmtime = { version = "46", default-features = false, features = ["runtime", "cranelift", "pulley", "std"] }
+wasmtime-wasi = "46"
+anyhow = "1"
+log = "0.4"
+toml = "0.9"
+egui-ios-plugin-abi = { path = "crates/plugin-abi" }
+egui-ios-plugin-host = { path = "crates/plugin-host" }
+egui-ios-plugin-sdk = { path = "crates/plugin-sdk" }
+
+# wasmtime compiles plugin modules at runtime; keep the compiler fast even in dev builds.
+[profile.dev.package.cranelift-codegen]
+opt-level = 2
+[profile.dev.package.regalloc2]
+opt-level = 2
+[profile.dev.package.pulley-interpreter]
+opt-level = 2

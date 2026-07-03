@@ -1,0 +1,12 @@
+[package]
+name = "egui-ios-plugin-sdk"
+description = "Guest-side SDK for writing egui-ios WASM plugins: full egui inside the plugin."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui = { workspace = true, features = ["default_fonts", "bytemuck", "serde"] }
+egui-ios-plugin-abi.workspace = true
+postcard.workspace = true

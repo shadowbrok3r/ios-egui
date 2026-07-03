@@ -1,0 +1,6 @@
+id = "com.example.ratatui-demo"
+name = "Ratatui Demo"
+version = "0.1.0"
+abi_version = 1
+description = "A ratatui TUI rendered inside a WASM plugin — the pattern a terminal plugin builds on."
+permissions = ["haptic"]

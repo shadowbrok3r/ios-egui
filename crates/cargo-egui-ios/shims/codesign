@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Codesign shim for non-macOS hosts. Accept any args and pretend signing succeeded.
+exit 0

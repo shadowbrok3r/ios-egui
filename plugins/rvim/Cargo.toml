@@ -1,0 +1,20 @@
+[package]
+name = "rvim"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[dependencies]
+egui-ios-plugin-sdk = { path = "../../crates/plugin-sdk" }
+ratatui = { version = "0.30.2", default-features = false }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+[workspace]

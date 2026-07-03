@@ -1,0 +1,6 @@
+id = "com.example.terminal"
+name = "Terminal"
+version = "0.1.0"
+abi_version = 1
+description = "A native-feeling ratatui terminal: iOS soft keyboard, touch-scroll scrollback, command history, and a built-in pocket shell (calc, base conversions, base64, sha256, text tools)."
+permissions = ["haptic", "clipboard.set", "keyboard.set"]
