@@ -1678,6 +1678,23 @@ fn word_back_end(text: &TextBuffer, p: Position, big: bool) -> Position {
     if pos == Position::new(0, 0) {
         return pos;
     }
+    // Step back to the start of the current word run first.
+    if let Some(c) = text.char_at(pos) {
+        let cls = char_class(c, big);
+        if cls != 0 {
+            while pos.col > 0 {
+                let prev = text.char_at(Position::new(pos.line, pos.col - 1));
+                if prev.map(|c| char_class(c, big)) == Some(cls) {
+                    pos.col -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    if pos == Position::new(0, 0) {
+        return pos;
+    }
     pos = step_back(text, pos);
     loop {
         if pos == Position::new(0, 0) {
