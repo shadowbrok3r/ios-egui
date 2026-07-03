@@ -79,6 +79,37 @@ impl PluginViewport {
         let focused = response.has_focus();
         let hovered = response.hovered();
 
+        // When the plugin viewport is focused, consume navigation keys from the
+        // host's egui context. Without this, Tab/arrows/Escape/Enter bubble up to
+        // egui's built-in focus system and move focus to the menu button or trigger
+        // widget interactions outside the plugin.
+        if focused {
+            ui.input_mut(|i| {
+                use egui::Key;
+                for key in [
+                    Key::Tab,
+                    Key::ArrowUp,
+                    Key::ArrowDown,
+                    Key::ArrowLeft,
+                    Key::ArrowRight,
+                    Key::Escape,
+                    Key::Enter,
+                    Key::Backspace,
+                    Key::Delete,
+                    Key::Home,
+                    Key::End,
+                    Key::PageUp,
+                    Key::PageDown,
+                    Key::Space,
+                ] {
+                    i.consume_key(egui::Modifiers::NONE, key);
+                    i.consume_key(egui::Modifiers::SHIFT, key);
+                    i.consume_key(egui::Modifiers::CTRL, key);
+                    i.consume_key(egui::Modifiers::COMMAND, key);
+                }
+            });
+        }
+
         let raw_input = self.gather_input(ui, plugin, rect, focused, hovered);
         let result = plugin.run_frame(&abi::FrameInput { raw_input });
 
