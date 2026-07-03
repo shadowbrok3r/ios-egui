@@ -58,20 +58,52 @@ impl EguiApp for App {
         let insets = host.safe_area_insets();
         egui::CentralPanel::default().show(ui, |ui| {
             ui.add_space(insets.top);
+            // A dropdown menu instead of a horizontal tab strip: the plugin list can grow past
+            // the screen width, and there's no side-scroll on the tab bar.
             ui.horizontal(|ui| {
-                if ui
-                    .selectable_label(self.show_manager, "⚙ manager")
-                    .clicked()
-                {
-                    self.show_manager = !self.show_manager;
-                }
-                for (i, plugin) in manager.plugins.iter().enumerate() {
-                    if ui
-                        .selectable_label(!self.show_manager && self.selected == i, &plugin.manifest.name)
-                        .clicked()
-                    {
-                        self.selected = i;
-                        self.show_manager = false;
+                let current = if self.show_manager {
+                    "☰  Manager".to_owned()
+                } else {
+                    manager
+                        .plugins
+                        .get(self.selected)
+                        .map(|p| format!("☰  {}", p.manifest.name))
+                        .unwrap_or_else(|| "☰  Manager".to_owned())
+                };
+                // Selection is applied after the menu closes so the closure only reads `self`.
+                let mut pick: Option<Option<usize>> = None;
+                ui.menu_button(current, |ui| {
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        if ui.selectable_label(self.show_manager, "⚙  Manager").clicked() {
+                            pick = Some(None);
+                            ui.close();
+                        }
+                        if !manager.plugins.is_empty() {
+                            ui.separator();
+                        }
+                        for (i, plugin) in manager.plugins.iter().enumerate() {
+                            let selected = !self.show_manager && self.selected == i;
+                            let label = match (&plugin.status, plugin.enabled) {
+                                (egui_ios::plugins::PluginStatus::Errored(_), _) => {
+                                    format!("⚠  {}", plugin.manifest.name)
+                                }
+                                (_, false) => format!("○  {}", plugin.manifest.name),
+                                _ => plugin.manifest.name.clone(),
+                            };
+                            if ui.selectable_label(selected, label).clicked() {
+                                pick = Some(Some(i));
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                if let Some(sel) = pick {
+                    match sel {
+                        None => self.show_manager = true,
+                        Some(i) => {
+                            self.selected = i;
+                            self.show_manager = false;
+                        }
                     }
                 }
             });

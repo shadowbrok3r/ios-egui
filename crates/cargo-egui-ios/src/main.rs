@@ -68,6 +68,10 @@ struct BuildArgs {
     /// Bundle an assets directory into the app (rsync, dereferencing symlinks).
     #[arg(long)]
     assets: Option<PathBuf>,
+    /// Build the app in release configuration (`xtool dev -c release`). The Rust staticlib is
+    /// always built `--release`; this switches the Swift/app build from debug to release too.
+    #[arg(long)]
+    release: bool,
 }
 
 fn main() -> Result<()> {
@@ -269,12 +273,15 @@ fn cmd_run(args: &BuildArgs) -> Result<()> {
         None => shims.into_os_string(),
     };
 
-    println!("xtool dev");
+    println!("xtool dev{}", if args.release { " -c release" } else { "" });
     let mut cmd = Command::new("xtool");
     cmd.arg("dev")
         .current_dir(&root)
         .env("PATH", &path)
         .env("EGUI_IOS_RUST_TARGET_DIR", &target_dir);
+    if args.release {
+        cmd.arg("-c").arg("release");
+    }
     if let Some(sdk) = std::env::var_os("SDKROOT") {
         cmd.env("SDKROOT", sdk);
     }
