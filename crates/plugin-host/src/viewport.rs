@@ -76,39 +76,43 @@ impl PluginViewport {
         if response.clicked() || pressed_inside {
             response.request_focus();
         }
+
+        // Track focus across frames so we can reclaim it when egui's focus system
+        // steals it via Tab/Arrow at end-of-frame. Without this, Tab cycles focus to
+        // the menu button and our `if focused` guard never fires to prevent it.
+        let focus_id = egui::Id::new(("plugin_viewport_focus", plugin.instance_key));
+        let had_focus: bool = ui.data(|d| d.get_temp(focus_id)).unwrap_or(false);
+
+        // If we had focus last frame but lost it, a navigation key stole it — reclaim.
+        if had_focus && !response.has_focus() {
+            response.request_focus();
+        }
+
         let focused = response.has_focus();
         let hovered = response.hovered();
 
-        // When the plugin viewport is focused, consume navigation keys from the
-        // host's egui context. Without this, Tab/arrows/Escape/Enter bubble up to
-        // egui's built-in focus system and move focus to the menu button or trigger
-        // widget interactions outside the plugin.
+        // When the plugin viewport has (or should have) focus, remove navigation key
+        // events from the host's event list entirely. This prevents egui's
+        // Focus::end_pass() from seeing them and cycling focus to the menu button.
+        // We must remove from i.events (not just consume_key) because the focus system
+        // uses key_pressed() which scans i.events directly.
         if focused {
             ui.input_mut(|i| {
-                use egui::Key;
-                for key in [
-                    Key::Tab,
-                    Key::ArrowUp,
-                    Key::ArrowDown,
-                    Key::ArrowLeft,
-                    Key::ArrowRight,
-                    Key::Escape,
-                    Key::Enter,
-                    Key::Backspace,
-                    Key::Delete,
-                    Key::Home,
-                    Key::End,
-                    Key::PageUp,
-                    Key::PageDown,
-                    Key::Space,
-                ] {
-                    i.consume_key(egui::Modifiers::NONE, key);
-                    i.consume_key(egui::Modifiers::SHIFT, key);
-                    i.consume_key(egui::Modifiers::CTRL, key);
-                    i.consume_key(egui::Modifiers::COMMAND, key);
-                }
+                i.events.retain(|ev| {
+                    !matches!(ev, Event::Key {
+                        key: egui::Key::Tab
+                            | egui::Key::ArrowUp
+                            | egui::Key::ArrowDown
+                            | egui::Key::Escape,
+                        pressed: true,
+                        ..
+                    })
+                });
             });
         }
+
+        // Persist focus state for next frame.
+        ui.data_mut(|d| d.insert_temp(focus_id, focused));
 
         let raw_input = self.gather_input(ui, plugin, rect, focused, hovered);
         let result = plugin.run_frame(&abi::FrameInput { raw_input });
