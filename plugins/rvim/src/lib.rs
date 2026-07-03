@@ -79,8 +79,9 @@ impl Rvim {
     fn handle_keys(&mut self, ui: &egui::Ui, host: &HostHandle) -> bool {
         let mut activity = false;
         ui.input_mut(|i| {
+            let events = std::mem::take(&mut i.events);
             let mut keep = Vec::new();
-            for ev in i.events.drain(..) {
+            for ev in events {
                 let mut consumed = false;
                 match &ev {
                     egui::Event::Text(text) => {
@@ -126,6 +127,9 @@ impl Rvim {
                 }
                 if !consumed {
                     keep.push(ev);
+                } else if let egui::Event::Key { key, modifiers, .. } = ev {
+                    // Explicitly tell egui this key is consumed to stop focus traversal/menu navigation
+                    i.consume_key(modifiers, key);
                 }
             }
             i.events = keep;

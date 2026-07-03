@@ -59,19 +59,41 @@ final class MetalHostView: UIView, UIKeyInput {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        for p in presses where p.key != nil {
-            let k = p.key!
-            onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), true)
+        var unhandled = Set<UIPress>()
+        for p in presses {
+            if let k = p.key {
+                onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), true)
+                // Filter out control keys so they don't trigger duplicate UIKeyInput events
+                // 0x28=Enter, 0x2A=Backspace, 0x2B=Tab, 0x29=Escape, 0x4F-0x52=Arrows
+                let code = k.keyCode.rawValue
+                if code != 0x2A && code != 0x28 && code != 0x2B && code != 0x29 && !(code >= 0x4F && code <= 0x52) {
+                    unhandled.insert(p)
+                }
+            } else {
+                unhandled.insert(p)
+            }
         }
-        super.pressesBegan(presses, with: event)
+        if !unhandled.isEmpty {
+            super.pressesBegan(unhandled, with: event)
+        }
     }
     
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        for p in presses where p.key != nil {
-            let k = p.key!
-            onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), false)
+        var unhandled = Set<UIPress>()
+        for p in presses {
+            if let k = p.key {
+                onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), false)
+                let code = k.keyCode.rawValue
+                if code != 0x2A && code != 0x28 && code != 0x2B && code != 0x29 && !(code >= 0x4F && code <= 0x52) {
+                    unhandled.insert(p)
+                }
+            } else {
+                unhandled.insert(p)
+            }
         }
-        super.pressesEnded(presses, with: event)
+        if !unhandled.isEmpty {
+            super.pressesEnded(unhandled, with: event)
+        }
     }
     
     override func pressesChanged(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -79,11 +101,21 @@ final class MetalHostView: UIView, UIKeyInput {
     }
     
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        for p in presses where p.key != nil {
-            let k = p.key!
-            onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), false)
+        var unhandled = Set<UIPress>()
+        for p in presses {
+            if let k = p.key {
+                onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), false)
+                let code = k.keyCode.rawValue
+                if code != 0x2A && code != 0x28 && code != 0x2B && code != 0x29 && !(code >= 0x4F && code <= 0x52) {
+                    unhandled.insert(p)
+                }
+            } else {
+                unhandled.insert(p)
+            }
         }
-        super.pressesCancelled(presses, with: event)
+        if !unhandled.isEmpty {
+            super.pressesCancelled(unhandled, with: event)
+        }
     }
 
     @objc private func handlePan(_ gr: UIPanGestureRecognizer) {
