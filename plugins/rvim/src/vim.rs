@@ -208,6 +208,13 @@ impl VimEngine {
         self.scroll_req.take()
     }
 
+    pub fn leader_state(&self) -> Option<u8> {
+        match self.awaiting {
+            Await::Leader(n) => Some(n),
+            _ => None,
+        }
+    }
+
     fn idle(&self) -> bool {
         self.count == 0
             && self.opcount == 0
@@ -403,19 +410,30 @@ impl VimEngine {
                 return;
             }
             Await::Leader(1) => {
+                match key {
+                    Key::Char('f') => self.awaiting = Await::Leader(2),
+                    Key::Char('w') => {
+                        self.execute_cmd(st, vfs, host, "w");
+                        self.reset();
+                    }
+                    Key::Char('q') => {
+                        self.execute_cmd(st, vfs, host, "q");
+                        self.reset();
+                    }
+                    _ => self.reset(),
+                }
+                return;
+            }
+            Await::Leader(2) => {
                 if key == Key::Char('f') {
-                    self.awaiting = Await::Leader(2);
+                    self.open_finder(st, vfs, host);
                 } else {
                     self.reset();
                 }
                 return;
             }
             Await::Leader(_) => {
-                if key == Key::Char('f') {
-                    self.open_finder(st, vfs, host);
-                } else {
-                    self.reset();
-                }
+                self.reset();
                 return;
             }
         }

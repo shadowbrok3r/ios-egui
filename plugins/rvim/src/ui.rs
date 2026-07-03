@@ -136,6 +136,8 @@ pub fn draw(term: &mut Terminal<TestBackend>, ctx: DrawCtx) -> LayoutInfo {
         draw_touchbar(g, vl.touchbar, cols, ctrl_armed);
         if let Some(f) = &st.finder {
             draw_finder(g, &vl, cols, f);
+        } else if let Some(state) = vim.leader_state() {
+            draw_leader_menu(g, &vl, cols, state);
         }
     });
 
@@ -719,6 +721,8 @@ fn draw_dashboard(g: &mut Grid, vl: &VLayout, cols: u16) {
     lines.push(("", theme::DIM));
     lines.push((":e <file>   new/open file", theme::DIM));
     lines.push(("Space f f   find file", theme::DIM));
+    lines.push(("Space w     save file", theme::DIM));
+    lines.push(("Space q     quit file", theme::DIM));
     lines.push((":help       cheatsheet", theme::DIM));
     lines.push(("tap ⌨ to hide keyboard", theme::DIM));
     let total = lines.len() as u16;
@@ -1175,5 +1179,67 @@ mod tests {
         let l = vertical_layout(1);
         assert_eq!(l.text_rows, 0);
         assert_eq!(l.touchbar, 0);
+    }
+}
+
+fn draw_leader_menu(g: &mut Grid, vl: &VLayout, cols: u16, state: u8) {
+    if vl.text_rows < 5 || cols < 20 {
+        return;
+    }
+    let items = if state == 1 {
+        vec![
+            ("f", "find..."),
+            ("w", "save"),
+            ("q", "quit"),
+            ("x", "save & quit"),
+        ]
+    } else {
+        vec![
+            ("f", "find file"),
+        ]
+    };
+    
+    let w = 24u16.min(cols);
+    let h = (items.len() as u16 + 2).min(vl.text_rows);
+    let x0 = (cols - w) / 2;
+    let y0 = vl.text_top + (vl.text_rows - h) / 2;
+    let x1 = x0 + w - 1;
+    let y1 = y0 + h - 1;
+
+    let bg = theme::SURFACE;
+    let border = Style::new().fg(theme::ACCENT).bg(bg);
+    let text = Style::new().fg(theme::TEXT).bg(bg);
+    let key_style = Style::new().fg(theme::ACCENT).bg(bg);
+
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            set_cell(g, x, y, ' ', text);
+        }
+    }
+    for x in x0 + 1..x1 {
+        for y in [y0, y1] {
+            set_cell(g, x, y, '─', border);
+        }
+    }
+    for y in y0 + 1..y1 {
+        for x in [x0, x1] {
+            set_cell(g, x, y, '│', border);
+        }
+    }
+    for (x, y, ch) in [(x0, y0, '┌'), (x1, y0, '┐'), (x0, y1, '└'), (x1, y1, '┘')] {
+        set_cell(g, x, y, ch, border);
+    }
+    
+    let title = if state == 1 { " leader " } else { " leader > f " };
+    put_str(g, x0 + 2, y0, title, border, x1);
+
+    for (i, (key, desc)) in items.iter().enumerate() {
+        let y = y0 + 1 + i as u16;
+        if y >= y1 {
+            break;
+        }
+        let k_len = key.chars().count() as u16;
+        put_str(g, x0 + 2, y, key, key_style, x1);
+        put_str(g, x0 + 2 + k_len, y, &format!(" -> {}", desc), text, x1);
     }
 }

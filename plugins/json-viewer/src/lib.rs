@@ -40,8 +40,8 @@ impl PluginApp for JsonViewer {
 
             ui.horizontal(|ui| {
                 match &parsed {
-                    Ok(_) => ui.colored_label(OK, "✓ valid JSON"),
-                    Err(e) => ui.colored_label(ERR, format!("✗ line {}, col {}: {}", e.line(), e.column(), e)),
+                    Ok(_) => ui.colored_label(OK, "[OK] valid JSON"),
+                    Err(e) => ui.colored_label(ERR, format!("[X] line {}, col {}: {}", e.line(), e.column(), e)),
                 };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut self.show_tree, true, "Tree");

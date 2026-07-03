@@ -183,7 +183,7 @@ impl PluginApp for Devices {
             ui.horizontal(|ui| {
                 ui.heading("Devices");
                 let pending = matches!(self.fetch, Fetch::Pending(_));
-                if ui.add_enabled(!pending, egui::Button::new("↻ Refresh")).clicked() {
+                if ui.add_enabled(!pending, egui::Button::new("⟳ Refresh")).clicked() {
                     self.refresh(host);
                 }
                 if ui.selectable_label(self.show_settings, "⚙").clicked() {
@@ -200,7 +200,7 @@ impl PluginApp for Devices {
             }
 
             if let Fetch::Failed(e) = &self.fetch {
-                ui.colored_label(ERR, format!("✗ {e}"));
+                ui.colored_label(ERR, format!("X {e}"));
             }
 
             self.device_list(ui, host);
@@ -226,7 +226,7 @@ impl Devices {
             let key = ui.add(
                 egui::TextEdit::singleline(&mut self.settings.api_key)
                     .password(true)
-                    .hint_text("tskey-api-…")
+                    .hint_text("tskey-api-...")
                     .desired_width(f32::INFINITY),
             );
             ui.end_row();
@@ -242,7 +242,7 @@ impl Devices {
             ui.label("SSH user");
             let user = ui.add(
                 egui::TextEdit::singleline(&mut self.settings.ssh_user)
-                    .hint_text("root, ubuntu, …")
+                    .hint_text("root, ubuntu, ...")
                     .desired_width(f32::INFINITY),
             );
             ui.end_row();
@@ -264,7 +264,7 @@ impl Devices {
     fn device_list(&self, ui: &mut egui::Ui, host: &HostHandle) {
         if self.devices.is_empty() && matches!(self.fetch, Fetch::Idle) {
             ui.add_space(8.0);
-            ui.colored_label(DIM, "No devices loaded — tap Refresh.");
+            ui.colored_label(DIM, "No devices loaded -- tap Refresh.");
             return;
         }
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64);
@@ -276,9 +276,9 @@ impl Devices {
                         .zip(parse_rfc3339_to_unix(&dev.last_seen))
                         .map(|(n, seen)| n - seen <= ONLINE_WINDOW_SECS);
                     let (dot, color) = match online {
-                        Some(true) => ("●", OK),
-                        Some(false) => ("●", DIM),
-                        None => ("○", DIM),
+                        Some(true) => ("*", OK),
+                        Some(false) => ("*", DIM),
+                        None => ("o", DIM),
                     };
                     ui.colored_label(color, dot);
                     ui.strong(dev.short_name());

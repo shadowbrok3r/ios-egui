@@ -138,13 +138,13 @@ impl PluginApp for HttpClient {
                         }
                     });
                 let pending = matches!(self.resp, Response::Pending(_));
-                let send = ui.add_enabled(!pending, egui::Button::new(if pending { "…" } else { "Send" }));
+                let send = ui.add_enabled(!pending, egui::Button::new(if pending { "..." } else { "Send" }));
                 if send.clicked() {
                     self.send(host);
                 }
                 ui.add(
                     egui::TextEdit::singleline(&mut self.req.url)
-                        .hint_text("https://…")
+                        .hint_text("https://...")
                         .desired_width(f32::INFINITY),
                 );
             });
@@ -156,7 +156,7 @@ impl PluginApp for HttpClient {
                     let mut remove = None;
                     for (i, (k, v)) in self.req.headers.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
-                            if ui.small_button("✕").clicked() {
+                            if ui.small_button("X").clicked() {
                                 remove = Some(i);
                             }
                             ui.add(
@@ -190,7 +190,7 @@ impl PluginApp for HttpClient {
                                 .code_editor()
                                 .desired_rows(4)
                                 .desired_width(f32::INFINITY)
-                                .hint_text("request body (JSON, form, …)"),
+                                .hint_text("request body (JSON, form, ...)"),
                         );
                     });
             }
@@ -216,16 +216,16 @@ impl HttpClient {
     fn show_response(&self, ui: &mut egui::Ui, host: &HostHandle) {
         match &self.resp {
             Response::Idle => {
-                ui.colored_label(DIM, "No response yet — set a URL and tap Send.");
+                ui.colored_label(DIM, "No response yet -- set a URL and tap Send.");
             }
             Response::Pending(_) => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.colored_label(DIM, "Requesting…");
+                    ui.colored_label(DIM, "Requesting...");
                 });
             }
             Response::Failed(e) => {
-                ui.colored_label(ERR, format!("✗ {e}"));
+                ui.colored_label(ERR, format!("[X] {e}"));
             }
             Response::Done(resp) => {
                 let color = match resp.status {

@@ -77,49 +77,60 @@ impl Rvim {
 
     /// Translate this frame's egui events into vim keys. Returns true on any key.
     fn handle_keys(&mut self, ui: &egui::Ui, host: &HostHandle) -> bool {
-        let events = ui.input(|i| i.events.clone());
         let mut activity = false;
-        for ev in events {
-            match ev {
-                egui::Event::Text(text) => {
-                    for c in text.chars() {
-                        if c == '\n' || c == '\r' {
-                            self.feed(Key::Enter, host);
-                        } else if !c.is_control() {
-                            self.feed(Key::Char(c), host);
+        ui.input_mut(|i| {
+            let mut keep = Vec::new();
+            for ev in i.events.drain(..) {
+                let mut consumed = false;
+                match &ev {
+                    egui::Event::Text(text) => {
+                        for c in text.chars() {
+                            if c != '\n' && c != '\r' && !c.is_control() {
+                                self.feed(Key::Char(c), host);
+                                activity = true;
+                                consumed = true;
+                            }
                         }
-                        activity = true;
                     }
-                }
-                egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    let ctrl = modifiers.ctrl || modifiers.command;
-                    let translated = match key {
-                        egui::Key::Escape => Some(Key::Esc),
-                        egui::Key::Enter => Some(Key::Enter),
-                        egui::Key::Backspace => Some(Key::Backspace),
-                        egui::Key::Delete => Some(Key::Delete),
-                        egui::Key::Tab => Some(Key::Tab),
-                        egui::Key::ArrowUp => Some(Key::Up),
-                        egui::Key::ArrowDown => Some(Key::Down),
-                        egui::Key::ArrowLeft => Some(Key::Left),
-                        egui::Key::ArrowRight => Some(Key::Right),
-                        egui::Key::Home => Some(Key::Home),
-                        egui::Key::End => Some(Key::End),
-                        egui::Key::PageUp => Some(Key::PageUp),
-                        egui::Key::PageDown => Some(Key::PageDown),
-                        egui::Key::OpenBracket if ctrl => Some(Key::Esc),
-                        // Plain letters arrive as Event::Text; only Ctrl-chords come from here.
-                        k if ctrl => letter(k).map(Key::Ctrl),
-                        _ => None,
-                    };
-                    if let Some(k) = translated {
-                        self.feed(k, host);
-                        activity = true;
+                    egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                        let ctrl = modifiers.ctrl || modifiers.command;
+                        let translated = match key {
+                            egui::Key::Escape => Some(Key::Esc),
+                            egui::Key::Enter => Some(Key::Enter),
+                            egui::Key::Backspace => Some(Key::Backspace),
+                            egui::Key::Delete => Some(Key::Delete),
+                            egui::Key::Tab => Some(Key::Tab),
+                            egui::Key::ArrowUp => Some(Key::Up),
+                            egui::Key::ArrowDown => Some(Key::Down),
+                            egui::Key::ArrowLeft => Some(Key::Left),
+                            egui::Key::ArrowRight => Some(Key::Right),
+                            egui::Key::Home => Some(Key::Home),
+                            egui::Key::End => Some(Key::End),
+                            egui::Key::PageUp => Some(Key::PageUp),
+                            egui::Key::PageDown => Some(Key::PageDown),
+                            egui::Key::OpenBracket if ctrl => Some(Key::Esc),
+                            egui::Key::Period if ctrl => Some(Key::Esc), // Cmd+. is iOS escape
+                            k if ctrl => letter(*k).map(Key::Ctrl),
+                            _ => None,
+                        };
+                        if let Some(k) = translated {
+                            self.feed(k, host);
+                            activity = true;
+                            // Only consume the key if we are focused, so we don't steal global keys unless focused
+                            if self.focused || k == Key::Esc {
+                                consumed = true;
+                            }
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                if !consumed {
+                    keep.push(ev);
+                }
             }
-        }
+            i.events = keep;
+        });
+        
         if activity {
             self.last_input = ui.input(|i| i.time);
         }

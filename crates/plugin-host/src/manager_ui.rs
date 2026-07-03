@@ -110,9 +110,9 @@ impl PluginManagerUi {
         for (i, plugin) in manager.plugins.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 let (dot, color) = match (&plugin.status, plugin.enabled) {
-                    (PluginStatus::Errored(_), _) => ("●", egui::Color32::RED),
-                    (_, false) => ("●", egui::Color32::GRAY),
-                    (PluginStatus::Ready, true) => ("●", egui::Color32::GREEN),
+                    (PluginStatus::Errored(_), _) => ("*", egui::Color32::RED),
+                    (_, false) => ("*", egui::Color32::GRAY),
+                    (PluginStatus::Ready, true) => ("*", egui::Color32::GREEN),
                 };
                 ui.colored_label(color, dot);
                 let label = format!("{} v{}", plugin.manifest.name, plugin.manifest.version);

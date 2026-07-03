@@ -81,13 +81,13 @@ impl PluginApp for RegexTester {
             ui.separator();
             match &compiled {
                 Err(e) => {
-                    ui.colored_label(ERR, format!("✗ {e}"));
+                    ui.colored_label(ERR, format!("[X] {e}"));
                 }
                 Ok(re) => {
                     let caps: Vec<_> = re.captures_iter(&self.text).collect();
                     ui.colored_label(
                         OK,
-                        format!("✓ {} match{}", caps.len(), if caps.len() == 1 { "" } else { "es" }),
+                        format!("[OK] {} match{}", caps.len(), if caps.len() == 1 { "" } else { "es" }),
                     );
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (i, cap) in caps.iter().enumerate() {

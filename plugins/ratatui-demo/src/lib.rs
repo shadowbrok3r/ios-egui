@@ -64,7 +64,7 @@ impl TuiDemo {
                     .split(frame.area());
 
                 frame.render_widget(
-                    Paragraph::new("ratatui inside a WASM plugin — ▲/▼ to select")
+                    Paragraph::new("ratatui inside a WASM plugin -- Up/Down to select")
                         .style(THEME.title())
                         .block(
                             Block::default()
@@ -90,7 +90,7 @@ impl TuiDemo {
                                 .title(Line::from(" hosts ").style(THEME.title())),
                         )
                         .highlight_style(THEME.menu_highlight())
-                        .highlight_symbol("▶"),
+                        .highlight_symbol(">"),
                     middle[0],
                     list_state,
                 );

@@ -76,8 +76,8 @@ impl Terminal {
             mode: Mode::Local,
             toolbar_hidden: false,
         };
-        term.push(OutLine_new("Terminal ready — tap to type, `help` for commands.", theme::ACCENT));
-        term.push(OutLine_new("`ssh user@host` to connect · swipe to scroll · ↑/↓ history", theme::DIM));
+        term.push(OutLine::new("Terminal ready -- tap to type, `help` for commands.", theme::ACCENT));
+        term.push(OutLine::new("`ssh user@host` to connect - swipe to scroll - Up/Down history", theme::DIM));
         term
     }
 
@@ -106,7 +106,7 @@ impl Terminal {
 
     fn submit(&mut self) {
         let line = self.editor.take();
-        self.push(OutLine_new(format!("❯ {line}"), theme::DIM));
+        self.push(OutLine::new(format!("> {line}"), theme::DIM));
         if let Some((user, host, port)) = parse_ssh(&line) {
             self.mode = Mode::Auth(AuthPrompt { user, host, port, password: String::new() });
             self.focused = true;
@@ -159,7 +159,7 @@ impl Terminal {
                         egui::Key::U if ctrl => self.editor.kill_to_start(),
                         egui::Key::L if ctrl => self.clear_scrollback(),
                         egui::Key::C if ctrl => {
-                            self.push(OutLine_new(format!("❯ {}^C", self.editor.text()), theme::DIM));
+                            self.push(OutLine::new(format!("> {}^C", self.editor.text()), theme::DIM));
                             self.editor.clear();
                         }
                         _ => {}
@@ -259,9 +259,9 @@ impl Terminal {
     }
 
     fn header_line(&self, width: usize) -> Line<'static> {
-        let title = if self.focused { " terminal — tap to hide keyboard" } else { " terminal — tap to type" };
+        let title = if self.focused { " terminal -- tap to hide keyboard" } else { " terminal -- tap to type" };
         let hint = if self.scroll_offset > 0 {
-            format!("↓ {} newer ", self.scroll_offset)
+            format!("v {} newer ", self.scroll_offset)
         } else {
             String::new()
         };
