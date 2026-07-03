@@ -1,0 +1,6 @@
+id = "com.example.http"
+name = "HTTP Client"
+version = "0.1.0"
+abi_version = 1
+description = "A REST client: pick a method, set headers and a body, send, and read the status, headers, and pretty-printed JSON response. Requests run on the native host so TLS is fast."
+permissions = ["net", "clipboard.set", "haptic"]

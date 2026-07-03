@@ -1,15 +1,18 @@
 //! A native-feeling terminal rendered with ratatui inside a WASM plugin.
 //!
-//! Input handling is the point: egui's translated iOS keyboard text and `Key` events drive a
-//! char-indexed line editor; touch drags and the scroll wheel move the scrollback; tapping
-//! focuses the terminal and raises the iOS soft keyboard via `HostHandle::request_keyboard`.
+//! Two modes share one surface: a local pocket shell (line editor + built-in commands) and an
+//! interactive SSH session (a VT emulator driven by the native `ssh.*` host ops). `ssh user@host`
+//! or a hand-off from the Devices plugin opens a password prompt, then a full PTY.
 
 mod calc;
 mod editor;
 mod render;
 mod shell;
+mod sshmode;
 mod theme;
+mod vt;
 
+use egui_ios_plugin_sdk::abi::{self, net};
 use egui_ios_plugin_sdk::{CreateConfig, HostHandle, PluginApp, egui, plugin};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -19,29 +22,38 @@ use ratatui::widgets::Paragraph;
 use editor::LineEditor;
 use render::TerminalSurface;
 use shell::{Effect, OutLine};
+use sshmode::{Phase, SshClient};
 
 /// Cap on retained scrollback lines.
 const SCROLLBACK_CAP: usize = 2000;
+
+/// A password prompt while opening an SSH session.
+struct AuthPrompt {
+    user: String,
+    host: String,
+    port: u16,
+    password: String,
+}
+
+enum Mode {
+    Local,
+    Auth(AuthPrompt),
+    Ssh(SshClient),
+}
 
 struct Terminal {
     surface: TerminalSurface,
     editor: LineEditor,
     scrollback: Vec<OutLine>,
-    /// Display rows scrolled up from the bottom; 0 pins to the newest output.
     scroll_offset: usize,
-    /// Sub-row scroll remainder, so slow drags accumulate instead of being rounded away.
     scroll_accum: f32,
-    /// Pointer position on the previous frame while a drag is in progress.
     last_pointer: Option<egui::Pos2>,
-    /// The terminal has been tapped, so it wants the keyboard and shows a solid cursor.
     focused: bool,
-    /// egui time of the last keystroke, for cursor-blink reset.
     last_input: f64,
-    /// Bumped whenever scrollback changes; invalidates the wrapped-row cache.
     scrollback_rev: u64,
-    /// Wrapped display rows cached by (scrollback_rev, width) so idle frames skip re-wrapping.
     display_cache: Vec<(String, Color)>,
     cache_key: Option<(u64, usize)>,
+    mode: Mode,
 }
 
 impl Terminal {
@@ -58,9 +70,10 @@ impl Terminal {
             scrollback_rev: 0,
             display_cache: Vec::new(),
             cache_key: None,
+            mode: Mode::Local,
         };
         term.push(OutLine_new("Terminal ready — tap to type, `help` for commands.", theme::ACCENT));
-        term.push(OutLine_new("swipe to scroll · ↑/↓ history · Ctrl+L clear", theme::DIM));
+        term.push(OutLine_new("`ssh user@host` to connect · swipe to scroll · ↑/↓ history", theme::DIM));
         term
     }
 
@@ -90,6 +103,11 @@ impl Terminal {
     fn submit(&mut self) {
         let line = self.editor.take();
         self.push(OutLine_new(format!("❯ {line}"), theme::DIM));
+        if let Some((user, host, port)) = parse_ssh(&line) {
+            self.mode = Mode::Auth(AuthPrompt { user, host, port, password: String::new() });
+            self.focused = true;
+            return;
+        }
         let response = shell::run(&line, self.editor.history());
         if let Effect::Clear = response.effect {
             self.clear_scrollback();
@@ -159,7 +177,6 @@ impl Terminal {
         let (down, pos, wheel) = ui.input(|i| {
             (i.pointer.primary_down(), i.pointer.interact_pos(), i.smooth_scroll_delta.y)
         });
-        // Grab-scroll: track the pointer's own vertical movement between frames while held.
         let mut drag = 0.0;
         match (down, pos) {
             (true, Some(p)) => {
@@ -170,7 +187,6 @@ impl Terminal {
             }
             _ => self.last_pointer = None,
         }
-        // Dragging down (positive) reveals older lines above; accumulate sub-row remainders.
         self.scroll_accum += drag + wheel;
         let rows = (self.scroll_accum / row_h).trunc() as i64;
         if rows != 0 {
@@ -180,7 +196,6 @@ impl Terminal {
         }
     }
 
-    /// Build wrapped display rows from the scrollback for the given width.
     fn display_rows(&self, width: usize) -> Vec<(String, Color)> {
         let mut rows = Vec::new();
         for line in &self.scrollback {
@@ -189,6 +204,16 @@ impl Terminal {
             }
         }
         rows
+    }
+
+    fn blink(&self, time: f64) -> bool {
+        if !self.focused {
+            false
+        } else if time - self.last_input < 0.5 {
+            true
+        } else {
+            (time * 1.2) as i64 % 2 == 0
+        }
     }
 
     fn draw(&mut self, blink_on: bool) {
@@ -203,7 +228,6 @@ impl Terminal {
         let start = max_off - scroll_offset;
         let end = (start + body_rows).min(total);
 
-        // Bottom-anchor: pad empty rows above short scrollback.
         let pad = body_rows.saturating_sub(end - start);
         let mut body_lines: Vec<Line> = Vec::with_capacity(body_rows);
         for _ in 0..pad {
@@ -264,9 +288,242 @@ impl Terminal {
         }
         Line::from(spans)
     }
+
+    // ── Local / auth console ─────────────────────────────────────────────────
+
+    fn update_console(&mut self, ui: &mut egui::Ui, host: &HostHandle) {
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        if resp.clicked() {
+            self.focused = !self.focused;
+            if self.focused {
+                host.haptic(6);
+            }
+        }
+        host.request_keyboard(self.focused);
+        let (_cols, rows) = self.surface.fit(ui, avail);
+
+        if matches!(self.mode, Mode::Auth(_)) {
+            self.update_auth(ui, host);
+        } else {
+            self.handle_keys(ui, host);
+            let width = self.surface.grid().0 as usize;
+            let body_rows = (rows as usize).saturating_sub(2);
+            let max_off = self.ensure_display(width).saturating_sub(body_rows);
+            self.handle_scroll(ui, max_off);
+            let time = ui.input(|i| i.time);
+            let blink_on = self.blink(time);
+            self.draw(blink_on);
+        }
+        self.surface.paint(ui.painter(), rect);
+    }
+
+    fn update_auth(&mut self, ui: &egui::Ui, host: &HostHandle) {
+        let events = ui.input(|i| i.events.clone());
+        let mut connect = false;
+        let mut cancel = false;
+        if let Mode::Auth(p) = &mut self.mode {
+            for ev in events {
+                match ev {
+                    egui::Event::Text(t) => {
+                        for c in t.chars() {
+                            if !c.is_control() {
+                                p.password.push(c);
+                            }
+                        }
+                    }
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => connect = true,
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                        p.password.pop();
+                    }
+                    egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => cancel = true,
+                    _ => {}
+                }
+            }
+        }
+        if cancel {
+            self.push(OutLine_new("ssh: cancelled", theme::DIM));
+            self.mode = Mode::Local;
+            self.draw(false);
+            return;
+        }
+        if connect {
+            let (user, host_s, port, password) = if let Mode::Auth(p) = &self.mode {
+                (p.user.clone(), p.host.clone(), p.port, p.password.clone())
+            } else {
+                return;
+            };
+            let (cols, rows_full) = self.surface.grid();
+            let vt_rows = rows_full.saturating_sub(1).max(1);
+            self.push(OutLine_new(format!("Connecting to {user}@{host_s}:{port}…"), theme::ACCENT));
+            match SshClient::connect(
+                host,
+                &user,
+                &host_s,
+                port,
+                net::SshAuth::Password(password),
+                cols,
+                vt_rows,
+            ) {
+                Ok(client) => self.mode = Mode::Ssh(client),
+                Err(e) => {
+                    self.push(OutLine_new(format!("ssh: {e}"), theme::ERROR));
+                    self.mode = Mode::Local;
+                }
+            }
+            self.draw(false);
+            return;
+        }
+        self.draw_auth();
+    }
+
+    fn draw_auth(&mut self) {
+        let (user, host_s, masked) = if let Mode::Auth(p) = &self.mode {
+            (p.user.clone(), p.host.clone(), "•".repeat(p.password.chars().count()))
+        } else {
+            return;
+        };
+        let header = Line::from(Span::styled(
+            format!(" SSH → {user}@{host_s}"),
+            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        let prompt = Line::from(vec![
+            Span::styled("  password: ", Style::new().fg(theme::TEXT)),
+            Span::styled(masked, Style::new().fg(theme::SUCCESS)),
+            Span::styled("▏", Style::new().fg(theme::ACCENT)),
+        ]);
+        let hint = Line::from(Span::styled(
+            "  Enter to connect · Esc to cancel",
+            Style::new().fg(theme::DIM),
+        ));
+        self.surface
+            .terminal_mut()
+            .draw(|frame| {
+                let areas = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Length(2), Constraint::Min(1)])
+                    .split(frame.area());
+                frame.render_widget(Paragraph::new(header), areas[0]);
+                frame.render_widget(Paragraph::new(prompt), areas[1]);
+                frame.render_widget(Paragraph::new(hint), areas[2]);
+            })
+            .expect("tui draw");
+    }
+
+    // ── SSH session ──────────────────────────────────────────────────────────
+
+    fn update_ssh(&mut self, ui: &mut egui::Ui, host: &HostHandle) {
+        let ready = matches!(&self.mode, Mode::Ssh(c) if matches!(c.phase, Phase::Ready));
+        let mut tb_bytes: Vec<u8> = Vec::new();
+        let mut disconnect = false;
+        ui.horizontal(|ui| {
+            let mut send = |ui: &mut egui::Ui, label: &str, bytes: &[u8]| {
+                if ui.add_enabled(ready, egui::Button::new(label).small()).clicked() {
+                    tb_bytes.extend_from_slice(bytes);
+                }
+            };
+            send(ui, "esc", b"\x1b");
+            send(ui, "tab", b"\t");
+            send(ui, "^C", b"\x03");
+            send(ui, "^D", b"\x04");
+            send(ui, "↑", b"\x1b[A");
+            send(ui, "↓", b"\x1b[B");
+            send(ui, "←", b"\x1b[D");
+            send(ui, "→", b"\x1b[C");
+            if ui.button("⏻").on_hover_text("Disconnect").clicked() {
+                disconnect = true;
+            }
+        });
+
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        if resp.clicked() {
+            self.focused = !self.focused;
+            if self.focused {
+                host.haptic(6);
+            }
+        }
+        host.request_keyboard(self.focused);
+        let (cols, rows) = self.surface.fit(ui, avail);
+        let vt_rows = rows.saturating_sub(1).max(1);
+
+        if let Mode::Ssh(c) = &mut self.mode {
+            c.resize(host, cols, vt_rows);
+            c.poll(host);
+        }
+
+        let ready = matches!(&self.mode, Mode::Ssh(c) if matches!(c.phase, Phase::Ready));
+        let ended = matches!(&self.mode, Mode::Ssh(c) if matches!(c.phase, Phase::Ended(_)));
+
+        if disconnect {
+            if let Mode::Ssh(c) = &self.mode {
+                c.close(host);
+            }
+            self.push(OutLine_new("ssh: disconnected", theme::DIM));
+            self.mode = Mode::Local;
+            return;
+        }
+
+        if ended {
+            // Once the session is over, any keypress or tap returns to the local shell.
+            let go = ui.input(|i| {
+                i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { pressed: true, .. })
+                        || matches!(e, egui::Event::PointerButton { pressed: true, .. })
+                })
+            });
+            if go {
+                if let Mode::Ssh(c) = &self.mode {
+                    c.close(host);
+                }
+                self.mode = Mode::Local;
+                return;
+            }
+        } else if ready {
+            let mut bytes = tb_bytes;
+            if self.focused {
+                bytes.extend(sshmode::input_bytes(ui));
+            }
+            if let Mode::Ssh(c) = &self.mode {
+                c.write(host, &bytes);
+            }
+        }
+
+        self.draw_ssh();
+        self.surface.paint(ui.painter(), rect);
+    }
+
+    fn draw_ssh(&mut self) {
+        let (header_text, body) = if let Mode::Ssh(c) = &self.mode {
+            let text = match &c.phase {
+                Phase::Connecting => format!(" ssh {}@{} — connecting…", c.user, c.host),
+                Phase::Ready => format!(" ssh {}@{}", c.user, c.host),
+                Phase::Ended(m) => format!(" ssh {}@{} — {m} · tap to return", c.user, c.host),
+            };
+            let show_cursor = self.focused && matches!(c.phase, Phase::Ready);
+            (text, c.vt.to_lines(show_cursor))
+        } else {
+            return;
+        };
+        let header = Line::from(Span::styled(
+            header_text,
+            Style::new().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+        ));
+        self.surface
+            .terminal_mut()
+            .draw(|frame| {
+                let areas = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(1)])
+                    .split(frame.area());
+                frame.render_widget(Paragraph::new(header), areas[0]);
+                frame.render_widget(Paragraph::new(body), areas[1]);
+            })
+            .expect("tui draw");
+    }
 }
 
-// Free helper (module-name-collision-free) to build an OutLine.
+/// Free helper (module-name-collision-free) to build an OutLine.
 #[allow(non_snake_case)]
 fn OutLine_new(text: impl Into<String>, color: Color) -> OutLine {
     OutLine { text: text.into(), color }
@@ -274,47 +531,30 @@ fn OutLine_new(text: impl Into<String>, color: Color) -> OutLine {
 
 impl PluginApp for Terminal {
     fn update(&mut self, ui: &mut egui::Ui, host: &HostHandle) {
-        let avail = ui.available_size();
-        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-
-        // Tap toggles focus, so a soft-keyboard-only device can dismiss the keyboard by
-        // tapping again — Escape is unreachable there.
-        if resp.clicked() {
-            self.focused = !self.focused;
-            if self.focused {
-                host.haptic(6);
-            }
-        }
-        // Latched each frame: the host bridges this to the iOS soft keyboard.
-        host.request_keyboard(self.focused);
-
-        // Size the grid, then handle input against the fitted dimensions.
-        let (_cols, rows) = self.surface.fit(ui, avail);
-        self.handle_keys(ui, host);
-
-        let width = self.surface.grid().0 as usize;
-        let body_rows = (rows as usize).saturating_sub(2);
-        let max_off = self.ensure_display(width).saturating_sub(body_rows);
-        self.handle_scroll(ui, max_off);
-
-        let time = ui.input(|i| i.time);
-        let blink_on = if !self.focused {
-            false
-        } else if time - self.last_input < 0.5 {
-            true
+        if matches!(self.mode, Mode::Ssh(_)) {
+            self.update_ssh(ui, host);
         } else {
-            (time * 1.2) as i64 % 2 == 0
-        };
-
-        self.draw(blink_on);
-        self.surface.paint(ui.painter(), rect);
-
-        // Keep the cursor blinking and any drag momentum smooth.
+            self.update_console(ui, host);
+        }
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
     }
 
+    fn on_host_event(&mut self, topic: &str, payload: &[u8], _host: &HostHandle) {
+        if topic == net::EVENT_SSH_OPEN {
+            if let Ok(req) = abi::decode::<net::SshOpenRequest>(payload) {
+                let port = if req.port == 0 { 22 } else { req.port };
+                self.mode = Mode::Auth(AuthPrompt {
+                    user: req.user,
+                    host: req.host,
+                    port,
+                    password: String::new(),
+                });
+                self.focused = true;
+            }
+        }
+    }
+
     fn save_state(&self) -> Vec<u8> {
-        // Preserve the scrollback text across hot reloads (colors reset to default).
         self.scrollback
             .iter()
             .map(|l| l.text.clone())
@@ -332,6 +572,41 @@ impl PluginApp for Terminal {
             self.scrollback_rev = self.scrollback_rev.wrapping_add(1);
         }
     }
+}
+
+/// Parse an `ssh [user@]host [-p port]` command line; `None` if it isn't an ssh command.
+fn parse_ssh(line: &str) -> Option<(String, String, u16)> {
+    let mut it = line.split_whitespace();
+    if it.next()? != "ssh" {
+        return None;
+    }
+    let toks: Vec<&str> = it.collect();
+    let mut target: Option<&str> = None;
+    let mut port = 22u16;
+    let mut i = 0;
+    while i < toks.len() {
+        let t = toks[i];
+        if t == "-p" {
+            if let Some(p) = toks.get(i + 1) {
+                port = p.parse().unwrap_or(22);
+                i += 1;
+            }
+        } else if let Some(rest) = t.strip_prefix("-p") {
+            port = rest.parse().unwrap_or(22);
+        } else if !t.starts_with('-') && target.is_none() {
+            target = Some(t);
+        }
+        i += 1;
+    }
+    let target = target?;
+    let (user, host) = match target.split_once('@') {
+        Some((u, h)) => (u.to_string(), h.to_string()),
+        None => ("root".to_string(), target.to_string()),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((user, host, port))
 }
 
 /// Wrap `text` to `width` columns, breaking at spaces where possible without dropping content.
@@ -355,7 +630,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         out.push(chars[i..end].iter().collect::<String>());
         i = end;
         if i < chars.len() && chars[i] == ' ' {
-            i += 1; // consume the break space
+            i += 1;
         }
     }
     out

@@ -142,3 +142,16 @@ pub struct SshResize {
     pub cols: u16,
     pub rows: u16,
 }
+
+/// Topic a plugin emits (and the terminal listens for) to hand off an SSH target — e.g. the
+/// Devices plugin asking the terminal to connect to a tailnet host. Payload: [`SshOpenRequest`].
+pub const EVENT_SSH_OPEN: &str = "ssh.open";
+
+/// Cross-plugin request to open an SSH session to a host. Carries no credentials; the
+/// receiving terminal prompts for the password or key.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SshOpenRequest {
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+}

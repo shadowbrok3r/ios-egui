@@ -1,0 +1,6 @@
+id = "com.example.devices"
+name = "Devices"
+version = "0.1.0"
+abi_version = 1
+description = "Lists your Tailscale devices (name, 100.x address, OS, last seen) from the Tailscale API. Tap a device to copy its address or hand it to the terminal to SSH in."
+permissions = ["net", "clipboard.set", "haptic"]

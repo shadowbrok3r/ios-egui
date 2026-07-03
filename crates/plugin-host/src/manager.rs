@@ -152,6 +152,24 @@ impl PluginManager {
         PluginViewport::default().show(ui, &mut self.plugins[index], &mut self.retired_keys)
     }
 
+    /// Index of the enabled, ready plugin whose manifest id is `id`.
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.plugins.iter().position(|p| p.manifest.id == id)
+    }
+
+    /// Deliver a host event to the plugin with manifest id `id` (e.g. a cross-plugin handoff).
+    /// Returns whether a matching, ready plugin received it.
+    pub fn send_event_to(&mut self, id: &str, topic: &str, payload: &[u8]) -> bool {
+        let Some(index) = self.index_of(id) else { return false };
+        match self.plugins[index].send_event(topic, payload) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("send_event_to {id}/{topic}: {e:#}");
+                false
+            }
+        }
+    }
+
     /// Apply pending dev-sync pushes; returns how many plugins were (re)installed. Only a
     /// successful install is confirmed back to the poller, so a failed push is retried.
     pub fn poll_devsync(&mut self, sync: &DevSync, ctx: &egui::Context) -> usize {

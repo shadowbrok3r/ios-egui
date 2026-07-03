@@ -22,6 +22,17 @@ Working examples under `plugins/` (build any with `cargo egui-ios plugin serve` 
   Up/Down recall history, and a built-in pocket shell runs `calc` (scientific expressions),
   `hex`/`bin`/`oct`/`dec` conversions, `b64`, `sha256`, and text utilities. This is the shell an
   SSH client grows from — sockets and PTY would be host ops (`ssh.*`), keeping crypto native.
+- **terminal (SSH mode)** — the same terminal doubles as an interactive SSH client. `ssh
+  user@host [-p port]` (or a hand-off from the Devices plugin) opens a password prompt, then a
+  full PTY: a built-in VT/xterm emulator (`vte`-parsed) renders the remote screen with colors,
+  and a soft-key toolbar supplies keys the iOS keyboard lacks (Esc, Tab, Ctrl-C/D, arrows,
+  disconnect). Crypto runs natively via the `ssh.*` host ops — never in the Pulley interpreter.
+- **http-client** — a REST client: method, URL, headers, and body; sends through the native
+  `net.http.*` ops and shows the status, headers, and pretty-printed JSON response. The last
+  request persists across reloads.
+- **devices** — lists your Tailscale devices (name, 100.x address, OS, last-seen) from the
+  Tailscale API via `net.http`. Tap a device to copy its address, or "SSH" to open it in the
+  terminal. The API key + tailnet + default SSH user persist across reloads.
 - **regex-tester** — live regular-expression testing; matches highlight inline in the editable
   text via a `TextEdit` layouter, with a capture-group breakdown and flags.
 - **json-viewer** — validate, pretty-print, minify, and browse JSON as a collapsible,
@@ -115,9 +126,9 @@ Desktop (eframe 0.35 + wgpu): see `examples/desktop-host`. The one-time hookup o
 `egui_ios_plugin_host::install(&mut renderer, surface_format, msaa_samples)`; the iOS runtime
 does this automatically when the `plugins` feature is on.
 
-Apps extend the op surface by implementing `HostOps` — e.g. a Termius-style app registers
-native `ssh.*`/`net.tcp.*` ops (native crypto speed) and plugins drive them via
-`host.call("ssh.connect", …)`, gated by their manifest.
+On iOS, `IosOps` already implements the standard capability ops **and** the native `net.http.*`
+/ `ssh.*` ops (see "Network ops"), so a plugin can `host.call("ssh.connect", …)` out of the box,
+gated by its manifest. Apps extend the op surface further by implementing `HostOps`.
 
 ## Architecture
 
@@ -173,3 +184,37 @@ accent) for TUI plugins.
 | `keyboard.set` | 1 byte 0/1 | explicit soft-keyboard control |
 
 Everything else is app-defined via `HostOps`.
+
+## Network ops (feature `net`)
+
+The iOS runtime (and any host that opts into `egui-ios-plugin-host/net`) provides native HTTP
+and SSH through `NetOps`, so plugins get native TLS and crypto speed instead of running it in
+the Pulley interpreter. Every network op is **non-blocking**: a `*.request`/`connect` op
+returns a `u64` handle immediately and the plugin polls for progress, so the UI thread never
+stalls on I/O. Payload types live in `egui_ios_plugin_abi::net`.
+
+| op | payload → return | notes |
+| --- | --- | --- |
+| `net.http.request` | `HttpRequest` → `u64` id | runs on a throwaway thread (`ureq`, rustls) |
+| `net.http.poll` | id → `HttpPoll` (`Pending`/`Done`/`Error`) | terminal state delivered once, then dropped |
+| `net.http.cancel` | id → () | forget a pending request |
+| `ssh.connect` | `SshConnect` → `u64` id | opens a PTY shell (`russh`, ring); password or key auth |
+| `ssh.poll` | id → `SshPoll` (state + new output bytes) | output drained per poll; capped at 1 MiB between polls |
+| `ssh.write` | `SshWrite` (id, bytes) → () | stdin to the PTY |
+| `ssh.resize` | `SshResize` (id, cols, rows) → () | window-change on rotation/keyboard |
+| `ssh.close` | id → () | end the session |
+
+The `net` permission grants `net.*`; `ssh` grants `ssh.*`. SSH host-key verification is
+currently trust-all (intended for reaching your own machines over an already-encrypted overlay
+like Tailscale); known-hosts TOFU is a follow-up.
+
+A plugin can hand an SSH target to the terminal by emitting `abi::net::EVENT_SSH_OPEN`
+(`SshOpenRequest`); the host app routes it with `PluginManager::send_event_to`. The Devices
+plugin uses this for its "SSH" button.
+
+## Dev server & offline cache
+
+The manager panel persists the dev-server address and a "Reconnect on launch" flag in
+`<plugins-dir>/settings.json`, so a reinstall keeps your server and reconnects automatically.
+Plugins pushed over dev-sync (or installed statically) are written to `Documents/plugins` and
+scanned on launch, so they keep working offline with no server connected.

@@ -97,6 +97,17 @@ impl EguiApp for App {
                 let size = egui::vec2(avail.x, (avail.y - bottom).max(64.0));
                 let response = ui.allocate_ui(size, |ui| manager.show_plugin(ui, index)).inner;
                 wants_keyboard = response.wants_keyboard;
+
+                // Cross-plugin hand-off: Devices asks the terminal to SSH into a host.
+                for ev in &response.events {
+                    if ev.topic == egui_ios::plugins::abi::net::EVENT_SSH_OPEN
+                        && manager.send_event_to("com.example.terminal", &ev.topic, &ev.payload)
+                    {
+                        if let Some(t) = manager.index_of("com.example.terminal") {
+                            self.selected = t;
+                        }
+                    }
+                }
             }
             // Reconcile on every path so leaving a plugin lowers the keyboard.
             if wants_keyboard != self.wants_keyboard {
