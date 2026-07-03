@@ -59,22 +59,31 @@ final class MetalHostView: UIView, UIKeyInput {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        var handled = false
         for p in presses where p.key != nil {
             let k = p.key!
             onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), true)
-            handled = true
         }
-        if !handled { super.pressesBegan(presses, with: event) }
+        super.pressesBegan(presses, with: event)
     }
+    
     override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        var handled = false
         for p in presses where p.key != nil {
             let k = p.key!
             onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), false)
-            handled = true
         }
-        if !handled { super.pressesEnded(presses, with: event) }
+        super.pressesEnded(presses, with: event)
+    }
+    
+    override func pressesChanged(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        super.pressesChanged(presses, with: event)
+    }
+    
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for p in presses where p.key != nil {
+            let k = p.key!
+            onKey?(Int32(k.keyCode.rawValue), Int32(k.modifierFlags.rawValue), false)
+        }
+        super.pressesCancelled(presses, with: event)
     }
 
     @objc private func handlePan(_ gr: UIPanGestureRecognizer) {
