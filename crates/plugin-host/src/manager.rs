@@ -1,7 +1,10 @@
 //! Loads plugins from a directory tree (`<root>/<id>/{plugin.wasm, manifest.toml}`),
 //! hot-reloads them with state carried across instances, and applies dev-sync updates.
+//! All compilation and guest creation happens on the loader thread; `scan`, `reload_at`,
+//! and `install_bytes` only enqueue work, and [`PluginManager::pump`] — called every frame
+//! by [`PluginManagerUi::tick`](crate::PluginManagerUi::tick) — integrates the results.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
@@ -10,19 +13,30 @@ use abi::{CreateConfig, PluginManifest};
 
 use crate::devsync::DevSync;
 use crate::engine::PluginEngine;
+use crate::loader::{LoadJob, Loader};
 use crate::ops::HostOps;
 use crate::plugin::{LoadedPlugin, PluginStatus};
 use crate::viewport::{PluginViewport, PluginViewportResponse};
 
+/// One in-flight background load, for status UI.
+pub struct PendingLoad {
+    /// Directory name or plugin id, whichever was known at submit time.
+    pub name: String,
+    /// What queued it: `"scan"`, `"reload"`, `"install"`, or `"dev sync"`.
+    pub what: &'static str,
+    dir: PathBuf,
+    devsync: Option<(String, String)>,
+}
+
 pub struct PluginManager {
-    engine: PluginEngine,
-    ops: Arc<dyn HostOps>,
+    loader: Loader,
     root: PathBuf,
     host_name: String,
     pub plugins: Vec<LoadedPlugin>,
-    /// Load failures from the last `scan`/install, for the manager UI.
+    /// Load failures, for the manager UI. One entry per source; retries overwrite in place.
     pub load_errors: Vec<(String, String)>,
     retired_keys: Vec<u64>,
+    pending: Vec<PendingLoad>,
 }
 
 impl PluginManager {
@@ -32,18 +46,23 @@ impl PluginManager {
         let root = root.into();
         std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
         Ok(PluginManager {
-            engine: PluginEngine::new()?,
-            ops,
+            loader: Loader::new(PluginEngine::new()?, ops)?,
             root,
             host_name: host_name.to_owned(),
             plugins: Vec::new(),
             load_errors: Vec::new(),
             retired_keys: Vec::new(),
+            pending: Vec::new(),
         })
     }
 
     pub fn root(&self) -> &std::path::Path {
         &self.root
+    }
+
+    /// Loads queued but not yet finished, oldest first.
+    pub fn pending_loads(&self) -> &[PendingLoad] {
+        &self.pending
     }
 
     fn create_cfg(&self, ctx: &egui::Context) -> CreateConfig {
@@ -56,70 +75,91 @@ impl PluginManager {
         }
     }
 
-    /// Load every plugin directory not yet loaded. Failures land in `load_errors`.
+    fn is_pending(&self, dir: &Path) -> bool {
+        self.pending.iter().any(|p| p.dir == dir)
+    }
+
+    fn submit(&mut self, name: String, what: &'static str, job: LoadJob) {
+        self.pending.push(PendingLoad {
+            name,
+            what,
+            dir: job.dir.clone(),
+            devsync: job.devsync.clone(),
+        });
+        self.loader.submit(job);
+    }
+
+    /// Record a load failure, replacing any earlier failure from the same source so a
+    /// dev-sync retry loop cannot grow the list without bound.
+    fn push_error(&mut self, what: String, err: String) {
+        match self.load_errors.iter_mut().find(|(w, _)| *w == what) {
+            Some(entry) => entry.1 = err,
+            None => self.load_errors.push((what, err)),
+        }
+    }
+
+    /// Queue every plugin directory not yet loaded or loading. Failures land in
+    /// `load_errors` as the background loads finish.
     pub fn scan(&mut self, ctx: &egui::Context) {
         self.load_errors.clear();
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return;
         };
-        let cfg = self.create_cfg(ctx);
         for entry in entries.flatten() {
             let dir = entry.path();
             if !dir.is_dir() || !dir.join("plugin.wasm").exists() {
                 continue;
             }
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            if self.plugins.iter().any(|p| p.dir == dir) {
+            if self.plugins.iter().any(|p| p.dir == dir) || self.is_pending(&dir) {
                 continue;
             }
-            match LoadedPlugin::load(&self.engine, Arc::clone(&self.ops), &dir, &cfg) {
-                Ok(p) => {
-                    // Dedup by manifest id, not directory: a dir whose name differs from its
-                    // manifest id must not shadow an already-loaded plugin of the same id.
-                    if self.plugins.iter().any(|q| q.manifest.id == p.manifest.id) {
-                        self.load_errors.push((
-                            dir_name,
-                            format!("duplicate plugin id {} — ignoring this directory", p.manifest.id),
-                        ));
-                    } else {
-                        self.plugins.push(p);
-                    }
-                }
-                Err(e) => self.load_errors.push((dir_name, format!("{e:#}"))),
-            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let job = LoadJob {
+                dir,
+                cfg: self.create_cfg(ctx),
+                install: None,
+                devsync: None,
+            };
+            self.submit(name, "scan", job);
         }
-        self.plugins.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
     }
 
-    /// Hot-reload the plugin at `index` from its directory, carrying guest state across.
-    /// The old instance keeps running if the new one fails to load.
+    /// Queue a hot reload of the plugin at `index` from its directory. The old instance
+    /// keeps running until the replacement is ready; its state carries across at swap time.
     pub fn reload_at(&mut self, index: usize, ctx: &egui::Context) -> Result<()> {
-        let cfg = self.create_cfg(ctx);
-        let old = &mut self.plugins[index];
-        // Never snapshot a trapped guest — its memory may be inconsistent. Start fresh instead.
-        let state = if old.status == PluginStatus::Ready {
-            old.save_state().unwrap_or_default()
-        } else {
-            Vec::new()
+        let Some(plugin) = self.plugins.get(index) else {
+            bail!("no plugin at index {index}");
         };
-        let dir = old.dir.clone();
-        let mut fresh = LoadedPlugin::load(&self.engine, Arc::clone(&self.ops), &dir, &cfg)?;
-        if let Err(e) = fresh.restore_state(&state) {
-            // A restore trap must degrade to fresh state, not a dead-on-arrival plugin.
-            log::warn!("plugin {}: state restore failed, starting fresh: {e:#}", fresh.manifest.id);
-            fresh.clear_error();
+        if self.is_pending(&plugin.dir) {
+            return Ok(());
         }
-        let mut old = std::mem::replace(&mut self.plugins[index], fresh);
-        old.destroy();
-        self.retired_keys.push(old.instance_key);
+        let name = plugin.manifest.name.clone();
+        let job = LoadJob {
+            dir: plugin.dir.clone(),
+            cfg: self.create_cfg(ctx),
+            install: None,
+            devsync: None,
+        };
+        self.submit(name, "reload", job);
         Ok(())
     }
 
-    /// Write plugin files under the managed root and (re)load the plugin.
+    /// Queue an install: plugin files are written under the managed root and the plugin is
+    /// (re)loaded, all on the loader thread.
     pub fn install_bytes(
         &mut self,
         manifest_toml: &str,
         wasm: &[u8],
+        ctx: &egui::Context,
+    ) -> Result<()> {
+        self.queue_install(manifest_toml, wasm, None, ctx)
+    }
+
+    fn queue_install(
+        &mut self,
+        manifest_toml: &str,
+        wasm: &[u8],
+        devsync: Option<(String, String)>,
         ctx: &egui::Context,
     ) -> Result<()> {
         let manifest: PluginManifest = toml::from_str(manifest_toml).context("parsing manifest.toml")?;
@@ -131,19 +171,97 @@ impl PluginManager {
         if safe_id.is_empty() {
             bail!("plugin id {:?} is empty after sanitizing", manifest.id);
         }
-        let dir = self.root.join(&safe_id);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join("manifest.toml"), manifest_toml)?;
-        std::fs::write(dir.join("plugin.wasm"), wasm)?;
+        let what = if devsync.is_some() { "dev sync" } else { "install" };
+        let job = LoadJob {
+            dir: self.root.join(&safe_id),
+            cfg: self.create_cfg(ctx),
+            install: Some((manifest_toml.to_owned(), wasm.to_vec())),
+            devsync,
+        };
+        self.submit(safe_id, what, job);
+        Ok(())
+    }
 
-        if let Some(index) = self.plugins.iter().position(|p| p.dir == dir) {
-            self.reload_at(index, ctx)
-        } else {
-            let cfg = self.create_cfg(ctx);
-            let plugin = LoadedPlugin::load(&self.engine, Arc::clone(&self.ops), &dir, &cfg)?;
-            self.plugins.push(plugin);
-            Ok(())
+    /// Queue pending dev-sync pushes; returns how many were queued. A push already in
+    /// flight at the same hash is dropped — the poller resends until an install confirms.
+    pub fn poll_devsync(&mut self, sync: &DevSync, ctx: &egui::Context) -> usize {
+        let mut queued = 0;
+        while let Some(update) = sync.try_recv() {
+            let key = Some((update.id.clone(), update.hash.clone()));
+            if self.pending.iter().any(|p| p.devsync == key) {
+                continue;
+            }
+            match self.queue_install(&update.manifest_toml, &update.wasm, key, ctx) {
+                Ok(()) => queued += 1,
+                Err(e) => self.push_error(update.id, format!("{e:#}")),
+            }
         }
+        queued
+    }
+
+    /// Integrate finished background loads; returns how many plugins were (re)installed.
+    /// Call every frame (`PluginManagerUi::tick` does). Only a successful install is
+    /// confirmed back to the dev-sync poller, so a failed push is retried.
+    pub fn pump(&mut self, sync: Option<&DevSync>, ctx: &egui::Context) -> usize {
+        let mut applied = 0;
+        while let Some(done) = self.loader.try_recv() {
+            if let Some(i) = self.pending.iter().position(|p| p.dir == done.dir) {
+                self.pending.remove(i);
+            }
+            let name = done
+                .dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| done.dir.display().to_string());
+            let mut fresh = match done.result {
+                Ok(fresh) => fresh,
+                Err(e) => {
+                    self.push_error(name, format!("{e:#}"));
+                    continue;
+                }
+            };
+            self.load_errors.retain(|(w, _)| *w != name);
+            if let Some(i) = self.plugins.iter().position(|p| p.dir == done.dir) {
+                // Never carry state from a trapped guest — its memory may be inconsistent.
+                if self.plugins[i].status == PluginStatus::Ready {
+                    let state = self.plugins[i].save_state().unwrap_or_default();
+                    if let Err(e) = fresh.restore_state(&state) {
+                        // A restore trap degrades to fresh state, not a dead-on-arrival plugin.
+                        log::warn!(
+                            "plugin {}: state restore failed, starting fresh: {e:#}",
+                            fresh.manifest.id
+                        );
+                        fresh.clear_error();
+                    }
+                }
+                let mut old = std::mem::replace(&mut self.plugins[i], fresh);
+                old.destroy();
+                self.retired_keys.push(old.instance_key);
+            } else if self.plugins.iter().any(|q| q.manifest.id == fresh.manifest.id) {
+                // Dedup by manifest id, not directory: a dir whose name differs from its
+                // manifest id must not shadow an already-loaded plugin of the same id.
+                self.push_error(
+                    name,
+                    format!("duplicate plugin id {} — ignoring this directory", fresh.manifest.id),
+                );
+                continue;
+            } else {
+                self.plugins.push(fresh);
+                self.plugins.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+            }
+            if let (Some(sync), Some((id, hash))) = (sync, &done.devsync) {
+                sync.mark_installed(id, hash);
+            }
+            applied += 1;
+        }
+        if applied > 0 {
+            ctx.request_repaint();
+        }
+        if !self.pending.is_empty() {
+            // Completions arrive without user input; keep frames coming while work is queued.
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        applied
     }
 
     /// Show the plugin at `index`. Retired GPU keys from hot reloads ride along and are
@@ -168,21 +286,5 @@ impl PluginManager {
                 false
             }
         }
-    }
-
-    /// Apply pending dev-sync pushes; returns how many plugins were (re)installed. Only a
-    /// successful install is confirmed back to the poller, so a failed push is retried.
-    pub fn poll_devsync(&mut self, sync: &DevSync, ctx: &egui::Context) -> usize {
-        let mut applied = 0;
-        while let Some(update) = sync.try_recv() {
-            match self.install_bytes(&update.manifest_toml, &update.wasm, ctx) {
-                Ok(()) => {
-                    sync.mark_installed(&update.id, &update.hash);
-                    applied += 1;
-                }
-                Err(e) => self.load_errors.push((update.id, format!("{e:#}"))),
-            }
-        }
-        applied
     }
 }

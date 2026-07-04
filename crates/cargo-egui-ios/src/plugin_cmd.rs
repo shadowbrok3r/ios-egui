@@ -194,9 +194,9 @@ struct Served {
 type ServeState = Arc<Mutex<HashMap<String, Served>>>;
 
 /// Expand each input path into concrete plugin crate directories (those with a `manifest.toml`).
-/// A path that is itself a plugin is used as-is; otherwise its immediate subdirectories — or a
-/// nested `plugins/` directory — are scanned, so pointing at a folder of plugins (or the repo
-/// root) serves them all. Duplicates are removed.
+/// A path that is itself a plugin is used as-is; otherwise its immediate subdirectories AND a
+/// nested `plugins/` directory are scanned, so pointing at a folder of plugins (or the repo
+/// root) serves them all. Scaffold templates are skipped; duplicates are removed.
 fn expand_plugin_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let push = |p: PathBuf, out: &mut Vec<PathBuf>| {
@@ -210,8 +210,8 @@ fn expand_plugin_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
             continue;
         }
         let mut found = scan_plugin_children(path);
-        if found.is_empty() && path.join("plugins").is_dir() {
-            found = scan_plugin_children(&path.join("plugins"));
+        if path.join("plugins").is_dir() {
+            found.extend(scan_plugin_children(&path.join("plugins")));
         }
         if found.is_empty() {
             eprintln!("no plugin crates found under {}", path.display());
@@ -223,19 +223,27 @@ fn expand_plugin_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Immediate subdirectories of `dir` that are plugin crates (contain a `manifest.toml`), sorted.
+/// Immediate subdirectories of `dir` that are buildable plugin crates: they have a
+/// `manifest.toml` and are not scaffold templates.
 fn scan_plugin_children(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
         children.sort();
         for child in children {
-            if child.is_dir() && child.join("manifest.toml").is_file() {
+            if child.is_dir() && child.join("manifest.toml").is_file() && !is_template_crate(&child) {
                 found.push(child);
             }
         }
     }
     found
+}
+
+/// A crate whose Cargo.toml still holds `{{…}}` scaffold placeholders cannot build.
+fn is_template_crate(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("Cargo.toml"))
+        .map(|s| s.contains("{{"))
+        .unwrap_or(false)
 }
 
 fn cmd_serve(args: &PluginServeArgs) -> Result<()> {
@@ -254,17 +262,20 @@ fn cmd_serve(args: &PluginServeArgs) -> Result<()> {
 
     let state: ServeState = Arc::new(Mutex::new(HashMap::new()));
 
-    for path in &paths {
-        match build_plugin(path, args.debug) {
-            Ok(b) => insert(&state, b),
-            Err(e) => eprintln!("initial build failed for {}: {e:#}", path.display()),
-        }
-    }
-
+    // Build in the background so the server is reachable at once; each plugin is pushed
+    // to connected devices as its build lands, and one broken crate delays nothing.
     {
         let debug = args.debug;
         let state = Arc::clone(&state);
-        std::thread::spawn(move || watch_loop(&paths, debug, &state));
+        std::thread::spawn(move || {
+            for path in &paths {
+                match build_plugin(path, debug) {
+                    Ok(b) => insert(&state, b),
+                    Err(e) => eprintln!("initial build failed for {}: {e:#}", path.display()),
+                }
+            }
+            watch_loop(&paths, debug, &state);
+        });
     }
 
     let listener = TcpListener::bind(&args.addr)
@@ -430,4 +441,61 @@ fn respond(stream: &mut TcpStream, code: u16, ctype: &str, body: &[u8]) -> Resul
     )?;
     stream.write_all(body)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lay out `<root>/{template-plugin, other.txt, plugins/{a,b}, standalone}` where
+    /// template-plugin still holds scaffold placeholders.
+    fn fake_repo() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let mk = |rel: &str, cargo: &str| {
+            let dir = root.path().join(rel);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("manifest.toml"), "id = \"x\"\n").unwrap();
+            std::fs::write(dir.join("Cargo.toml"), cargo).unwrap();
+        };
+        mk("template-plugin", "[package]\nname = \"{{project_name}}\"\n");
+        mk("plugins/a", "[package]\nname = \"a\"\n");
+        mk("plugins/b", "[package]\nname = \"b\"\n");
+        mk("standalone", "[package]\nname = \"standalone\"\n");
+        std::fs::write(root.path().join("other.txt"), "").unwrap();
+        root
+    }
+
+    #[test]
+    fn repo_root_finds_nested_plugins_and_skips_templates() {
+        let root = fake_repo();
+        let found = expand_plugin_dirs(&[root.path().to_path_buf()]);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["standalone", "a", "b"], "found: {names:?}");
+    }
+
+    #[test]
+    fn explicit_plugin_dir_is_used_as_is() {
+        let root = fake_repo();
+        let a = root.path().join("plugins/a");
+        let found = expand_plugin_dirs(&[a.clone(), a.clone()]);
+        assert_eq!(found, [a], "duplicates collapse");
+    }
+
+    #[test]
+    fn plugins_folder_direct_scan_works() {
+        let root = fake_repo();
+        let found = expand_plugin_dirs(&[root.path().join("plugins")]);
+        assert_eq!(found.len(), 2);
+    }
+
+    #[test]
+    fn template_detection_reads_cargo_toml() {
+        let root = fake_repo();
+        assert!(is_template_crate(&root.path().join("template-plugin")));
+        assert!(!is_template_crate(&root.path().join("plugins/a")));
+        assert!(!is_template_crate(&root.path().join("does-not-exist")));
+    }
 }

@@ -10,35 +10,66 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::buffer::{Position, TextBuffer};
-use crate::finder::FinderState;
+use crate::finder::{FinderState, FinderTarget};
+use crate::fs::Vfs;
 use crate::highlight::{Highlighter, HlSpan};
-use crate::state::{Buffer as EdBuffer, EditorState, MsgKind};
+use crate::state::{Buffer as EdBuffer, EditorState, MsgKind, SplitDir};
 use crate::theme;
-use crate::vim::{Key, Mode, VimEngine};
+use crate::vim::{Key, Mode, ScrollRequest, VimEngine, VisualKind};
 
 /// Per-frame inputs the renderer needs beyond the editor state.
 pub struct DrawCtx<'a> {
     pub st: &'a mut EditorState,
     pub vim: &'a VimEngine,
     pub hl: &'a mut Highlighter,
+    pub vfs: &'a Vfs,
     /// Blink phase: the cursor cell renders solid when true.
     pub blink_on: bool,
     /// Sticky-Ctrl armed from the touchbar.
     pub ctrl_armed: bool,
     pub focused: bool,
+    /// Typing has paused; non-menu which-key panels only show then.
+    pub paused: bool,
+}
+
+/// Grid rectangle one window occupies, plus its gutter width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WinRect {
+    pub win: usize,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub gutter_w: u16,
 }
 
 /// Where things landed on the grid, for mapping taps back to buffer positions.
-#[derive(Clone, Copy, Default)]
+/// The flat fields describe the FOCUSED window.
+#[derive(Clone, Default)]
 pub struct LayoutInfo {
-    /// Columns taken by the line-number gutter.
+    /// Columns taken by the focused window's line-number gutter.
+    #[allow(dead_code)]
     pub gutter_w: u16,
-    /// First grid row of the text area.
+    /// First grid row of the focused window.
+    #[allow(dead_code)]
     pub text_top: u16,
+    #[allow(dead_code)]
     pub text_rows: u16,
     /// Grid row of the touchbar.
     pub touchbar_row: u16,
     pub cols: u16,
+    /// Every window's rectangle within the text area.
+    pub windows: Vec<WinRect>,
+    /// Explorer sidebar width in columns; 0 = hidden.
+    pub explorer_w: u16,
+    /// First grid row of the explorer sidebar (the full text area).
+    pub explorer_top: u16,
+    /// Sidebar rows (the full text-area height).
+    pub explorer_rows: u16,
+    /// First grid row of the which-key panel.
+    pub whichkey_top: u16,
+    /// Panel rows including the title; 0 = hidden.
+    pub whichkey_rows: u16,
 }
 
 /// A tap on the touchbar resolves to one of these.
@@ -86,34 +117,131 @@ fn vertical_layout(rows: u16) -> VLayout {
     }
 }
 
+/// Minimum grid rows for the which-key panel to dock without starving the text area.
+const WHICHKEY_MIN_SPARE: u16 = 5;
+
+/// Explorer sidebar width for `cols` grid columns; `None` = too narrow to show.
+fn explorer_width(cols: u16) -> Option<u16> {
+    if cols < 30 {
+        None
+    } else {
+        Some(28.min((cols as u32 * 35 / 100) as u16))
+    }
+}
+
+/// Tile `n` windows along `dir` inside the given area; `(x, y, w, h)` per window.
+/// One row (or column) between neighbours is left for a separator; tiles are exact.
+fn tile_windows(n: usize, dir: SplitDir, x0: u16, y0: u16, w: u16, h: u16) -> Vec<(u16, u16, u16, u16)> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let seps = (n - 1) as u16;
+    let mut out = Vec::with_capacity(n);
+    match dir {
+        SplitDir::Horizontal => {
+            let avail = h.saturating_sub(seps);
+            let (base, extra) = (avail / n as u16, (avail % n as u16) as usize);
+            let mut y = y0;
+            for i in 0..n {
+                let hh = base + u16::from(i < extra);
+                out.push((x0, y, w, hh));
+                y = y.saturating_add(hh).saturating_add(1);
+            }
+        }
+        SplitDir::Vertical => {
+            let avail = w.saturating_sub(seps);
+            let (base, extra) = (avail / n as u16, (avail % n as u16) as usize);
+            let mut x = x0;
+            for i in 0..n {
+                let ww = base + u16::from(i < extra);
+                out.push((x, y0, ww, h));
+                x = x.saturating_add(ww).saturating_add(1);
+            }
+        }
+    }
+    out
+}
+
 /// Draw one frame; also scroll-follows the cursor (mutates the active buffer's scroll).
 pub fn draw(term: &mut Terminal<TestBackend>, ctx: DrawCtx) -> LayoutInfo {
     let area = term.backend().buffer().area;
     let (cols, rows) = (area.width, area.height);
-    let vl = vertical_layout(rows);
 
-    let DrawCtx { st, vim, hl, blink_on, ctrl_armed, focused } = ctx;
+    let DrawCtx { st, vim, hl, vfs, blink_on, ctrl_armed, focused, paused } = ctx;
 
-    let gutter_w = match st.buf() {
-        Some(b) => gutter_width(b.text.line_count(), st.options.number, st.options.relativenumber, cols),
-        None => 0,
+    // Which-key panel overlays the rows above the touchbar without moving the text.
+    // Menus (leader, Ctrl+w) show at once; prefix cheatsheets wait for a typing pause.
+    let hints = vim.key_hints().filter(|h| h.immediate || paused);
+    let panel_h = match &hints {
+        Some(h) if !h.entries.is_empty() => {
+            let (hint_rows, _) = whichkey_grid(cols, h.entries.len());
+            let ph = hint_rows + 1;
+            if rows >= ph + WHICHKEY_MIN_SPARE { ph } else { 0 }
+        }
+        _ => 0,
     };
-    if let Some(b) = st.buf_mut() {
-        follow_scroll(b, vl.text_rows, cols.saturating_sub(gutter_w));
+    let vl = vertical_layout(rows);
+    let whichkey_top = vl.touchbar.saturating_sub(panel_h);
+
+    let explorer_w = if st.explorer.is_some() { explorer_width(cols) } else { None };
+    let (sidebar_w, win_x0) = match explorer_w {
+        Some(w) => (w, (w + 1).min(cols)),
+        None => (0, 0),
+    };
+    let win_w = cols - win_x0;
+    st.text_dims = (win_w, vl.text_rows);
+
+    let rects: Vec<WinRect> = if st.buffers.is_empty() {
+        Vec::new()
+    } else {
+        tile_windows(st.windows.len(), st.split_dir, win_x0, vl.text_top, win_w, vl.text_rows)
+            .into_iter()
+            .enumerate()
+            .map(|(i, (x, y, w, h))| {
+                let lines = st
+                    .buffers
+                    .get(st.windows[i].buffer)
+                    .map(|b| b.text.line_count())
+                    .unwrap_or(1);
+                let g = gutter_width(lines, st.options.number, st.options.relativenumber, w);
+                WinRect { win: i, x, y, w, h, gutter_w: g }
+            })
+            .collect()
+    };
+    let focus_rect = rects.get(st.active_win.min(rects.len().saturating_sub(1))).copied();
+
+    if let Some(fr) = focus_rect {
+        if let Some(b) = st.buf_mut() {
+            apply_scroll_request(b, vim.take_scroll_request(), fr.h);
+            follow_scroll(b, fr.h, fr.w.saturating_sub(fr.gutter_w));
+        }
+    }
+    if sidebar_w > 0 {
+        let visible = vl.text_rows.saturating_sub(1) as usize;
+        let flen = vfs.len();
+        if let Some(ex) = st.explorer.as_mut() {
+            ex.selected = ex.selected.min(flen.saturating_sub(1));
+            if ex.selected < ex.offset {
+                ex.offset = ex.selected;
+            } else if visible > 0 && ex.selected >= ex.offset + visible {
+                ex.offset = ex.selected + 1 - visible;
+            }
+        }
     }
 
     let st: &EditorState = st;
-    let spans: &[Vec<HlSpan>] = match st.buf() {
-        Some(b) => hl.spans(&b.name, &b.text),
-        None => &[],
-    };
-
     let info = LayoutInfo {
-        gutter_w,
-        text_top: vl.text_top,
-        text_rows: vl.text_rows,
+        gutter_w: focus_rect.map(|r| r.gutter_w).unwrap_or(0),
+        text_top: focus_rect.map(|r| r.y).unwrap_or(vl.text_top),
+        text_rows: focus_rect.map(|r| r.h).unwrap_or(vl.text_rows),
         touchbar_row: vl.touchbar,
         cols,
+        windows: rects.clone(),
+        explorer_w: sidebar_w,
+        explorer_top: vl.text_top,
+        explorer_rows: vl.text_rows,
+        whichkey_top,
+        whichkey_rows: panel_h,
     };
 
     let _ = term.draw(|frame| {
@@ -122,10 +250,27 @@ pub fn draw(term: &mut Terminal<TestBackend>, ctx: DrawCtx) -> LayoutInfo {
         if let Some(row) = vl.bufferline {
             draw_bufferline(g, row, cols, st);
         }
-        if st.buf().is_some() {
-            draw_text(g, &vl, gutter_w, cols, st, vim, spans, blink_on);
+        if st.buffers.is_empty() {
+            draw_dashboard(g, &vl, win_x0, win_w);
         } else {
-            draw_dashboard(g, &vl, cols);
+            for (i, r) in rects.iter().enumerate() {
+                let focused_win = i == st.active_win;
+                let spans: &[Vec<HlSpan>] = match st.buffers.get(st.windows[r.win].buffer) {
+                    Some(b) => hl.spans(&b.name, &b.text),
+                    None => &[],
+                };
+                draw_window(g, r, st, vim, spans, blink_on, focused_win);
+                if i + 1 < rects.len() {
+                    match st.split_dir {
+                        SplitDir::Horizontal => draw_hsep(g, r, st, focused_win),
+                        SplitDir::Vertical => draw_vdiv(g, r.x + r.w, vl.text_top, vl.text_rows),
+                    }
+                }
+            }
+        }
+        if sidebar_w > 0 {
+            draw_explorer(g, sidebar_w, vl.text_top, vl.text_rows, st, vfs);
+            draw_vdiv(g, sidebar_w, vl.text_top, vl.text_rows);
         }
         if let Some(row) = vl.status {
             draw_statusline(g, row, cols, st, vim, &vl);
@@ -133,11 +278,14 @@ pub fn draw(term: &mut Terminal<TestBackend>, ctx: DrawCtx) -> LayoutInfo {
         if let Some(row) = vl.cmdline {
             draw_cmdline(g, row, cols, st, vim, blink_on, focused);
         }
+        if panel_h > 0 {
+            if let Some(h) = &hints {
+                draw_whichkey(g, whichkey_top, cols, h.title, &h.entries);
+            }
+        }
         draw_touchbar(g, vl.touchbar, cols, ctrl_armed);
         if let Some(f) = &st.finder {
             draw_finder(g, &vl, cols, f);
-        } else if let Some(state) = vim.leader_state() {
-            draw_leader_menu(g, &vl, cols, state);
         }
     });
 
@@ -202,6 +350,38 @@ fn gutter_width(line_count: usize, number: bool, relativenumber: bool, cols: u16
     }
     let w = digits.max(3) + 1;
     if w.saturating_add(4) > cols { 0 } else { w }
+}
+
+/// Apply a pending zz/zt/zb or paging request against the real viewport height.
+fn apply_scroll_request(buf: &mut EdBuffer, req: Option<ScrollRequest>, text_rows: u16) {
+    let Some(req) = req else { return };
+    let rows = text_rows as usize;
+    if rows == 0 {
+        return;
+    }
+    let last = buf.text.line_count().saturating_sub(1);
+    let cur = buf.text.clamp(buf.cursor, true);
+    match req {
+        ScrollRequest::Center => buf.scroll.0 = cur.line.saturating_sub(rows / 2),
+        ScrollRequest::Top => buf.scroll.0 = cur.line,
+        ScrollRequest::Bottom => buf.scroll.0 = (cur.line + 1).saturating_sub(rows),
+        ScrollRequest::HalfDown
+        | ScrollRequest::HalfUp
+        | ScrollRequest::PageDown
+        | ScrollRequest::PageUp => {
+            let delta = match req {
+                ScrollRequest::HalfDown | ScrollRequest::HalfUp => (rows / 2).max(1),
+                _ => rows.saturating_sub(2).max(1),
+            };
+            let down = matches!(req, ScrollRequest::HalfDown | ScrollRequest::PageDown);
+            let line =
+                if down { (cur.line + delta).min(last) } else { cur.line.saturating_sub(delta) };
+            buf.cursor = buf.text.clamp(Position::new(line, buf.desired_col), false);
+            let top =
+                if down { buf.scroll.0 + delta } else { buf.scroll.0.saturating_sub(delta) };
+            buf.scroll.0 = top.min(last);
+        }
+    }
 }
 
 /// Clamp scroll and move it so the cursor stays in view with scrolloff margins.
@@ -269,7 +449,7 @@ fn draw_bufferline(g: &mut Grid, row: u16, cols: u16, st: &EditorState) {
         }
         return;
     }
-    let active = st.active.min(st.buffers.len() - 1);
+    let active = st.active().min(st.buffers.len() - 1);
     let labels: Vec<String> = st
         .buffers
         .iter()
@@ -301,48 +481,55 @@ fn draw_bufferline(g: &mut Grid, row: u16, cols: u16, st: &EditorState) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_text(
+/// Draw one window's gutter and text into its rect. Cursor, cursorline, visual,
+/// search, and bracket highlights paint only in the focused window.
+fn draw_window(
     g: &mut Grid,
-    vl: &VLayout,
-    gutter_w: u16,
-    cols: u16,
+    r: &WinRect,
     st: &EditorState,
     vim: &VimEngine,
     spans: &[Vec<HlSpan>],
     blink_on: bool,
+    focused: bool,
 ) {
-    let Some(b) = st.buf() else { return };
-    if vl.text_rows == 0 || cols == 0 {
+    let Some(b) = st.buffers.get(st.windows.get(r.win).map(|w| w.buffer).unwrap_or(0)) else {
+        return;
+    };
+    if r.h == 0 || r.w == 0 {
         return;
     }
-    let (top, left) = b.scroll;
-    let text_cols = cols.saturating_sub(gutter_w) as usize;
+    let gutter_w = r.gutter_w;
+    let line_count = b.text.line_count();
+    let top = b.scroll.0.min(line_count.saturating_sub(1));
+    let left = b.scroll.1;
+    let text_cols = r.w.saturating_sub(gutter_w) as usize;
     if text_cols == 0 {
         return;
     }
-    let line_count = b.text.line_count();
-    let sel = vim.visual_range(b.cursor);
-    let pat: Vec<char> = if !st.search.pattern.is_empty() && !st.search.suppressed {
+    let max_x = r.x + r.w;
+    let sel = if focused { vim.visual_range(b.cursor) } else { None };
+    // desired_col pinned to MAX means a $-extended block: highlight to each line's end.
+    let block_eol = b.desired_col == usize::MAX;
+    let pat: Vec<char> = if focused && !st.search.pattern.is_empty() && !st.search.suppressed {
         st.search.pattern.chars().collect()
     } else {
         Vec::new()
     };
-    let bracket = bracket_pair(&b.text, b.cursor);
+    let bracket = if focused { bracket_pair(&b.text, b.cursor) } else { None };
 
-    for r in 0..vl.text_rows {
-        let y = vl.text_top + r;
-        let li = top + r as usize;
+    for row in 0..r.h {
+        let y = r.y + row;
+        let li = top + row as usize;
         if li >= line_count {
-            put_str(g, 0, y, "~", Style::new().fg(theme::DIM), cols);
+            put_str(g, r.x, y, "~", Style::new().fg(theme::DIM), max_x);
             continue;
         }
-        let cursor_line = li == b.cursor.line;
+        let cursor_line = focused && li == b.cursor.line;
         if cursor_line {
-            g.set_style(Rect::new(0, y, cols, 1), Style::new().bg(theme::CURSORLINE_BG));
+            g.set_style(Rect::new(r.x, y, r.w, 1), Style::new().bg(theme::CURSORLINE_BG));
         }
         if gutter_w > 0 {
-            let num = if cursor_line || !st.options.relativenumber {
+            let num = if li == b.cursor.line || !st.options.relativenumber {
                 li + 1
             } else {
                 li.abs_diff(b.cursor.line)
@@ -350,7 +537,7 @@ fn draw_text(
             let fg = if cursor_line { theme::LINENR_CUR } else { theme::LINENR };
             let bg = if cursor_line { theme::CURSORLINE_BG } else { theme::BG };
             let s = format!("{:>w$} ", num, w = (gutter_w - 1) as usize);
-            put_str(g, 0, y, &s, Style::new().fg(fg).bg(bg), gutter_w);
+            put_str(g, r.x, y, &s, Style::new().fg(fg).bg(bg), r.x + gutter_w);
         }
         let line = b.text.line(li);
         let row_spans: &[HlSpan] = spans.get(li).map(Vec::as_slice).unwrap_or(&[]);
@@ -374,32 +561,37 @@ fn draw_text(
                 .map(|&(s, l)| cursor_line && b.cursor.col >= s && b.cursor.col < s + l);
             let in_bracket = bracket
                 .map_or(false, |(a, p)| (a.line == li && a.col == ci) || (p.line == li && p.col == ci));
-            let (fg, bg) =
-                cell_colors(base_fg, cursor_line, in_bracket, search, in_visual(&sel, li, ci));
-            let x = gutter_w + (ci - left) as u16;
+            let (fg, bg) = cell_colors(
+                base_fg,
+                cursor_line,
+                in_bracket,
+                search,
+                in_visual(&sel, li, ci, block_eol),
+            );
+            let x = r.x + gutter_w + (ci - left) as u16;
             set_cell(g, x, y, ch, Style::new().fg(fg).bg(bg));
         }
         // Linewise selection covers the text region past the line's last char too.
-        if let Some((s, e, true)) = sel {
+        if let Some((s, e, VisualKind::Line)) = sel {
             if li >= s.line && li <= e.line {
                 let drawn = b.text.line_len(li).saturating_sub(left).min(text_cols);
-                let from = gutter_w + drawn as u16;
-                if from < cols {
-                    g.set_style(Rect::new(from, y, cols - from, 1), Style::new().bg(theme::VISUAL_BG));
+                let from = r.x + gutter_w + drawn as u16;
+                if from < max_x {
+                    g.set_style(Rect::new(from, y, max_x - from, 1), Style::new().bg(theme::VISUAL_BG));
                 }
             }
         }
     }
 
-    if blink_on && vim.cmdline().is_none() && st.finder.is_none() {
+    if focused && blink_on && vim.cmdline().is_none() && st.finder.is_none() && !st.explorer_focused {
         let cur = b.cursor;
         let in_view = cur.line >= top
-            && cur.line < top + vl.text_rows as usize
+            && cur.line < top + r.h as usize
             && cur.col >= left
             && cur.col < left + text_cols;
         if in_view {
-            let x = gutter_w + (cur.col - left) as u16;
-            let y = vl.text_top + (cur.line - top) as u16;
+            let x = r.x + gutter_w + (cur.col - left) as u16;
+            let y = r.y + (cur.line - top) as u16;
             if let Some(cell) = g.cell_mut((x, y)) {
                 if vim.mode() == Mode::Insert {
                     cell.set_style(Style::new().fg(theme::BG).bg(theme::ACCENT));
@@ -408,6 +600,132 @@ fn draw_text(
                 }
             }
         }
+    }
+}
+
+/// Separator row below a stacked window: its buffer name (+ modified marker) centered.
+fn draw_hsep(g: &mut Grid, r: &WinRect, st: &EditorState, focused: bool) {
+    let y = r.y.saturating_add(r.h);
+    let base = Style::new().fg(theme::MUTED).bg(theme::SURFACE_DIM);
+    g.set_style(Rect::new(r.x, y, r.w, 1), base);
+    let Some(b) = st.buffers.get(st.windows.get(r.win).map(|w| w.buffer).unwrap_or(0)) else {
+        return;
+    };
+    let label = format!(" {}{} ", b.name, if b.modified() { " [+]" } else { "" });
+    let lw = label.chars().count() as u16;
+    let x = r.x + r.w.saturating_sub(lw) / 2;
+    let fg = if focused { theme::ACCENT } else { theme::MUTED };
+    put_str(g, x, y, &label, Style::new().fg(fg).bg(theme::SURFACE_DIM), r.x + r.w);
+}
+
+/// Vertical divider column between side-by-side regions.
+fn draw_vdiv(g: &mut Grid, x: u16, top: u16, rows: u16) {
+    let style = Style::new().fg(theme::BORDER_MUTED).bg(theme::BG);
+    for y in top..top.saturating_add(rows) {
+        set_cell(g, x, y, '│', style);
+    }
+}
+
+/// Explorer sidebar: header, one row per vfs file, optional new-file input row.
+fn draw_explorer(g: &mut Grid, w: u16, top: u16, rows: u16, st: &EditorState, vfs: &Vfs) {
+    let Some(ex) = &st.explorer else { return };
+    if rows == 0 || w == 0 {
+        return;
+    }
+    put_str(g, 0, top, " files", Style::new().fg(theme::ACCENT).bg(theme::BG), w);
+    let visible = rows.saturating_sub(1) as usize;
+    let mut shown = 0usize;
+    for (i, name) in vfs.names().enumerate().skip(ex.offset).take(visible) {
+        let y = top + 1 + (i - ex.offset) as u16;
+        let selected = i == ex.selected;
+        let bg = if selected { theme::SURFACE } else { theme::BG };
+        if selected {
+            g.set_style(Rect::new(0, y, w, 1), Style::new().bg(theme::SURFACE));
+        }
+        let fg = if selected {
+            if st.explorer_focused { theme::ACCENT } else { theme::MUTED }
+        } else if name.ends_with(".rs") {
+            theme::TEXT
+        } else {
+            theme::MUTED
+        };
+        let x = put_str(g, 0, y, " ", Style::new().fg(fg).bg(bg), w);
+        put_str(g, x, y, name, Style::new().fg(fg).bg(bg), w);
+        shown += 1;
+    }
+    if let Some(nn) = &ex.new_name {
+        let y = top + 1 + shown.min(visible.saturating_sub(1)) as u16;
+        let style = Style::new().fg(theme::ACCENT).bg(theme::BG);
+        let x = put_str(g, 0, y, " + ", style, w);
+        let x = put_str(g, x, y, nn, Style::new().fg(theme::TEXT).bg(theme::BG), w);
+        put_str(g, x, y, "▉", style, w);
+    }
+}
+
+/// Hint grid shape for the which-key panel: (hint rows, columns).
+fn whichkey_grid(cols: u16, n: usize) -> (u16, u16) {
+    let n = n.max(1) as u16;
+    let mut ncols: u16 = if cols >= 80 {
+        4
+    } else if cols >= 40 {
+        2
+    } else {
+        1
+    };
+    if n.div_ceil(ncols) > 3 {
+        ncols = n.div_ceil(3);
+    }
+    (n.div_ceil(ncols).min(3), ncols)
+}
+
+/// Docked which-key panel: an ACCENT title row plus hint rows in columns.
+fn draw_whichkey(g: &mut Grid, top: u16, cols: u16, title: &str, hints: &[(&str, &str)]) {
+    let (rows, ncols) = whichkey_grid(cols, hints.len());
+    let bg = theme::SURFACE_DIM;
+    g.set_style(Rect::new(0, top, cols, rows + 1), Style::new().fg(theme::TEXT).bg(bg));
+    // The panel overlays other chrome; blank the band before writing hints.
+    let blank = " ".repeat(cols as usize);
+    for y in top..top + rows + 1 {
+        put_str(g, 0, y, &blank, Style::new().bg(bg), cols);
+    }
+    put_str(g, 0, top, title, Style::new().fg(theme::ACCENT).bg(bg), cols);
+    let col_w = (cols / ncols).max(1);
+    for (i, (key, label)) in hints.iter().enumerate() {
+        let row = i / ncols as usize;
+        if row >= rows as usize {
+            break;
+        }
+        let y = top + 1 + row as u16;
+        let cell = (i % ncols as usize) as u16;
+        let x = cell * col_w;
+        let max = if cell + 1 == ncols { cols } else { x + col_w };
+        let x = put_str(g, x + 1, y, key, Style::new().fg(theme::ACCENT).bg(bg), max);
+        put_str(g, x + 1, y, label, Style::new().fg(theme::TEXT).bg(bg), max);
+    }
+}
+
+/// Resolve a tap inside the which-key panel; `row` is relative to the panel top.
+/// Only hints whose first key token is a single char are tappable — pattern rows
+/// like "a-z" are documentation, not buttons.
+pub fn whichkey_action_at(
+    col: u16,
+    row: u16,
+    cols: u16,
+    hints: &[(&str, &str)],
+) -> Option<Key> {
+    let hint_row = row.checked_sub(1)?;
+    let (rows, ncols) = whichkey_grid(cols, hints.len());
+    if hint_row >= rows {
+        return None;
+    }
+    let col_w = (cols / ncols).max(1);
+    let cell = (col / col_w).min(ncols - 1);
+    let idx = hint_row as usize * ncols as usize + cell as usize;
+    let first = hints.get(idx)?.0.split_whitespace().next()?;
+    let mut chars = first.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(Key::Char(c)),
+        _ => None,
     }
 }
 
@@ -436,15 +754,24 @@ fn cell_colors(
 }
 
 /// Whether `(line, col)` falls inside the selection; charwise includes the end col.
-fn in_visual(sel: &Option<(Position, Position, bool)>, line: usize, col: usize) -> bool {
-    let Some((s, e, linewise)) = sel else { return false };
+fn in_visual(
+    sel: &Option<(Position, Position, VisualKind)>,
+    line: usize,
+    col: usize,
+    block_eol: bool,
+) -> bool {
+    let Some((s, e, kind)) = sel else { return false };
     if line < s.line || line > e.line {
         return false;
     }
-    if *linewise {
-        return true;
+    match kind {
+        VisualKind::Line => true,
+        VisualKind::Char => (line > s.line || col >= s.col) && (line < e.line || col <= e.col),
+        VisualKind::Block => {
+            let (c1, c2) = if s.col <= e.col { (s.col, e.col) } else { (e.col, s.col) };
+            col >= c1 && (block_eol || col <= c2)
+        }
     }
-    (line > s.line || col >= s.col) && (line < e.line || col <= e.col)
 }
 
 /// Non-overlapping literal matches of `pat` within `line`, scanning chars `[from, from+span)`.
@@ -541,7 +868,7 @@ fn draw_statusline(g: &mut Grid, row: u16, cols: u16, st: &EditorState, vim: &Vi
     let label = vim.mode_label();
     let (cfg, cbg) = match label {
         "INSERT" => theme::MODE_INSERT,
-        "VISUAL" | "V-LINE" => theme::MODE_VISUAL,
+        "VISUAL" | "V-LINE" | "V-BLOCK" => theme::MODE_VISUAL,
         "REPLACE" => theme::MODE_REPLACE,
         "COMMAND" | "SEARCH" => theme::MODE_COMMAND,
         _ => theme::MODE_NORMAL,
@@ -552,9 +879,15 @@ fn draw_statusline(g: &mut Grid, row: u16, cols: u16, st: &EditorState, vim: &Vi
         put_str(g, x, row, &name, base, cols);
     }
     let mut right = String::new();
+    if let Some(reg) = vim.recording_reg() {
+        right.push_str(&format!("recording @{reg}  "));
+    }
     if !vim.pending_display().is_empty() {
         right.push_str(vim.pending_display());
         right.push_str("  ");
+    }
+    if st.windows.len() > 1 {
+        right.push_str(&format!("⧉ {}/{}  ", st.active_win + 1, st.windows.len()));
     }
     if let Some(b) = st.buf() {
         let pct = scroll_pct(b.scroll.0, vl.text_rows as usize, b.text.line_count());
@@ -667,7 +1000,11 @@ fn draw_finder(g: &mut Grid, vl: &VLayout, cols: u16, f: &FinderState) {
     for (x, y, ch) in [(x0, y0, '┌'), (x1, y0, '┐'), (x0, y1, '└'), (x1, y1, '┘')] {
         set_cell(g, x, y, ch, border);
     }
-    put_str(g, x0 + 2, y0, " find file ", border, x1);
+    let title = match f.target {
+        FinderTarget::Files => " find file ",
+        FinderTarget::Buffers => " buffers ",
+    };
+    put_str(g, x0 + 2, y0, title, border, x1);
 
     let prompt_y = y0 + 1;
     let px = put_str(g, x0 + 2, prompt_y, "> ", border, x1);
@@ -707,12 +1044,12 @@ const LOGO: [&str; 5] = [
     r"|_|     \_/  |_||_| |_| |_|",
 ];
 
-fn draw_dashboard(g: &mut Grid, vl: &VLayout, cols: u16) {
+fn draw_dashboard(g: &mut Grid, vl: &VLayout, x0: u16, cols: u16) {
     if vl.text_rows == 0 {
         return;
     }
     let version = concat!("rvim v", env!("CARGO_PKG_VERSION"));
-    let mut lines: Vec<(&str, Color)> = Vec::with_capacity(LOGO.len() + 7);
+    let mut lines: Vec<(&str, Color)> = Vec::with_capacity(LOGO.len() + 8);
     for l in LOGO {
         lines.push((l, theme::ACCENT));
     }
@@ -721,6 +1058,7 @@ fn draw_dashboard(g: &mut Grid, vl: &VLayout, cols: u16) {
     lines.push(("", theme::DIM));
     lines.push((":e <file>   new/open file", theme::DIM));
     lines.push(("Space f f   find file", theme::DIM));
+    lines.push(("Space e     file explorer", theme::DIM));
     lines.push(("Space w     save file", theme::DIM));
     lines.push(("Space q     quit file", theme::DIM));
     lines.push((":help       cheatsheet", theme::DIM));
@@ -733,8 +1071,8 @@ fn draw_dashboard(g: &mut Grid, vl: &VLayout, cols: u16) {
             break;
         }
         let w = text.chars().count() as u16;
-        let x = cols.saturating_sub(w) / 2;
-        put_str(g, x, y, text, Style::new().fg(*color), cols);
+        let x = x0 + cols.saturating_sub(w) / 2;
+        put_str(g, x, y, text, Style::new().fg(*color), x0 + cols);
     }
 }
 
@@ -749,12 +1087,43 @@ mod tests {
     }
 
     fn render(st: &mut EditorState, w: u16, h: u16, blink: bool) -> (Terminal<TestBackend>, LayoutInfo) {
+        render_with(st, &VimEngine::new(), &Vfs::load(), w, h, blink)
+    }
+
+    fn render_with(
+        st: &mut EditorState,
+        vim: &VimEngine,
+        vfs: &Vfs,
+        w: u16,
+        h: u16,
+        blink: bool,
+    ) -> (Terminal<TestBackend>, LayoutInfo) {
+        render_paused(st, vim, vfs, w, h, blink, true)
+    }
+
+    fn render_paused(
+        st: &mut EditorState,
+        vim: &VimEngine,
+        vfs: &Vfs,
+        w: u16,
+        h: u16,
+        blink: bool,
+        paused: bool,
+    ) -> (Terminal<TestBackend>, LayoutInfo) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
-        let vim = VimEngine::new();
         let mut hl = Highlighter::new();
         let info = draw(
             &mut term,
-            DrawCtx { st, vim: &vim, hl: &mut hl, blink_on: blink, ctrl_armed: false, focused: true },
+            DrawCtx {
+                st,
+                vim,
+                hl: &mut hl,
+                vfs,
+                blink_on: blink,
+                ctrl_armed: false,
+                focused: true,
+                paused,
+            },
         );
         (term, info)
     }
@@ -854,7 +1223,7 @@ mod tests {
         let mut st = mk_state("one");
         st.buffers.push(EdBuffer::new("lib.rs", "two"));
         st.buffers[1].text.insert_char(Position::new(0, 0), 'x');
-        st.active = 1;
+        st.set_active(1);
         let (term, _) = render(&mut st, 40, 10, false);
         let top = row_text(&term, 0);
         assert!(top.contains("main.rs"));
@@ -868,7 +1237,7 @@ mod tests {
         for i in 0..5 {
             st.buffers.push(EdBuffer::new(&format!("verylongfilename{i}.rs"), ""));
         }
-        st.active = 4;
+        st.set_active(4);
         let (term, _) = render(&mut st, 30, 10, false);
         assert!(row_text(&term, 0).contains("verylongfilename4"), "{:?}", row_text(&term, 0));
     }
@@ -1129,18 +1498,32 @@ mod tests {
 
     #[test]
     fn in_visual_charwise_and_linewise() {
-        let sel = Some((Position::new(1, 2), Position::new(3, 1), false));
-        assert!(!in_visual(&sel, 0, 5));
-        assert!(!in_visual(&sel, 1, 1));
-        assert!(in_visual(&sel, 1, 2));
-        assert!(in_visual(&sel, 2, 0));
-        assert!(in_visual(&sel, 3, 1));
-        assert!(!in_visual(&sel, 3, 2));
-        let sel = Some((Position::new(1, 2), Position::new(2, 0), true));
-        assert!(in_visual(&sel, 1, 0));
-        assert!(in_visual(&sel, 2, 99));
-        assert!(!in_visual(&sel, 3, 0));
-        assert!(!in_visual(&None, 0, 0));
+        let sel = Some((Position::new(1, 2), Position::new(3, 1), VisualKind::Char));
+        assert!(!in_visual(&sel, 0, 5, false));
+        assert!(!in_visual(&sel, 1, 1, false));
+        assert!(in_visual(&sel, 1, 2, false));
+        assert!(in_visual(&sel, 2, 0, false));
+        assert!(in_visual(&sel, 3, 1, false));
+        assert!(!in_visual(&sel, 3, 2, false));
+        let sel = Some((Position::new(1, 2), Position::new(2, 0), VisualKind::Line));
+        assert!(in_visual(&sel, 1, 0, false));
+        assert!(in_visual(&sel, 2, 99, false));
+        assert!(!in_visual(&sel, 3, 0, false));
+        assert!(!in_visual(&None, 0, 0, false));
+    }
+
+    #[test]
+    fn in_visual_block_is_a_rectangle() {
+        // Anchor right of the cursor end: cols still normalize to 1..=3.
+        let sel = Some((Position::new(1, 3), Position::new(3, 1), VisualKind::Block));
+        assert!(in_visual(&sel, 2, 1, false));
+        assert!(in_visual(&sel, 2, 3, false));
+        assert!(!in_visual(&sel, 2, 0, false));
+        assert!(!in_visual(&sel, 2, 4, false));
+        assert!(!in_visual(&sel, 0, 2, false));
+        assert!(!in_visual(&sel, 4, 2, false));
+        assert!(in_visual(&sel, 2, 99, true), "block $ extends to line ends");
+        assert!(!in_visual(&sel, 2, 0, true));
     }
 
     #[test]
@@ -1159,6 +1542,309 @@ mod tests {
         assert_eq!(b[(info.gutter_w, 1)].symbol(), "é");
         assert_eq!(b[(info.gutter_w + 1, 1)].symbol(), "中");
         assert_eq!(b[(info.gutter_w + 2, 1)].symbol(), "x");
+    }
+
+    fn leader_pending_vim(st: &mut EditorState, vfs: &mut Vfs) -> VimEngine {
+        let mut vim = VimEngine::new();
+        vim.handle_key(st, vfs, &egui_ios_plugin_sdk::HostHandle, Key::Char(' '));
+        vim
+    }
+
+    #[test]
+    fn whichkey_hit_test_matches_drawn_cells() {
+        let hints: &[(&str, &str)] = &[
+            ("e", "explorer"),
+            ("f", "find…"),
+            ("o", "other window"),
+            ("t", "split…"),
+            ("w", "save"),
+            ("c", "close buffer"),
+            ("q", "close window"),
+            ("h", "help"),
+        ];
+        for cols in [20u16, 39, 40, 79, 80, 120] {
+            let (rows, ncols) = whichkey_grid(cols, hints.len());
+            let col_w = (cols / ncols).max(1);
+            for (i, (k, _)) in hints.iter().enumerate() {
+                let row = i / ncols as usize;
+                if row >= rows as usize {
+                    continue;
+                }
+                let x = (i % ncols as usize) as u16 * col_w;
+                let got = whichkey_action_at(x, 1 + row as u16, cols, hints);
+                assert_eq!(got, k.chars().next().map(Key::Char), "cols {cols} hint {i}");
+            }
+            assert_eq!(whichkey_action_at(0, 0, cols, hints), None, "title row is inert");
+            assert_eq!(whichkey_action_at(0, rows + 1, cols, hints), None);
+        }
+        let (rows, ncols) = whichkey_grid(60, 8);
+        assert_eq!((rows, ncols), (3, 3), "overflow bumps the column count");
+        assert_eq!(whichkey_grid(80, 8), (2, 4));
+        assert_eq!(whichkey_grid(30, 2), (2, 1));
+    }
+
+    #[test]
+    fn whichkey_pattern_rows_are_inert() {
+        let hints: &[(&str, &str)] = &[
+            ("a-z", "named register"),
+            ("w e b", "word motions"),
+            ("$ 0 ^", "line ends"),
+        ];
+        // Single-char first token taps; range patterns do not.
+        assert_eq!(whichkey_action_at(0, 1, 30, hints), None, "a-z row is documentation");
+        assert_eq!(whichkey_action_at(0, 2, 30, hints), Some(Key::Char('w')));
+        assert_eq!(whichkey_action_at(0, 3, 30, hints), Some(Key::Char('$')));
+    }
+
+    #[test]
+    fn whichkey_prefix_panels_wait_for_a_pause() {
+        let mut st = mk_state("alpha\nbeta");
+        let mut vfs = Vfs::load();
+        let mut vim = VimEngine::new();
+        vim.handle_key(&mut st, &mut vfs, &egui_ios_plugin_sdk::HostHandle, Key::Char('d'));
+
+        let (_, info) = render_paused(&mut st, &vim, &vfs, 80, 20, false, false);
+        assert_eq!(info.whichkey_rows, 0, "mid-typing: no operator panel");
+        let (term, info) = render_paused(&mut st, &vim, &vfs, 80, 20, false, true);
+        assert!(info.whichkey_rows > 0, "paused: the operator cheatsheet shows");
+        assert!(row_text(&term, info.whichkey_top).contains(" d"));
+
+        // Leader menus are immediate regardless of the pause state.
+        let mut st = mk_state("alpha");
+        let vim = leader_pending_vim(&mut st, &mut vfs);
+        let (_, info) = render_paused(&mut st, &vim, &vfs, 80, 20, false, false);
+        assert!(info.whichkey_rows > 0, "leader menu shows without waiting");
+    }
+
+    #[test]
+    fn whichkey_panel_docks_above_touchbar() {
+        let mut st = mk_state("alpha");
+        let mut vfs = Vfs::load();
+        let vim = leader_pending_vim(&mut st, &mut vfs);
+        let (term, info) = render_with(&mut st, &vim, &vfs, 80, 20, false);
+        assert_eq!(info.whichkey_rows, 3);
+        assert_eq!(info.whichkey_top, 16);
+        assert_eq!(info.touchbar_row, 19);
+        assert_eq!(info.text_rows, 16, "panel overlays; the text area does not move");
+        let title = row_text(&term, 16);
+        assert!(title.contains(" space"), "{title:?}");
+        let hints = row_text(&term, 17) + &row_text(&term, 18);
+        for label in ["explorer", "find…", "save", "help"] {
+            assert!(hints.contains(label), "missing {label} in {hints:?}");
+        }
+        let b = term.backend().buffer();
+        assert_eq!(b[(0, 16)].bg, theme::SURFACE_DIM);
+        let ex = row_text(&term, 17).find("e explorer").unwrap() as u16;
+        assert_eq!(b[(ex, 17)].fg, theme::ACCENT);
+        assert_eq!(b[(ex + 2, 17)].fg, theme::TEXT);
+        // No panel without a pending leader.
+        let (_, info) = render(&mut st, 80, 20, false);
+        assert_eq!(info.whichkey_rows, 0);
+    }
+
+    #[test]
+    fn whichkey_panel_skipped_on_tiny_grids() {
+        let mut st = mk_state("alpha");
+        let mut vfs = Vfs::load();
+        let vim = leader_pending_vim(&mut st, &mut vfs);
+        let (_, info) = render_with(&mut st, &vim, &vfs, 20, 6, false);
+        assert_eq!(info.whichkey_rows, 0);
+    }
+
+    #[test]
+    fn tile_windows_exactly_partitions_the_area() {
+        for n in 1..=4usize {
+            for h in [1u16, 3, 7, 10, 24] {
+                let tiles = tile_windows(n, SplitDir::Horizontal, 2, 1, 30, h);
+                assert_eq!(tiles.len(), n);
+                let mut y = 1u16;
+                for (i, &(x, ty, w, th)) in tiles.iter().enumerate() {
+                    assert_eq!((x, w), (2, 30));
+                    assert_eq!(ty, y, "window {i} starts after the previous separator");
+                    y = y.saturating_add(th).saturating_add(1);
+                }
+                if h >= (2 * n - 1) as u16 {
+                    let total: u16 = tiles.iter().map(|t| t.3).sum::<u16>() + (n as u16 - 1);
+                    assert_eq!(total, h, "H tiles + separators fill exactly at h={h} n={n}");
+                }
+            }
+            let tiles = tile_windows(n, SplitDir::Vertical, 5, 2, 41, 9);
+            let total: u16 = tiles.iter().map(|t| t.2).sum::<u16>() + (n as u16 - 1);
+            assert_eq!(total, 41);
+            assert!(tiles.iter().all(|&(_, y, _, h)| y == 2 && h == 9));
+            let mut x = 5u16;
+            for &(tx, _, tw, _) in &tiles {
+                assert_eq!(tx, x);
+                x += tw + 1;
+            }
+        }
+        assert!(tile_windows(0, SplitDir::Horizontal, 0, 0, 10, 10).is_empty());
+    }
+
+    #[test]
+    fn horizontal_split_renders_separator_and_statusline_count() {
+        let mut st = mk_state("alpha\nbravo");
+        st.split(SplitDir::Horizontal);
+        let (term, info) = render(&mut st, 40, 14, false);
+        assert_eq!(info.windows.len(), 2);
+        let sep_y = info.windows[0].y + info.windows[0].h;
+        assert!(row_text(&term, sep_y).contains("main.rs"), "{:?}", row_text(&term, sep_y));
+        let b = term.backend().buffer();
+        assert_eq!(b[(0, sep_y)].bg, theme::SURFACE_DIM);
+        let status = row_text(&term, 11);
+        assert!(status.contains("⧉ 2/2"), "{status:?}");
+        // Both windows show the buffer's first line with their own gutter.
+        assert!(row_text(&term, info.windows[0].y).contains("1 alpha"));
+        assert!(row_text(&term, info.windows[1].y).contains("1 alpha"));
+        // Cursorline paints only in the focused (second) window.
+        assert_eq!(b[(20, info.windows[1].y)].bg, theme::CURSORLINE_BG);
+        assert_ne!(b[(20, info.windows[0].y)].bg, theme::CURSORLINE_BG);
+    }
+
+    #[test]
+    fn scroll_follow_uses_focused_window_height() {
+        let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let mut st = mk_state(text.trim_end());
+        st.split(SplitDir::Horizontal);
+        st.buffers[0].cursor = Position::new(50, 0);
+        let (_, info) = render(&mut st, 40, 14, false);
+        let fr = info.windows[1];
+        assert_eq!((info.text_top, info.text_rows), (fr.y, fr.h));
+        let top = st.buffers[0].scroll.0;
+        assert!(fr.h < 10, "split window is shorter than the full text area");
+        assert!(50 >= top && 50 < top + fr.h as usize, "cursor in view at top={top} h={}", fr.h);
+    }
+
+    #[test]
+    fn vertical_split_renders_divider() {
+        let mut st = mk_state("alpha");
+        st.split(SplitDir::Vertical);
+        let (term, info) = render(&mut st, 41, 12, false);
+        assert_eq!(info.windows.len(), 2);
+        let div_x = info.windows[0].x + info.windows[0].w;
+        let b = term.backend().buffer();
+        assert_eq!(b[(div_x, info.windows[0].y)].symbol(), "│");
+        assert_eq!(b[(div_x, info.windows[0].y)].fg, theme::BORDER_MUTED);
+        assert!(row_text(&term, info.windows[0].y).matches("1 alpha").count() >= 2);
+    }
+
+    #[test]
+    fn explorer_sidebar_renders_files_and_divider() {
+        let mut st = mk_state("alpha");
+        st.explorer = Some(crate::explorer::ExplorerState::new());
+        st.explorer_focused = true;
+        let mut vfs = Vfs::load();
+        vfs.write("a.rs", "");
+        vfs.write("b.md", "");
+        let (term, info) = render_with(&mut st, &VimEngine::new(), &vfs, 60, 14, false);
+        assert_eq!(info.explorer_w, 21);
+        assert!(row_text(&term, 1).starts_with(" files"));
+        let a_row = find_row(&term, "a.rs").unwrap();
+        let b_row = find_row(&term, "b.md").unwrap();
+        assert_eq!((a_row, b_row), (2, 3));
+        let b = term.backend().buffer();
+        assert_eq!(b[(1, a_row)].fg, theme::ACCENT, "selected row, explorer focused");
+        assert_eq!(b[(1, a_row)].bg, theme::SURFACE);
+        assert_eq!(b[(1, b_row)].fg, theme::MUTED, "non-rs file dimmed");
+        assert_eq!(b[(21, 2)].symbol(), "│");
+        assert_eq!(info.windows[0].x, 22);
+        // Unfocused explorer dims the selection.
+        st.explorer_focused = false;
+        let (term, _) = render_with(&mut st, &VimEngine::new(), &vfs, 60, 14, false);
+        let b = term.backend().buffer();
+        assert_eq!(b[(1, 2)].fg, theme::MUTED);
+    }
+
+    #[test]
+    fn explorer_new_name_row_renders() {
+        let mut st = mk_state("alpha");
+        let mut ex = crate::explorer::ExplorerState::new();
+        ex.new_name = Some("fresh.rs".into());
+        st.explorer = Some(ex);
+        let mut vfs = Vfs::load();
+        vfs.write("a.rs", "");
+        let (term, _) = render_with(&mut st, &VimEngine::new(), &vfs, 60, 14, false);
+        assert!(find_row(&term, "+ fresh.rs").is_some());
+    }
+
+    #[test]
+    fn explorer_skipped_below_30_cols() {
+        let mut st = mk_state("alpha");
+        st.explorer = Some(crate::explorer::ExplorerState::new());
+        let mut vfs = Vfs::load();
+        vfs.write("a.rs", "");
+        let (term, info) = render_with(&mut st, &VimEngine::new(), &vfs, 25, 10, false);
+        assert_eq!(info.explorer_w, 0);
+        assert!(find_row(&term, "files").is_none());
+        assert!(row_text(&term, 1).contains("alpha"));
+    }
+
+    #[test]
+    fn explorer_offset_follows_selection() {
+        let mut st = mk_state("alpha");
+        let mut ex = crate::explorer::ExplorerState::new();
+        ex.selected = 9;
+        st.explorer = Some(ex);
+        let mut vfs = Vfs::load();
+        for i in 0..10 {
+            vfs.write(&format!("f{i}.rs"), "");
+        }
+        let (term, _) = render_with(&mut st, &VimEngine::new(), &vfs, 60, 8, false);
+        // 4 text rows; header + 3 file rows: the selected f9.rs must be visible.
+        assert!(find_row(&term, "f9.rs").is_some());
+        assert_eq!(st.explorer.as_ref().unwrap().offset, 7);
+    }
+
+    #[test]
+    fn buffers_finder_overlay_title() {
+        let mut st = mk_state("alpha");
+        st.finder = Some(FinderState::buffers(vec!["main.rs".into()]));
+        let (term, _) = render(&mut st, 40, 20, false);
+        assert!(find_row(&term, " buffers ").is_some());
+        assert!(find_row(&term, " find file ").is_none());
+    }
+
+    #[test]
+    fn tiny_grid_with_explorer_and_splits_never_panics() {
+        let mut st = mk_state("fn main() {}\nx");
+        st.explorer = Some(crate::explorer::ExplorerState::new());
+        st.explorer_focused = true;
+        st.split(SplitDir::Horizontal);
+        st.split(SplitDir::Horizontal);
+        st.split(SplitDir::Vertical);
+        let mut vfs = Vfs::load();
+        vfs.write("a.rs", "x");
+        let mut vim = VimEngine::new();
+        vim.handle_key(&mut st, &mut vfs, &egui_ios_plugin_sdk::HostHandle, Key::Char(' '));
+        for (w, h) in [(20u16, 6u16), (30, 6), (20, 3), (35, 8), (10, 2)] {
+            let (_, info) = render_with(&mut st, &vim, &vfs, w, h, true);
+            assert_eq!(info.cols, w);
+        }
+    }
+
+    #[test]
+    fn unicode_file_names_render_everywhere_without_panic() {
+        let mut st = mk_state("fn main() {}\né中🎉");
+        st.buffers.push(EdBuffer::new("中文ファイル.md", "本文"));
+        st.buffers[1].text.insert_char(Position::default(), 'x');
+        st.explorer = Some(crate::explorer::ExplorerState::new());
+        st.explorer_focused = true;
+        st.split(SplitDir::Horizontal);
+        st.split(SplitDir::Vertical);
+        st.windows[0].buffer = 1;
+        let mut vfs = Vfs::load();
+        for name in ["héllo wörld.rs", "中文ファイル.md", "🎉 party.rs", "русский.txt"] {
+            vfs.write(name, "é中");
+        }
+        let mut vim = VimEngine::new();
+        vim.handle_key(&mut st, &mut vfs, &egui_ios_plugin_sdk::HostHandle, Key::Char(' '));
+        for (w, h) in [(0u16, 0u16), (1, 1), (20, 6), (30, 8), (45, 12), (80, 24), (200, 4)] {
+            let (_, info) = render_with(&mut st, &vim, &vfs, w, h, true);
+            assert_eq!(info.cols, w);
+        }
+        let (term, _) = render_with(&mut st, &VimEngine::new(), &vfs, 60, 16, true);
+        assert!(find_row(&term, "héllo").is_some());
+        assert!(find_row(&term, "中文").is_some());
     }
 
     #[test]
@@ -1182,64 +1868,3 @@ mod tests {
     }
 }
 
-fn draw_leader_menu(g: &mut Grid, vl: &VLayout, cols: u16, state: u8) {
-    if vl.text_rows < 5 || cols < 20 {
-        return;
-    }
-    let items = if state == 1 {
-        vec![
-            ("f", "find..."),
-            ("w", "save"),
-            ("q", "quit"),
-            ("x", "save & quit"),
-        ]
-    } else {
-        vec![
-            ("f", "find file"),
-        ]
-    };
-    
-    let w = 24u16.min(cols);
-    let h = (items.len() as u16 + 2).min(vl.text_rows);
-    let x0 = (cols - w) / 2;
-    let y0 = vl.text_top + (vl.text_rows - h) / 2;
-    let x1 = x0 + w - 1;
-    let y1 = y0 + h - 1;
-
-    let bg = theme::SURFACE;
-    let border = Style::new().fg(theme::ACCENT).bg(bg);
-    let text = Style::new().fg(theme::TEXT).bg(bg);
-    let key_style = Style::new().fg(theme::ACCENT).bg(bg);
-
-    for y in y0..=y1 {
-        for x in x0..=x1 {
-            set_cell(g, x, y, ' ', text);
-        }
-    }
-    for x in x0 + 1..x1 {
-        for y in [y0, y1] {
-            set_cell(g, x, y, '─', border);
-        }
-    }
-    for y in y0 + 1..y1 {
-        for x in [x0, x1] {
-            set_cell(g, x, y, '│', border);
-        }
-    }
-    for (x, y, ch) in [(x0, y0, '┌'), (x1, y0, '┐'), (x0, y1, '└'), (x1, y1, '┘')] {
-        set_cell(g, x, y, ch, border);
-    }
-    
-    let title = if state == 1 { " leader " } else { " leader > f " };
-    put_str(g, x0 + 2, y0, title, border, x1);
-
-    for (i, (key, desc)) in items.iter().enumerate() {
-        let y = y0 + 1 + i as u16;
-        if y >= y1 {
-            break;
-        }
-        let k_len = key.chars().count() as u16;
-        put_str(g, x0 + 2, y, key, key_style, x1);
-        put_str(g, x0 + 2 + k_len, y, &format!(" -> {}", desc), text, x1);
-    }
-}

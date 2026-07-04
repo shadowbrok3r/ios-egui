@@ -60,6 +60,21 @@ impl Vfs {
         self.files.keys().cloned().collect()
     }
 
+    /// Borrowed file names in sorted order.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
+    /// Number of files.
+    pub fn len(&self) -> usize {
+        self.files.len()
+    }
+
+    /// The i-th file name in sorted order.
+    pub fn name_at(&self, i: usize) -> Option<&str> {
+        self.files.keys().nth(i).map(String::as_str)
+    }
+
     pub fn read(&self, name: &str) -> Option<String> {
         self.files.get(name).cloned()
     }
@@ -82,6 +97,7 @@ impl Vfs {
         true
     }
 
+    #[allow(dead_code)]
     pub fn exists(&self, name: &str) -> bool {
         self.files.contains_key(name)
     }

@@ -116,13 +116,18 @@ fn load_frame_state_and_reload() {
     assert_eq!(saved, state, "save must roundtrip what restore loaded");
 
     // --- manager scan + hot reload preserves state ------------------------------------
+    // Loads run on the background loader thread; pump until they land.
     let ctx = egui::Context::default();
     let mut manager = PluginManager::new(root.path(), Arc::new(NoOps), "test").expect("manager");
     manager.scan(&ctx);
-    assert_eq!(manager.plugins.len(), 1, "load_errors: {:?}", manager.load_errors);
+    pump_until(&mut manager, &ctx, |m| m.plugins.len() == 1);
+    assert!(manager.load_errors.is_empty(), "load_errors: {:?}", manager.load_errors);
 
     manager.plugins[0].restore_state(&state).expect("restore into managed");
     manager.reload_at(0, &ctx).expect("hot reload");
+    // The old instance keeps running until the replacement lands.
+    assert_eq!(manager.plugins[0].status, PluginStatus::Ready);
+    pump_until(&mut manager, &ctx, |m| m.pending_loads().is_empty());
     assert_eq!(manager.plugins[0].status, PluginStatus::Ready);
     let after = manager.plugins[0].save_state().expect("save after reload");
     assert_eq!(after, state, "hot reload must carry guest state across instances");
@@ -132,4 +137,41 @@ fn load_frame_state_and_reload() {
         .run_frame(&frame_input(0.1, vec![]))
         .expect("frame after reload");
     assert!(!frame.primitives.is_empty());
+
+    // --- install over a live plugin replaces it in place ------------------------------
+    let dir = root.path().join("com.example.hello");
+    let manifest_toml = std::fs::read_to_string(dir.join("manifest.toml")).unwrap();
+    let wasm_bytes = std::fs::read(dir.join("plugin.wasm")).unwrap();
+    manager
+        .install_bytes(&manifest_toml, &wasm_bytes, &ctx)
+        .expect("queue install");
+    pump_until(&mut manager, &ctx, |m| m.pending_loads().is_empty());
+    assert_eq!(manager.plugins.len(), 1, "install must replace, not duplicate");
+    assert!(manager.load_errors.is_empty(), "load_errors: {:?}", manager.load_errors);
+    assert_eq!(
+        manager.plugins[0].save_state().expect("save after install"),
+        state,
+        "install over a live plugin must carry guest state across"
+    );
+}
+
+/// Pump the manager until `pred` holds or a generous deadline passes.
+fn pump_until(
+    manager: &mut PluginManager,
+    ctx: &egui::Context,
+    pred: impl Fn(&PluginManager) -> bool,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        manager.pump(None, ctx);
+        if pred(manager) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for background loads; errors: {:?}",
+            manager.load_errors
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
 }

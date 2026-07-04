@@ -42,9 +42,9 @@ impl Default for PluginManagerUi {
 }
 
 impl PluginManagerUi {
-    /// Poll dev-sync and, on the first call, load persisted settings and autoconnect.
-    /// Safe to call every frame regardless of which view is on screen, so hot-reload
-    /// pushes land even while a plugin (not the manager) is showing.
+    /// Pump background loads, poll dev-sync, and, on the first call, load persisted
+    /// settings and autoconnect. Safe to call every frame regardless of which view is on
+    /// screen, so hot-reload pushes land even while a plugin (not the manager) is showing.
     pub fn tick(&mut self, manager: &mut PluginManager, ctx: &egui::Context) {
         if !self.initialized {
             self.initialized = true;
@@ -54,11 +54,12 @@ impl PluginManagerUi {
                 self.devsync = Some(DevSync::start(&self.devsync_addr));
             }
         }
+        let applied = manager.pump(self.devsync.as_ref(), ctx);
+        if applied > 0 {
+            log::info!("{applied} plugin(s) loaded");
+        }
         if let Some(sync) = &self.devsync {
-            let applied = manager.poll_devsync(sync, ctx);
-            if applied > 0 {
-                log::info!("dev sync applied {applied} plugin update(s)");
-            }
+            manager.poll_devsync(sync, ctx);
             // Keep polling for pushes while connected, even with no user input.
             ctx.request_repaint_after(std::time::Duration::from_secs(1));
         }
@@ -105,6 +106,12 @@ impl PluginManagerUi {
         // Plugin list ----------------------------------------------------------------
         if ui.button("Rescan plugins dir").clicked() {
             manager.scan(ui.ctx());
+        }
+        for p in manager.pending_loads() {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(12.0));
+                ui.weak(format!("{} — {}…", p.name, p.what));
+            });
         }
         let mut reload: Option<usize> = None;
         for (i, plugin) in manager.plugins.iter_mut().enumerate() {

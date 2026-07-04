@@ -14,7 +14,7 @@ pub struct OutLine {
 }
 
 impl OutLine {
-    fn new(text: impl Into<String>, color: Color) -> Self {
+    pub fn new(text: impl Into<String>, color: Color) -> Self {
         OutLine { text: text.into(), color }
     }
 }

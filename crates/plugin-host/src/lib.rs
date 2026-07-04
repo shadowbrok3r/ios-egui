@@ -11,6 +11,7 @@
 
 mod devsync;
 mod engine;
+mod loader;
 mod manager;
 mod manager_ui;
 #[cfg(feature = "net")]
@@ -22,7 +23,7 @@ mod viewport;
 
 pub use devsync::DevSync;
 pub use engine::PluginEngine;
-pub use manager::PluginManager;
+pub use manager::{PendingLoad, PluginManager};
 pub use manager_ui::PluginManagerUi;
 #[cfg(feature = "net")]
 pub use net_ops::NetOps;

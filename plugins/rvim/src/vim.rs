@@ -6,10 +6,11 @@ use std::cell::Cell;
 use egui_ios_plugin_sdk::HostHandle;
 
 use crate::buffer::{Position, TextBuffer};
-use crate::finder::{FinderAction, FinderState};
+use crate::explorer::{self, ExplorerState};
+use crate::finder::{FinderAction, FinderState, FinderTarget};
 use crate::fs::Vfs;
 use crate::help;
-use crate::state::{EditorState, Register};
+use crate::state::{EditorState, RegKind, Register, SplitDir};
 
 /// A decoded input key. Printable chars arrive as `Char`; Ctrl-chords as `Ctrl` with the
 /// lowercase letter.
@@ -32,11 +33,19 @@ pub enum Key {
     PageDown,
 }
 
+/// Shape of a visual selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VisualKind {
+    Char,
+    Line,
+    Block,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     Insert,
-    Visual { linewise: bool },
+    Visual { kind: VisualKind },
     Replace,
     /// Ex command line (`:`).
     Command,
@@ -95,8 +104,147 @@ enum Await {
     Prefix(char),
     /// After i/a with an operator (or in visual): a text-object char; true = around.
     Object(bool),
-    /// Space leader progress: 1 = Space seen, 2 = Space f seen.
-    Leader(u8),
+    /// Space leader pending at this menu node.
+    Leader(LeaderNode),
+    /// After Ctrl+w: a window-command key.
+    CtrlW,
+    /// After q: the macro register to record into.
+    MacroReg,
+    /// After @: the macro register to replay.
+    MacroPlay,
+}
+
+/// Which leader menu the next key selects from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LeaderNode {
+    Root,
+    Find,
+    Split,
+}
+
+/// Ceiling on any typed count (vim caps too); keeps count arithmetic and repeat
+/// loops from exploding on absurd input like `99999999999999999999p`.
+const MAX_COUNT: usize = 1_000_000;
+
+/// Budget for text materialized by one paste beyond a single copy of the register.
+const PASTE_MAX_BYTES: usize = 4 << 20;
+
+/// Ceiling on dot-repeat replays of one change.
+const MAX_REPEAT: usize = 10_000;
+
+/// Total key budget across one macro replay, nested plays included.
+const MAX_MACRO_STEPS: usize = 100_000;
+
+/// Nesting ceiling for macros that invoke macros.
+const MAX_REPLAY_DEPTH: usize = 16;
+
+/// Which-key hints for the root leader menu.
+const LEADER_ROOT: &[(&str, &str)] = &[
+    ("e", "explorer"),
+    ("f", "find…"),
+    ("o", "other window"),
+    ("t", "split…"),
+    ("w", "save"),
+    ("c", "close buffer"),
+    ("q", "close window"),
+    ("h", "help"),
+];
+
+/// Which-key hints after Space f.
+const LEADER_FIND: &[(&str, &str)] = &[("f", "find file"), ("b", "buffers")];
+
+/// Which-key hints after Space t.
+const LEADER_SPLIT: &[(&str, &str)] =
+    &[("h", "split below"), ("v", "split right"), ("q", "close window")];
+
+/// Which-key hints after g.
+const G_MENU: &[(&str, &str)] = &[
+    ("g", "first line (gg)"),
+    ("e", "prev word end"),
+    ("u", "lowercase…"),
+    ("U", "uppercase…"),
+    ("c", "toggle comment…"),
+];
+
+/// Which-key hints after z.
+const Z_MENU: &[(&str, &str)] = &[
+    ("z", "center cursor line"),
+    ("t", "cursor line to top"),
+    ("b", "cursor line to bottom"),
+];
+
+/// Which-key hints after Ctrl+w.
+const CTRLW_MENU: &[(&str, &str)] = &[
+    ("s", "split below"),
+    ("v", "split right"),
+    ("w", "next window"),
+    ("h", "prev window"),
+    ("l", "next window"),
+    ("q", "close window"),
+];
+
+/// Which-key hints after " (register select).
+const REG_MENU: &[(&str, &str)] = &[
+    ("a-z", "named register"),
+    ("0", "last yank"),
+    ("\"", "unnamed register"),
+];
+
+/// Which-key hints after m.
+const MARK_SET: &[(&str, &str)] = &[("a-z", "set mark here")];
+
+/// Which-key hints after ` or '.
+const MARK_JUMP: &[(&str, &str)] = &[("a-z", "jump to mark")];
+
+/// Which-key hints after i/a in operator-pending or visual mode.
+const OBJ_MENU: &[(&str, &str)] = &[
+    ("w", "word"),
+    ("W", "WORD"),
+    ("(", "parens (also b)"),
+    ("{", "braces (also B)"),
+    ("[", "brackets"),
+    ("<", "angle brackets"),
+    ("\"", "double quotes"),
+    ("'", "single quotes"),
+    ("`", "backticks"),
+];
+
+/// Which-key hints after q.
+const MACRO_REC: &[(&str, &str)] = &[
+    ("a-z", "record into register"),
+    ("A-Z", "append to register"),
+];
+
+/// Which-key hints after @.
+const MACRO_PLAY: &[(&str, &str)] = &[
+    ("a-z", "replay macro"),
+    ("@", "repeat last replay"),
+];
+
+/// Which-key hints after f/F/t/T.
+const FIND_HINT: &[(&str, &str)] = &[("a-z…", "any character: jump to it on this line")];
+
+/// Which-key hints after r.
+const REPLACE_HINT: &[(&str, &str)] = &[("a-z…", "any character: overwrite with it")];
+
+/// Motions shown while an operator is pending; the doubled-key row is prepended per op.
+const OP_MOTIONS: &[(&str, &str)] = &[
+    ("w e b", "word / end / back"),
+    ("i", "inside object…"),
+    ("a", "around object…"),
+    ("f F t T", "to / till char"),
+    ("$ 0 ^", "line end / start"),
+    ("G", "last line (gg first)"),
+    ("{ }", "paragraph back / fwd"),
+    ("%", "matching bracket"),
+];
+
+/// Which-key panel content for one pending-key state.
+pub struct KeyHints {
+    pub title: &'static str,
+    pub entries: Vec<(&'static str, &'static str)>,
+    /// Menus show instantly; prefix cheatsheets wait for a typing pause.
+    pub immediate: bool,
 }
 
 pub struct VimEngine {
@@ -130,6 +278,50 @@ pub struct VimEngine {
     search_origin: Position,
     /// Pattern before the incremental search started.
     search_prev: String,
+    /// Blockwise insert to replicate across its lines when insert mode ends.
+    block_insert: Option<BlockInsert>,
+    /// Recorded macro key streams by register name.
+    macros: std::collections::HashMap<char, Vec<Key>>,
+    /// Active recording: target register and keys captured so far.
+    recording: Option<(char, Vec<Key>)>,
+    /// Register of the last @ replay, for @@.
+    last_macro: Option<char>,
+    replay_depth: usize,
+    replay_steps: usize,
+}
+
+/// A pending blockwise insert: where typing started and which lines replicate it.
+struct BlockInsert {
+    /// Buffer index the insert started in; a focus change cancels replication.
+    buf: usize,
+    start: Position,
+    top: usize,
+    bot: usize,
+    col: usize,
+    /// Pad short lines with spaces out to `col` (block A).
+    pad: bool,
+    /// Insert at each line's end (block $ A).
+    to_eol: bool,
+}
+
+/// Block selection rectangle: lines `top..=bot`, char cols `c1..=c2` or to line ends.
+struct BlockSpan {
+    top: usize,
+    bot: usize,
+    c1: usize,
+    c2: usize,
+    to_eol: bool,
+}
+
+impl BlockSpan {
+    /// Rect cols on a line of `len` chars as `[start, end)`; None when the line ends first.
+    fn cols(&self, len: usize) -> Option<(usize, usize)> {
+        if len <= self.c1 {
+            return None;
+        }
+        let end = if self.to_eol { len } else { (self.c2 + 1).min(len) };
+        (end > self.c1).then_some((self.c1, end))
+    }
 }
 
 impl VimEngine {
@@ -155,6 +347,12 @@ impl VimEngine {
             scroll_req: Cell::new(None),
             search_origin: Position::default(),
             search_prev: String::new(),
+            block_insert: None,
+            macros: std::collections::HashMap::new(),
+            recording: None,
+            last_macro: None,
+            replay_depth: 0,
+            replay_steps: 0,
         }
     }
 
@@ -167,12 +365,18 @@ impl VimEngine {
         match self.mode {
             Mode::Normal => "NORMAL",
             Mode::Insert => "INSERT",
-            Mode::Visual { linewise: false } => "VISUAL",
-            Mode::Visual { linewise: true } => "V-LINE",
+            Mode::Visual { kind: VisualKind::Char } => "VISUAL",
+            Mode::Visual { kind: VisualKind::Line } => "V-LINE",
+            Mode::Visual { kind: VisualKind::Block } => "V-BLOCK",
             Mode::Replace => "REPLACE",
             Mode::Command => "COMMAND",
             Mode::Search { .. } => "SEARCH",
         }
+    }
+
+    /// Register a macro is being recorded into, for the statusline.
+    pub fn recording_reg(&self) -> Option<char> {
+        self.recording.as_ref().map(|(c, _)| *c)
     }
 
     /// `(prefix, text, char cursor)` of the active command/search line, when in one.
@@ -191,27 +395,55 @@ impl VimEngine {
         &self.pending
     }
 
-    /// Visual selection as `(start, end, linewise)` in buffer order, when in visual mode.
-    pub fn visual_range(&self, cursor: Position) -> Option<(Position, Position, bool)> {
+    /// Visual selection as `(start, end, kind)` in buffer order, when in visual mode.
+    pub fn visual_range(&self, cursor: Position) -> Option<(Position, Position, VisualKind)> {
         match self.mode {
-            Mode::Visual { linewise } => {
+            Mode::Visual { kind } => {
                 let (a, b) = if self.anchor <= cursor { (self.anchor, cursor) } else { (cursor, self.anchor) };
-                Some((a, b, linewise))
+                Some((a, b, kind))
             }
             _ => None,
         }
     }
 
     /// Consume the pending viewport scroll request, if a key produced one.
-    #[allow(dead_code)]
     pub fn take_scroll_request(&self) -> Option<ScrollRequest> {
         self.scroll_req.take()
     }
 
-    pub fn leader_state(&self) -> Option<u8> {
+    /// Which-key panel for whatever key state is pending: leader menus, prefix chords
+    /// (g/z/Ctrl+w), pending operators, text objects, registers, marks, and macros.
+    pub fn key_hints(&self) -> Option<KeyHints> {
+        let menu = |title, entries: &'static [(&'static str, &'static str)], immediate| {
+            Some(KeyHints { title, entries: entries.to_vec(), immediate })
+        };
         match self.awaiting {
-            Await::Leader(n) => Some(n),
-            _ => None,
+            Await::Leader(LeaderNode::Root) => menu(" space", LEADER_ROOT, true),
+            Await::Leader(LeaderNode::Find) => menu(" space f", LEADER_FIND, true),
+            Await::Leader(LeaderNode::Split) => menu(" space t", LEADER_SPLIT, true),
+            Await::Prefix('g') => menu(" g", G_MENU, false),
+            Await::Prefix('z') => menu(" z", Z_MENU, false),
+            Await::Prefix(_) => None,
+            Await::CtrlW => menu(" ctrl+w", CTRLW_MENU, true),
+            Await::Register => menu(" \"", REG_MENU, false),
+            Await::Mark => menu(" m", MARK_SET, false),
+            Await::JumpExact => menu(" `", MARK_JUMP, false),
+            Await::JumpLine => menu(" '", MARK_JUMP, false),
+            Await::Object(false) => menu(" i", OBJ_MENU, false),
+            Await::Object(true) => menu(" a", OBJ_MENU, false),
+            Await::Find(kind) => {
+                let title = match kind {
+                    'f' => " f",
+                    'F' => " F",
+                    't' => " t",
+                    _ => " T",
+                };
+                menu(title, FIND_HINT, false)
+            }
+            Await::Replace => menu(" r", REPLACE_HINT, false),
+            Await::MacroReg => menu(" q", MACRO_REC, false),
+            Await::MacroPlay => menu(" @", MACRO_PLAY, false),
+            Await::None => self.op.map(op_menu),
         }
     }
 
@@ -237,7 +469,7 @@ impl VimEngine {
     }
 
     fn total_count(&self) -> usize {
-        self.count.max(1) * self.opcount.max(1)
+        self.count.max(1).saturating_mul(self.opcount.max(1)).min(MAX_COUNT)
     }
 
     /// Explicit count when one was typed, e.g. to distinguish G from 5G.
@@ -259,17 +491,45 @@ impl VimEngine {
 
     /// Feed one key through the modal state machine, mutating the editor state.
     pub fn handle_key(&mut self, st: &mut EditorState, vfs: &mut Vfs, host: &HostHandle, key: Key) {
+        // Macros capture pressed keys only; replayed keys regenerate at play time.
+        if !self.replaying {
+            if let Some((_, keys)) = &mut self.recording {
+                keys.push(key);
+            }
+        }
         if st.finder.is_some() {
+            let target =
+                st.finder.as_ref().map(|f| f.target).unwrap_or(FinderTarget::Files);
             let action =
                 st.finder.as_mut().map(|f| f.handle_key(key)).unwrap_or(FinderAction::None);
             match action {
                 FinderAction::Close => st.finder = None,
                 FinderAction::Open(name) => {
-                    st.open_file(vfs, &name);
+                    match target {
+                        FinderTarget::Files => st.open_file(vfs, &name),
+                        // Buffer picker: switch windows without touching the vfs.
+                        FinderTarget::Buffers => {
+                            if let Some(i) = st.buffers.iter().position(|b| b.name == name) {
+                                st.set_active(i);
+                            }
+                        }
+                    }
                     st.finder = None;
                 }
                 FinderAction::None => {}
             }
+            return;
+        }
+
+        if st.explorer_focused && !matches!(self.mode, Mode::Command | Mode::Search { .. }) {
+            let action = match st.explorer.as_mut() {
+                Some(ex) => ex.handle_key(vfs, key),
+                None => {
+                    st.explorer_focused = false;
+                    return;
+                }
+            };
+            explorer::apply_action(st, vfs, action);
             return;
         }
 
@@ -278,17 +538,19 @@ impl VimEngine {
             if matches!(self.mode, Mode::Normal) && self.idle() {
                 self.keybuf.clear();
                 self.keybuf_version = ver_before.unwrap_or(0);
-                self.norepeat = matches!(
-                    key,
-                    Key::Char('u' | '.' | ':' | '/' | '?' | 'n' | 'N' | '*' | '#') | Key::Ctrl(_)
-                );
+                self.norepeat = match key {
+                    Key::Char('u' | '.' | ':' | '/' | '?' | 'n' | 'N' | '*' | '#' | ' ' | 'q' | '@') => true,
+                    Key::Ctrl('v') => false,
+                    Key::Ctrl(_) => true,
+                    _ => false,
+                };
             }
             self.keybuf.push(key);
         }
 
         match self.mode {
             Mode::Normal => self.normal_key(st, vfs, host, key),
-            Mode::Visual { linewise } => self.visual_key(st, host, key, linewise),
+            Mode::Visual { kind } => self.visual_key(st, host, key, kind),
             Mode::Insert => self.insert_key(st, host, key),
             Mode::Replace => self.replace_key(st, host, key),
             Mode::Command => self.command_key(st, vfs, host, key),
@@ -315,6 +577,7 @@ impl VimEngine {
         if self.last_change.is_empty() {
             return;
         }
+        let n = n.min(MAX_REPEAT);
         let keys = self.last_change.clone();
         self.replaying = true;
         for _ in 0..n {
@@ -325,9 +588,159 @@ impl VimEngine {
         self.replaying = false;
     }
 
+    /// Replay macro `reg` `n` times, bounded by nesting depth and a total key budget.
+    fn play_macro(
+        &mut self,
+        st: &mut EditorState,
+        vfs: &mut Vfs,
+        host: &HostHandle,
+        reg: char,
+        n: usize,
+    ) {
+        let keys = match self.macros.get(&reg) {
+            Some(keys) if !keys.is_empty() => keys.clone(),
+            _ => {
+                self.err(st, host, format!("E749: register @{reg} is empty"));
+                return;
+            }
+        };
+        if self.replay_depth >= MAX_REPLAY_DEPTH {
+            return;
+        }
+        self.last_macro = Some(reg);
+        self.replay_depth += 1;
+        let was_replaying = self.replaying;
+        self.replaying = true;
+        'runs: for _ in 0..n {
+            for &k in &keys {
+                if self.replay_steps >= MAX_MACRO_STEPS {
+                    break 'runs;
+                }
+                self.replay_steps += 1;
+                self.handle_key(st, vfs, host, k);
+            }
+        }
+        self.replaying = was_replaying;
+        self.replay_depth -= 1;
+        if self.replay_depth == 0 {
+            self.replay_steps = 0;
+        }
+    }
+
     fn open_finder(&mut self, st: &mut EditorState, vfs: &Vfs, host: &HostHandle) {
         st.finder = Some(FinderState::new(vfs.list()));
         host.haptic(6);
+        self.reset();
+    }
+
+    fn open_buffer_picker(&mut self, st: &mut EditorState, host: &HostHandle) {
+        let names = st.buffers.iter().map(|b| b.name.clone()).collect();
+        st.finder = Some(FinderState::buffers(names));
+        host.haptic(6);
+        self.reset();
+    }
+
+    /// Split the focused window, refusing when the resulting windows would be too small.
+    fn do_split(&mut self, st: &mut EditorState, host: &HostHandle, dir: SplitDir) {
+        if st.buf().is_none() {
+            return;
+        }
+        if st.can_split(dir) {
+            st.split(dir);
+        } else {
+            self.err(st, host, "E36: not enough room");
+        }
+    }
+
+    /// Show or hide the explorer sidebar; showing it also focuses it.
+    fn toggle_explorer(&mut self, st: &mut EditorState, host: &HostHandle) {
+        if st.explorer.is_some() {
+            st.explorer = None;
+            st.explorer_focused = false;
+        } else if st.text_dims.0 < 30 {
+            self.err(st, host, "E36: not enough room for the explorer");
+        } else {
+            st.explorer = Some(ExplorerState::new());
+            st.explorer_focused = true;
+        }
+    }
+
+    /// Resolve the key after a pending leader node.
+    fn leader_key(
+        &mut self,
+        st: &mut EditorState,
+        vfs: &mut Vfs,
+        host: &HostHandle,
+        node: LeaderNode,
+        key: Key,
+    ) {
+        use LeaderNode::*;
+        match (node, key) {
+            (Root, Key::Char('e')) => {
+                self.toggle_explorer(st, host);
+                self.reset();
+            }
+            (Root, Key::Char('f')) => self.awaiting = Await::Leader(Find),
+            (Root, Key::Char('o')) => {
+                if st.explorer.is_some() {
+                    st.explorer_focused = !st.explorer_focused;
+                } else {
+                    st.next_window();
+                }
+                self.reset();
+            }
+            (Root, Key::Char('t')) => self.awaiting = Await::Leader(Split),
+            (Root, Key::Char('w')) => {
+                self.execute_cmd(st, vfs, host, "w");
+                self.reset();
+            }
+            (Root, Key::Char('c')) => {
+                self.execute_cmd(st, vfs, host, "bd");
+                self.reset();
+            }
+            (Root, Key::Char('q')) => {
+                if st.windows.len() > 1 {
+                    st.close_window();
+                } else {
+                    self.execute_cmd(st, vfs, host, "q");
+                }
+                self.reset();
+            }
+            (Root, Key::Char('h')) => {
+                self.execute_cmd(st, vfs, host, "help");
+                self.reset();
+            }
+            (Find, Key::Char('f')) => self.open_finder(st, vfs, host),
+            (Find, Key::Char('b')) => self.open_buffer_picker(st, host),
+            (Split, Key::Char('h')) => {
+                self.do_split(st, host, SplitDir::Horizontal);
+                self.reset();
+            }
+            (Split, Key::Char('v')) => {
+                self.do_split(st, host, SplitDir::Vertical);
+                self.reset();
+            }
+            (Split, Key::Char('q')) => {
+                st.close_window();
+                self.reset();
+            }
+            _ => self.reset(),
+        }
+    }
+
+    /// Resolve the key after Ctrl+w.
+    fn ctrl_w_key(&mut self, st: &mut EditorState, host: &HostHandle, key: Key) {
+        match key {
+            Key::Char('w') => st.next_window(),
+            Key::Char('s') => self.do_split(st, host, SplitDir::Horizontal),
+            Key::Char('v') => self.do_split(st, host, SplitDir::Vertical),
+            Key::Char('q' | 'c') => {
+                st.close_window();
+            }
+            Key::Char('j' | 'l') | Key::Down | Key::Right => st.next_window(),
+            Key::Char('k' | 'h') | Key::Up | Key::Left => st.prev_window(),
+            _ => {}
+        }
         self.reset();
     }
 }
@@ -341,11 +754,10 @@ impl VimEngine {
         // Buffer-less (dashboard): only commands, the finder, and the leader work.
         if st.buf().is_none() {
             match (std::mem::replace(&mut self.awaiting, Await::None), key) {
-                (Await::Leader(1), Key::Char('f')) => self.awaiting = Await::Leader(2),
-                (Await::Leader(2), Key::Char('f')) => self.open_finder(st, vfs, host),
+                (Await::Leader(node), k) => self.leader_key(st, vfs, host, node, k),
                 (Await::None, Key::Char(':')) => self.enter_cmdline(host),
                 (Await::None, Key::Ctrl('p')) => self.open_finder(st, vfs, host),
-                (Await::None, Key::Char(' ')) => self.awaiting = Await::Leader(1),
+                (Await::None, Key::Char(' ')) => self.awaiting = Await::Leader(LeaderNode::Root),
                 _ => self.reset(),
             }
             return;
@@ -409,31 +821,33 @@ impl VimEngine {
                 }
                 return;
             }
-            Await::Leader(1) => {
+            Await::Leader(node) => return self.leader_key(st, vfs, host, node, key),
+            Await::CtrlW => return self.ctrl_w_key(st, host, key),
+            Await::MacroReg => {
                 match key {
-                    Key::Char('f') => self.awaiting = Await::Leader(2),
-                    Key::Char('w') => {
-                        self.execute_cmd(st, vfs, host, "w");
-                        self.reset();
+                    Key::Char(c @ 'a'..='z') => self.recording = Some((c, Vec::new())),
+                    // Uppercase appends to the existing macro.
+                    Key::Char(c @ 'A'..='Z') => {
+                        let lc = c.to_ascii_lowercase();
+                        let keys = self.macros.get(&lc).cloned().unwrap_or_default();
+                        self.recording = Some((lc, keys));
                     }
-                    Key::Char('q') => {
-                        self.execute_cmd(st, vfs, host, "q");
-                        self.reset();
-                    }
-                    _ => self.reset(),
+                    _ => {}
                 }
-                return;
-            }
-            Await::Leader(2) => {
-                if key == Key::Char('f') {
-                    self.open_finder(st, vfs, host);
-                } else {
-                    self.reset();
-                }
-                return;
-            }
-            Await::Leader(_) => {
                 self.reset();
+                return;
+            }
+            Await::MacroPlay => {
+                let n = self.total_count();
+                let reg = match key {
+                    Key::Char('@') => self.last_macro,
+                    Key::Char(c @ ('a'..='z' | '0'..='9')) => Some(c),
+                    _ => None,
+                };
+                self.reset();
+                if let Some(reg) = reg {
+                    self.play_macro(st, vfs, host, reg, n);
+                }
                 return;
             }
         }
@@ -442,9 +856,9 @@ impl VimEngine {
             Key::Char(c @ '0'..='9') if !(c == '0' && self.pending_count() == 0) => {
                 let d = c as usize - '0' as usize;
                 if self.op.is_some() {
-                    self.opcount = self.opcount.saturating_mul(10).saturating_add(d);
+                    self.opcount = self.opcount.saturating_mul(10).saturating_add(d).min(MAX_COUNT);
                 } else {
-                    self.count = self.count.saturating_mul(10).saturating_add(d);
+                    self.count = self.count.saturating_mul(10).saturating_add(d).min(MAX_COUNT);
                 }
                 self.pend(c);
             }
@@ -481,7 +895,7 @@ impl VimEngine {
                     let end = Position::new(cur.line, (cur.col + n).min(buf.text.line_len(cur.line)));
                     buf.text.begin_undo_group(cur);
                     let removed = buf.text.delete_range(cur, end);
-                    self.store_register(st, removed, false, false);
+                    self.store_register(st, removed, RegKind::Char, false);
                     self.enter_insert(st, host);
                 }
             }
@@ -563,16 +977,43 @@ impl VimEngine {
             Key::Char('v') => {
                 if let Some(buf) = st.buf() {
                     self.anchor = buf.cursor;
-                    self.set_mode(host, Mode::Visual { linewise: false });
+                    self.set_mode(host, Mode::Visual { kind: VisualKind::Char });
                     self.reset();
                 }
             }
             Key::Char('V') => {
                 if let Some(buf) = st.buf() {
                     self.anchor = buf.cursor;
-                    self.set_mode(host, Mode::Visual { linewise: true });
+                    self.set_mode(host, Mode::Visual { kind: VisualKind::Line });
                     self.reset();
                 }
+            }
+            Key::Ctrl('v') => {
+                if let Some(buf) = st.buf() {
+                    self.anchor = buf.cursor;
+                    self.set_mode(host, Mode::Visual { kind: VisualKind::Block });
+                    self.reset();
+                }
+            }
+
+            // Macros.
+            Key::Char('q') if !self.replaying => {
+                if let Some((name, mut keys)) = self.recording.take() {
+                    // Drop the stopping q itself from the recording.
+                    keys.pop();
+                    self.macros.insert(name, keys);
+                    st.info(format!("recorded @{name}"));
+                    self.reset();
+                } else if self.op.is_some() {
+                    self.reset();
+                } else {
+                    self.awaiting = Await::MacroReg;
+                    self.pend('q');
+                }
+            }
+            Key::Char('@') => {
+                self.awaiting = Await::MacroPlay;
+                self.pend('@');
             }
 
             // Marks.
@@ -613,7 +1054,8 @@ impl VimEngine {
                 self.awaiting = Await::Prefix('z');
                 self.pend('z');
             }
-            Key::Char(' ') => self.awaiting = Await::Leader(1),
+            Key::Char(' ') => self.awaiting = Await::Leader(LeaderNode::Root),
+            Key::Ctrl('w') => self.awaiting = Await::CtrlW,
             Key::Ctrl('p') => self.open_finder(st, vfs, host),
 
             Key::Esc | Key::Ctrl('c') => {
@@ -863,7 +1305,14 @@ impl VimEngine {
             }
             _ => return false,
         };
+        let had_op = self.op.is_some();
         self.finish_motion(st, host, target, kind, set_desired);
+        // $ pins the desired column to end-of-line, so j/k (and block selections) track it.
+        if matches!(key, Key::Char('$') | Key::End) && !had_op {
+            if let Some(buf) = st.buf_mut() {
+                buf.desired_col = usize::MAX;
+            }
+        }
         true
     }
 
@@ -961,20 +1410,20 @@ impl VimEngine {
                 let removed = buf.text.delete_range(a, end);
                 buf.cursor = buf.text.clamp(a, false);
                 buf.desired_col = buf.cursor.col;
-                self.store_register(st, removed, false, false);
+                self.store_register(st, removed, RegKind::Char, false);
             }
             Op::Change => {
                 buf.text.begin_undo_group(cur);
                 let removed = buf.text.delete_range(a, end);
                 buf.cursor = buf.text.clamp(a, true);
-                self.store_register(st, removed, false, false);
+                self.store_register(st, removed, RegKind::Char, false);
                 self.enter_insert(st, host);
             }
             Op::Yank => {
                 let text = extract_range(&buf.text, a, end);
                 buf.cursor = buf.text.clamp(a, false);
                 buf.desired_col = buf.cursor.col;
-                self.store_register(st, text, false, true);
+                self.store_register(st, text, RegKind::Char, true);
             }
             Op::Lower | Op::Upper => {
                 map_case_range(&mut buf.text, a, end, op == Op::Upper);
@@ -1003,12 +1452,12 @@ impl VimEngine {
                 let line = first.min(buf.text.line_count() - 1);
                 buf.cursor = Position::new(line, first_nonblank(buf.text.line(line)));
                 buf.desired_col = buf.cursor.col;
-                self.store_register(st, removed, true, false);
+                self.store_register(st, removed, RegKind::Line, false);
             }
             Op::Yank => {
                 let text = extract_lines(&buf.text, first, last);
                 buf.cursor = buf.text.clamp(Position::new(first, buf.cursor.col), false);
-                self.store_register(st, text, true, true);
+                self.store_register(st, text, RegKind::Line, true);
             }
             Op::Change => {
                 let indent: String =
@@ -1023,7 +1472,7 @@ impl VimEngine {
                     buf.text.insert_lines(at, vec![indent]);
                 }
                 buf.cursor = Position::new(at.min(buf.text.line_count() - 1), ilen);
-                self.store_register(st, removed, true, false);
+                self.store_register(st, removed, RegKind::Line, false);
                 self.enter_insert(st, host);
             }
             Op::Indent | Op::Dedent => {
@@ -1050,7 +1499,9 @@ impl VimEngine {
                 buf.text.begin_undo_group(buf.cursor);
                 toggle_comment(&mut buf.text, first, last);
                 buf.text.end_undo_group();
-                buf.cursor = buf.text.clamp(buf.cursor, false);
+                buf.cursor =
+                    buf.text.clamp(Position::new(first, first_nonblank(buf.text.line(first))), false);
+                buf.desired_col = buf.cursor.col;
             }
             Op::Lower | Op::Upper => {
                 buf.text.begin_undo_group(buf.cursor);
@@ -1066,17 +1517,19 @@ impl VimEngine {
                     }
                 }
                 buf.text.end_undo_group();
-                buf.cursor = buf.text.clamp(buf.cursor, false);
+                buf.cursor =
+                    buf.text.clamp(Position::new(first, first_nonblank(buf.text.line(first))), false);
+                buf.desired_col = buf.cursor.col;
             }
         }
     }
 
     /// Write `text` to the unnamed register, the named one if prefixed, and 0 for yanks.
-    fn store_register(&self, st: &mut EditorState, text: String, linewise: bool, is_yank: bool) {
-        if text.is_empty() && !linewise {
+    fn store_register(&self, st: &mut EditorState, text: String, kind: RegKind, is_yank: bool) {
+        if text.is_empty() && kind == RegKind::Char {
             return;
         }
-        let r = Register { text, linewise };
+        let r = Register { text, kind };
         if let Some(name) = self.reg {
             st.registers.insert(name, r.clone());
         }
@@ -1107,7 +1560,7 @@ impl VimEngine {
                 let removed = buf.text.delete_range(a, b);
                 buf.cursor = buf.text.clamp(a, false);
                 buf.desired_col = buf.cursor.col;
-                self.store_register(st, removed, false, false);
+                self.store_register(st, removed, RegKind::Char, false);
             }
         }
         self.reset();
@@ -1178,7 +1631,6 @@ impl VimEngine {
 
     /// p / P: put the register after or before the cursor, count times.
     fn do_paste(&mut self, st: &mut EditorState, after: bool) {
-        let n = self.total_count();
         let name = self.reg.unwrap_or('"');
         let Some(r) = st.registers.get(&name).cloned() else {
             self.reset();
@@ -1188,25 +1640,59 @@ impl VimEngine {
             self.reset();
             return;
         }
+        // One copy always goes in; further repeats fit within the paste budget.
+        let n = self
+            .total_count()
+            .min((PASTE_MAX_BYTES / (r.text.len() + 1)).max(1));
         if let Some(buf) = st.buf_mut() {
             buf.text.begin_undo_group(buf.cursor);
-            if r.linewise {
-                let at = if after { buf.cursor.line + 1 } else { buf.cursor.line };
-                let mut lines: Vec<String> = Vec::new();
-                for _ in 0..n {
-                    lines.extend(r.text.split('\n').map(str::to_string));
+            match r.kind {
+                RegKind::Line => {
+                    let at = if after { buf.cursor.line + 1 } else { buf.cursor.line };
+                    let mut lines: Vec<String> = Vec::new();
+                    for _ in 0..n {
+                        lines.extend(r.text.split('\n').map(str::to_string));
+                    }
+                    buf.text.insert_lines(at, lines);
+                    let line = at.min(buf.text.line_count() - 1);
+                    buf.cursor = Position::new(line, first_nonblank(buf.text.line(line)));
                 }
-                buf.text.insert_lines(at, lines);
-                let line = at.min(buf.text.line_count() - 1);
-                buf.cursor = Position::new(line, first_nonblank(buf.text.line(line)));
-            } else {
-                let mut at = buf.cursor;
-                if after && buf.text.line_len(at.line) > 0 {
-                    at.col += 1;
+                RegKind::Char => {
+                    let mut at = buf.cursor;
+                    if after && buf.text.line_len(at.line) > 0 {
+                        at.col += 1;
+                    }
+                    let text = r.text.repeat(n);
+                    let end = buf.text.insert_text(at, &text);
+                    buf.cursor = buf.text.clamp(step_back(&buf.text, end), false);
                 }
-                let text = r.text.repeat(n);
-                let end = buf.text.insert_text(at, &text);
-                buf.cursor = buf.text.clamp(step_back(&buf.text, end), false);
+                // Block: each fragment lands on its own line at the paste column,
+                // padding short lines with spaces and appending lines past the end.
+                RegKind::Block => {
+                    let base = buf.cursor.line;
+                    let col = if after && buf.text.line_len(base) > 0 {
+                        buf.cursor.col + 1
+                    } else {
+                        buf.cursor.col
+                    };
+                    for (k, frag) in r.text.split('\n').enumerate() {
+                        if frag.is_empty() {
+                            continue;
+                        }
+                        let l = base + k;
+                        while l >= buf.text.line_count() {
+                            let at = buf.text.line_count();
+                            buf.text.insert_lines(at, vec![String::new()]);
+                        }
+                        let len = buf.text.line_len(l);
+                        if len < col {
+                            let text = buf.text.line(l).to_string();
+                            buf.text.set_line(l, text + &" ".repeat(col - len));
+                        }
+                        buf.text.insert_text(Position::new(l, col), &frag.repeat(n));
+                    }
+                    buf.cursor = buf.text.clamp(Position::new(base, col), false);
+                }
             }
             buf.text.end_undo_group();
             buf.desired_col = buf.cursor.col;
@@ -1276,6 +1762,7 @@ impl VimEngine {
 
     /// Leave insert/replace mode: close the undo group and step the cursor back.
     fn leave_insert(&mut self, st: &mut EditorState, host: &HostHandle) {
+        self.finish_block_insert(st);
         if let Some(buf) = st.buf_mut() {
             buf.text.end_undo_group();
             buf.cursor.col = buf.cursor.col.saturating_sub(1);
@@ -1285,6 +1772,47 @@ impl VimEngine {
         self.insert_j = false;
         self.set_mode(host, Mode::Normal);
         self.reset();
+    }
+
+    /// Replicate a completed blockwise insert onto the block's other lines. Runs inside
+    /// the still-open undo group, so the whole block edit undoes as one step. Skipped if
+    /// focus moved to another buffer or the typing spilled onto another line.
+    fn finish_block_insert(&mut self, st: &mut EditorState) {
+        let Some(bi) = self.block_insert.take() else { return };
+        if st.active() != bi.buf {
+            return;
+        }
+        let Some(buf) = st.buf_mut() else { return };
+        if buf.cursor.line != bi.start.line || buf.cursor.col < bi.start.col {
+            return;
+        }
+        let line: Vec<char> = buf.text.line(bi.start.line).chars().collect();
+        let s = bi.start.col.min(line.len());
+        let e = buf.cursor.col.min(line.len());
+        if e <= s {
+            return;
+        }
+        let typed: String = line[s..e].iter().collect();
+        let last = buf.text.line_count() - 1;
+        for l in bi.top..=bi.bot.min(last) {
+            if l == bi.start.line {
+                continue;
+            }
+            let len = buf.text.line_len(l);
+            let col = if bi.to_eol {
+                len
+            } else if len < bi.col {
+                if !bi.pad {
+                    continue;
+                }
+                let text = buf.text.line(l).to_string();
+                buf.text.set_line(l, text + &" ".repeat(bi.col - len));
+                bi.col
+            } else {
+                bi.col
+            };
+            buf.text.insert_text(Position::new(l, col), &typed);
+        }
     }
 }
 
@@ -1327,20 +1855,20 @@ impl VimEngine {
                     let removed = buf.text.delete_range(a, b);
                     buf.cursor = buf.text.clamp(a, false);
                     buf.desired_col = buf.cursor.col;
-                    self.store_register(st, removed, false, false);
+                    self.store_register(st, removed, RegKind::Char, false);
                 }
                 Op::Change => {
                     buf.text.begin_undo_group(buf.cursor);
                     let removed = buf.text.delete_range(a, b);
                     buf.cursor = buf.text.clamp(a, true);
-                    self.store_register(st, removed, false, false);
+                    self.store_register(st, removed, RegKind::Char, false);
                     self.enter_insert(st, host);
                     return;
                 }
                 Op::Yank => {
                     let text = extract_range(&buf.text, a, b);
                     buf.cursor = buf.text.clamp(a, false);
-                    self.store_register(st, text, false, true);
+                    self.store_register(st, text, RegKind::Char, true);
                 }
                 Op::Lower | Op::Upper => {
                     map_case_range(&mut buf.text, a, b, op == Op::Upper);
@@ -1852,7 +2380,7 @@ fn toggle_comment(text: &mut TextBuffer, first: usize, last: usize) {
 // ---------------------------------------------------------------------------
 
 impl VimEngine {
-    fn visual_key(&mut self, st: &mut EditorState, host: &HostHandle, key: Key, linewise: bool) {
+    fn visual_key(&mut self, st: &mut EditorState, host: &HostHandle, key: Key, kind: VisualKind) {
         match std::mem::replace(&mut self.awaiting, Await::None) {
             Await::None => {}
             Await::Find(kind) => {
@@ -1888,9 +2416,9 @@ impl VimEngine {
                             buf.desired_col = 0;
                         }
                     }
-                    Key::Char('u') => self.visual_op(st, host, Op::Lower, linewise),
-                    Key::Char('U') => self.visual_op(st, host, Op::Upper, linewise),
-                    Key::Char('c') => self.visual_op(st, host, Op::Comment, linewise),
+                    Key::Char('u') => self.visual_op(st, host, Op::Lower, kind),
+                    Key::Char('U') => self.visual_op(st, host, Op::Upper, kind),
+                    Key::Char('c') => self.visual_op(st, host, Op::Comment, kind),
                     Key::Char('e') => {
                         if let Some(buf) = st.buf_mut() {
                             let p = word_back_end(&buf.text, buf.cursor, false);
@@ -1910,7 +2438,8 @@ impl VimEngine {
 
         match key {
             Key::Char(c @ '0'..='9') if !(c == '0' && self.count == 0) => {
-                self.count = self.count.saturating_mul(10).saturating_add(c as usize - '0' as usize);
+                self.count =
+                    self.count.saturating_mul(10).saturating_add(c as usize - '0' as usize).min(MAX_COUNT);
                 self.pend(c);
             }
             Key::Esc | Key::Ctrl('c') => {
@@ -1918,18 +2447,26 @@ impl VimEngine {
                 self.reset();
             }
             Key::Char('v') => {
-                if linewise {
-                    self.set_mode(host, Mode::Visual { linewise: false });
-                } else {
+                if kind == VisualKind::Char {
                     self.set_mode(host, Mode::Normal);
+                } else {
+                    self.set_mode(host, Mode::Visual { kind: VisualKind::Char });
                 }
                 self.reset();
             }
             Key::Char('V') => {
-                if linewise {
+                if kind == VisualKind::Line {
                     self.set_mode(host, Mode::Normal);
                 } else {
-                    self.set_mode(host, Mode::Visual { linewise: true });
+                    self.set_mode(host, Mode::Visual { kind: VisualKind::Line });
+                }
+                self.reset();
+            }
+            Key::Ctrl('v') => {
+                if kind == VisualKind::Block {
+                    self.set_mode(host, Mode::Normal);
+                } else {
+                    self.set_mode(host, Mode::Visual { kind: VisualKind::Block });
                 }
                 self.reset();
             }
@@ -1939,18 +2476,43 @@ impl VimEngine {
                     buf.desired_col = buf.cursor.col;
                 }
             }
+            Key::Char('O') => {
+                // Block: swap the horizontal corners; otherwise same as o.
+                if let Some(buf) = st.buf_mut() {
+                    if kind == VisualKind::Block {
+                        std::mem::swap(&mut self.anchor.col, &mut buf.cursor.col);
+                    } else {
+                        std::mem::swap(&mut self.anchor, &mut buf.cursor);
+                    }
+                    buf.desired_col = buf.cursor.col;
+                }
+            }
+            Key::Char('I') if kind == VisualKind::Block => {
+                self.block_insert_enter(st, host, false);
+            }
+            Key::Char('A') if kind == VisualKind::Block => {
+                self.block_insert_enter(st, host, true);
+            }
+            Key::Char('D') if kind == VisualKind::Block => {
+                self.block_to_eol(st, host, Op::Delete);
+            }
+            Key::Char('C') if kind == VisualKind::Block => {
+                self.block_to_eol(st, host, Op::Change);
+            }
             Key::Char('"') => self.awaiting = Await::Register,
             Key::Char('d') | Key::Char('x') | Key::Delete => {
-                self.visual_op(st, host, Op::Delete, linewise)
+                self.visual_op(st, host, Op::Delete, kind)
             }
-            Key::Char('c') | Key::Char('s') => self.visual_op(st, host, Op::Change, linewise),
-            Key::Char('y') => self.visual_op(st, host, Op::Yank, linewise),
-            Key::Char('>') => self.visual_op(st, host, Op::Indent, linewise),
-            Key::Char('<') => self.visual_op(st, host, Op::Dedent, linewise),
+            Key::Char('c') | Key::Char('s') => self.visual_op(st, host, Op::Change, kind),
+            Key::Char('y') => self.visual_op(st, host, Op::Yank, kind),
+            Key::Char('>') => self.visual_op(st, host, Op::Indent, kind),
+            Key::Char('<') => self.visual_op(st, host, Op::Dedent, kind),
             Key::Char('~') => {
                 let upper_any = self.selection_has_lower(st);
-                self.visual_op(st, host, if upper_any { Op::Upper } else { Op::Lower }, linewise)
+                self.visual_op(st, host, if upper_any { Op::Upper } else { Op::Lower }, kind)
             }
+            Key::Char('u') => self.visual_op(st, host, Op::Lower, kind),
+            Key::Char('U') => self.visual_op(st, host, Op::Upper, kind),
             Key::Char('J') => {
                 let Some(buf) = st.buf() else { return };
                 let (a, b) = ordered(self.anchor, buf.cursor);
@@ -1973,17 +2535,153 @@ impl VimEngine {
     }
 
     /// Apply `op` to the visual selection and drop back to normal mode.
-    fn visual_op(&mut self, st: &mut EditorState, host: &HostHandle, op: Op, linewise: bool) {
+    fn visual_op(&mut self, st: &mut EditorState, host: &HostHandle, op: Op, kind: VisualKind) {
         let Some(buf) = st.buf() else { return };
         let (a, b) = ordered(self.anchor, buf.cursor);
+        let span = self.block_span(buf);
         self.op = Some(op);
         self.mode = Mode::Normal;
         host.haptic(6);
-        if linewise {
-            self.apply_linewise(st, host, op, a.line, b.line);
-        } else {
-            self.apply_op(st, host, a, b, MotionKind::Inclusive);
+        match kind {
+            VisualKind::Line => self.apply_linewise(st, host, op, a.line, b.line),
+            // Indent-family ops act on whole lines even from a block selection.
+            VisualKind::Block if matches!(op, Op::Indent | Op::Dedent | Op::Comment) => {
+                self.apply_linewise(st, host, op, a.line, b.line)
+            }
+            VisualKind::Block => self.apply_block(st, host, op, span),
+            VisualKind::Char => self.apply_op(st, host, a, b, MotionKind::Inclusive),
         }
+        if !matches!(self.mode, Mode::Insert) {
+            self.reset();
+        }
+        self.op = None;
+    }
+
+    /// Rectangle covered by the block selection between the anchor and the cursor.
+    fn block_span(&self, buf: &crate::state::Buffer) -> BlockSpan {
+        let (a, b) = ordered(self.anchor, buf.cursor);
+        let (c1, c2) = if self.anchor.col <= buf.cursor.col {
+            (self.anchor.col, buf.cursor.col)
+        } else {
+            (buf.cursor.col, self.anchor.col)
+        };
+        BlockSpan { top: a.line, bot: b.line, c1, c2, to_eol: buf.desired_col == usize::MAX }
+    }
+
+    /// Apply a charwise operator over the block rectangle, one line at a time.
+    fn apply_block(&mut self, st: &mut EditorState, host: &HostHandle, op: Op, span: BlockSpan) {
+        let active = st.active();
+        let Some(buf) = st.buf_mut() else { return };
+        let bot = span.bot.min(buf.text.line_count() - 1);
+        let top = span.top.min(bot);
+        match op {
+            Op::Delete | Op::Change | Op::Yank => {
+                if op != Op::Yank {
+                    buf.text.begin_undo_group(buf.cursor);
+                }
+                let mut frags: Vec<String> = Vec::with_capacity(bot - top + 1);
+                for l in top..=bot {
+                    match span.cols(buf.text.line_len(l)) {
+                        Some((s, e)) => {
+                            let (a, b) = (Position::new(l, s), Position::new(l, e));
+                            frags.push(if op == Op::Yank {
+                                extract_range(&buf.text, a, b)
+                            } else {
+                                buf.text.delete_range(a, b)
+                            });
+                        }
+                        None => frags.push(String::new()),
+                    }
+                }
+                let cursor = buf.text.clamp(Position::new(top, span.c1), op == Op::Change);
+                buf.cursor = cursor;
+                buf.desired_col = cursor.col;
+                if op == Op::Delete {
+                    buf.text.end_undo_group();
+                }
+                self.store_register(st, frags.join("\n"), RegKind::Block, op == Op::Yank);
+                if op == Op::Change {
+                    // Undo group stays open through the insert; Esc replicates the typed
+                    // text onto the block's other lines.
+                    self.block_insert = Some(BlockInsert {
+                        buf: active,
+                        start: cursor,
+                        top,
+                        bot,
+                        col: span.c1,
+                        pad: false,
+                        to_eol: false,
+                    });
+                    self.enter_insert(st, host);
+                }
+            }
+            Op::Lower | Op::Upper => {
+                buf.text.begin_undo_group(buf.cursor);
+                for l in top..=bot {
+                    if let Some((s, e)) = span.cols(buf.text.line_len(l)) {
+                        map_case_range(
+                            &mut buf.text,
+                            Position::new(l, s),
+                            Position::new(l, e),
+                            op == Op::Upper,
+                        );
+                    }
+                }
+                buf.text.end_undo_group();
+                buf.cursor = buf.text.clamp(Position::new(top, span.c1), false);
+                buf.desired_col = buf.cursor.col;
+            }
+            Op::Indent | Op::Dedent | Op::Comment => unreachable!(),
+        }
+    }
+
+    /// Block I / A: park the cursor on the top line and arm cross-line replication.
+    fn block_insert_enter(&mut self, st: &mut EditorState, host: &HostHandle, append: bool) {
+        let Some(buf) = st.buf() else { return };
+        let span = self.block_span(buf);
+        let active = st.active();
+        let Some(buf) = st.buf_mut() else { return };
+        let last = buf.text.line_count() - 1;
+        let (top, bot) = (span.top.min(last), span.bot.min(last));
+        buf.text.begin_undo_group(buf.cursor);
+        let col = if append {
+            if span.to_eol {
+                buf.text.line_len(top)
+            } else {
+                let target = span.c2 + 1;
+                let len = buf.text.line_len(top);
+                if len < target {
+                    // Pad so typing starts exactly after the block edge.
+                    let line = buf.text.line(top).to_string();
+                    buf.text.set_line(top, line + &" ".repeat(target - len));
+                }
+                target
+            }
+        } else {
+            span.c1.min(buf.text.line_len(top))
+        };
+        buf.cursor = Position::new(top, col);
+        self.block_insert = Some(BlockInsert {
+            buf: active,
+            start: Position::new(top, col),
+            top,
+            bot,
+            col: if append { span.c2 + 1 } else { span.c1 },
+            pad: append,
+            to_eol: append && span.to_eol,
+        });
+        self.enter_insert(st, host);
+    }
+
+    /// Block D / C: the rect extends to end-of-line on every spanned line.
+    fn block_to_eol(&mut self, st: &mut EditorState, host: &HostHandle, op: Op) {
+        let Some(buf) = st.buf() else { return };
+        let mut span = self.block_span(buf);
+        span.to_eol = true;
+        self.op = Some(op);
+        self.mode = Mode::Normal;
+        host.haptic(6);
+        self.apply_block(st, host, op, span);
         if !matches!(self.mode, Mode::Insert) {
             self.reset();
         }
@@ -1993,21 +2691,35 @@ impl VimEngine {
     /// r{char} in visual: overwrite every selected char.
     fn visual_replace(&mut self, st: &mut EditorState, host: &HostHandle, c: char) {
         let Some(buf) = st.buf() else { return };
-        let linewise = matches!(self.mode, Mode::Visual { linewise: true });
+        let kind = match self.mode {
+            Mode::Visual { kind } => kind,
+            _ => VisualKind::Char,
+        };
+        let span = self.block_span(buf);
         let (a, b) = ordered(self.anchor, buf.cursor);
         if let Some(buf) = st.buf_mut() {
             buf.text.begin_undo_group(a);
             let last = b.line.min(buf.text.line_count() - 1);
             for l in a.line..=last {
                 let len = buf.text.line_len(l);
-                let from = if !linewise && l == a.line { a.col } else { 0 };
-                let to = if !linewise && l == b.line { (b.col + 1).min(len) } else { len };
+                let (from, to) = match kind {
+                    VisualKind::Line => (0, len),
+                    VisualKind::Char => (
+                        if l == a.line { a.col } else { 0 },
+                        if l == b.line { (b.col + 1).min(len) } else { len },
+                    ),
+                    VisualKind::Block => match span.cols(len) {
+                        Some(cols) => cols,
+                        None => continue,
+                    },
+                };
                 for col in from..to {
                     buf.text.replace_char(Position::new(l, col), c);
                 }
             }
             buf.text.end_undo_group();
-            buf.cursor = buf.text.clamp(a, false);
+            let home = if kind == VisualKind::Block { Position::new(a.line, span.c1) } else { a };
+            buf.cursor = buf.text.clamp(home, false);
         }
         self.set_mode(host, Mode::Normal);
         self.reset();
@@ -2023,6 +2735,23 @@ impl VimEngine {
 
 fn ordered(a: Position, b: Position) -> (Position, Position) {
     if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Operator-pending which-key panel: the doubled-key row for `op` plus shared motions.
+fn op_menu(op: Op) -> KeyHints {
+    let (title, doubled) = match op {
+        Op::Delete => (" d", ("d", "whole line (dd)")),
+        Op::Change => (" c", ("c", "whole line (cc)")),
+        Op::Yank => (" y", ("y", "whole line (yy)")),
+        Op::Indent => (" >", (">", "this line (>>)")),
+        Op::Dedent => (" <", ("<", "this line (<<)")),
+        Op::Lower => (" gu", ("u", "whole line (guu)")),
+        Op::Upper => (" gU", ("U", "whole line (gUU)")),
+        Op::Comment => (" gc", ("c", "this line (gcc)")),
+    };
+    let mut entries = vec![doubled];
+    entries.extend_from_slice(OP_MOTIONS);
+    KeyHints { title, entries, immediate: false }
 }
 
 // ---------------------------------------------------------------------------
@@ -2086,6 +2815,34 @@ impl VimEngine {
                         buf.cursor = Position::new(cur.line - 1, plen);
                     }
                     buf.desired_col = buf.cursor.col;
+                }
+            }
+            // Ctrl+w deletes the word before the cursor, stopping at line start.
+            Key::Ctrl('w') => {
+                self.insert_j = false;
+                if let Some(buf) = st.buf_mut() {
+                    let cur = buf.cursor;
+                    let mut target = word_back(&buf.text, cur, false);
+                    if target.line != cur.line {
+                        target = Position::new(cur.line, 0);
+                    }
+                    if target < cur {
+                        buf.text.delete_range(target, cur);
+                        buf.cursor = buf.text.clamp(target, true);
+                        buf.desired_col = buf.cursor.col;
+                    }
+                }
+            }
+            // Ctrl+u deletes from the line start to the cursor.
+            Key::Ctrl('u') => {
+                self.insert_j = false;
+                if let Some(buf) = st.buf_mut() {
+                    let cur = buf.cursor;
+                    if cur.col > 0 {
+                        buf.text.delete_range(Position::new(cur.line, 0), cur);
+                        buf.cursor = Position::new(cur.line, 0);
+                        buf.desired_col = 0;
+                    }
                 }
             }
             Key::Delete => {
@@ -2545,13 +3302,23 @@ impl VimEngine {
                 st.info(format!("{n} buffer(s) written"));
             }
             ("q", b) | ("quit", b) => {
-                if !st.buffers.is_empty() {
-                    st.close_buffer(st.active, b);
+                if st.windows.len() > 1 {
+                    st.close_window();
+                } else if !st.buffers.is_empty() {
+                    st.close_buffer(st.active(), b);
                 }
             }
+            ("sp", false) | ("split", false) => self.do_split(st, host, SplitDir::Horizontal),
+            ("vs", false) | ("vsplit", false) => self.do_split(st, host, SplitDir::Vertical),
+            ("close", false) | ("clo", false) => {
+                if !st.close_window() {
+                    self.err(st, host, "E444: Cannot close last window");
+                }
+            }
+            ("only", false) | ("on", false) => st.only(),
             ("wq", _) | ("x", _) | ("xit", _) => {
                 if st.save_active(vfs).is_some() {
-                    st.close_buffer(st.active, true);
+                    st.close_buffer(st.active(), true);
                 } else {
                     self.err(st, host, "E32: No file name");
                 }
@@ -2576,7 +3343,7 @@ impl VimEngine {
             }
             ("enew", _) => {
                 st.buffers.push(crate::state::Buffer::new("[No Name]", ""));
-                st.active = st.buffers.len() - 1;
+                st.set_active(st.buffers.len() - 1);
             }
             ("ls", false) | ("buffers", false) | ("files", false) => {
                 let list: Vec<String> = st
@@ -2587,7 +3354,7 @@ impl VimEngine {
                         format!(
                             "{}{} \"{}\"{}",
                             i + 1,
-                            if i == st.active { "%" } else { " " },
+                            if i == st.active() { "%" } else { " " },
                             b.name,
                             if b.modified() { " [+]" } else { "" }
                         )
@@ -2602,7 +3369,7 @@ impl VimEngine {
             ("b", false) | ("buffer", false) | ("bu", false) => {
                 if let Ok(n) = arg.parse::<usize>() {
                     if n >= 1 && n <= st.buffers.len() {
-                        st.active = n - 1;
+                        st.set_active(n - 1);
                     } else {
                         self.err(st, host, format!("E86: Buffer {n} does not exist"));
                     }
@@ -2610,7 +3377,7 @@ impl VimEngine {
                     if arg.is_empty() {
                         self.err(st, host, "E471: Argument required");
                     } else {
-                        st.active = i;
+                        st.set_active(i);
                     }
                 } else {
                     self.err(st, host, format!("E94: No matching buffer for {arg}"));
@@ -2620,7 +3387,7 @@ impl VimEngine {
             ("bp", false) | ("bprev", false) | ("bprevious", false) => st.prev_buffer(),
             ("bd", b) | ("bdelete", b) => {
                 if !st.buffers.is_empty() {
-                    st.close_buffer(st.active, b);
+                    st.close_buffer(st.active(), b);
                 }
             }
             ("noh", false) | ("nohl", false) | ("nohlsearch", false) => {
@@ -2635,10 +3402,10 @@ impl VimEngine {
             },
             ("help", false) | ("h", false) => {
                 if let Some(i) = st.buffers.iter().position(|b| b.name == help::HELP_BUFFER) {
-                    st.active = i;
+                    st.set_active(i);
                 } else {
                     st.buffers.push(crate::state::Buffer::new(help::HELP_BUFFER, help::HELP_TEXT));
-                    st.active = st.buffers.len() - 1;
+                    st.set_active(st.buffers.len() - 1);
                 }
             }
             ("reg", false) | ("registers", false) => {
@@ -2986,7 +3753,7 @@ mod tests {
         let mut e = env("1\n2\n3\n4");
         e.feed("3dd");
         assert_eq!(e.text(), "4");
-        assert!(e.reg('"').unwrap().linewise);
+        assert_eq!(e.reg('"').unwrap().kind, RegKind::Line);
         assert_eq!(e.reg('"').unwrap().text, "1\n2\n3");
     }
 
@@ -3152,8 +3919,7 @@ mod tests {
     fn count_paste_charwise() {
         let mut e = env("xy");
         e.feed("ylp");
-        assert_eq!(e.text(), "xyxy".replacen("yx", "xy", 0).replace("xyxy", "xyxx") + "");
-        // yl yanks "x"; p after col1 pastes → "xyx" then... recompute directly:
+        assert_eq!(e.text(), "xxy");
         let mut e = env("xy");
         e.feed("yl");
         assert_eq!(e.reg('"').unwrap().text, "x");
@@ -3166,7 +3932,11 @@ mod tests {
         let mut e = env("one\ntwo");
         e.feed("\"ayy");
         assert_eq!(e.reg('a').unwrap().text, "one");
-        assert_eq!(e.reg('0').is_none(), false);
+        // A named yank fills the unnamed register but skips register 0.
+        assert!(e.reg('0').is_none());
+        e.feed("yy");
+        assert_eq!(e.reg('0').unwrap().text, "one");
+        // A delete goes to the unnamed register and leaves register 0 alone.
         e.feed("dd");
         assert_eq!(e.reg('"').unwrap().text, "one");
         assert_eq!(e.reg('0').unwrap().text, "one");
@@ -3179,7 +3949,7 @@ mod tests {
         let mut e = env("foo bar");
         e.feed("yw");
         assert_eq!(e.reg('"').unwrap().text, "foo ");
-        assert!(!e.reg('"').unwrap().linewise);
+        assert_eq!(e.reg('"').unwrap().kind, RegKind::Char);
         e.feed("$p");
         assert_eq!(e.text(), "foo barfoo ");
     }
@@ -3242,9 +4012,9 @@ mod tests {
         let mut e = env("abcdef");
         e.feed("x.");
         assert_eq!(e.text(), "cdef");
+        // r leaves the cursor on the replaced char, so . re-replaces in place.
         e.feed("ry.");
-        assert_eq!(e.text(), "yyef".replace("yy", "yy"));
-        assert_eq!(e.text(), "yyef");
+        assert_eq!(e.text(), "ydef");
         let mut e = env("a\nb");
         e.feed(">>j.");
         assert_eq!(e.text(), "    a\n    b");
@@ -3557,7 +4327,7 @@ mod tests {
         let mut e = env("hello world");
         e.feed("vey");
         assert_eq!(e.reg('"').unwrap().text, "hello");
-        assert!(!e.reg('"').unwrap().linewise);
+        assert_eq!(e.reg('"').unwrap().kind, RegKind::Char);
         assert_eq!(e.cursor(), (0, 0));
     }
 
@@ -3566,7 +4336,7 @@ mod tests {
         let mut e = env("one\ntwo\nthree");
         e.feed("Vjd");
         assert_eq!(e.text(), "three");
-        assert!(e.reg('"').unwrap().linewise);
+        assert_eq!(e.reg('"').unwrap().kind, RegKind::Line);
         e.feed("Vy");
         e.feed("p");
         assert_eq!(e.text(), "three\nthree");
@@ -3601,9 +4371,9 @@ mod tests {
     fn visual_switch_char_to_line() {
         let mut e = env("aaa\nbbb");
         e.feed("v");
-        assert_eq!(e.vim.mode(), Mode::Visual { linewise: false });
+        assert_eq!(e.vim.mode(), Mode::Visual { kind: VisualKind::Char });
         e.feed("V");
-        assert_eq!(e.vim.mode(), Mode::Visual { linewise: true });
+        assert_eq!(e.vim.mode(), Mode::Visual { kind: VisualKind::Line });
         e.feed("jd");
         assert_eq!(e.text(), "");
     }
@@ -3698,8 +4468,7 @@ mod tests {
     fn insert_entries_a_A_I_o_O() {
         let mut e = env("  ab");
         e.feed("a1\u{1b}");
-        assert_eq!(e.text(), "  1ab".replace("  1ab", "  1ab"));
-        assert_eq!(e.text(), "  1ab");
+        assert_eq!(e.text(), " 1 ab");
         let mut e = env("  ab");
         e.feed("A!\u{1b}");
         assert_eq!(e.text(), "  ab!");
@@ -3772,9 +4541,9 @@ mod tests {
         let mut e = env("ab");
         e.feed("i中é\u{1b}");
         assert_eq!(e.text(), "中éab");
+        // Esc leaves the cursor on é, so vl selects é and a.
         e.feed("vly");
-        assert_eq!(e.reg('"').unwrap().text, "中é".chars().rev().collect::<String>().chars().rev().collect::<String>());
-        assert_eq!(e.reg('"').unwrap().text, "中é");
+        assert_eq!(e.reg('"').unwrap().text, "éa");
     }
 
     // -- brackets and paragraphs -------------------------------------------------
@@ -3978,5 +4747,608 @@ mod tests {
         let mut e = env("a\nb\nc");
         e.feed("VjJ");
         assert_eq!(e.text(), "a b\nc");
+    }
+    // -- leader, windows, explorer routing -----------------------------------------
+
+    #[test]
+    fn leader_hints_per_node_and_cancel() {
+        let mut e = env("x");
+        assert!(e.vim.key_hints().is_none());
+        e.feed(" ");
+        let h = e.vim.key_hints().unwrap();
+        assert_eq!(h.title, " space");
+        assert!(h.entries.iter().any(|&(k, l)| k == "e" && l == "explorer"));
+        assert!(h.entries.iter().any(|&(k, _)| k == "q"));
+        e.feed("f");
+        let h = e.vim.key_hints().unwrap();
+        assert_eq!(h.title, " space f");
+        assert!(h.entries.iter().any(|&(k, l)| k == "b" && l == "buffers"));
+        e.key(Key::Esc);
+        assert!(e.vim.key_hints().is_none());
+        e.feed(" t");
+        let h = e.vim.key_hints().unwrap();
+        assert_eq!(h.title, " space t");
+        assert_eq!(h.entries.len(), 3);
+        e.feed("z");
+        assert!(e.vim.key_hints().is_none());
+        assert_eq!(e.text(), "x", "unmapped leader key cancels silently");
+    }
+
+    #[test]
+    fn leader_e_toggles_explorer_with_focus() {
+        let mut e = env("x");
+        e.feed(" e");
+        assert!(e.st.explorer.is_some());
+        assert!(e.st.explorer_focused);
+        // Keys now route to the explorer; q closes it.
+        e.feed("q");
+        assert!(e.st.explorer.is_none());
+        assert!(!e.st.explorer_focused);
+    }
+
+    #[test]
+    fn leader_e_refuses_when_too_narrow() {
+        let mut e = env("x");
+        e.st.text_dims = (25, 10);
+        e.feed(" e");
+        assert!(e.st.explorer.is_none());
+        assert!(e.status().contains("not enough room"));
+    }
+
+    #[test]
+    fn leader_o_toggles_explorer_focus_or_cycles_windows() {
+        let mut e = env("x");
+        e.feed(" e");
+        assert!(e.st.explorer_focused);
+        // Explorer consumes keys while focused; h returns focus to the editor.
+        e.feed("h");
+        assert!(!e.st.explorer_focused);
+        e.feed(" o");
+        assert!(e.st.explorer_focused);
+        let mut e = env("x");
+        e.feed(" tv");
+        assert_eq!(e.st.windows.len(), 2);
+        assert_eq!(e.st.active_win, 1);
+        e.feed(" o");
+        assert_eq!(e.st.active_win, 0);
+    }
+
+    #[test]
+    fn explorer_keys_open_files_through_routing() {
+        let mut e = env("x");
+        e.vfs.write("aaa.rs", "AAA");
+        e.feed(" e");
+        assert!(e.st.explorer_focused);
+        e.key(Key::Enter);
+        assert_eq!(e.st.buf().unwrap().name, "aaa.rs");
+        assert_eq!(e.text(), "AAA");
+        assert!(!e.st.explorer_focused);
+        assert!(e.st.explorer.is_some());
+    }
+
+    #[test]
+    fn explorer_dd_delete_closes_clean_buffer() {
+        let mut e = env("x");
+        e.vfs.write("aaa.rs", "AAA");
+        e.st.open_file(&e.vfs, "aaa.rs");
+        e.feed(" e");
+        e.feed("dd");
+        assert!(!e.vfs.exists("aaa.rs"));
+        assert!(e.st.buffers.iter().all(|b| b.name != "aaa.rs"));
+    }
+
+    #[test]
+    fn explorer_dd_refuses_modified_buffer() {
+        let mut e = env("x");
+        e.vfs.write("aaa.rs", "AAA");
+        e.st.open_file(&e.vfs, "aaa.rs");
+        e.feed("ix\u{1b}");
+        e.feed(" e");
+        e.feed("dd");
+        assert!(e.vfs.exists("aaa.rs"));
+        assert!(e.status().contains("unsaved"));
+    }
+
+    #[test]
+    fn leader_splits_and_close() {
+        let mut e = env("x");
+        e.feed(" th");
+        assert_eq!(e.st.windows.len(), 2);
+        assert_eq!(e.st.split_dir, SplitDir::Horizontal);
+        e.feed(" tq");
+        assert_eq!(e.st.windows.len(), 1);
+        e.feed(" tv");
+        assert_eq!(e.st.split_dir, SplitDir::Vertical);
+        assert_eq!(e.st.windows.len(), 2);
+        e.feed(" q");
+        assert_eq!(e.st.windows.len(), 1, "space q closes the window first");
+        assert_eq!(e.st.buffers.len(), 1);
+        e.feed(" q");
+        assert!(e.st.buffers.is_empty(), "space q on the last window closes the buffer");
+    }
+
+    #[test]
+    fn leader_split_refused_when_too_small() {
+        let mut e = env("x");
+        e.st.text_dims = (15, 3);
+        e.feed(" tv");
+        assert_eq!(e.st.windows.len(), 1);
+        assert!(e.status().contains("E36"));
+        e.feed(" th");
+        assert_eq!(e.st.windows.len(), 1);
+        assert!(e.status().contains("E36"));
+    }
+
+    #[test]
+    fn leader_w_c_h() {
+        let mut e = env("hello");
+        e.feed(" w");
+        assert!(e.status().contains("written"));
+        assert!(e.vfs.exists("main.rs"));
+        e.feed(" h");
+        assert_eq!(e.st.buf().unwrap().name, help::HELP_BUFFER);
+        e.feed(" c");
+        assert_eq!(e.st.buf().unwrap().name, "main.rs");
+        assert_eq!(e.st.buffers.len(), 1);
+        e.feed(".");
+        assert_eq!(e.st.buffers.len(), 1, "leader chords are not dot-repeatable");
+    }
+
+    #[test]
+    fn leader_fb_opens_buffer_picker_without_vfs_reads() {
+        let mut e = env("unsaved content");
+        e.st.buffers.push(Buffer::new("other.rs", "OTHER"));
+        e.feed(" fb");
+        let f = e.st.finder.as_ref().unwrap();
+        assert_eq!(f.target, FinderTarget::Buffers);
+        assert_eq!(f.results.len(), 2);
+        e.feed("other");
+        e.key(Key::Enter);
+        assert!(e.st.finder.is_none());
+        assert_eq!(e.st.buf().unwrap().name, "other.rs");
+        assert_eq!(e.text(), "OTHER", "buffer content untouched by the vfs");
+        assert_eq!(e.st.buffers.len(), 2, "no new buffer created");
+        assert!(!e.vfs.exists("other.rs"), "picker never touched the vfs");
+    }
+
+    #[test]
+    fn buffer_picker_enter_with_no_match_closes() {
+        let mut e = env("x");
+        e.feed(" fb");
+        e.feed("nomatch");
+        e.key(Key::Enter);
+        assert!(e.st.finder.is_none());
+        assert_eq!(e.st.buffers.len(), 1);
+        assert_eq!(e.st.buf().unwrap().name, "main.rs");
+    }
+
+    #[test]
+    fn ctrl_w_chords() {
+        let mut e = env("x");
+        e.key(Key::Ctrl('w'));
+        e.feed("s");
+        assert_eq!(e.st.windows.len(), 2);
+        assert_eq!(e.st.split_dir, SplitDir::Horizontal);
+        e.key(Key::Ctrl('w'));
+        e.feed("w");
+        assert_eq!(e.st.active_win, 0);
+        e.key(Key::Ctrl('w'));
+        e.feed("j");
+        assert_eq!(e.st.active_win, 1);
+        e.key(Key::Ctrl('w'));
+        e.feed("k");
+        assert_eq!(e.st.active_win, 0);
+        e.key(Key::Ctrl('w'));
+        e.feed("q");
+        assert_eq!(e.st.windows.len(), 1);
+        e.key(Key::Ctrl('w'));
+        e.feed("v");
+        assert_eq!(e.st.split_dir, SplitDir::Vertical);
+        e.key(Key::Ctrl('w'));
+        e.feed("c");
+        assert_eq!(e.st.windows.len(), 1);
+        e.key(Key::Ctrl('w'));
+        e.feed("x");
+        assert_eq!(e.text(), "x", "unmapped ctrl-w key is dropped");
+    }
+
+    #[test]
+    fn split_ex_commands() {
+        let mut e = env("x");
+        e.feed(":sp\n");
+        assert_eq!(e.st.windows.len(), 2);
+        e.feed(":close\n");
+        assert_eq!(e.st.windows.len(), 1);
+        e.feed(":close\n");
+        assert!(e.status().contains("E444"));
+        e.feed(":vsplit\n");
+        e.feed(":split\n");
+        assert_eq!(e.st.windows.len(), 3);
+        e.feed(":only\n");
+        assert_eq!(e.st.windows.len(), 1);
+        e.feed(":vs\n");
+        assert_eq!(e.st.windows.len(), 2);
+        e.feed(":q\n");
+        assert_eq!(e.st.windows.len(), 1);
+        assert_eq!(e.st.buffers.len(), 1, ":q closes the window, not the buffer");
+        e.feed(":q\n");
+        assert!(e.st.buffers.is_empty());
+    }
+
+    #[test]
+    fn q_bang_still_forces_on_last_window() {
+        let mut e = env("x");
+        e.feed("ichanged\u{1b}");
+        e.feed(":q\n");
+        assert_eq!(e.st.buffers.len(), 1);
+        assert!(e.status().contains("E89"));
+        e.feed(":q!\n");
+        assert!(e.st.buffers.is_empty());
+    }
+
+    #[test]
+    fn dashboard_leader_chords_work() {
+        let mut e = empty_env();
+        e.feed(" fb");
+        assert!(e.st.finder.is_some());
+        assert_eq!(e.st.finder.as_ref().unwrap().target, FinderTarget::Buffers);
+        e.key(Key::Esc);
+        e.feed(" h");
+        assert_eq!(e.st.buf().unwrap().name, help::HELP_BUFFER);
+        e.feed(":bd\n");
+        e.feed(" e");
+        assert!(e.st.explorer.is_some());
+        e.feed("q");
+        assert!(e.st.explorer.is_none());
+    }
+
+    #[test]
+    fn explorer_routing_skips_cmdline_and_finder() {
+        let mut e = env("x");
+        e.feed(" e");
+        assert!(e.st.explorer_focused);
+        // The finder takes precedence over explorer routing.
+        e.st.finder = Some(FinderState::new(vec!["main.rs".into()]));
+        e.feed("j");
+        assert_eq!(e.st.finder.as_ref().unwrap().query, "j");
+        e.key(Key::Esc);
+        assert!(e.st.finder.is_none());
+        assert!(e.st.explorer_focused, "esc went to the finder, not the explorer");
+    }
+
+    #[test]
+    fn visual_linewise_gc_steps() {
+        let mut e = env("a();\n    b();");
+        e.feed("V");
+        assert_eq!(e.vim.mode(), Mode::Visual { kind: VisualKind::Line }, "V enters V-LINE");
+        e.feed("j");
+        assert_eq!(e.cursor(), (1, 0), "j moves down in visual");
+        e.feed("g");
+        e.feed("c");
+        assert_eq!(e.text(), "// a();\n    // b();");
+    }
+
+    // -- visual block ------------------------------------------------------------------
+
+    #[test]
+    fn block_delete_removes_rectangle() {
+        let mut e = env("abcd\nefgh\nijkl");
+        e.feed("l");
+        e.key(Key::Ctrl('v'));
+        assert_eq!(e.vim.mode(), Mode::Visual { kind: VisualKind::Block });
+        e.feed("jjl");
+        e.feed("d");
+        assert_eq!(e.text(), "ad\neh\nil");
+        assert_eq!(e.cursor(), (0, 1));
+        let r = e.reg('"').unwrap();
+        assert_eq!(r.kind, RegKind::Block);
+        assert_eq!(r.text, "bc\nfg\njk");
+    }
+
+    #[test]
+    fn block_delete_skips_short_lines() {
+        let mut e = env("abcd\ne\nijkl");
+        e.set_cursor(0, 1);
+        e.key(Key::Ctrl('v'));
+        e.feed("jjld");
+        assert_eq!(e.text(), "ad\ne\nil");
+        assert_eq!(e.reg('"').unwrap().text, "bc\n\njk");
+    }
+
+    #[test]
+    fn block_yank_then_paste_is_rectangular() {
+        let mut e = env("abcd\nefgh\nijkl");
+        e.feed("l");
+        e.key(Key::Ctrl('v'));
+        e.feed("jly");
+        assert_eq!(e.text(), "abcd\nefgh\nijkl", "yank leaves text untouched");
+        assert_eq!(e.cursor(), (0, 1), "cursor jumps to the block's top-left");
+        assert_eq!(e.reg('"').unwrap().kind, RegKind::Block);
+        e.feed("$p");
+        assert_eq!(e.text(), "abcdbc\nefghfg\nijkl");
+    }
+
+    #[test]
+    fn block_paste_pads_and_extends_lines() {
+        let mut e = env("12\n34");
+        e.key(Key::Ctrl('v'));
+        e.feed("jly");
+        e.feed("j$p");
+        assert_eq!(e.text(), "12\n3412\n  34", "short and missing lines pad to the paste col");
+    }
+
+    #[test]
+    fn block_insert_replicates_on_all_lines() {
+        let mut e = env("one\ntwo\nthree");
+        e.key(Key::Ctrl('v'));
+        e.feed("jjI");
+        e.feed("# ");
+        e.key(Key::Esc);
+        assert_eq!(e.text(), "# one\n# two\n# three");
+        e.feed("u");
+        assert_eq!(e.text(), "one\ntwo\nthree", "the whole block insert is one undo step");
+    }
+
+    #[test]
+    fn block_insert_skips_lines_shorter_than_left_edge() {
+        let mut e = env("alpha\nx\ngamma");
+        e.set_cursor(0, 2);
+        e.key(Key::Ctrl('v'));
+        e.feed("jjI");
+        e.feed("_");
+        e.key(Key::Esc);
+        assert_eq!(e.text(), "al_pha\nx\nga_mma");
+    }
+
+    #[test]
+    fn block_append_pads_short_lines() {
+        let mut e = env("aa\nb\ncccc");
+        e.key(Key::Ctrl('v'));
+        e.feed("jjlA");
+        e.feed("!");
+        e.key(Key::Esc);
+        assert_eq!(e.text(), "aa!\nb !\ncc!cc");
+    }
+
+    #[test]
+    fn block_dollar_append_lands_at_each_eol() {
+        let mut e = env("short\nlonger line\nmid");
+        e.key(Key::Ctrl('v'));
+        e.feed("jj$A");
+        e.feed(";");
+        e.key(Key::Esc);
+        assert_eq!(e.text(), "short;\nlonger line;\nmid;");
+    }
+
+    #[test]
+    fn block_change_replicates_replacement() {
+        let mut e = env("foo_a\nfoo_b\nfoo_c");
+        e.key(Key::Ctrl('v'));
+        e.feed("jjllc");
+        e.feed("bar");
+        e.key(Key::Esc);
+        assert_eq!(e.text(), "bar_a\nbar_b\nbar_c");
+        e.feed("u");
+        assert_eq!(e.text(), "foo_a\nfoo_b\nfoo_c");
+    }
+
+    #[test]
+    fn block_replace_fills_rectangle() {
+        let mut e = env("abcd\nefgh\nijkl");
+        e.feed("l");
+        e.key(Key::Ctrl('v'));
+        e.feed("jjlrx");
+        assert_eq!(e.text(), "axxd\nexxh\nixxl");
+        assert_eq!(e.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn block_d_and_c_run_to_line_ends() {
+        let mut e = env("aa11\nbb22\ncc33");
+        e.set_cursor(0, 2);
+        e.key(Key::Ctrl('v'));
+        e.feed("jjD");
+        assert_eq!(e.text(), "aa\nbb\ncc");
+
+        let mut e = env("xx11\nyy22");
+        e.set_cursor(0, 2);
+        e.key(Key::Ctrl('v'));
+        e.feed("jC");
+        e.feed("Z");
+        e.key(Key::Esc);
+        assert_eq!(e.text(), "xxZ\nyyZ");
+    }
+
+    #[test]
+    fn block_corner_swap_and_case_ops() {
+        let mut e = env("abcd\nefgh");
+        e.feed("l");
+        e.key(Key::Ctrl('v'));
+        e.feed("jl");
+        e.feed("O");
+        assert_eq!(e.cursor(), (1, 1), "O swaps the horizontal corners");
+        e.feed("U");
+        assert_eq!(e.text(), "aBCd\neFGh");
+    }
+
+    #[test]
+    fn dollar_motion_sticks_to_line_ends() {
+        let mut e = env("long line\nab\nlonger line!");
+        e.feed("$");
+        assert_eq!(e.cursor(), (0, 8));
+        e.feed("j");
+        assert_eq!(e.cursor(), (1, 1), "j after $ tracks the shorter line's end");
+        e.feed("j");
+        assert_eq!(e.cursor(), (2, 11), "and springs back out on longer lines");
+        e.feed("h");
+        e.feed("j");
+        assert_eq!(e.cursor(), (2, 10), "h breaks the $ pin");
+    }
+
+    #[test]
+    fn escape_leaves_block_mode() {
+        let mut e = env("abc\ndef");
+        e.key(Key::Ctrl('v'));
+        e.feed("j");
+        e.key(Key::Esc);
+        assert_eq!(e.vim.mode(), Mode::Normal);
+        e.key(Key::Ctrl('v'));
+        e.key(Key::Ctrl('v'));
+        assert_eq!(e.vim.mode(), Mode::Normal, "Ctrl+v toggles back out");
+    }
+
+    // -- macros ------------------------------------------------------------------------
+
+    #[test]
+    fn macro_records_and_replays() {
+        let mut e = env("one\ntwo\nthree");
+        e.feed("qaA;");
+        e.key(Key::Esc);
+        e.feed("jq");
+        assert_eq!(e.text(), "one;\ntwo\nthree");
+        assert_eq!(e.vim.recording_reg(), None);
+        assert!(e.status().contains("recorded @a"), "status: {}", e.status());
+        e.feed("@a");
+        assert_eq!(e.text(), "one;\ntwo;\nthree", "@a replays the append+move");
+        e.feed("@@");
+        assert_eq!(e.text(), "one;\ntwo;\nthree;", "@@ repeats the last macro");
+    }
+
+    #[test]
+    fn macro_takes_a_count() {
+        let mut e = env("a\nb\nc\nd");
+        e.feed("qqxjq");
+        assert_eq!(e.text(), "\nb\nc\nd");
+        e.feed("3@q");
+        assert_eq!(e.text(), "\n\n\n");
+    }
+
+    #[test]
+    fn macro_uppercase_appends() {
+        let mut e = env("abcdef");
+        e.feed("qaxq");
+        e.feed("qAxq");
+        e.feed("@a");
+        assert_eq!(e.text(), "ef", "two x recorded across sessions, both replayed");
+    }
+
+    #[test]
+    fn recording_indicator_tracks_q() {
+        let mut e = env("x");
+        e.feed("qb");
+        assert_eq!(e.vim.recording_reg(), Some('b'));
+        e.feed("q");
+        assert_eq!(e.vim.recording_reg(), None);
+        assert_eq!(e.vim.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn empty_or_unknown_macro_reports_error() {
+        let mut e = env("x");
+        e.feed("@z");
+        assert!(e.status().contains("E749"), "status: {}", e.status());
+    }
+
+    #[test]
+    fn recursive_macro_is_bounded() {
+        let mut e = env(&"y\n".repeat(64));
+        // @a deletes a char then calls itself: must stop at the budget, not hang.
+        e.feed("qaxj@aq");
+        e.feed("@a");
+        assert_eq!(e.vim.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn macro_survives_insert_and_visual_keys() {
+        let mut e = env("abc abc\nabc abc");
+        e.feed("qwviwc123");
+        e.key(Key::Esc);
+        e.feed("q");
+        assert_eq!(e.text(), "123 abc\nabc abc");
+        e.feed("j0@w");
+        assert_eq!(e.text(), "123 abc\n123 abc");
+    }
+
+    // -- which-key ---------------------------------------------------------------------
+
+    #[test]
+    fn key_hints_cover_every_pending_state() {
+        // (keys to press, expected panel title, shows without a pause)
+        let cases: &[(&[Key], &str, bool)] = &[
+            (&[Key::Char(' ')], " space", true),
+            (&[Key::Char(' '), Key::Char('f')], " space f", true),
+            (&[Key::Char(' '), Key::Char('t')], " space t", true),
+            (&[Key::Char('g')], " g", false),
+            (&[Key::Char('z')], " z", false),
+            (&[Key::Ctrl('w')], " ctrl+w", true),
+            (&[Key::Char('"')], " \"", false),
+            (&[Key::Char('m')], " m", false),
+            (&[Key::Char('`')], " `", false),
+            (&[Key::Char('\'')], " '", false),
+            (&[Key::Char('f')], " f", false),
+            (&[Key::Char('T')], " T", false),
+            (&[Key::Char('r')], " r", false),
+            (&[Key::Char('q')], " q", false),
+            (&[Key::Char('@')], " @", false),
+            (&[Key::Char('d')], " d", false),
+            (&[Key::Char('c')], " c", false),
+            (&[Key::Char('y')], " y", false),
+            (&[Key::Char('>')], " >", false),
+            (&[Key::Char('g'), Key::Char('u')], " gu", false),
+            (&[Key::Char('g'), Key::Char('c')], " gc", false),
+            (&[Key::Char('d'), Key::Char('i')], " i", false),
+            (&[Key::Char('d'), Key::Char('a')], " a", false),
+        ];
+        for (keys, title, immediate) in cases {
+            let mut e = env("word (one) \"two\"");
+            for &k in *keys {
+                e.key(k);
+            }
+            let h = e.vim.key_hints().unwrap_or_else(|| panic!("no hints for {title:?}"));
+            assert_eq!(h.title, *title);
+            assert_eq!(h.immediate, *immediate, "immediate flag for {title:?}");
+            assert!(!h.entries.is_empty(), "{title:?} panel has entries");
+        }
+        // No pending state — no panel.
+        let e = env("x");
+        assert!(e.vim.key_hints().is_none());
+        // Visual-mode object pending shows the panel too.
+        let mut e = env("word");
+        e.feed("vi");
+        assert_eq!(e.vim.key_hints().unwrap().title, " i");
+    }
+
+    #[test]
+    fn key_hints_menu_entries_match_real_bindings() {
+        // Every root-leader hint key actually does something (state visibly changes).
+        let mut e = env("text");
+        e.feed(" e");
+        assert!(e.st.explorer.is_some(), "space e opens the explorer");
+        assert!(e.st.explorer_focused, "opening the explorer focuses it");
+        e.key(Key::Esc);
+        assert!(!e.st.explorer_focused, "esc returns to the editor");
+        e.feed(" o");
+        assert!(e.st.explorer_focused, "space o refocuses the explorer");
+        e.feed("q");
+        assert!(e.st.explorer.is_none(), "q hides the explorer");
+        e.feed(" th");
+        assert_eq!(e.st.windows.len(), 2, "space t h splits below");
+        assert_eq!(e.st.split_dir, SplitDir::Horizontal);
+        e.feed(" tv");
+        assert_eq!(e.st.windows.len(), 3, "space t v splits right");
+        assert_eq!(e.st.split_dir, SplitDir::Vertical);
+        e.feed(" tq");
+        assert_eq!(e.st.windows.len(), 2, "space t q closes the window");
+        e.feed(" c");
+        assert!(e.st.buffers.is_empty(), "space c closes the buffer");
+    }
+
+    #[test]
+    fn huge_count_paste_is_capped() {
+        let mut e = env("line one\nline two");
+        e.feed("yy99999999999999999999p");
+        let lines = e.st.buf().unwrap().text.line_count();
+        assert!(lines <= 2 + PASTE_MAX_BYTES / 8, "paste stays within budget: {lines}");
+        assert!(lines > 2, "one copy still pastes");
     }
 }

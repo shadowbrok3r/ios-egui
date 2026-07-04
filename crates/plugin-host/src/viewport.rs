@@ -77,42 +77,24 @@ impl PluginViewport {
             response.request_focus();
         }
 
-        // Track focus across frames so we can reclaim it when egui's focus system
-        // steals it via Tab/Arrow at end-of-frame. Without this, Tab cycles focus to
-        // the menu button and our `if focused` guard never fires to prevent it.
-        let focus_id = egui::Id::new(("plugin_viewport_focus", plugin.instance_key));
-        let had_focus: bool = ui.data(|d| d.get_temp(focus_id)).unwrap_or(false);
-
-        // If we had focus last frame but lost it, a navigation key stole it — reclaim.
-        if had_focus && !response.has_focus() {
-            response.request_focus();
-        }
-
         let focused = response.has_focus();
         let hovered = response.hovered();
 
-        // When the plugin viewport has (or should have) focus, remove navigation key
-        // events from the host's event list entirely. This prevents egui's
-        // Focus::end_pass() from seeing them and cycling focus to the menu button.
-        // We must remove from i.events (not just consume_key) because the focus system
-        // uses key_pressed() which scans i.events directly.
+        // While focused, lock Tab/arrows/Escape to this widget so egui's end-of-pass
+        // focus traversal never acts on keys meant for the guest.
         if focused {
-            ui.input_mut(|i| {
-                i.events.retain(|ev| {
-                    !matches!(ev, Event::Key {
-                        key: egui::Key::Tab
-                            | egui::Key::ArrowUp
-                            | egui::Key::ArrowDown
-                            | egui::Key::Escape,
-                        pressed: true,
-                        ..
-                    })
-                });
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
+                );
             });
         }
-
-        // Persist focus state for next frame.
-        ui.data_mut(|d| d.insert_temp(focus_id, focused));
 
         let raw_input = self.gather_input(ui, plugin, rect, focused, hovered);
         let result = plugin.run_frame(&abi::FrameInput { raw_input });

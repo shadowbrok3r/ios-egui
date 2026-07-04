@@ -34,10 +34,6 @@ pub struct TextBuffer {
 }
 
 impl TextBuffer {
-    pub fn new() -> Self {
-        Self::from_text("")
-    }
-
     pub fn from_text(text: &str) -> Self {
         let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
         if lines.is_empty() {

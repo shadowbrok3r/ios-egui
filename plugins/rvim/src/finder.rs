@@ -13,18 +13,39 @@ pub enum FinderAction {
     Open(String),
 }
 
+/// What the finder picks over: vfs files or open buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinderTarget {
+    Files,
+    Buffers,
+}
+
 pub struct FinderState {
     pub query: String,
     /// Filtered file names, best match first, with matched char indices for highlighting.
     pub results: Vec<(String, Vec<usize>)>,
     pub selected: usize,
+    pub target: FinderTarget,
     all: Vec<String>,
 }
 
 impl FinderState {
     pub fn new(files: Vec<String>) -> Self {
-        let mut f = FinderState { query: String::new(), results: Vec::new(), selected: 0, all: files };
+        let mut f = FinderState {
+            query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+            target: FinderTarget::Files,
+            all: files,
+        };
         f.refilter();
+        f
+    }
+
+    /// Picker over the open buffer names.
+    pub fn buffers(names: Vec<String>) -> Self {
+        let mut f = Self::new(names);
+        f.target = FinderTarget::Buffers;
         f
     }
 
@@ -35,6 +56,8 @@ impl FinderState {
             Key::Enter => {
                 if let Some((name, _)) = self.results.get(self.selected) {
                     FinderAction::Open(name.clone())
+                } else if self.target == FinderTarget::Buffers {
+                    FinderAction::Close
                 } else if !self.query.is_empty() {
                     // Create-on-open: no match, the query becomes a new file name.
                     FinderAction::Open(self.query.clone())
@@ -362,6 +385,19 @@ mod tests {
     fn enter_with_nothing_stays_open() {
         let mut f = FinderState::new(Vec::new());
         assert_eq!(f.handle_key(Key::Enter), FinderAction::None);
+    }
+
+    #[test]
+    fn buffers_target_never_creates_on_open() {
+        let mut f = FinderState::buffers(vec!["main.rs".to_string()]);
+        assert_eq!(f.target, FinderTarget::Buffers);
+        for c in "zzz".chars() {
+            f.handle_key(Key::Char(c));
+        }
+        assert!(f.results.is_empty());
+        assert_eq!(f.handle_key(Key::Enter), FinderAction::Close);
+        let mut f = FinderState::buffers(Vec::new());
+        assert_eq!(f.handle_key(Key::Enter), FinderAction::Close);
     }
 
     #[test]

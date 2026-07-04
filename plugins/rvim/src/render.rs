@@ -43,10 +43,6 @@ impl TerminalSurface {
         (cols, rows)
     }
 
-    pub fn grid(&self) -> (u16, u16) {
-        self.grid
-    }
-
     pub fn terminal_mut(&mut self) -> &mut Terminal<TestBackend> {
         &mut self.terminal
     }

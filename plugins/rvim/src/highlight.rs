@@ -14,30 +14,44 @@ pub struct HlSpan {
     pub color: Color,
 }
 
+/// Cached buffers beyond this count evict the whole map on the next miss.
+const CACHE_CAP: usize = 16;
+
 pub struct Highlighter {
-    cache_key: Option<(String, u64)>,
-    lines: Vec<Vec<HlSpan>>,
+    cache: std::collections::HashMap<String, (u64, Vec<Vec<HlSpan>>)>,
+    #[cfg(test)]
+    relexes: usize,
 }
 
 impl Highlighter {
     pub fn new() -> Self {
-        Highlighter { cache_key: None, lines: Vec::new() }
+        Highlighter {
+            cache: std::collections::HashMap::new(),
+            #[cfg(test)]
+            relexes: 0,
+        }
     }
 
-    /// Spans per line for `buf`, relexed only when (name, version) changed.
+    /// Spans per line for `buf`, relexed only when this name's cached version changed.
     /// Non-`.rs` names get no highlighting (empty span lists).
     pub fn spans(&mut self, name: &str, buf: &TextBuffer) -> &[Vec<HlSpan>] {
         let version = buf.version();
-        let fresh = self.cache_key.as_ref().is_some_and(|(n, v)| n == name && *v == version);
-        if !fresh {
-            self.lines = if name.ends_with(".rs") {
+        if self.cache.get(name).map(|(v, _)| *v) != Some(version) {
+            if self.cache.len() >= CACHE_CAP && !self.cache.contains_key(name) {
+                self.cache.clear();
+            }
+            let lines = if name.ends_with(".rs") {
                 lex_rust(buf.lines())
             } else {
                 vec![Vec::new(); buf.line_count()]
             };
-            self.cache_key = Some((name.to_string(), version));
+            #[cfg(test)]
+            {
+                self.relexes += 1;
+            }
+            self.cache.insert(name.to_string(), (version, lines));
         }
-        &self.lines
+        &self.cache[name].1
     }
 }
 
@@ -807,6 +821,37 @@ mod tests {
         buf.insert_text(Position::new(0, 2), " main() {}");
         let relexed = hl.spans("a.rs", &buf);
         assert!(relexed[0].iter().any(|s| s.color == theme::SYN_FUNCTION));
+    }
+
+    #[test]
+    fn alternating_buffers_do_not_thrash_the_cache() {
+        let mut hl = Highlighter::new();
+        let a = TextBuffer::from_text("fn a() {}");
+        let b = TextBuffer::from_text("fn b() {}");
+        hl.spans("a.rs", &a);
+        hl.spans("b.rs", &b);
+        assert_eq!(hl.relexes, 2);
+        for _ in 0..10 {
+            assert!(!hl.spans("a.rs", &a)[0].is_empty());
+            assert!(!hl.spans("b.rs", &b)[0].is_empty());
+        }
+        assert_eq!(hl.relexes, 2);
+        let mut a2 = TextBuffer::from_text("fn a() {}");
+        a2.insert_text(Position::new(0, 0), "// ");
+        hl.spans("a.rs", &a2);
+        assert_eq!(hl.relexes, 3);
+        hl.spans("b.rs", &b);
+        assert_eq!(hl.relexes, 3);
+    }
+
+    #[test]
+    fn cache_evicts_past_capacity_without_losing_correctness() {
+        let mut hl = Highlighter::new();
+        for i in 0..20 {
+            let t = TextBuffer::from_text("let x = 1;");
+            assert!(!hl.spans(&format!("f{i}.rs"), &t)[0].is_empty());
+        }
+        assert!(hl.cache.len() <= CACHE_CAP);
     }
 
     #[test]
