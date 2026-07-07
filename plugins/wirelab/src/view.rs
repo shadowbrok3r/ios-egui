@@ -46,17 +46,19 @@ enum Push {
     Edit,
 }
 
-/// How canvas taps are interpreted.
+/// What's selected on the canvas (for highlight + delete).
 #[derive(Clone, Copy, PartialEq)]
-pub enum EditMode {
-    /// Drag components to reposition them.
-    Move,
-    /// Tap two endpoints to run a wire between them.
-    Wire,
-    /// Tap to drop the palette-selected component.
-    Add,
-    /// Tap a component or wire to remove it.
-    Delete,
+enum CanvasSel {
+    Comp(u32),
+    Wire(u32),
+}
+
+/// An in-progress touch drag, decided at drag-start by what's under the finger.
+enum CanvasDrag {
+    /// Dragging a component body to reposition it.
+    Move { id: CompId, grab: [f32; 2] },
+    /// Dragging from a pin/terminal to run a wire.
+    Wire { from: Endpoint },
 }
 
 /// Poll-driven fetcher + the fetched project.
@@ -76,13 +78,13 @@ pub struct ProjectView {
     push: Option<(u64, Push)>,
     /// A rejected push: the desktop changed underneath — offer a reload.
     pub conflict: Option<String>,
-    /// Component being dragged: (id, grab offset in world mm).
-    drag: Option<(CompId, [f32; 2])>,
+    /// In-progress canvas drag (move a part, or pull a wire).
+    drag: Option<CanvasDrag>,
     moved: Vec<(u32, [f32; 2])>,
-    /// Canvas interaction mode and its transient state.
-    pub edit_mode: EditMode,
-    place_def: Option<String>,
-    wire_from: Option<Endpoint>,
+    /// Palette part armed for placing; tap empty canvas to drop it.
+    armed_def: Option<String>,
+    /// Current canvas selection (highlight + Delete target).
+    sel: Option<CanvasSel>,
     /// A structural edit landed; re-pull the authoritative circuit next frame.
     needs_refetch: bool,
     /// Script editor: which component, the buffer, and diagnostics served by
@@ -94,6 +96,11 @@ pub struct ProjectView {
     script_push: Option<u64>,
     diagnostics: Vec<(u32, u32, String)>,
     compile_error: Option<String>,
+    /// Autocomplete popup: candidates + the char index the word started at,
+    /// recomputed only when (cursor, buffer-hash) moves.
+    completion: Vec<wirelab_core::script_api::CompletionItem>,
+    completion_ws: usize,
+    completion_key: (usize, u64),
     /// Passive listener for the desktop's own discovery beacon (UDP 4521).
     desktop_scan: DesktopScan,
 }
@@ -182,6 +189,131 @@ fn parse_host_beacon(from: &str, data: &[u8], now: f64) -> Option<DiscoveredDesk
     Some(DiscoveredDesktop { addr: format!("{ip}:{port}"), name, last_seen: now })
 }
 
+const RHAI_KEYWORDS: &[&str] = &[
+    "fn", "let", "const", "if", "else", "switch", "while", "loop", "for", "in", "do", "until",
+    "return", "break", "continue", "true", "false", "this", "throw", "try", "catch",
+];
+
+fn char_to_byte(buf: &str, ci: usize) -> usize {
+    buf.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(buf.len())
+}
+
+/// A diagnostic point (1-based line/col) → byte span covering the token there.
+fn line_col_to_span(text: &str, line: u32, col: u32) -> Option<(usize, usize)> {
+    let mut cur = 1u32;
+    let mut it = text.char_indices().peekable();
+    // Walk to the start of `line`.
+    while cur < line {
+        match it.next() {
+            Some((_, '\n')) => cur += 1,
+            Some(_) => {}
+            None => return None,
+        }
+    }
+    // Advance col-1 chars into the line.
+    for _ in 1..col {
+        match it.peek() {
+            Some((_, '\n')) | None => break,
+            Some(_) => {
+                it.next();
+            }
+        }
+    }
+    let s = it.peek().map(|(b, _)| *b).unwrap_or(text.len());
+    // Extend over the identifier token (or one char).
+    let mut e = s;
+    for (b, ch) in text[s..].char_indices() {
+        if ch.is_alphanumeric() || ch == '_' {
+            e = s + b + ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if e == s {
+        e = (s + 1).min(text.len());
+    }
+    Some((s, e))
+}
+
+/// Minimal Rhai syntax highlighter → egui LayoutJob, with red underlines over
+/// the diagnostic spans. Colors track the desktop's dark code theme.
+fn highlight_rhai(
+    text: &str,
+    base: egui::Color32,
+    diag: &[(usize, usize)],
+) -> egui::text::LayoutJob {
+    use egui::text::{LayoutJob, TextFormat};
+    let comment = egui::Color32::from_gray(110);
+    let string = egui::Color32::from_rgb(166, 227, 161);
+    let number = egui::Color32::from_rgb(137, 180, 250);
+    let keyword = egui::Color32::from_rgb(203, 166, 247);
+    let font = egui::FontId::monospace(13.0);
+    let mut job = LayoutJob::default();
+    let underlined = |s: usize, e: usize| diag.iter().any(|(ds, de)| s < *de && *ds < e);
+    let mut push = |slice: &str, s: usize, color: egui::Color32| {
+        let mut fmt = TextFormat::simple(font.clone(), color);
+        if underlined(s, s + slice.len()) {
+            fmt.underline = egui::Stroke::new(1.5, egui::Color32::from_rgb(243, 139, 168));
+        }
+        job.append(slice, 0.0, fmt);
+    };
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let ch = rest.chars().next().unwrap();
+        if rest.starts_with("//") {
+            let end = rest.find('\n').map(|n| i + n).unwrap_or(text.len());
+            push(&text[i..end], i, comment);
+            i = end;
+        } else if ch == '"' || ch == '`' {
+            let quote = ch;
+            let mut j = i + 1;
+            while j < text.len() {
+                let c = text[j..].chars().next().unwrap();
+                j += c.len_utf8();
+                if c == '\\' && j < text.len() {
+                    j += text[j..].chars().next().unwrap().len_utf8();
+                } else if c == quote {
+                    break;
+                }
+            }
+            push(&text[i..j], i, string);
+            i = j;
+        } else if ch.is_ascii_digit() {
+            let mut j = i;
+            while j < text.len() {
+                let c = text[j..].chars().next().unwrap();
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+                    j += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            push(&text[i..j], i, number);
+            i = j;
+        } else if ch.is_alphabetic() || ch == '_' {
+            let mut j = i;
+            while j < text.len() {
+                let c = text[j..].chars().next().unwrap();
+                if c.is_alphanumeric() || c == '_' {
+                    j += c.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let word = &text[i..j];
+            let color = if RHAI_KEYWORDS.contains(&word) { keyword } else { base };
+            push(word, i, color);
+            i = j;
+        } else {
+            let n = ch.len_utf8();
+            push(&text[i..i + n], i, base);
+            i += n;
+        }
+    }
+    job
+}
+
 impl Default for ProjectView {
     fn default() -> Self {
         ProjectView {
@@ -199,9 +331,8 @@ impl Default for ProjectView {
             conflict: None,
             drag: None,
             moved: Vec::new(),
-            edit_mode: EditMode::Move,
-            place_def: None,
-            wire_from: None,
+            armed_def: None,
+            sel: None,
             needs_refetch: false,
             script_comp: None,
             script_buf: String::new(),
@@ -210,6 +341,9 @@ impl Default for ProjectView {
             script_push: None,
             diagnostics: Vec::new(),
             compile_error: None,
+            completion: Vec::new(),
+            completion_ws: 0,
+            completion_key: (usize::MAX, 0),
             desktop_scan: DesktopScan::default(),
         }
     }
@@ -301,8 +435,7 @@ impl ProjectView {
             || self.drag.is_some()
             || self.conflict.is_some()
             || !self.moved.is_empty()
-            || self.edit_mode != EditMode::Move
-            || self.wire_from.is_some()
+            || self.armed_def.is_some()
             || self.needs_refetch
             || self.script_dirty_at.is_some()
             || self.script_push.is_some()
@@ -329,7 +462,7 @@ impl ProjectView {
             }
             if ui.button("Reload").clicked() {
                 self.conflict = None;
-                self.wire_from = None;
+                self.drag = None;
                 self.flow_dirty_at = None;
                 self.moved.clear();
                 self.start_fetch(ops, now);
@@ -430,7 +563,7 @@ impl ProjectView {
             Push::Moves => {}
             Push::Edit => {
                 // The circuit changed structurally: pull fresh ids/geometry.
-                self.wire_from = None;
+                self.drag = None;
                 self.needs_refetch = true;
             }
         }
@@ -509,70 +642,83 @@ impl ProjectView {
         pt.distance(a + ab * t)
     }
 
-    fn canvas_toolbar(&mut self, ui: &mut egui::Ui) {
+    /// Modeless toolbar (like the desktop): a palette to arm a part for
+    /// placing, a Delete button for the current selection, and a hint. Drag a
+    /// body to move it; drag from a pin/terminal to wire; tap to select.
+    fn canvas_toolbar(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, board_id: u64) {
         ui.horizontal_wrapped(|ui| {
-            for (m, label) in [
-                (EditMode::Move, "Move"),
-                (EditMode::Wire, "Wire"),
-                (EditMode::Add, "Add"),
-                (EditMode::Delete, "Delete"),
-            ] {
-                if ui.selectable_label(self.edit_mode == m, label).clicked() {
-                    self.edit_mode = m;
-                    self.wire_from = None;
-                }
-            }
-            ui.separator();
-            match self.edit_mode {
-                EditMode::Add => {
-                    let cats = self.categories();
-                    let text = self
-                        .place_def
-                        .as_ref()
-                        .and_then(|id| cats.iter().flat_map(|(_, v)| v).find(|(i, _)| i == id))
-                        .map(|(_, n)| n.clone())
-                        .unwrap_or_else(|| "pick part".to_string());
-                    let mut chosen = None;
-                    ui.menu_button(text, |ui| {
-                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-                            for (cat, parts) in &cats {
-                                ui.menu_button(cat, |ui| {
-                                    for (id, name) in parts {
-                                        if ui.button(name).clicked() {
-                                            chosen = Some(id.clone());
-                                            ui.close();
-                                        }
-                                    }
-                                });
+            let cats = self.categories();
+            let armed_name = self
+                .armed_def
+                .as_ref()
+                .and_then(|id| cats.iter().flat_map(|(_, v)| v).find(|(i, _)| i == id))
+                .map(|(_, n)| n.clone());
+            let btn_text = match &armed_name {
+                Some(n) => format!("placing: {n}"),
+                None => "add part".to_string(),
+            };
+            let mut chosen = None;
+            ui.menu_button(btn_text, |ui| {
+                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                    for (cat, parts) in &cats {
+                        ui.menu_button(cat, |ui| {
+                            for (id, name) in parts {
+                                if ui.button(name).clicked() {
+                                    chosen = Some(id.clone());
+                                    ui.close();
+                                }
                             }
                         });
-                    });
-                    if let Some(c) = chosen {
-                        self.place_def = Some(c);
                     }
-                    ui.label(egui::RichText::new("tap to place").small().weak());
-                }
-                EditMode::Wire => {
-                    let hint = if self.wire_from.is_some() {
-                        "tap the second pin/terminal"
-                    } else {
-                        "tap a pin or terminal"
+                });
+            });
+            if let Some(c) = chosen {
+                self.armed_def = Some(c);
+            }
+            if armed_name.is_some() && ui.button("stop").on_hover_text("stop placing").clicked() {
+                self.armed_def = None;
+            }
+
+            // Delete the current selection.
+            if let Some(sel) = self.sel {
+                ui.separator();
+                if ui.button("Delete").clicked() {
+                    let op = match sel {
+                        CanvasSel::Comp(id) => {
+                            serde_json::json!({ "op": "remove_comp", "comp": id })
+                        }
+                        CanvasSel::Wire(id) => {
+                            serde_json::json!({ "op": "remove_wire", "wire": id })
+                        }
                     };
-                    ui.label(egui::RichText::new(hint).small().weak());
-                }
-                EditMode::Delete => {
-                    ui.label(egui::RichText::new("tap a part or wire to remove").small().weak());
-                }
-                EditMode::Move => {
-                    ui.label(egui::RichText::new("drag parts to reposition").small().weak());
+                    self.edit(ops, board_id, op);
+                    self.sel = None;
                 }
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let hint = if self.armed_def.is_some() {
+                    "tap the board to place"
+                } else if matches!(self.drag, Some(CanvasDrag::Wire { .. })) {
+                    "release on a pin/terminal"
+                } else {
+                    "drag a part to move · drag from a pin to wire · tap to select"
+                };
+                ui.label(egui::RichText::new(hint).small().weak());
+            });
         });
     }
 
     pub fn show_canvas(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) {
         self.conflict_banner(ui, ops, now);
-        self.canvas_toolbar(ui);
+        let toolbar_board = self
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.boards.get(self.selected_board))
+            .map(|t| t.id);
+        if let Some(bid) = toolbar_board {
+            self.canvas_toolbar(ui, ops, bid);
+        }
 
         // Owned interaction data collected during the draw pass, so mutation
         // below doesn't fight the read borrow of the snapshot.
@@ -583,7 +729,7 @@ impl ProjectView {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let p = ui.painter_at(rect);
-        p.rect_filled(rect, 6.0, egui::Color32::from_gray(16));
+        p.rect_filled(rect, 6.0, egui::Color32::from_rgb(13, 13, 18));
 
         let (min, scale, origin, board_id) = {
             let Some(snap) = &self.snapshot else { return };
@@ -617,6 +763,21 @@ impl ProjectView {
             let to_px = |w: [f32; 2]| {
                 origin + egui::vec2((w[0] - min[0]) * scale, (w[1] - min[1]) * scale)
             };
+
+            // Dot grid (5 mm), matching the desktop canvas.
+            let step = 5.0 * scale;
+            if step > 7.0 {
+                let dot = egui::Color32::from_gray(30);
+                let mut x = rect.min.x + (origin.x - rect.min.x).rem_euclid(step);
+                while x < rect.max.x {
+                    let mut y = rect.min.y + (origin.y - rect.min.y).rem_euclid(step);
+                    while y < rect.max.y {
+                        p.circle_filled(egui::pos2(x, y), 1.0, dot);
+                        y += step;
+                    }
+                    x += step;
+                }
+            }
 
             // Board body.
             let board_rect = egui::Rect::from_two_pos(
@@ -838,47 +999,100 @@ impl ProjectView {
             (min, scale, origin, board_id)
         };
 
-        // In wire mode, make every endpoint an obvious tap target and show
-        // the pending source ringed.
-        if self.edit_mode == EditMode::Wire {
-            for (ep, px) in &endpoints {
-                let picked = self.wire_from.as_ref() == Some(ep);
+        // Selection highlight.
+        match self.sel {
+            Some(CanvasSel::Comp(id)) => {
+                if let Some((_, c, h)) = comp_bodies.iter().find(|(i, _, _)| i.0 == id) {
+                    let r = egui::Rect::from_two_pos(
+                        origin
+                            + egui::vec2((c[0] - h[0] - min[0]) * scale, (c[1] - h[1] - min[1]) * scale),
+                        origin
+                            + egui::vec2((c[0] + h[0] - min[0]) * scale, (c[1] + h[1] - min[1]) * scale),
+                    )
+                    .expand(3.0);
+                    p.rect_stroke(
+                        r,
+                        4.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(249, 226, 175)),
+                        egui::StrokeKind::Middle,
+                    );
+                }
+            }
+            Some(CanvasSel::Wire(id)) => {
+                for (wid, s0, s1) in &wire_segs {
+                    if wid.0 == id {
+                        p.line_segment(
+                            [*s0, *s1],
+                            egui::Stroke::new(3.5, egui::Color32::from_rgb(249, 226, 175)),
+                        );
+                    }
+                }
+            }
+            None => {}
+        }
+
+        // While pulling a wire, ring every endpoint and rubber-band to the finger.
+        let to_world = |px: egui::Pos2| {
+            [(px.x - origin.x) / scale + min[0], (px.y - origin.y) / scale + min[1]]
+        };
+        if let Some(CanvasDrag::Wire { from }) = &self.drag {
+            for (_, px) in &endpoints {
                 p.circle_stroke(
                     *px,
-                    if picked { 6.0 } else { 3.5 },
-                    egui::Stroke::new(
-                        if picked { 2.0 } else { 1.0 },
-                        if picked {
-                            egui::Color32::from_rgb(249, 226, 175)
-                        } else {
-                            egui::Color32::from_rgb(203, 166, 247)
-                        },
-                    ),
+                    3.5,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 166, 247)),
+                );
+            }
+            if let (Some(src), Some(ptr)) = (
+                endpoints.iter().find(|(ep, _)| ep == from).map(|(_, px)| *px),
+                response.interact_pointer_pos(),
+            ) {
+                p.line_segment(
+                    [src, ptr],
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(249, 226, 175)),
                 );
             }
         }
 
-        // ── interaction ────────────────────────────────────────────────
-        let to_world = |px: egui::Pos2| {
-            [(px.x - origin.x) / scale + min[0], (px.y - origin.y) / scale + min[1]]
+        // ── interaction (modeless, like the desktop) ───────────────────
+        let nearest_endpoint = |ptr: egui::Pos2, radius: f32| -> Option<Endpoint> {
+            endpoints
+                .iter()
+                .map(|(ep, px)| (ep, px.distance(ptr)))
+                .filter(|(_, d)| *d <= radius)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(ep, _)| ep.clone())
         };
-        match self.edit_mode {
-            EditMode::Move => {
-                if response.drag_started()
-                    && let Some(ptr) = response.interact_pointer_pos()
-                {
-                    let w = to_world(ptr);
-                    self.drag = comp_bodies
-                        .iter()
-                        .find(|(_, c, h)| {
-                            (w[0] - c[0]).abs() <= h[0].max(3.0)
-                                && (w[1] - c[1]).abs() <= h[1].max(3.0)
-                        })
-                        .map(|(id, c, _)| (*id, [w[0] - c[0], w[1] - c[1]]));
-                }
-                if let Some((id, grab)) = self.drag
-                    && let Some(ptr) = response.interact_pointer_pos()
-                {
+        let hit_comp = |w: [f32; 2]| -> Option<CompId> {
+            comp_bodies
+                .iter()
+                .find(|(_, c, h)| {
+                    (w[0] - c[0]).abs() <= h[0].max(3.0) && (w[1] - c[1]).abs() <= h[1].max(3.0)
+                })
+                .map(|(id, _, _)| *id)
+        };
+
+        // Drag start: a pin/terminal begins a wire, a body begins a move.
+        if response.drag_started()
+            && let Some(ptr) = response.interact_pointer_pos()
+        {
+            if let Some(ep) = nearest_endpoint(ptr, 18.0) {
+                self.drag = Some(CanvasDrag::Wire { from: ep });
+            } else {
+                let w = to_world(ptr);
+                self.drag = comp_bodies
+                    .iter()
+                    .find(|(_, c, h)| {
+                        (w[0] - c[0]).abs() <= h[0].max(3.0) && (w[1] - c[1]).abs() <= h[1].max(3.0)
+                    })
+                    .map(|(id, c, _)| CanvasDrag::Move { id: *id, grab: [w[0] - c[0], w[1] - c[1]] });
+            }
+        }
+
+        match &self.drag {
+            Some(CanvasDrag::Move { id, grab }) => {
+                let (id, grab) = (*id, *grab);
+                if let Some(ptr) = response.interact_pointer_pos() {
                     let wp = to_world(ptr);
                     let pos = [wp[0] - grab[0], wp[1] - grab[1]];
                     if let Some(snap) = &mut self.snapshot
@@ -892,82 +1106,59 @@ impl ProjectView {
                         self.moved.push((id.0, pos));
                     }
                 }
-                if !self.moved.is_empty() && self.push.is_none() {
-                    let moves = std::mem::take(&mut self.moved);
-                    let body =
-                        serde_json::json!({ "board_id": board_id, "moves": moves }).to_string();
-                    self.post(ops, "/project/positions", body, Push::Moves);
-                }
             }
-            EditMode::Add => {
-                if response.clicked()
-                    && let Some(ptr) = response.interact_pointer_pos()
-                    && let Some(def) = self.place_def.clone()
+            Some(CanvasDrag::Wire { from }) if response.drag_stopped() => {
+                let from = from.clone();
+                let target =
+                    response.interact_pointer_pos().and_then(|ptr| nearest_endpoint(ptr, 22.0));
+                self.drag = None;
+                if let Some(to) = target
+                    && to != from
                 {
-                    let w = to_world(ptr);
                     self.edit(
                         ops,
                         board_id,
-                        serde_json::json!({ "op": "add_comp", "def_id": def, "pos": [w[0], w[1]] }),
+                        serde_json::json!({
+                            "op": "add_wire",
+                            "a": serde_json::to_value(&from).unwrap_or_default(),
+                            "b": serde_json::to_value(&to).unwrap_or_default(),
+                        }),
                     );
                 }
             }
-            EditMode::Wire => {
-                if response.clicked()
-                    && let Some(ptr) = response.interact_pointer_pos()
-                {
-                    let nearest = endpoints
-                        .iter()
-                        .map(|(ep, px)| (ep, px.distance(ptr)))
-                        .filter(|(_, d)| *d <= 22.0)
-                        .min_by(|a, b| a.1.total_cmp(&b.1))
-                        .map(|(ep, _)| ep.clone());
-                    if let Some(ep) = nearest {
-                        match self.wire_from.take() {
-                            None => self.wire_from = Some(ep),
-                            Some(from) if from != ep => self.edit(
-                                ops,
-                                board_id,
-                                serde_json::json!({
-                                    "op": "add_wire",
-                                    "a": serde_json::to_value(&from).unwrap_or_default(),
-                                    "b": serde_json::to_value(&ep).unwrap_or_default(),
-                                }),
-                            ),
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            EditMode::Delete => {
-                if response.clicked()
-                    && let Some(ptr) = response.interact_pointer_pos()
-                {
-                    let w = to_world(ptr);
-                    let comp = comp_bodies.iter().find(|(_, c, h)| {
-                        (w[0] - c[0]).abs() <= h[0].max(3.0)
-                            && (w[1] - c[1]).abs() <= h[1].max(3.0)
-                    });
-                    if let Some((id, _, _)) = comp {
-                        self.edit(
-                            ops,
-                            board_id,
-                            serde_json::json!({ "op": "remove_comp", "comp": id.0 }),
-                        );
-                    } else if let Some(wid) = wire_segs
-                        .iter()
-                        .map(|(id, a, b)| (*id, Self::seg_dist(ptr, *a, *b)))
-                        .filter(|(_, d)| *d <= 10.0)
-                        .min_by(|a, b| a.1.total_cmp(&b.1))
-                        .map(|(id, _)| id)
-                    {
-                        self.edit(
-                            ops,
-                            board_id,
-                            serde_json::json!({ "op": "remove_wire", "wire": wid.0 }),
-                        );
-                    }
-                }
+            _ => {}
+        }
+
+        // Flush finished moves.
+        if !self.moved.is_empty() && self.push.is_none() {
+            let moves = std::mem::take(&mut self.moved);
+            let body = serde_json::json!({ "board_id": board_id, "moves": moves }).to_string();
+            self.post(ops, "/project/positions", body, Push::Moves);
+        }
+
+        // A plain tap: place the armed part, else select what's under it.
+        if response.clicked()
+            && let Some(ptr) = response.interact_pointer_pos()
+        {
+            let w = to_world(ptr);
+            if let Some(def) = self.armed_def.clone() {
+                self.edit(
+                    ops,
+                    board_id,
+                    serde_json::json!({ "op": "add_comp", "def_id": def, "pos": [w[0], w[1]] }),
+                );
+            } else if let Some(id) = hit_comp(w) {
+                self.sel = Some(CanvasSel::Comp(id.0));
+            } else if let Some(wid) = wire_segs
+                .iter()
+                .map(|(id, a, b)| (*id, Self::seg_dist(ptr, *a, *b)))
+                .filter(|(_, d)| *d <= 10.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(id, _)| id)
+            {
+                self.sel = Some(CanvasSel::Wire(wid.0));
+            } else {
+                self.sel = None;
             }
         }
     }
@@ -1217,15 +1408,97 @@ impl ProjectView {
             return;
         };
 
-        // The editor. A TextEdit raises the iOS soft keyboard on focus.
-        egui::ScrollArea::vertical().id_salt("script-scroll").max_height(320.0).show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut self.script_buf)
-                    .code_editor()
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(16),
-            );
+        // Inline squiggle spans mapped from the served diagnostics.
+        let diag_ranges: Vec<(usize, usize)> = self
+            .diagnostics
+            .iter()
+            .filter_map(|(l, c, _)| line_col_to_span(&self.script_buf, *l, *c))
+            .collect();
+
+        // Status + first problem, above the editor so the editor fills height.
+        ui.horizontal_wrapped(|ui| {
+            let n = self.diagnostics.len() + usize::from(self.compile_error.is_some());
+            let ok = egui::Color32::from_rgb(166, 227, 161);
+            let err = egui::Color32::from_rgb(243, 139, 168);
+            let status = match (&self.script_dirty_at, &self.script_push) {
+                (_, Some(_)) => egui::RichText::new("linting…").small().weak(),
+                (Some(_), _) => egui::RichText::new("editing…").small().weak(),
+                _ if n == 0 => egui::RichText::new("no problems").small().color(ok),
+                _ => egui::RichText::new(format!("{n} problem(s)")).small().color(err),
+            };
+            ui.label(status);
+            if let Some((l, c, msg)) = self.diagnostics.first() {
+                ui.label(egui::RichText::new(format!("· {l}:{c} {msg}")).small().color(err));
+            } else if let Some(e) = &self.compile_error {
+                ui.label(egui::RichText::new(format!("· {e}")).small().color(err));
+            }
         });
+
+        // The editor fills ~99% of the remaining height; the completion bar,
+        // when present, reserves a thin strip below it.
+        let has_suggestions = !self.completion.is_empty();
+        let editor_id = egui::Id::new("wirelab-script-editor");
+        let base = ui.visuals().text_color();
+        let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+            let mut job = highlight_rhai(buf.as_str(), base, &diag_ranges);
+            job.wrap.max_width = wrap;
+            ui.fonts_mut(|f| f.layout_job(job))
+        };
+        let reserve = if has_suggestions { 34.0 } else { 0.0 };
+        let row_h = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+        let avail = (ui.available_height() * 0.99 - reserve).max(row_h * 4.0);
+        let rows = ((avail / row_h).floor() as usize).max(4);
+        let out = egui::TextEdit::multiline(&mut self.script_buf)
+            .id(editor_id)
+            .code_editor()
+            .desired_width(f32::INFINITY)
+            .desired_rows(rows)
+            .layouter(&mut layouter)
+            .show(ui);
+
+        // Touch-first completion bar (tap a candidate to insert it).
+        if has_suggestions {
+            let mut accept = None;
+            egui::ScrollArea::horizontal().id_salt("script-suggest").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, item) in self.completion.iter().enumerate() {
+                        if ui
+                            .small_button(&item.label)
+                            .on_hover_text(&item.detail)
+                            .clicked()
+                        {
+                            accept = Some(i);
+                        }
+                    }
+                });
+            });
+            if let Some(i) = accept {
+                self.apply_completion(ui, editor_id, i);
+            }
+        }
+
+        // Recompute candidates when the cursor or buffer moved.
+        let focused = out.response.has_focus();
+        if focused && let Some(cr) = out.cursor_range {
+            use std::hash::{Hash, Hasher};
+            let ci = cr.primary.index.0;
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.script_buf.hash(&mut h);
+            let key = (ci, h.finish());
+            if key != self.completion_key {
+                self.completion_key = key;
+                let names = self.script_comp_names();
+                match wirelab_core::script_api::completions(&self.script_buf, ci, &names) {
+                    Some(c) => {
+                        self.completion = c.items;
+                        self.completion_ws = c.word_start;
+                    }
+                    None => self.completion.clear(),
+                }
+            }
+        } else if !focused {
+            self.completion.clear();
+        }
 
         // Debounced push to the desktop, which applies + lints the script.
         if self.script_buf != self.script_synced {
@@ -1241,33 +1514,38 @@ impl ProjectView {
         } else if self.script_push.is_none() {
             self.script_dirty_at = None;
         }
+    }
 
-        // Status + diagnostics served by the desktop linter.
-        ui.horizontal(|ui| {
-            let n = self.diagnostics.len() + usize::from(self.compile_error.is_some());
-            let status = match (&self.script_dirty_at, &self.script_push) {
-                (_, Some(_)) => egui::RichText::new("linting…").small().weak(),
-                (Some(_), _) => egui::RichText::new("• editing").small().weak(),
-                _ if n == 0 => egui::RichText::new("✔ no problems")
-                    .small()
-                    .color(egui::Color32::from_rgb(166, 227, 161)),
-                _ => egui::RichText::new(format!("✖ {n} problem(s)"))
-                    .small()
-                    .color(egui::Color32::from_rgb(243, 139, 168)),
-            };
-            ui.label(status);
-        });
-        if let Some(e) = &self.compile_error {
-            ui.label(
-                egui::RichText::new(e).small().color(egui::Color32::from_rgb(243, 139, 168)),
-            );
+    /// Component names for the active board, matching the desktop's naming.
+    fn script_comp_names(&self) -> Vec<String> {
+        let Some(snap) = &self.snapshot else { return Vec::new() };
+        let Some(tab) = snap.boards.get(self.selected_board) else { return Vec::new() };
+        let mut lib = wirelab_core::library::Library::default();
+        for def in snap.defs.values() {
+            lib.add_component(def.clone());
         }
-        for (line, col, msg) in &self.diagnostics {
-            ui.label(
-                egui::RichText::new(format!("{line}:{col}  {msg}"))
-                    .small()
-                    .color(egui::Color32::from_rgb(243, 139, 168)),
-            );
+        wirelab_core::script::component_names(&tab.circuit, &lib).into_values().collect()
+    }
+
+    /// Insert the chosen completion, replacing the in-progress word.
+    fn apply_completion(&mut self, ui: &egui::Ui, editor_id: egui::Id, idx: usize) {
+        let Some(item) = self.completion.get(idx).cloned() else { return };
+        let ws = self.completion_ws;
+        let ci = self.completion_key.0.min(self.script_buf.chars().count());
+        let sb = char_to_byte(&self.script_buf, ws);
+        let eb = char_to_byte(&self.script_buf, ci);
+        if sb <= eb && eb <= self.script_buf.len() {
+            self.script_buf.replace_range(sb..eb, &item.insert);
+            let caret = ws + item.insert.chars().count() - item.back;
+            if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), editor_id) {
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(caret),
+                )));
+                st.store(ui.ctx(), editor_id);
+            }
+            ui.ctx().memory_mut(|m| m.request_focus(editor_id));
         }
+        self.completion.clear();
+        self.completion_key = (usize::MAX, 0);
     }
 }
