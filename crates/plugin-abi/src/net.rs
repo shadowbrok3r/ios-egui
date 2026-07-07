@@ -1,4 +1,4 @@
-//! Payload types for the built-in network host ops (`net.http.*`, `ssh.*`).
+//! Payload types for the built-in network host ops (`net.http.*`, `net.tcp.*`, `net.udp.*`, `ssh.*`).
 //!
 //! These are op payloads — opaque bytes by convention, postcard-encoded — not part of
 //! [`ABI_VERSION`](crate::ABI_VERSION) or [`WIRE_FORMAT`](crate::WIRE_FORMAT). Adding a field
@@ -16,6 +16,15 @@ pub mod op {
     pub const HTTP_REQUEST: &str = "net.http.request";
     pub const HTTP_POLL: &str = "net.http.poll";
     pub const HTTP_CANCEL: &str = "net.http.cancel";
+
+    pub const TCP_CONNECT: &str = "net.tcp.connect";
+    pub const TCP_POLL: &str = "net.tcp.poll";
+    pub const TCP_SEND: &str = "net.tcp.send";
+    pub const TCP_CLOSE: &str = "net.tcp.close";
+
+    pub const UDP_LISTEN: &str = "net.udp.listen";
+    pub const UDP_POLL: &str = "net.udp.poll";
+    pub const UDP_CLOSE: &str = "net.udp.close";
 
     pub const SSH_CONNECT: &str = "ssh.connect";
     pub const SSH_POLL: &str = "ssh.poll";
@@ -74,6 +83,74 @@ pub enum HttpPoll {
     Pending,
     Done(HttpResponse),
     Error(String),
+}
+
+// ── TCP / UDP ───────────────────────────────────────────────────────────────
+
+/// Payload for [`op::TCP_CONNECT`]. Opens a raw TCP connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TcpConnect {
+    pub host: String,
+    pub port: u16,
+    /// Connect timeout; 0 means the host default (5000 ms).
+    pub timeout_ms: u32,
+}
+
+/// Connection lifecycle state reported by [`op::TCP_POLL`] and [`op::UDP_POLL`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TcpState {
+    Connecting,
+    Ready,
+    /// Closed cleanly (carries a note or empty).
+    Closed(String),
+    /// Failed to connect or dropped with an error.
+    Error(String),
+}
+
+impl TcpState {
+    /// Whether the connection has reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, TcpState::Closed(_) | TcpState::Error(_))
+    }
+}
+
+/// Result of [`op::TCP_POLL`]: the current state plus rx bytes received since the previous
+/// poll (drained, so each byte is delivered once). The host drops the slot after returning a
+/// terminal state, so poll again only while non-terminal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TcpPoll {
+    pub state: TcpState,
+    pub data: Vec<u8>,
+}
+
+/// Payload for [`op::TCP_SEND`]: bytes to write to a connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TcpSend {
+    pub id: u64,
+    pub data: Vec<u8>,
+}
+
+/// Payload for [`op::UDP_LISTEN`]. Binds `0.0.0.0:port` for datagrams (e.g. discovery
+/// beacons) and returns a `u64` id. A taken port still returns an id; the failure surfaces
+/// as [`TcpState::Error`] on the first poll.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UdpListen {
+    pub port: u16,
+}
+
+/// One received datagram: the sender's socket address and its payload.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UdpDatagram {
+    pub from: String,
+    pub data: Vec<u8>,
+}
+
+/// Result of [`op::UDP_POLL`]: packets received since the previous poll (drained; ~64 queued
+/// between polls, oldest dropped). Reuses [`TcpState`] for lifecycle (`Ready` / `Error`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UdpPoll {
+    pub state: TcpState,
+    pub packets: Vec<UdpDatagram>,
 }
 
 // ── SSH ───────────────────────────────────────────────────────────────────────

@@ -213,8 +213,8 @@ pub const MAX_TEXTURE_SIDE: u32 = 16384;
 /// (the host) MUST drop `None`; egui-wgpu does not CPU-scan index values, so an unchecked
 /// mesh would issue an out-of-bounds `draw_indexed`.
 pub fn wire_to_primitive(wp: &WirePrimitive) -> Option<ClippedPrimitive> {
-    if wp.vertices.len() % std::mem::size_of::<epaint::Vertex>() != 0
-        || wp.indices.len() % std::mem::size_of::<u32>() != 0
+    if !wp.vertices.len().is_multiple_of(std::mem::size_of::<epaint::Vertex>())
+        || !wp.indices.len().is_multiple_of(std::mem::size_of::<u32>())
     {
         return None;
     }

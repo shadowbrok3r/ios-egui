@@ -1,0 +1,6 @@
+id = "com.wirelab.panel"
+name = "WireLab"
+version = "0.1.0"
+abi_version = 1
+description = "Live panel for WireLab ESP32 boards over Wi-Fi: discovers boards on the network (UDP beacons), speaks the WireLab TCP protocol, and gives you telemetry, GPIO control, analog watches and the on-board RGB LED — no cable, no desktop."
+permissions = ["net", "haptic"]

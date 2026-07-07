@@ -25,7 +25,7 @@ russh = { version = "0.54", optional = true, default-features = false, features 
 tokio = { version = "1", optional = true, features = ["rt", "io-util", "net", "time", "sync", "macros"] }
 
 [features]
-# Native network ops (`net.http.*`, `ssh.*`) via `NetOps`. Pulls a TLS + SSH stack.
+# Native network ops (`net.http.*`, `net.tcp.*`, `net.udp.*`, `ssh.*`) via `NetOps`. Pulls a TLS + SSH stack.
 net = ["dep:ureq", "dep:russh", "dep:tokio"]
 
 [dev-dependencies]

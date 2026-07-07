@@ -1,9 +1,10 @@
-//! Native network ops backing `net.http.*` and `ssh.*` (feature `net`).
+//! Native network ops backing `net.http.*`, `net.tcp.*`, `net.udp.*` and `ssh.*` (feature `net`).
 //!
-//! Every op is non-blocking: a `request`/`connect` op returns a `u64` handle immediately and
-//! the plugin polls for progress, so the host's UI thread (which drives guest frames) never
-//! blocks on I/O. HTTP runs on a throwaway thread per request (ureq, blocking); each SSH
-//! session owns a thread with a current-thread tokio runtime driving russh.
+//! Every op is non-blocking: a `request`/`connect`/`listen` op returns a `u64` handle
+//! immediately and the plugin polls for progress, so the host's UI thread (which drives guest
+//! frames) never blocks on I/O. HTTP runs on a throwaway thread per request (ureq, blocking);
+//! raw TCP/UDP run one `std::net` thread per connection/listener; each SSH session owns a
+//! thread with a current-thread tokio runtime driving russh.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -15,6 +16,7 @@ use egui_ios_plugin_abi as abi;
 use abi::net::{HttpPoll, HttpRequest, HttpResponse};
 
 mod ssh;
+mod tcp;
 
 /// Ceiling on a buffered HTTP response body.
 const MAX_HTTP_BODY: u64 = 32 << 20;
@@ -30,6 +32,8 @@ pub struct NetOps {
 struct NetHub {
     next_id: AtomicU64,
     http: Mutex<HashMap<u64, HttpSlot>>,
+    tcp: Mutex<HashMap<u64, tcp::TcpConn>>,
+    udp: Mutex<HashMap<u64, tcp::UdpBind>>,
     ssh: Mutex<HashMap<u64, ssh::Session>>,
 }
 
@@ -52,6 +56,13 @@ impl NetOps {
             HTTP_REQUEST => self.http_request(payload),
             HTTP_POLL => self.http_poll(payload),
             HTTP_CANCEL => self.http_cancel(payload),
+            TCP_CONNECT => self.hub.tcp_connect(payload),
+            TCP_POLL => self.hub.tcp_poll(payload),
+            TCP_SEND => self.hub.tcp_send(payload),
+            TCP_CLOSE => self.hub.tcp_close(payload),
+            UDP_LISTEN => self.hub.udp_listen(payload),
+            UDP_POLL => self.hub.udp_poll(payload),
+            UDP_CLOSE => self.hub.udp_close(payload),
             SSH_CONNECT => self.hub.ssh_connect(payload),
             SSH_POLL => self.hub.ssh_poll(payload),
             SSH_WRITE => self.hub.ssh_write(payload),

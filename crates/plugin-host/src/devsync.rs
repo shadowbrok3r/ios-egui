@@ -139,11 +139,12 @@ fn poll_once(
             continue;
         }
         // Sent this exact hash recently and still awaiting confirmation — hold off resending.
-        if let Some((sent_hash, waited)) = pending.get_mut(&id) {
-            if *sent_hash == hash && *waited < RETRY_POLLS {
-                *waited += 1;
-                continue;
-            }
+        if let Some((sent_hash, waited)) = pending.get_mut(&id)
+            && *sent_hash == hash
+            && *waited < RETRY_POLLS
+        {
+            *waited += 1;
+            continue;
         }
 
         let wasm_path = entry["wasm"].as_str().unwrap_or_default();
@@ -204,10 +205,10 @@ fn http_get(addr: &str, path: &str) -> Result<Vec<u8>> {
         .and_then(|(_, v)| v.trim().parse::<usize>().ok());
 
     let body = response[header_end + 4..].to_vec();
-    if let Some(len) = content_length {
-        if body.len() != len {
-            bail!("GET {path}: truncated body ({} of {len} bytes)", body.len());
-        }
+    if let Some(len) = content_length
+        && body.len() != len
+    {
+        bail!("GET {path}: truncated body ({} of {len} bytes)", body.len());
     }
     Ok(body)
 }

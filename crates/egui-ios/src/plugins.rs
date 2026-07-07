@@ -12,8 +12,8 @@ use crate::{Haptic, Host};
 /// Standard ops backed by [`Host`], plus native network ops. The wasmtime store requires
 /// `Send + Sync` op handlers, while `Host` is main-thread only — so main-thread ops queue
 /// here and the app applies them once per frame with [`IosOps::drain_into`]. Network ops
-/// (`net.http.*`, `ssh.*`) are non-blocking and run on background threads via [`NetOps`], so
-/// they return synchronously without touching the main thread.
+/// (`net.http.*`, `ssh.*`, `net.tcp.*`, `net.udp.*`) are non-blocking and run on background
+/// threads via [`NetOps`], so they return synchronously without touching the main thread.
 ///
 /// Ops handled: `haptic` (1 byte, 0..=6), `notify` (postcard `(title, body)`),
 /// `url.open` / `clipboard.set` / `share.file` (utf8), `keyboard.set` (1 byte, 0/1),

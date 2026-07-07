@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 eframe = { workspace = true, features = ["wgpu"] }
 egui.workspace = true
-egui-ios-plugin-host.workspace = true
+egui-ios-plugin-host = { workspace = true, features = ["net"] }
 egui-ios-plugin-abi.workspace = true
 postcard.workspace = true
 env_logger = "0.11"

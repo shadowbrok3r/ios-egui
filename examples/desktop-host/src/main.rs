@@ -10,11 +10,18 @@ use std::sync::Arc;
 use egui_ios_plugin_host::abi::PluginManifest;
 use egui_ios_plugin_host::{HostOps, PluginManager, PluginManagerUi, install};
 
-/// Desktop stand-ins for the iOS capability ops: log and accept.
-struct DesktopOps;
+/// Desktop stand-ins for the iOS capability ops: log and accept. Network ops
+/// run natively through the same `NetOps` backend the iOS runtime uses.
+#[derive(Default)]
+struct DesktopOps {
+    net: egui_ios_plugin_host::NetOps,
+}
 
 impl HostOps for DesktopOps {
     fn call(&self, plugin: &PluginManifest, op: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+        if let Some(r) = self.net.handle(op, payload) {
+            return r;
+        }
         match op {
             "haptic" => Ok(Vec::new()),
             "notify" => {
@@ -47,7 +54,7 @@ impl HostApp {
 
         let root = std::env::args().nth(1).unwrap_or_else(|| "plugins-dist".into());
         let mut manager =
-            PluginManager::new(root, Arc::new(DesktopOps), "desktop").expect("plugin manager");
+            PluginManager::new(root, Arc::new(DesktopOps::default()), "desktop").expect("plugin manager");
         manager.scan(&cc.egui_ctx);
         HostApp {
             manager,

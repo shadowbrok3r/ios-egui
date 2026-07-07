@@ -125,20 +125,20 @@ impl PluginViewport {
                     ui.ctx()
                         .request_repaint_after(std::time::Duration::from_secs_f64(secs.max(0.0)));
                 }
-                if hovered {
-                    if let Some(cursor) = frame.platform.cursor_icon {
-                        ui.ctx().output_mut(|o| o.cursor_icon = cursor);
-                    }
+                if hovered
+                    && let Some(cursor) = frame.platform.cursor_icon
+                {
+                    ui.ctx().output_mut(|o| o.cursor_icon = cursor);
                 }
-                if let Some(url) = frame.platform.open_url.take() {
-                    if plugin.manifest.allows("url.open") {
-                        ui.ctx().open_url(egui::OpenUrl::same_tab(url));
-                    }
+                if let Some(url) = frame.platform.open_url.take()
+                    && plugin.manifest.allows("url.open")
+                {
+                    ui.ctx().open_url(egui::OpenUrl::same_tab(url));
                 }
-                if let Some(text) = frame.platform.copy_text.take() {
-                    if plugin.manifest.allows("clipboard.set") {
-                        ui.ctx().copy_text(text);
-                    }
+                if let Some(text) = frame.platform.copy_text.take()
+                    && plugin.manifest.allows("clipboard.set")
+                {
+                    ui.ctx().copy_text(text);
                 }
                 if frame.skipped_callbacks > 0 {
                     log::warn!(
@@ -229,10 +229,10 @@ impl PluginViewport {
                         events.push(ev.clone());
                     }
                 }
-                Event::Key { .. } | Event::Text(_) | Event::Copy | Event::Cut | Event::Paste(_) | Event::Ime(_) => {
-                    if focused {
-                        events.push(ev.clone());
-                    }
+                Event::Key { .. } | Event::Text(_) | Event::Copy | Event::Cut | Event::Paste(_) | Event::Ime(_)
+                    if focused =>
+                {
+                    events.push(ev.clone());
                 }
                 _ => {}
             }

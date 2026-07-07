@@ -135,10 +135,10 @@ impl PluginManagerUi {
                 }
             });
         }
-        if let Some(i) = reload {
-            if let Err(e) = manager.reload_at(i, ui.ctx()) {
-                manager.load_errors.push((format!("reload #{i}"), format!("{e:#}")));
-            }
+        if let Some(i) = reload
+            && let Err(e) = manager.reload_at(i, ui.ctx())
+        {
+            manager.load_errors.push((format!("reload #{i}"), format!("{e:#}")));
         }
 
         for (what, err) in &manager.load_errors {
@@ -146,26 +146,26 @@ impl PluginManagerUi {
         }
 
         // Logs -----------------------------------------------------------------------
-        if let Some(i) = self.selected {
-            if let Some(plugin) = manager.plugins.get(i) {
-                ui.separator();
-                if let PluginStatus::Errored(e) = &plugin.status {
-                    ui.colored_label(egui::Color32::LIGHT_RED, e);
-                }
-                egui::ScrollArea::vertical()
-                    .max_height(160.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for (level, line) in plugin.logs() {
-                            let color = match level {
-                                4 => egui::Color32::LIGHT_RED,
-                                3 => egui::Color32::YELLOW,
-                                _ => ui.visuals().text_color(),
-                            };
-                            ui.colored_label(color, egui::RichText::new(line).monospace());
-                        }
-                    });
+        if let Some(i) = self.selected
+            && let Some(plugin) = manager.plugins.get(i)
+        {
+            ui.separator();
+            if let PluginStatus::Errored(e) = &plugin.status {
+                ui.colored_label(egui::Color32::LIGHT_RED, e);
             }
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for (level, line) in plugin.logs() {
+                        let color = match level {
+                            4 => egui::Color32::LIGHT_RED,
+                            3 => egui::Color32::YELLOW,
+                            _ => ui.visuals().text_color(),
+                        };
+                        ui.colored_label(color, egui::RichText::new(line).monospace());
+                    }
+                });
         }
     }
 

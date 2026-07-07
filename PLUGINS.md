@@ -187,17 +187,24 @@ Everything else is app-defined via `HostOps`.
 
 ## Network ops (feature `net`)
 
-The iOS runtime (and any host that opts into `egui-ios-plugin-host/net`) provides native HTTP
-and SSH through `NetOps`, so plugins get native TLS and crypto speed instead of running it in
-the Pulley interpreter. Every network op is **non-blocking**: a `*.request`/`connect` op
-returns a `u64` handle immediately and the plugin polls for progress, so the UI thread never
-stalls on I/O. Payload types live in `egui_ios_plugin_abi::net`.
+The iOS runtime (and any host that opts into `egui-ios-plugin-host/net`) provides native HTTP,
+raw TCP/UDP, and SSH through `NetOps`, so plugins get native TLS and crypto speed instead of
+running it in the Pulley interpreter. Every network op is **non-blocking**: a
+`*.request`/`connect`/`listen` op returns a `u64` handle immediately and the plugin polls for
+progress, so the UI thread never stalls on I/O. Payload types live in `egui_ios_plugin_abi::net`.
 
 | op | payload → return | notes |
 | --- | --- | --- |
 | `net.http.request` | `HttpRequest` → `u64` id | runs on a throwaway thread (`ureq`, rustls) |
 | `net.http.poll` | id → `HttpPoll` (`Pending`/`Done`/`Error`) | terminal state delivered once, then dropped |
 | `net.http.cancel` | id → () | forget a pending request |
+| `net.tcp.connect` | `TcpConnect` → `u64` id | raw TCP client; reader thread drains into a 1 MiB rx buffer |
+| `net.tcp.poll` | id → `TcpPoll` (state + new rx bytes) | rx drained per poll; terminal state delivered once, then dropped |
+| `net.tcp.send` | `TcpSend` (id, bytes) → () | `write_all` on the connection |
+| `net.tcp.close` | id → () | shutdown and forget the connection |
+| `net.udp.listen` | `UdpListen` (port) → `u64` id | binds `0.0.0.0:port` for datagrams (e.g. discovery beacons); a taken port surfaces as `Error` on the first poll |
+| `net.udp.poll` | id → `UdpPoll` (state + packets) | packets drained per poll; ~64 queued max, oldest dropped |
+| `net.udp.close` | id → () | stop listening |
 | `ssh.connect` | `SshConnect` → `u64` id | opens a PTY shell (`russh`, ring); password or key auth |
 | `ssh.poll` | id → `SshPoll` (state + new output bytes) | output drained per poll; capped at 1 MiB between polls |
 | `ssh.write` | `SshWrite` (id, bytes) → () | stdin to the PTY |

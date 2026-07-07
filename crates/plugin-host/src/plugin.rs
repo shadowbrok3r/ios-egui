@@ -411,12 +411,12 @@ fn compile_cached(engine: &wasmtime::Engine, dir: &Path, wasm: &[u8]) -> Result<
     let artifact = dir.join("plugin.cwasm");
     let key_path = dir.join("plugin.cwasm.key");
 
-    if std::fs::read_to_string(&key_path).map(|k| k.trim() == key).unwrap_or(false) {
-        if let Ok(bytes) = std::fs::read(&artifact) {
-            match unsafe { Module::deserialize(engine, &bytes) } {
-                Ok(module) => return Ok(module),
-                Err(e) => log::warn!("plugin cache miss ({}): {e:?}", dir.display()),
-            }
+    if std::fs::read_to_string(&key_path).map(|k| k.trim() == key).unwrap_or(false)
+        && let Ok(bytes) = std::fs::read(&artifact)
+    {
+        match unsafe { Module::deserialize(engine, &bytes) } {
+            Ok(module) => return Ok(module),
+            Err(e) => log::warn!("plugin cache miss ({}): {e:?}", dir.display()),
         }
     }
 
