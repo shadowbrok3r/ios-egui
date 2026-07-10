@@ -1,0 +1,10 @@
+[package]
+name = "egui-mobile-core"
+description = "Platform-neutral core for egui mobile apps: the EguiApp trait and the Host capability bridge shared by egui-ios and egui-android."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true

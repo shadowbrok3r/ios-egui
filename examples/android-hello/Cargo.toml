@@ -1,0 +1,48 @@
+[package]
+name = "android_hello"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+egui-mobile = { path = "../../crates/egui-mobile" }
+egui = "0.35"
+
+# cargo-apk2 reads this to generate the APK manifest.
+[package.metadata.android]
+package = "com.example.androidhello"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "Android Hello"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.VIBRATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.POST_NOTIFICATIONS"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.REQUEST_INSTALL_PACKAGES"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.CAMERA"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"
+
+# The launcher activity. android-activity's native-activity glue is loaded by NativeActivity;
+# lib_name points at the cdylib (libandroid_hello.so).
+[[package.metadata.android.application.activity]]
+name = "android.app.NativeActivity"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "android_hello"
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]

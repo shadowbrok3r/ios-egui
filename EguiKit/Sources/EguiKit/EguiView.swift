@@ -199,6 +199,7 @@ final class EguiCoordinator: NSObject, UIDocumentPickerDelegate {
         case 8: camera.start()
         case 9: camera.stop()
         case 10: UIPasteboard.general.string = r.requestStrA()
+        case 11: Capabilities.shareText(r.requestStrA(), from: host)
         default: break
         }
     }

@@ -27,6 +27,7 @@ enum {
     EGUI_REQ_START_CAMERA_PREVIEW = 8,
     EGUI_REQ_STOP_CAMERA_PREVIEW = 9,
     EGUI_REQ_SET_CLIPBOARD = 10,
+    EGUI_REQ_SHARE_TEXT = 11,
 };
 
 // Permission kinds for egui_ios_on_permission_result.

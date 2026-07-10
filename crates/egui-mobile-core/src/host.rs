@@ -1,11 +1,15 @@
 //! Host capability bridge: app-side handle plus the request queue and pushed-in state the
-//! Swift host drains/feeds each frame. Main-thread only (`Rc`/`RefCell`, not `Send`).
+//! platform runtime drains/feeds each frame. Main-thread only (`Rc`/`RefCell`, not `Send`).
+//!
+//! The queue + pushed-in state are platform-neutral: on iOS the Swift host drains via the C ABI
+//! poll functions; on Android the runtime drains internally and calls JNI. Both go through the
+//! doc-hidden `drv_*` methods at the bottom of this file.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-/// Haptic feedback styles (maps to `UIImpactFeedbackGenerator` / notification feedback).
+/// Haptic feedback styles (`UIImpactFeedbackGenerator` on iOS, `Vibrator`/`VibrationEffect` on Android).
 #[derive(Clone, Copy, Debug)]
 pub enum Haptic {
     Light = 0,
@@ -24,7 +28,7 @@ pub enum Permission {
     Microphone = 1,
 }
 
-/// Safe-area insets in points, pushed in by the Swift host on layout.
+/// Safe-area insets in points, pushed in by the platform host on layout.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Insets {
     pub top: f32,
@@ -33,7 +37,7 @@ pub struct Insets {
     pub right: f32,
 }
 
-/// A request from the app for the Swift host to fulfill. Drained via the FFI poll loop.
+/// A request from the app for the platform host to fulfill. Drained via the driver API.
 pub enum HostRequest {
     ShareFile(String),
     Notify { title: String, body: String },
@@ -46,10 +50,20 @@ pub enum HostRequest {
     StartCameraPreview,
     StopCameraPreview,
     SetClipboard(String),
+    ShareText(String),
+    /// Backend-specific request: a raw (kind, strings, int) enqueued via [`Host::drv_enqueue`].
+    /// Used by platform extension traits (e.g. Android `HostExt`) for capabilities beyond the
+    /// common surface, without adding a typed variant per capability.
+    Raw {
+        kind: i32,
+        a: Option<String>,
+        b: Option<String>,
+        i: i32,
+    },
 }
 
 impl HostRequest {
-    /// Integer kind read by `egui_ios_poll_request`; must match `egui_ios.h`.
+    /// Integer kind read by the platform host; must match `egui_ios.h` (and the Android dispatcher).
     pub fn kind_code(&self) -> i32 {
         match self {
             HostRequest::ShareFile(_) => 0,
@@ -63,10 +77,12 @@ impl HostRequest {
             HostRequest::StartCameraPreview => 8,
             HostRequest::StopCameraPreview => 9,
             HostRequest::SetClipboard(_) => 10,
+            HostRequest::ShareText(_) => 11,
+            HostRequest::Raw { kind, .. } => *kind,
         }
     }
 
-    /// Primary string payload exposed via `egui_ios_request_str_a`.
+    /// Primary string payload.
     pub fn str_a(&self) -> Option<String> {
         match self {
             HostRequest::ShareFile(p) => Some(p.clone()),
@@ -74,49 +90,54 @@ impl HostRequest {
             HostRequest::OpenUrl(u) => Some(u.clone()),
             HostRequest::PickFile { types } => Some(types.join("\n")),
             HostRequest::SetClipboard(t) => Some(t.clone()),
+            HostRequest::ShareText(t) => Some(t.clone()),
+            HostRequest::Raw { a, .. } => a.clone(),
             _ => None,
         }
     }
 
-    /// Secondary string payload exposed via `egui_ios_request_str_b`.
+    /// Secondary string payload.
     pub fn str_b(&self) -> Option<String> {
         match self {
             HostRequest::Notify { body, .. } => Some(body.clone()),
+            HostRequest::Raw { b, .. } => b.clone(),
             _ => None,
         }
     }
 
-    /// Integer payload exposed via `egui_ios_request_int`.
+    /// Integer payload.
     pub fn int(&self) -> i32 {
         match self {
             HostRequest::SetKeyboard(v) => *v as i32,
             HostRequest::Haptic(h) => *h as i32,
+            HostRequest::Raw { i, .. } => *i,
             _ => 0,
         }
     }
 }
 
-pub(crate) struct HostState {
-    pub queue: VecDeque<HostRequest>,
-    pub current: Option<HostRequest>,
-    pub documents_dir: Option<String>,
-    pub safe_area: Insets,
-    pub keyboard_height: f32,
-    pub active: bool,
-    pub picked_file: Option<String>,
-    pub permissions: [Option<bool>; 2],
-    pub mic_level: f32,
-    pub haptic_cb: Option<extern "C" fn(i32)>,
+struct HostState {
+    queue: VecDeque<HostRequest>,
+    current: Option<HostRequest>,
+    documents_dir: Option<String>,
+    safe_area: Insets,
+    keyboard_height: f32,
+    active: bool,
+    picked_file: Option<String>,
+    permissions: [Option<bool>; 2],
+    mic_level: f32,
+    haptic_cb: Option<extern "C" fn(i32)>,
 }
 
 /// Cheap clonable handle the app calls from `update`. All methods are main-thread only.
 #[derive(Clone)]
 pub struct Host {
-    pub(crate) inner: Rc<RefCell<HostState>>,
+    inner: Rc<RefCell<HostState>>,
 }
 
 impl Host {
-    pub(crate) fn new() -> Self {
+    #[doc(hidden)]
+    pub fn new() -> Self {
         Host {
             inner: Rc::new(RefCell::new(HostState {
                 queue: VecDeque::new(),
@@ -175,10 +196,15 @@ impl Host {
         self.push(HostRequest::SetClipboard(text.into()));
     }
 
+    /// Present the system share sheet for a plain-text string.
+    pub fn share_text(&self, text: impl Into<String>) {
+        self.push(HostRequest::ShareText(text.into()));
+    }
+
     /// Present a document picker; the chosen path arrives via [`Host::take_picked_file`].
-    pub fn pick_file(&self, uti_types: &[&str]) {
+    pub fn pick_file(&self, types: &[&str]) {
         self.push(HostRequest::PickFile {
-            types: uti_types.iter().map(|s| s.to_string()).collect(),
+            types: types.iter().map(|s| s.to_string()).collect(),
         });
     }
 
@@ -233,5 +259,79 @@ impl Host {
     /// Latest microphone input level in 0..=1.
     pub fn mic_level(&self) -> f32 {
         self.inner.borrow().mic_level
+    }
+}
+
+/// Driver API used by the per-platform runtime to drain requests and feed state. Not for apps.
+#[doc(hidden)]
+impl Host {
+    /// Pop the next request into `current`; returns its kind code, or `None` if the queue is empty.
+    pub fn drv_pop(&self) -> Option<i32> {
+        let mut st = self.inner.borrow_mut();
+        if let Some(req) = st.queue.pop_front() {
+            let kind = req.kind_code();
+            st.current = Some(req);
+            Some(kind)
+        } else {
+            st.current = None;
+            None
+        }
+    }
+
+    pub fn drv_str_a(&self) -> Option<String> {
+        self.inner.borrow().current.as_ref().and_then(|r| r.str_a())
+    }
+
+    pub fn drv_str_b(&self) -> Option<String> {
+        self.inner.borrow().current.as_ref().and_then(|r| r.str_b())
+    }
+
+    pub fn drv_int(&self) -> i32 {
+        self.inner.borrow().current.as_ref().map(|r| r.int()).unwrap_or(0)
+    }
+
+    pub fn drv_set_documents_dir(&self, path: String) {
+        self.inner.borrow_mut().documents_dir = Some(path);
+    }
+
+    pub fn drv_set_safe_area(&self, top: f32, bottom: f32, left: f32, right: f32) {
+        self.inner.borrow_mut().safe_area = Insets { top, bottom, left, right };
+    }
+
+    pub fn drv_set_keyboard_height(&self, pts: f32) {
+        self.inner.borrow_mut().keyboard_height = pts.max(0.0);
+    }
+
+    /// Set the active flag; returns the previous value so the caller can fire on_resume/on_pause.
+    pub fn drv_set_active(&self, active: bool) -> bool {
+        let mut st = self.inner.borrow_mut();
+        let prev = st.active;
+        st.active = active;
+        prev
+    }
+
+    pub fn drv_set_picked_file(&self, path: String) {
+        self.inner.borrow_mut().picked_file = Some(path);
+    }
+
+    pub fn drv_set_permission(&self, index: usize, granted: bool) {
+        if index < 2 {
+            self.inner.borrow_mut().permissions[index] = Some(granted);
+        }
+    }
+
+    pub fn drv_set_mic_level(&self, level: f32) {
+        self.inner.borrow_mut().mic_level = level;
+    }
+
+    pub fn drv_register_haptic_cb(&self, cb: extern "C" fn(i32)) {
+        self.inner.borrow_mut().haptic_cb = Some(cb);
+    }
+
+    /// Enqueue a backend-specific request. Used by platform extension traits (e.g. Android
+    /// `HostExt`) for capabilities beyond the common surface. The backend's drain loop dispatches
+    /// on `kind`.
+    pub fn drv_enqueue(&self, kind: i32, a: Option<String>, b: Option<String>, i: i32) {
+        self.push(HostRequest::Raw { kind, a, b, i });
     }
 }

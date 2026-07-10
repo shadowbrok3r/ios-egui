@@ -5,7 +5,6 @@
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Mutex;
 
-use crate::host::HostRequest;
 use crate::{EguiApp, Host, RenderCore, Runtime};
 
 /// Last panic message, surfaced via `egui_ios_last_error` so the host can display init failures.
@@ -174,30 +173,25 @@ pub unsafe fn pointer_gone(h: *mut c_void) {
 
 pub unsafe fn set_documents_dir(h: *mut c_void, path: *const c_char) {
     if let Some(rt) = unsafe { rt(h) } {
-        rt.host.inner.borrow_mut().documents_dir = Some(unsafe { cstr(path) });
+        rt.host.drv_set_documents_dir(unsafe { cstr(path) });
     }
 }
 
 pub unsafe fn set_safe_area_insets(h: *mut c_void, top: f32, bottom: f32, left: f32, right: f32) {
     if let Some(rt) = unsafe { rt(h) } {
-        let mut st = rt.host.inner.borrow_mut();
-        st.safe_area.top = top;
-        st.safe_area.bottom = bottom;
-        st.safe_area.left = left;
-        st.safe_area.right = right;
+        rt.host.drv_set_safe_area(top, bottom, left, right);
     }
 }
 
 pub unsafe fn set_keyboard_height(h: *mut c_void, pts: f32) {
     if let Some(rt) = unsafe { rt(h) } {
-        rt.host.inner.borrow_mut().keyboard_height = pts.max(0.0);
+        rt.host.drv_set_keyboard_height(pts);
     }
 }
 
 pub unsafe fn set_app_active(h: *mut c_void, active: bool) {
     if let Some(rt) = unsafe { rt(h) } {
-        let was = rt.host.inner.borrow().active;
-        rt.host.inner.borrow_mut().active = active;
+        let was = rt.host.drv_set_active(active);
         rt.core.set_active(active);
         if active && !was {
             let host = &rt.host;
@@ -213,62 +207,58 @@ pub unsafe fn poll_request(h: *mut c_void, out_kind: *mut i32) -> bool {
     let Some(rt) = (unsafe { rt(h) }) else {
         return false;
     };
-    let mut st = rt.host.inner.borrow_mut();
-    if let Some(req) = st.queue.pop_front() {
-        if !out_kind.is_null() {
-            unsafe { *out_kind = req.kind_code() };
+    match rt.host.drv_pop() {
+        Some(kind) => {
+            if !out_kind.is_null() {
+                unsafe { *out_kind = kind };
+            }
+            true
         }
-        st.current = Some(req);
-        true
-    } else {
-        st.current = None;
-        false
+        None => false,
     }
 }
 
 pub unsafe fn request_str_a(h: *mut c_void) -> *mut c_char {
     match unsafe { rt(h) } {
-        Some(rt) => into_cstr(rt.host.inner.borrow().current.as_ref().and_then(|r| r.str_a())),
+        Some(rt) => into_cstr(rt.host.drv_str_a()),
         None => std::ptr::null_mut(),
     }
 }
 
 pub unsafe fn request_str_b(h: *mut c_void) -> *mut c_char {
     match unsafe { rt(h) } {
-        Some(rt) => into_cstr(rt.host.inner.borrow().current.as_ref().and_then(|r| r.str_b())),
+        Some(rt) => into_cstr(rt.host.drv_str_b()),
         None => std::ptr::null_mut(),
     }
 }
 
 pub unsafe fn request_int(h: *mut c_void) -> i32 {
-    unsafe { rt(h) }
-        .and_then(|rt| rt.host.inner.borrow().current.as_ref().map(|r| r.int()))
-        .unwrap_or(0)
+    unsafe { rt(h) }.map(|rt| rt.host.drv_int()).unwrap_or(0)
 }
 
 pub unsafe fn on_file_picked(h: *mut c_void, path: *const c_char) {
     if let Some(rt) = unsafe { rt(h) } {
-        rt.host.inner.borrow_mut().picked_file = Some(unsafe { cstr(path) });
+        rt.host.drv_set_picked_file(unsafe { cstr(path) });
     }
 }
 
 pub unsafe fn on_permission_result(h: *mut c_void, kind: i32, granted: bool) {
     if let Some(rt) = unsafe { rt(h) } {
-        if kind == 0 || kind == 1 {
-            rt.host.inner.borrow_mut().permissions[kind as usize] = Some(granted);
+        if kind >= 0 {
+            rt.host.drv_set_permission(kind as usize, granted);
         }
     }
 }
 
 pub unsafe fn on_mic_level(h: *mut c_void, level: f32) {
     if let Some(rt) = unsafe { rt(h) } {
-        rt.host.inner.borrow_mut().mic_level = level;
+        rt.host.drv_set_mic_level(level);
     }
 }
 
 pub unsafe fn register_haptic_cb(h: *mut c_void, cb: extern "C" fn(i32)) {
     if let Some(rt) = unsafe { rt(h) } {
-        rt.host.inner.borrow_mut().haptic_cb = Some(cb);
+        rt.host.drv_register_haptic_cb(cb);
     }
 }
 
@@ -277,8 +267,3 @@ pub unsafe fn string_free(s: *mut c_char) {
         drop(unsafe { CString::from_raw(s) });
     }
 }
-
-// Reference the request enum so a future variant addition is a compile error here.
-const _: fn() = || {
-    let _ = HostRequest::SetKeyboard(true).kind_code();
-};

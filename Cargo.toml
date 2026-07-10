@@ -1,8 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/egui-mobile-core",
+    "crates/egui-mobile",
     "crates/egui-ios",
+    "crates/egui-android",
+    "examples/android-hello",
     "crates/cargo-egui-ios",
+    "crates/cargo-egui-android",
     "crates/plugin-abi",
     "crates/plugin-host",
     "crates/plugin-sdk",
@@ -11,6 +16,21 @@ members = [
     "examples/plugins-ios/rust",
 ]
 exclude = ["template", "template-plugin", "plugins"]
+# egui-android only builds for android targets (android-activity/eframe-android), so it is a
+# member (buildable via `cargo ndk -p egui-android`) but excluded from the default host build.
+default-members = [
+    "crates/egui-mobile-core",
+    "crates/egui-mobile",
+    "crates/egui-ios",
+    "crates/cargo-egui-ios",
+    "crates/cargo-egui-android",
+    "crates/plugin-abi",
+    "crates/plugin-host",
+    "crates/plugin-sdk",
+    "examples/hello/rust",
+    "examples/desktop-host",
+    "examples/plugins-ios/rust",
+]
 
 [workspace.package]
 edition = "2024"
@@ -36,6 +56,9 @@ toml = "0.9"
 egui-ios-plugin-abi = { path = "crates/plugin-abi" }
 egui-ios-plugin-host = { path = "crates/plugin-host" }
 egui-ios-plugin-sdk = { path = "crates/plugin-sdk" }
+egui-mobile-core = { path = "crates/egui-mobile-core" }
+egui-ios = { path = "crates/egui-ios" }
+egui-android = { path = "crates/egui-android" }
 
 # wasmtime compiles plugin modules at runtime; keep the compiler fast even in dev builds.
 [profile.dev.package.cranelift-codegen]

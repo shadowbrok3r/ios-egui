@@ -1,0 +1,28 @@
+[package]
+name = "egui-android"
+description = "Android backend for egui-mobile: android_main + eframe(wgpu) render loop + JNI Host capability bridge."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui.workspace = true
+egui-mobile-core.workspace = true
+eframe = { version = "0.35", default-features = false, features = [
+    "android-native-activity",
+    "wgpu",
+    "default_fonts",
+] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+# Capability bridge: call Android APIs from Rust. jni 0.21 (stable, well-documented) drives the
+# calls; the raw JavaVM/Activity come from ndk-context (version-agnostic), so android-activity's
+# internal jni 0.22 is irrelevant.
+jni = "0.21"
+ndk-context = "0.1"
+log = "0.4"
+android_logger = "0.15"
+
+[lib]
+# rlib: the app crate is the cdylib that exports `android_main` (via the `app!` macro).
+crate-type = ["rlib"]

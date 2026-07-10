@@ -1,9 +1,10 @@
-//! Runtime for native egui iOS apps. Implement [`EguiApp`] and invoke [`app!`]; the macro
-//! emits the C ABI consumed by the `EguiKit` Swift package. No Swift or FFI in app code.
+//! iOS backend for the shared [`egui_mobile_core`] runtime. Implement [`EguiApp`] and invoke
+//! [`app!`]; the macro emits the C ABI consumed by the `EguiKit` Swift package. No Swift or FFI
+//! in app code. The `EguiApp` trait and `Host` bridge live in `egui-mobile-core` so the same app
+//! compiles for Android too.
 
 pub use egui;
 
-mod host;
 mod input;
 mod render_core;
 
@@ -13,7 +14,8 @@ pub mod plugins;
 #[doc(hidden)]
 pub mod __ffi;
 
-pub use host::{Haptic, Host, Insets, Permission};
+/// The app-author API, re-exported from the platform-neutral core.
+pub use egui_mobile_core::{CreateContext, EguiApp, Haptic, Host, Insets, Permission};
 pub use render_core::RenderCore;
 
 /// The default egui visual theme (near-black surfaces, pink/purple accents). Applied to the
@@ -22,32 +24,6 @@ pub use egui_ios_plugin_abi::theme;
 
 /// ABI version asserted by the Swift host at startup; bump on any breaking C ABI change.
 pub const ABI_VERSION: u32 = 2;
-
-/// Passed to the app factory at creation; carries the initial drawable geometry.
-pub struct CreateContext {
-    pub width_px: u32,
-    pub height_px: u32,
-    pub pixels_per_point: f32,
-}
-
-/// The single trait an app implements. Only [`EguiApp::update`] is required.
-pub trait EguiApp: 'static {
-    /// Build one frame of UI into the root [`egui::Ui`]. Use `ui.ctx()` for context-level calls
-    /// and `egui::CentralPanel::default().show(ui, ..)` for panels.
-    fn update(&mut self, ui: &mut egui::Ui, host: &Host);
-
-    /// Configure style and fonts once, before the first frame.
-    fn theme(&self, _ctx: &egui::Context) {}
-
-    /// Called once after the renderer and context are ready.
-    fn on_start(&mut self, _ctx: &egui::Context, _host: &Host) {}
-
-    /// Called when the app returns to the foreground.
-    fn on_resume(&mut self, _host: &Host) {}
-
-    /// Called when the app is backgrounded.
-    fn on_pause(&mut self, _host: &Host) {}
-}
 
 /// Owns the renderer, the boxed app, and the host bridge behind the opaque FFI handle.
 pub struct Runtime {

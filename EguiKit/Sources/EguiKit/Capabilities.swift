@@ -27,6 +27,16 @@ enum Capabilities {
         presenter(from: view)?.present(av, animated: true)
     }
 
+    static func shareText(_ text: String, from view: UIView?) {
+        guard !text.isEmpty else { return }
+        let av = UIActivityViewController(activityItems: [text], applicationActivities: nil)
+        if let pop = av.popoverPresentationController {
+            pop.sourceView = view
+            pop.sourceRect = CGRect(x: (view?.bounds.midX ?? 0), y: (view?.bounds.midY ?? 0), width: 0, height: 0)
+        }
+        presenter(from: view)?.present(av, animated: true)
+    }
+
     static func openURL(_ string: String) {
         guard let url = URL(string: string) else { return }
         UIApplication.shared.open(url)

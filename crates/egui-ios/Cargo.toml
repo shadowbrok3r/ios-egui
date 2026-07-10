@@ -11,6 +11,7 @@ egui.workspace = true
 egui-wgpu.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
+egui-mobile-core.workspace = true
 # Non-optional: provides the shared default egui theme applied by the runtime.
 egui-ios-plugin-abi.workspace = true
 egui-ios-plugin-host = { workspace = true, optional = true }

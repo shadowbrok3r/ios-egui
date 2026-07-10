@@ -1,0 +1,15 @@
+[package]
+name = "cargo-egui-android"
+description = "Cargo subcommand to scaffold, cross-compile, and run native egui Android apps via cargo-apk2 + adb."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[[bin]]
+name = "cargo-egui-android"
+path = "src/main.rs"

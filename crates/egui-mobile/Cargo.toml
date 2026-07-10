@@ -1,0 +1,18 @@
+[package]
+name = "egui-mobile"
+description = "Cross-platform facade for egui mobile apps: one EguiApp + Host API that builds for iOS and Android. Depends on the platform backend via cfg(target_os)."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+egui-mobile-core.workspace = true
+
+# iOS backend (provides the `app!` entry macro + C ABI runtime).
+[target.'cfg(target_os = "ios")'.dependencies]
+egui-ios.workspace = true
+
+# Android backend (provides the `app!` entry macro + android_main runtime).
+[target.'cfg(target_os = "android")'.dependencies]
+egui-android.workspace = true
