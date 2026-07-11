@@ -77,6 +77,8 @@ fn with_activity<R>(
     match f(&mut env, &activity) {
         Ok(r) => Some(r),
         Err(e) => {
+            // Clear any pending Java exception so it can't poison the next JNI call this frame.
+            let _ = env.exception_clear();
             log::error!("egui-android JNI error: {e:?}");
             None
         }
@@ -370,6 +372,25 @@ fn poll_pending_permissions(host: &Host) {
     }
 }
 
+/// Feed the app's private files directory into the host as its documents dir. Called once at
+/// startup. `getFilesDir()` is a Context method (thread-safe, no UI thread needed).
+pub fn init_documents_dir(host: &Host) {
+    let dir = with_activity(|env, activity| {
+        let files = env
+            .call_method(activity, "getFilesDir", "()Ljava/io/File;", &[])?
+            .l()?;
+        let path = env
+            .call_method(&files, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let s: JString = path.into();
+        let out: String = env.get_string(&s)?.into();
+        Ok(out)
+    });
+    if let Some(dir) = dir {
+        host.drv_set_documents_dir(dir);
+    }
+}
+
 /// Read the current system-bar + display-cutout insets and push them (in points) into the host so
 /// `host.safe_area_insets()` works on Android like on iOS. Called each frame by the runtime.
 pub fn update_insets(host: &Host, pixels_per_point: f32) {
@@ -379,41 +400,45 @@ pub fn update_insets(host: &Host, pixels_per_point: f32) {
     }
 }
 
+// Insets are read via `Resources` (Context method, thread-safe) rather than the View hierarchy —
+// `getRootWindowInsets`/`getDecorView` are View methods that MUST run on the UI thread and throw
+// `CalledFromWrongThreadException` from the render thread. `status_bar_height` covers the top
+// notch/camera region on virtually all phones; `navigation_bar_height` covers the bottom.
 fn read_root_insets_px() -> Option<(f32, f32, f32, f32)> {
     with_activity(|env, activity| {
-        let window = env
-            .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+        let res = env
+            .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?
             .l()?;
-        let decor = env
-            .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
-            .l()?;
-        let wi = env
-            .call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])?
-            .l()?;
-        if wi.is_null() {
-            return Ok((0.0, 0.0, 0.0, 0.0));
-        }
-        // WindowInsets.Type.systemBars() | displayCutout() (API 30+).
-        let sysbars = env
-            .call_static_method("android/view/WindowInsets$Type", "systemBars", "()I", &[])?
-            .i()?;
-        let cutout = env
-            .call_static_method("android/view/WindowInsets$Type", "displayCutout", "()I", &[])?
-            .i()?;
-        let insets = env
-            .call_method(
-                &wi,
-                "getInsets",
-                "(I)Landroid/graphics/Insets;",
-                &[JValue::Int(sysbars | cutout)],
-            )?
-            .l()?;
-        let top = env.get_field(&insets, "top", "I")?.i()? as f32;
-        let bottom = env.get_field(&insets, "bottom", "I")?.i()? as f32;
-        let left = env.get_field(&insets, "left", "I")?.i()? as f32;
-        let right = env.get_field(&insets, "right", "I")?.i()? as f32;
-        Ok((top, bottom, left, right))
+        let top = android_dimen_px(env, &res, "status_bar_height")?;
+        let bottom = android_dimen_px(env, &res, "navigation_bar_height")?;
+        Ok((top, bottom, 0.0, 0.0))
     })
+}
+
+/// Look up a framework `dimen` resource (e.g. `status_bar_height`) in pixels; 0 if absent.
+fn android_dimen_px(
+    env: &mut jni::JNIEnv,
+    res: &JObject,
+    name: &str,
+) -> jni::errors::Result<f32> {
+    let jname = env.new_string(name)?;
+    let jtype = env.new_string("dimen")?;
+    let jpkg = env.new_string("android")?;
+    let id = env
+        .call_method(
+            res,
+            "getIdentifier",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)I",
+            &[(&jname).into(), (&jtype).into(), (&jpkg).into()],
+        )?
+        .i()?;
+    if id <= 0 {
+        return Ok(0.0);
+    }
+    let px = env
+        .call_method(res, "getDimensionPixelSize", "(I)I", &[JValue::Int(id)])?
+        .i()?;
+    Ok(px as f32)
 }
 
 fn haptic_ms(kind: i32) -> i64 {

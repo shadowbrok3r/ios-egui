@@ -22,6 +22,12 @@ jni = "0.21"
 ndk-context = "0.1"
 log = "0.4"
 android_logger = "0.15"
+# WASM plugin runtime (feature `plugins`), shared with iOS. Pulley interpreter on Android too.
+egui-ios-plugin-host = { workspace = true, optional = true }
+postcard = { workspace = true, optional = true }
+
+[features]
+plugins = ["dep:egui-ios-plugin-host", "egui-ios-plugin-host/net", "dep:postcard"]
 
 [lib]
 # rlib: the app crate is the cdylib that exports `android_main` (via the `app!` macro).

@@ -1668,10 +1668,12 @@ dependencies = [
  "android_logger",
  "eframe",
  "egui",
+ "egui-ios-plugin-host",
  "egui-mobile-core",
  "jni 0.21.1",
  "log",
  "ndk-context",
+ "postcard",
 ]
 
 [[package]]
@@ -4009,6 +4011,14 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
+
+[[package]]
+name = "plugins_android"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui-android",
+]
 
 [[package]]
 name = "plugins_ios"

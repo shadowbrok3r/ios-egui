@@ -25,8 +25,10 @@ impl PluginEngine {
     pub fn new() -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.epoch_interruption(true);
-        // Explicit for clarity; wasmtime also auto-selects Pulley on iOS.
-        #[cfg(target_os = "ios")]
+        // iOS forbids executable memory outright; Android's SELinux `execmem` policy blocks RWX on
+        // many devices. Both use Pulley (wasmtime's portable interpreter) so no JIT/execmem is
+        // needed. (wasmtime auto-selects Pulley on iOS but NOT on Android, so set it explicitly.)
+        #[cfg(any(target_os = "ios", target_os = "android"))]
         {
             config.target("pulley64").map_err(crate::wt_err)?;
             // iOS caps a sandboxed app's address space. wasmtime's default reserves 4 GiB of

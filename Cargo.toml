@@ -6,6 +6,7 @@ members = [
     "crates/egui-ios",
     "crates/egui-android",
     "examples/android-hello",
+    "examples/plugins-android",
     "crates/cargo-egui-ios",
     "crates/cargo-egui-android",
     "crates/plugin-abi",

@@ -19,6 +19,7 @@ impl eframe::App for Adapter {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if !self.started {
             self.started = true;
+            crate::host::init_documents_dir(&self.host);
             self.app.on_start(ui.ctx(), &self.host);
         }
         // Feed Android WindowInsets (status bar / camera cutout / nav bar) into the host, then
@@ -56,6 +57,12 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
         "egui-android",
         options,
         Box::new(move |cc| {
+            // Install the plugin paint callback into eframe's wgpu renderer (feature `plugins`).
+            #[cfg(feature = "plugins")]
+            if let Some(rs) = cc.wgpu_render_state.as_ref() {
+                let mut renderer = rs.renderer.write();
+                egui_ios_plugin_host::install(&mut renderer, rs.target_format, 1);
+            }
             let cx = CreateContext {
                 width_px: 0,
                 height_px: 0,
@@ -76,6 +83,9 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
 
 pub mod host;
 pub use host::HostExt;
+
+#[cfg(feature = "plugins")]
+pub mod plugins;
 
 /// Generates `android_main` for a type implementing [`EguiApp`].
 ///
