@@ -6,9 +6,9 @@ publish = false
 
 [dependencies]
 egui-ios-plugin-sdk = { path = "../../crates/plugin-sdk" }
-wirelab-proto = { path = "/home/shadowbroker/Desktop/wirelab/crates/wirelab-proto", features = ["std"] }
-wirelab-core = { path = "/home/shadowbroker/Desktop/wirelab/crates/wirelab-core" }
-wirelab-flow-ui = { path = "/home/shadowbroker/Desktop/wirelab/crates/wirelab-flow-ui" }
+wirelab-proto = { path = "../../../../EmbeddedApps/wirelab/crates/wirelab-proto", features = ["std"] }
+wirelab-core = { path = "../../../../EmbeddedApps/wirelab/crates/wirelab-core" }
+wirelab-flow-ui = { path = "../../../../EmbeddedApps/wirelab/crates/wirelab-flow-ui" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -17,8 +17,8 @@ crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 egui-ios-plugin-host = { path = "../../crates/plugin-host", features = ["net"] }
-wirelab-link = { path = "/home/shadowbroker/Desktop/wirelab/crates/wirelab-link" }
-wirelab-core = { path = "/home/shadowbroker/Desktop/wirelab/crates/wirelab-core" }
+wirelab-link = { path = "../../../../EmbeddedApps/wirelab/crates/wirelab-link" }
+wirelab-core = { path = "../../../../EmbeddedApps/wirelab/crates/wirelab-core" }
 
 [profile.release]
 opt-level = "s"

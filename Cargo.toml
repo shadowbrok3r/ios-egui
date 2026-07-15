@@ -9,6 +9,7 @@ members = [
     "examples/plugins-android",
     "crates/cargo-egui-ios",
     "crates/cargo-egui-android",
+    "crates/cargo-egui-mobile",
     "crates/plugin-abi",
     "crates/plugin-host",
     "crates/plugin-sdk",
@@ -25,6 +26,7 @@ default-members = [
     "crates/egui-ios",
     "crates/cargo-egui-ios",
     "crates/cargo-egui-android",
+    "crates/cargo-egui-mobile",
     "crates/plugin-abi",
     "crates/plugin-host",
     "crates/plugin-sdk",
@@ -44,7 +46,7 @@ egui = "0.35"
 egui-wgpu = "0.35"
 eframe = "0.35"
 wgpu = "29"
-pollster = "0.4"
+pollster = "1.0.1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 postcard = { version = "1", features = ["use-std"] }
@@ -53,7 +55,7 @@ wasmtime = { version = "46", default-features = false, features = ["runtime", "c
 wasmtime-wasi = "46"
 anyhow = "1"
 log = "0.4"
-toml = "0.9"
+toml = "1"
 egui-ios-plugin-abi = { path = "crates/plugin-abi" }
 egui-ios-plugin-host = { path = "crates/plugin-host" }
 egui-ios-plugin-sdk = { path = "crates/plugin-sdk" }

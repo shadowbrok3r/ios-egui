@@ -1,12 +1,11 @@
-# egui-ios
+# egui-mobile
 
-Build native [egui](https://github.com/emilk/egui) iOS apps in **Rust**, cross-compiled on
-Linux with [xtool](https://github.com/xtool-org/xtool). Write only Rust — the Swift host,
-the FFI, and the build steps are all library code.
+Build native [egui](https://github.com/emilk/egui) apps for **iOS and Android** in pure Rust,
+cross-compiled from Linux. Write only Rust — the platform hosts, the FFI/JNI, and the build
+steps are all library code. One `impl EguiApp` runs on both platforms:
 
 ```rust
-use egui_ios::egui;
-use egui_ios::{CreateContext, EguiApp, Haptic, Host, app};
+use egui_mobile::{egui, CreateContext, EguiApp, Haptic, Host, app};
 
 struct App { count: u32 }
 impl App { fn new(_: &CreateContext) -> Self { Self { count: 0 } } }
@@ -20,92 +19,128 @@ impl EguiApp for App {
     }
 }
 
-app!(App::new);
+app!(App::new); // C ABI on iOS, android_main on Android
 ```
 
-That is the entire app. No Swift, no FFI, no build script.
+That is the entire app. No Swift, no Kotlin, no build script.
 
-## How it works
+## Crates
 
-- **`crates/egui-ios`** — the runtime. A `CAMetalLayer` pointer comes in from Swift; the crate
-  creates a `wgpu` Metal surface, runs the egui pass each frame (`egui-wgpu`), and forwards
-  touch/keyboard/scroll input. The [`app!`] macro emits a small, frozen `extern "C"` ABI
-  (`egui_ios_*`) so there is **no swift-bridge codegen** — nothing to copy, patch, or validate.
-- **`EguiKit`** (this repo, as a Swift package) — the generic host: a `CAMetalLayer` view, a
-  `CADisplayLink` loop, input forwarding, and the capability bridge (share sheet, notifications,
-  haptics, file picker, camera/mic). It ships the frozen C header at
-  `EguiKit/Sources/EguiKitC/include/egui_ios.h`. Apps reuse it unchanged.
-- **`crates/cargo-egui-ios`** — the `cargo egui-ios` subcommand that replaces a per-project
-  build script: it bundles the `xcrun`/`codesign` shims, cross-compiles the Rust staticlib,
-  links it directly from cargo's target dir (`EGUI_IOS_RUST_TARGET_DIR`, no copy), and runs
-  `xtool`.
+| crate | role |
+| --- | --- |
+| **`egui-mobile`** | the facade apps depend on: shared API + platform-selected `app!` macro |
+| **`egui-mobile-core`** | `EguiApp` trait and the `Host` capability bridge (queue + pushed-in state) |
+| **`egui-ios`** | iOS runtime: `CAMetalLayer` in from Swift, `wgpu` Metal surface, egui pass, frozen `egui_ios_*` C ABI (no swift-bridge codegen) |
+| **`egui-android`** | Android runtime: eframe (winit + NativeActivity + wgpu) render loop, JNI capability bridge, soft-keyboard + clipboard integration |
+| **`cargo-egui-mobile`** | the one CLI to install: `new`/`build`/`run` with `-i/--ios` or `-a/--android`, plus the platform-neutral `plugin` commands |
+| **`cargo-egui-ios`** / **`cargo-egui-android`** | per-platform tools (still installable standalone; the unified CLI wraps them) |
+| **`plugin-abi` / `plugin-host` / `plugin-sdk`** | the WASM plugin system shared by iOS, Android, and desktop hosts — see [PLUGINS.md](PLUGINS.md) |
 
-The app talks to the host through [`Host`]: `host.share_file(..)`, `host.notify(..)`,
-`host.haptic(..)`, `host.pick_file(..)`, `host.request_permission(..)`,
-`host.start_camera_preview()`, plus reads like `host.safe_area_insets()` and
-`host.documents_dir()`.
+`EguiKit/` is the generic Swift host package for iOS (Metal view, display link, input
+forwarding, capability bridge). Apps reuse it unchanged.
 
-## Create a new app
+## One-time setup
 
-One-time setup:
+Both platforms:
 
 ```bash
-xtool setup                          # installs the Darwin Swift SDK + signing
+cargo install --path crates/cargo-egui-mobile   # one install covers iOS + Android
+```
+
+iOS (device deploys from Linux via [xtool](https://github.com/xtool-org/xtool)):
+
+```bash
+xtool setup
 rustup target add aarch64-apple-ios
-cargo install --path crates/cargo-egui-ios   # or `cargo install cargo-egui-ios` once published
 ```
 
-Then:
+Android (gradle-free APKs via [cargo-apk2](https://crates.io/crates/cargo-apk2)):
 
 ```bash
-cargo egui-ios new my-app
+cargo install cargo-apk2
+rustup target add aarch64-linux-android
+# plus an SDK + NDK under ~/Android/Sdk (sdkmanager: platform-tools, platforms, build-tools, ndk)
+# and a JDK 17..21 on the system (auto-detected)
+```
+
+## Create and run an app
+
+```bash
+cargo egui-mobile new my-app --android     # or --ios / -i / -a
 cd my-app
-#   edit rust/src/lib.rs
-cargo egui-ios run                   # cross-compiles + xtool dev → on device
+#   edit src/lib.rs
+cargo egui-mobile run -a                   # build APK + adb install + launch
+cargo egui-mobile run -i                   # cross-compile + xtool dev → on device
 ```
 
-`cargo egui-ios run` does `build` then `xtool dev`. `build` accepts `--simulator` (macOS host
-only), `--assets <DIR>` (bundles a real-file asset tree), and `--swift-bridge` (reserved for
-apps that opt into swift-bridge codegen for custom typed FFI).
+`build`/`run` accept `--release` on both platforms; iOS additionally `--simulator` (macOS
+host only) and `--assets <DIR>`. Android release builds need a signing entry in the app's
+Cargo.toml (`[package.metadata.android.signing.release]` with `path` + `keystore_password`;
+pointing at `~/.android/debug.keystore` with password `android` is fine for sideloads).
 
-## Run the example
+## Host capabilities
 
-```bash
-cd examples/hello
-cargo egui-ios run
-```
+The app talks to the platform through [`Host`]: `share_file`/`share_text`, `notify`,
+`haptic`, `open_url`, `copy_text`, `pick_file`, `request_permission`, camera preview and
+mic level (iOS), plus reads like `safe_area_insets()`, `keyboard_height()`, and
+`documents_dir()`. Android extras live behind the `HostExt` trait (self-update via
+`PackageInstaller`, install/overlay/notification permissions, version code).
 
-The example exercises every capability: tap→haptic, notifications, open URL, a text field
-(keyboard), file picker, share sheet, camera permission + preview, and a live mic-level meter.
+Android specifics handled by the runtime:
+
+- **Soft keyboard**: `host.request_keyboard(..)` shows/hides the IME; `keyboard_height()`
+  is measured from the window/content-rect delta (declare
+  `window_soft_input_mode = "adjustResize"` on the activity, as the templates do).
+- **Clipboard + text actions**: egui has no Android selection menu, so while a text field
+  is being edited the runtime overlays a floating **Paste / Copy / Cut / Select all** bar,
+  bridges egui copies into the system clipboard via JNI, and injects clipboard text back
+  as paste events. This works for host-side text fields and WASM-plugin text fields alike.
+- **Insets**: status bar / cutout / nav bar are fed into `safe_area_insets()` each frame
+  and the root UI is inset automatically (Android 15 edge-to-edge).
 
 ## WASM plugins (hot-swappable UI extensions)
 
 Apps can host plugins: `wasm32-wasip1` modules running a **full egui context in-guest**
-(wasmtime — Pulley interpreter on iOS, Cranelift JIT on desktop). Push rebuilt plugins to a
-running app over WiFi — no reinstall, state preserved:
+(wasmtime — Pulley interpreter on iOS *and* Android, Cranelift JIT on desktop). Push rebuilt
+plugins to a running app over WiFi — no reinstall, state preserved:
 
 ```bash
-cargo egui-ios plugin new my-widget
-cd my-widget && cargo egui-ios plugin serve    # build + watch + serve
+cargo egui-mobile plugin new my-widget
+cd my-widget && cargo egui-mobile plugin serve    # build + watch + serve on :7878
 # in the app's plugin manager: connect to <dev-machine>:7878 → live hot reload
 ```
 
-The same `.wasm` runs in the iOS runtime (`egui-ios` feature `plugins`) and in eframe on
-desktop (`examples/desktop-host`). `examples/plugins-ios` is the on-device host app;
-`plugins/hello-plugin` and `plugins/ratatui-demo` (a ratatui TUI in a plugin) are working
-examples. See [PLUGINS.md](PLUGINS.md) for the architecture, ABI, permissions, and op surface.
+The same `.wasm` runs in the iOS runtime (`egui-ios` feature `plugins`), the Android runtime
+(`egui-android` feature `plugins`), and in eframe on desktop (`examples/desktop-host`).
+On-device host apps: `examples/plugins-ios` and `examples/plugins-android` (same manager UI,
+dev-sync, and native `net.http.*`/`net.tcp.*`/`net.udp.*`/`ssh.*` ops on both). See
+[PLUGINS.md](PLUGINS.md) for the architecture, ABI, permissions, and op surface.
+
+## Examples
+
+- `examples/hello` (iOS) and `examples/android-hello` — the capability tour per platform.
+- `examples/plugins-ios` / `examples/plugins-android` — on-device plugin hosts with
+  wireless hot reload.
+- `examples/desktop-host` — the same plugin host on desktop
+  (`cargo run -p desktop-host -- plugins-dist`).
+- `plugins/` — working plugins: terminal (with SSH client), http-client, devices
+  (Tailscale), regex-tester, json-viewer, rvim, ratatui-demo, and **wirelab** (live panel
+  for WireLab ESP32 boards: discovery, telemetry, GPIO/PWM, behaviors, UART, plus canvas /
+  flow / script mirroring of the desktop app).
 
 ## Notes
 
-- **Linux is device-only.** There is no iOS simulator on Linux (the bundled `xcrun` shim makes
-  `simctl` a no-op); `--simulator` is meaningful only on a macOS host.
-- **Pure egui needs no SDK hacks.** A pure egui+wgpu staticlib cross-compiles from Linux with
-  no `[patch.crates-io]`, no `blake3 pure`, no `tracing-oslog` stub — those were bevy-specific.
-  `SDKROOT` is only needed if a C dependency invokes `xcrun`.
-- **Lifetime.** The `CAMetalLayer` (and its hosting view) must outlive the renderer; do not
-  recreate the `EguiView` mid-session (`.id()` churn). `EguiKit` handles this for you.
-- **ABI stability.** `egui_ios.h` is append-only and version-checked at startup
-  (`egui_ios_abi_version`); the Rust runtime and `EguiKit` are released in lockstep.
+- **Linux is device-only for iOS.** No simulator on Linux; `--simulator` is meaningful only
+  on a macOS host.
+- **Interpreter budgets.** Plugins run under Pulley on phones (~10× slower than native).
+  The host gives the first frames of each plugin a long "cold" deadline (font-atlas build)
+  and a ~2 s steady-state deadline on mobile targets; a hung plugin still traps into an
+  error panel instead of freezing the app.
+- **Android IME path.** Text input rides eframe/winit on NativeActivity; the runtime adds
+  explicit keyboard control and the text-actions bar on top. Complex IME composition
+  (swipe typing) may vary by keyboard app.
+- **ABI stability (iOS).** `egui_ios.h` is append-only and version-checked at startup;
+  the Rust runtime and `EguiKit` are released in lockstep.
 
 ## Versions
 

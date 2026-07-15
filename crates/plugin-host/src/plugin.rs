@@ -54,6 +54,8 @@ pub(crate) struct StoreData {
     pending_response: Option<Vec<u8>>,
     logs: Arc<Mutex<VecDeque<(u8, String)>>>,
     limits: StoreLimits,
+    /// Budget host_call re-arms after an op, mirroring the deadline of the current guest call.
+    frame_deadline: u64,
 }
 
 pub struct LoadedPlugin {
@@ -78,7 +80,12 @@ pub struct LoadedPlugin {
     /// Current full-texture extent per wire id, for partial-update bounds checks.
     tex_extent: HashMap<u64, [u32; 2]>,
     logs: Arc<Mutex<VecDeque<(u8, String)>>>,
+    frames_run: u64,
 }
+
+/// Frames that keep the cold deadline: the first frames build the font atlas and warm the
+/// interpreter, which can far exceed the steady-state budget on Pulley.
+const WARMUP_FRAMES: u64 = 3;
 
 impl LoadedPlugin {
     /// Load `plugin.wasm` + `manifest.toml` from `dir` and create the guest app.
@@ -130,6 +137,7 @@ impl LoadedPlugin {
                 .tables(4)
                 .table_elements(1 << 20)
                 .build(),
+            frame_deadline: COLD_DEADLINE_TICKS,
         };
 
         let mut store = Store::new(engine.inner(), data);
@@ -197,6 +205,7 @@ impl LoadedPlugin {
             tex_map: HashMap::new(),
             tex_extent: HashMap::new(),
             logs,
+            frames_run: 0,
         };
 
         let cfg_bytes = abi::encode(create);
@@ -217,7 +226,13 @@ impl LoadedPlugin {
         }
         // Arm the frame deadline before ANY guest call this frame — plugin_alloc runs in the
         // guest too, so a stale deadline from a long idle gap would trap it instantly.
-        self.store.set_epoch_deadline(FRAME_DEADLINE_TICKS);
+        let ticks = if self.frames_run < WARMUP_FRAMES {
+            COLD_DEADLINE_TICKS
+        } else {
+            FRAME_DEADLINE_TICKS
+        };
+        self.store.set_epoch_deadline(ticks);
+        self.store.data_mut().frame_deadline = ticks;
         let bytes = abi::encode(input);
         let (ptr, len) = self.write_to_guest(&bytes)?;
         let packed = match self.f_frame.call(&mut self.store, (ptr, len)) {
@@ -228,6 +243,7 @@ impl LoadedPlugin {
                 bail!(msg);
             }
         };
+        self.frames_run += 1;
         self.store.set_epoch_deadline(COLD_DEADLINE_TICKS);
         if packed == 0 {
             let msg = format!("plugin_frame rejected input\n{}", self.recent_logs());
@@ -531,7 +547,8 @@ fn add_host_imports_wt(linker: &mut Linker<StoreData>) -> wasmtime::Result<()> {
             };
             // Host op time (file I/O, app ops) must not be charged against the guest's frame
             // budget, else one slow op traps the plugin. Re-arm the deadline for the guest.
-            caller.as_context_mut().set_epoch_deadline(FRAME_DEADLINE_TICKS);
+            let ticks = caller.data().frame_deadline;
+            caller.as_context_mut().set_epoch_deadline(ticks);
             let encoded = abi::encode(&rsp);
             let len = encoded.len() as u32;
             caller.data_mut().pending_response = Some(encoded);

@@ -1,7 +1,7 @@
 <!-- Cross-platform (iOS + Android) design for the egui-ios / egui-mobile library. -->
 > Auto-synthesized from a 6-way research workflow, verified against this repo's current state
 > (egui 0.35, existing `egui-ios-plugin-*` wasmtime host, `desktop-host` + `plugins-ios` examples).
-> Repo root: `/home/shadowbroker/Documents/Rust/IOS/ios-egui`.
+> Repo root: `$HOME/Documents/Rust/IOS/ios-egui`.
 
 # egui-mobile: Unified iOS + Android Design & Implementation Plan
 
@@ -605,9 +605,9 @@ The iOS Host stays exactly as capable as it is; the shared core guarantees an ap
 ---
 
 Key files (all absolute):
-- `/home/shadowbroker/Documents/Rust/IOS/ios-egui/crates/egui-mobile-core/` (new shared core)
-- `/home/shadowbroker/Documents/Rust/IOS/ios-egui/crates/egui-android/` (new runtime)
-- `/home/shadowbroker/Documents/Rust/IOS/ios-egui/crates/egui-mobile/` (new facade)
-- `/home/shadowbroker/Documents/Rust/IOS/ios-egui/tools/cargo-egui-android/` (new build tool)
-- `/home/shadowbroker/Documents/Rust/IOS/ios-egui/kotlin/{EguiHost,EguiService,EguiActivity}.kt` (bundled shims)
-- Refactor targets in existing `/home/shadowbroker/Documents/Rust/IOS/ios-egui/crates/egui-ios/src/{lib,render_core,host,input,plugins}.rs`
+- `$HOME/Documents/Rust/IOS/ios-egui/crates/egui-mobile-core/` (new shared core)
+- `$HOME/Documents/Rust/IOS/ios-egui/crates/egui-android/` (new runtime)
+- `$HOME/Documents/Rust/IOS/ios-egui/crates/egui-mobile/` (new facade)
+- `$HOME/Documents/Rust/IOS/ios-egui/tools/cargo-egui-android/` (new build tool)
+- `$HOME/Documents/Rust/IOS/ios-egui/kotlin/{EguiHost,EguiService,EguiActivity}.kt` (bundled shims)
+- Refactor targets in existing `$HOME/Documents/Rust/IOS/ios-egui/crates/egui-ios/src/{lib,render_core,host,input,plugins}.rs`

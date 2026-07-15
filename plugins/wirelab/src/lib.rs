@@ -10,7 +10,7 @@ use std::time::Duration;
 use egui_ios_plugin_sdk::abi;
 use egui_ios_plugin_sdk::{CreateConfig, HostCallError, HostHandle, PluginApp, egui, plugin};
 use serde::{Deserialize, Serialize};
-use wirelab_proto::HostMsg;
+use wirelab_proto::{BEHAVIOR_SLOTS, Behavior, HostMsg, PinMode, UART_CHUNK, WifiState, heapless};
 
 use link::{BoardLink, LinkState, Ops, Scanner};
 
@@ -39,6 +39,34 @@ struct Persisted {
     watch_pin: u8,
     #[serde(default)]
     desktop_addr: String,
+    #[serde(default)]
+    tab: Tab,
+    #[serde(default = "default_pwm_pin")]
+    pwm_pin: u8,
+    #[serde(default = "default_pwm_freq")]
+    pwm_freq: u32,
+    #[serde(default = "default_uart_tx")]
+    uart_tx: u8,
+    #[serde(default = "default_uart_rx")]
+    uart_rx: u8,
+    #[serde(default = "default_uart_baud")]
+    uart_baud: u32,
+}
+
+fn default_pwm_pin() -> u8 {
+    2
+}
+fn default_pwm_freq() -> u32 {
+    5000
+}
+fn default_uart_tx() -> u8 {
+    4
+}
+fn default_uart_rx() -> u8 {
+    5
+}
+fn default_uart_baud() -> u32 {
+    115_200
 }
 
 impl Default for Persisted {
@@ -48,16 +76,53 @@ impl Default for Persisted {
             rgb: [40, 0, 60],
             watch_pin: 4,
             desktop_addr: String::new(),
+            tab: Tab::Board,
+            pwm_pin: default_pwm_pin(),
+            pwm_freq: default_pwm_freq(),
+            uart_tx: default_uart_tx(),
+            uart_rx: default_uart_rx(),
+            uart_baud: default_uart_baud(),
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 enum Tab {
+    #[default]
     Board,
     Canvas,
     Flow,
     Script,
+}
+
+/// Draft parameters for the behavior editor row.
+struct BehaviorDraft {
+    kind: usize,
+    pin: u8,
+    period_ms: u16,
+    from: u8,
+    to: u8,
+    invert: bool,
+    debounce_ms: u8,
+}
+
+impl Default for BehaviorDraft {
+    fn default() -> Self {
+        BehaviorDraft { kind: 0, pin: 2, period_ms: 500, from: 4, to: 2, invert: false, debounce_ms: 20 }
+    }
+}
+
+const BEHAVIOR_KINDS: [&str; 4] = ["Blink", "Breathe", "Mirror", "Watch"];
+
+fn behavior_label(b: &Behavior) -> String {
+    match b {
+        Behavior::Blink { pin, period_ms } => format!("Blink GPIO{pin} every {period_ms}ms"),
+        Behavior::Breathe { pin, period_ms } => format!("Breathe GPIO{pin} over {period_ms}ms"),
+        Behavior::Mirror { from, to, invert } => {
+            format!("Mirror GPIO{from} -> GPIO{to}{}", if *invert { " inverted" } else { "" })
+        }
+        Behavior::Watch { pin, debounce_ms } => format!("Watch GPIO{pin} ({debounce_ms}ms debounce)"),
+    }
 }
 
 /// Disk key for settings that must survive a full app restart (not just a
@@ -76,6 +141,14 @@ struct App {
     /// Loaded from disk once; last bytes written, to persist only on change.
     loaded_from_disk: bool,
     last_persisted: Vec<u8>,
+    /// Pin currently PWM-driven by this panel, with the live duty in permille.
+    pwm_on: Option<u8>,
+    pwm_duty: u16,
+    /// Behavior slots this panel has attached (the protocol has no readback).
+    behaviors: std::collections::BTreeMap<u8, Behavior>,
+    behavior_draft: BehaviorDraft,
+    uart_open: bool,
+    uart_input: String,
 }
 
 impl App {
@@ -90,7 +163,22 @@ impl App {
             project: Default::default(),
             loaded_from_disk: false,
             last_persisted: Vec::new(),
+            pwm_on: None,
+            pwm_duty: 300,
+            behaviors: Default::default(),
+            behavior_draft: BehaviorDraft::default(),
+            uart_open: false,
+            uart_input: String::new(),
         }
+    }
+
+    /// Forget all per-connection control state (used on disconnect).
+    fn clear_session(&mut self) {
+        self.driven.clear();
+        self.watching = None;
+        self.pwm_on = None;
+        self.behaviors.clear();
+        self.uart_open = false;
     }
 }
 
@@ -109,13 +197,18 @@ impl PluginApp for App {
             {
                 self.saved = s;
             }
+            self.tab = self.saved.tab;
             self.last_persisted = abi::encode(&self.saved);
         }
 
         if self.link.connected() {
             // No reason to hold the beacon socket while a board is attached.
             self.scanner.close(&ops);
+            let was_ready = self.link.state == LinkState::Ready;
             self.link.poll(&ops, now);
+            if !was_ready && self.link.state == LinkState::Ready {
+                host.haptic(3);
+            }
         } else if self.tab == Tab::Board {
             self.scanner.poll(&ops, now);
         }
@@ -133,6 +226,7 @@ impl PluginApp for App {
             ] {
                 if ui.selectable_label(self.tab == tab, label).clicked() {
                     self.tab = tab;
+                    self.saved.tab = tab;
                 }
             }
         });
@@ -268,6 +362,17 @@ impl App {
                         .color(DIM)
                         .small(),
                     );
+                    if let Some((state, ip)) = self.link.wifi {
+                        let (text, color) = match state {
+                            WifiState::Connected => {
+                                (format!("wifi {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]), OK)
+                            }
+                            WifiState::Connecting => ("wifi connecting…".to_string(), HIGH),
+                            WifiState::Failed => ("wifi failed".to_string(), ERR),
+                            WifiState::Off => ("wifi off".to_string(), DIM),
+                        };
+                        ui.label(egui::RichText::new(text).color(color).small());
+                    }
                 }
                 _ => {
                     ui.spinner();
@@ -279,8 +384,7 @@ impl App {
                     let reset = HostMsg::Reset;
                     self.link.send(ops, &reset);
                     self.link.disconnect(ops);
-                    self.driven.clear();
-                    self.watching = None;
+                    self.clear_session();
                 }
             });
         });
@@ -410,7 +514,198 @@ impl App {
             }
 
             ui.add_space(10.0);
+            self.pwm_section(ui, ops);
+
+            ui.add_space(10.0);
+            self.behaviors_section(ui, ops);
+
+            ui.add_space(10.0);
+            self.uart_section(ui, ops);
+
+            ui.add_space(10.0);
             self.console(ui);
+        });
+    }
+
+    fn pwm_section(&mut self, ui: &mut egui::Ui, ops: &dyn Ops) {
+        ui.label(egui::RichText::new("PWM").color(ACCENT).small());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("GPIO");
+            ui.add_enabled(
+                self.pwm_on.is_none(),
+                egui::DragValue::new(&mut self.saved.pwm_pin).range(0..=48),
+            );
+            ui.label("Hz");
+            ui.add_enabled(
+                self.pwm_on.is_none(),
+                egui::DragValue::new(&mut self.saved.pwm_freq).range(1..=40_000).speed(50),
+            );
+            match self.pwm_on {
+                None => {
+                    if ui.button("start").clicked() {
+                        let msg = HostMsg::SetPwm {
+                            pin: self.saved.pwm_pin,
+                            freq_hz: self.saved.pwm_freq,
+                            duty_permille: self.pwm_duty,
+                        };
+                        self.link.send(ops, &msg);
+                        self.pwm_on = Some(self.saved.pwm_pin);
+                    }
+                }
+                Some(pin) => {
+                    if ui.button("stop").clicked() {
+                        let msg = HostMsg::SetPinMode { pin, mode: PinMode::Disabled };
+                        self.link.send(ops, &msg);
+                        self.pwm_on = None;
+                    }
+                }
+            }
+        });
+        if let Some(pin) = self.pwm_on {
+            let slider = egui::Slider::new(&mut self.pwm_duty, 0..=1000)
+                .custom_formatter(|n, _| format!("{:.0}%", n / 10.0))
+                .custom_parser(|s| s.trim_end_matches('%').parse::<f64>().ok().map(|p| p * 10.0));
+            if ui.add(slider).changed() {
+                let msg = HostMsg::SetPwm {
+                    pin,
+                    freq_hz: self.saved.pwm_freq,
+                    duty_permille: self.pwm_duty,
+                };
+                self.link.send(ops, &msg);
+            }
+        }
+    }
+
+    fn behaviors_section(&mut self, ui: &mut egui::Ui, ops: &dyn Ops) {
+        ui.label(
+            egui::RichText::new("Behaviors — run on the board, no round-trips")
+                .color(ACCENT)
+                .small(),
+        );
+        let entries: Vec<(u8, Behavior)> =
+            self.behaviors.iter().map(|(s, b)| (*s, *b)).collect();
+        for (slot, b) in entries {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!("{slot}")).color(DIM).monospace());
+                ui.label(behavior_label(&b));
+                if ui.small_button("detach").clicked() {
+                    self.link.send(ops, &HostMsg::DetachBehavior { slot });
+                    self.behaviors.remove(&slot);
+                }
+            });
+        }
+        let d = &mut self.behavior_draft;
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt("behavior-kind")
+                .selected_text(BEHAVIOR_KINDS[d.kind])
+                .show_ui(ui, |ui| {
+                    for (i, k) in BEHAVIOR_KINDS.iter().enumerate() {
+                        ui.selectable_value(&mut d.kind, i, *k);
+                    }
+                });
+            match d.kind {
+                0 | 1 => {
+                    ui.label("GPIO");
+                    ui.add(egui::DragValue::new(&mut d.pin).range(0..=48));
+                    ui.label("ms");
+                    ui.add(egui::DragValue::new(&mut d.period_ms).range(20..=10_000).speed(10));
+                }
+                2 => {
+                    ui.label("from");
+                    ui.add(egui::DragValue::new(&mut d.from).range(0..=48));
+                    ui.label("to");
+                    ui.add(egui::DragValue::new(&mut d.to).range(0..=48));
+                    ui.checkbox(&mut d.invert, "invert");
+                }
+                _ => {
+                    ui.label("GPIO");
+                    ui.add(egui::DragValue::new(&mut d.pin).range(0..=48));
+                    ui.label("debounce ms");
+                    ui.add(egui::DragValue::new(&mut d.debounce_ms).range(1..=255));
+                }
+            }
+            let free = (0..BEHAVIOR_SLOTS as u8).find(|s| !self.behaviors.contains_key(s));
+            let label = if free.is_some() { "attach" } else { "slots full" };
+            if ui.add_enabled(free.is_some(), egui::Button::new(label)).clicked()
+                && let Some(slot) = free
+            {
+                let behavior = match d.kind {
+                    0 => Behavior::Blink { pin: d.pin, period_ms: d.period_ms },
+                    1 => Behavior::Breathe { pin: d.pin, period_ms: d.period_ms },
+                    2 => Behavior::Mirror { from: d.from, to: d.to, invert: d.invert },
+                    _ => Behavior::Watch { pin: d.pin, debounce_ms: d.debounce_ms },
+                };
+                self.link.send(ops, &HostMsg::AttachBehavior { slot, behavior });
+                self.behaviors.insert(slot, behavior);
+            }
+        });
+    }
+
+    fn uart_section(&mut self, ui: &mut egui::Ui, ops: &dyn Ops) {
+        ui.label(egui::RichText::new("UART").color(ACCENT).small());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("tx");
+            ui.add_enabled(
+                !self.uart_open,
+                egui::DragValue::new(&mut self.saved.uart_tx).range(0..=48),
+            );
+            ui.label("rx");
+            ui.add_enabled(
+                !self.uart_open,
+                egui::DragValue::new(&mut self.saved.uart_rx).range(0..=48),
+            );
+            ui.label("baud");
+            ui.add_enabled(
+                !self.uart_open,
+                egui::DragValue::new(&mut self.saved.uart_baud).range(300..=1_000_000).speed(100),
+            );
+            if !self.uart_open {
+                if ui.button("open").clicked() {
+                    let msg = HostMsg::UartConfig {
+                        tx: self.saved.uart_tx,
+                        rx: self.saved.uart_rx,
+                        baud: self.saved.uart_baud,
+                    };
+                    self.link.send(ops, &msg);
+                    self.uart_open = true;
+                }
+            } else if ui.button("close").clicked() {
+                let msg = HostMsg::UartConfig { tx: 0, rx: 0, baud: 0 };
+                self.link.send(ops, &msg);
+                self.uart_open = false;
+            }
+        });
+        if !self.uart_open {
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("uart")
+            .max_height(120.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in &self.link.uart_rx {
+                    ui.label(egui::RichText::new(line).monospace().small());
+                }
+                if !self.link.uart_tail().is_empty() {
+                    ui.label(
+                        egui::RichText::new(self.link.uart_tail()).monospace().small().color(DIM),
+                    );
+                }
+            });
+        ui.horizontal(|ui| {
+            let edit = egui::TextEdit::singleline(&mut self.uart_input)
+                .hint_text("send a line…")
+                .desired_width(ui.available_width() - 64.0);
+            let submitted = ui.add(edit).lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("send").clicked() || submitted) && !self.uart_input.is_empty() {
+                let mut line = std::mem::take(&mut self.uart_input);
+                line.push('\n');
+                for chunk in line.as_bytes().chunks(UART_CHUNK) {
+                    if let Ok(data) = heapless::Vec::<u8, UART_CHUNK>::from_slice(chunk) {
+                        self.link.send(ops, &HostMsg::UartWrite { data });
+                    }
+                }
+            }
         });
     }
 

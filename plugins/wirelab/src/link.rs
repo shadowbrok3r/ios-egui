@@ -144,6 +144,9 @@ pub struct BoardLink {
     pub analog_hist: BTreeMap<u8, VecDeque<u16>>,
     pub wifi: Option<(wirelab_proto::WifiState, [u8; 4])>,
     pub log: VecDeque<String>,
+    /// Completed UART1 rx lines plus the still-unterminated tail.
+    pub uart_rx: VecDeque<String>,
+    uart_partial: String,
 }
 
 impl Default for BoardLink {
@@ -161,6 +164,8 @@ impl Default for BoardLink {
             analog_hist: BTreeMap::new(),
             wifi: None,
             log: VecDeque::new(),
+            uart_rx: VecDeque::new(),
+            uart_partial: String::new(),
         }
     }
 }
@@ -278,6 +283,7 @@ impl BoardLink {
                 if fresh {
                     self.push_log(format!("hello from {}", chip.name()));
                     self.send(ops, &HostMsg::SetTelemetry { interval_ms: 50 });
+                    self.send(ops, &HostMsg::WifiStatusReq);
                 }
             }
             DeviceMsg::Telemetry { millis, levels, analog } => {
@@ -305,10 +311,23 @@ impl BoardLink {
             DeviceMsg::Error { code, pin } => {
                 self.push_log(format!("board error {code:?} on pin {pin}"))
             }
-            DeviceMsg::Pong { .. }
-            | DeviceMsg::UartData { .. }
-            | DeviceMsg::SpiData { .. }
-            | DeviceMsg::I2cData { .. } => {}
+            DeviceMsg::UartData { data } => {
+                for &b in data.iter() {
+                    match b {
+                        b'\n' => {
+                            let line = std::mem::take(&mut self.uart_partial);
+                            self.uart_rx.push_back(line);
+                            while self.uart_rx.len() > LOG_CAP {
+                                self.uart_rx.pop_front();
+                            }
+                        }
+                        b'\r' => {}
+                        0x20..=0x7e => self.uart_partial.push(b as char),
+                        _ => self.uart_partial.push_str(&format!("\\x{b:02x}")),
+                    }
+                }
+            }
+            DeviceMsg::Pong { .. } | DeviceMsg::SpiData { .. } | DeviceMsg::I2cData { .. } => {}
         }
     }
 
@@ -319,12 +338,17 @@ impl BoardLink {
         }
     }
 
-    /// The WS2812 data pin of the board's on-board RGB LED.
+    /// The WS2812 data pin of the board's on-board RGB LED (matches the shipped board profiles).
     pub fn rgb_gpio(&self) -> u8 {
         match self.info.map(|i| i.chip) {
-            Some(ChipKind::Esp32C3) => 8,
+            Some(ChipKind::Esp32C3 | ChipKind::Esp32C6 | ChipKind::Esp32H2) => 8,
             _ => 27,
         }
+    }
+
+    /// The still-unterminated UART rx tail (shown live under the completed lines).
+    pub fn uart_tail(&self) -> &str {
+        &self.uart_partial
     }
 }
 
@@ -419,7 +443,8 @@ mod tests {
         assert_eq!(link.state, LinkState::Ready);
         assert_eq!(link.rgb_gpio(), 27);
         let msgs = decode_host(&ops.sent.borrow());
-        assert!(matches!(msgs.last(), Some(HostMsg::SetTelemetry { interval_ms: 50 })));
+        assert!(matches!(msgs.get(msgs.len() - 2), Some(HostMsg::SetTelemetry { interval_ms: 50 })));
+        assert!(matches!(msgs.last(), Some(HostMsg::WifiStatusReq)));
 
         // Telemetry updates the mirror.
         let mut analog = wirelab_proto::heapless::Vec::new();
@@ -440,6 +465,28 @@ mod tests {
         *ops.tcp_state.borrow_mut() = net::TcpState::Error("refused".into());
         link.poll(&ops, 0.0);
         assert_eq!(link.state, LinkState::Failed("refused".into()));
+    }
+
+    #[test]
+    fn uart_rx_assembles_lines() {
+        let ops = MockOps::default();
+        let mut link = BoardLink::default();
+        link.connect(&ops, "10.0.0.5:4518");
+        *ops.tcp_state.borrow_mut() = net::TcpState::Ready;
+
+        let data = |bytes: &[u8]| DeviceMsg::UartData {
+            data: wirelab_proto::heapless::Vec::from_slice(bytes).unwrap(),
+        };
+        ops.rx.borrow_mut().extend(device_frame(&data(b"hello\r\nwor")));
+        link.poll(&ops, 0.0);
+        assert_eq!(link.uart_rx, vec!["hello"]);
+        assert_eq!(link.uart_tail(), "wor");
+
+        // The tail completes across frames; non-printable bytes render as escapes.
+        ops.rx.borrow_mut().extend(device_frame(&data(b"ld\x01\n")));
+        link.poll(&ops, 0.1);
+        assert_eq!(link.uart_rx, vec!["hello", "world\\x01"]);
+        assert_eq!(link.uart_tail(), "");
     }
 
     #[test]

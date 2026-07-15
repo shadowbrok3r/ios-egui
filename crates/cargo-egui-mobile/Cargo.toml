@@ -1,0 +1,17 @@
+[package]
+name = "cargo-egui-mobile"
+description = "Unified cargo subcommand to scaffold, cross-compile, and run native egui apps for iOS (-i) and Android (-a), plus WASM UI plugins."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cargo-egui-ios = { path = "../cargo-egui-ios" }
+cargo-egui-android = { path = "../cargo-egui-android" }
+
+[[bin]]
+name = "cargo-egui-mobile"
+path = "src/main.rs"

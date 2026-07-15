@@ -9,8 +9,12 @@ use anyhow::Result;
 /// Milliseconds per epoch tick; guest-call deadlines are expressed in ticks.
 pub const EPOCH_TICK_MS: u64 = 20;
 
-/// Ticks a plugin frame may run before it traps (~500 ms).
+/// Ticks a plugin frame may run before it traps (~500 ms under the JIT; ~2 s under Pulley,
+/// where glyph-heavy frames legitimately run ~10x slower).
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
 pub const FRAME_DEADLINE_TICKS: u64 = 25;
+#[cfg(any(target_os = "ios", target_os = "android"))]
+pub const FRAME_DEADLINE_TICKS: u64 = 100;
 
 /// Ticks allowed for create/save/restore (~10 s; first frame under Pulley is slow).
 pub const COLD_DEADLINE_TICKS: u64 = 500;

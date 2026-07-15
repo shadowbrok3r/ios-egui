@@ -8,11 +8,27 @@
 //! need a bundled Kotlin helper and are the next pass — their permission/gating flows are already
 //! wired here.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
+use android_activity::AndroidApp;
 use egui_mobile_core::Host;
 use jni::JavaVM;
 use jni::objects::{JObject, JString, JValue};
+
+// AndroidApp handle for IME control and content-rect reads; set once by `run`.
+static ANDROID_APP: OnceLock<AndroidApp> = OnceLock::new();
+
+// Last keyboard state the app requested; drives the text-actions bar visibility.
+static KEYBOARD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_android_app(app: AndroidApp) {
+    let _ = ANDROID_APP.set(app);
+}
+
+pub(crate) fn keyboard_requested() -> bool {
+    KEYBOARD_REQUESTED.load(Ordering::Relaxed)
+}
 
 // Backend-specific request kinds enqueued by `HostExt` (via `Host::drv_enqueue`).
 const K_SELF_UPDATE: i32 = 100;
@@ -34,6 +50,11 @@ pub fn drain(host: &Host) {
                 &host.drv_str_a().unwrap_or_default(),
                 &host.drv_str_b().unwrap_or_default(),
             ),
+            2 => {
+                let show = host.drv_int() != 0;
+                KEYBOARD_REQUESTED.store(show, Ordering::Relaxed);
+                set_soft_keyboard(show);
+            }
             3 => vibrate(haptic_ms(host.drv_int())),
             4 => {
                 if let Some(url) = host.drv_str_a() {
@@ -186,6 +207,56 @@ fn set_clipboard(text: &str) {
         )?;
         Ok(())
     });
+}
+
+/// Read the system clipboard as text (Android grants reads only while the app has focus).
+pub(crate) fn clipboard_text() -> Option<String> {
+    with_activity(|env, activity| {
+        let svc = env.new_string("clipboard")?;
+        let cm = env
+            .call_method(
+                activity,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[(&svc).into()],
+            )?
+            .l()?;
+        let clip = env
+            .call_method(&cm, "getPrimaryClip", "()Landroid/content/ClipData;", &[])?
+            .l()?;
+        if clip.is_null() {
+            return Ok(None);
+        }
+        if env.call_method(&clip, "getItemCount", "()I", &[])?.i()? == 0 {
+            return Ok(None);
+        }
+        let item = env
+            .call_method(
+                &clip,
+                "getItemAt",
+                "(I)Landroid/content/ClipData$Item;",
+                &[JValue::Int(0)],
+            )?
+            .l()?;
+        let text = env
+            .call_method(
+                &item,
+                "coerceToText",
+                "(Landroid/content/Context;)Ljava/lang/CharSequence;",
+                &[JValue::Object(activity)],
+            )?
+            .l()?;
+        if text.is_null() {
+            return Ok(None);
+        }
+        let s = env
+            .call_method(&text, "toString", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let js: JString = s.into();
+        let out: String = env.get_string(&js)?.into();
+        Ok((!out.is_empty()).then_some(out))
+    })
+    .flatten()
 }
 
 fn share_text(text: &str) {
@@ -394,9 +465,88 @@ pub fn init_documents_dir(host: &Host) {
 /// Read the current system-bar + display-cutout insets and push them (in points) into the host so
 /// `host.safe_area_insets()` works on Android like on iOS. Called each frame by the runtime.
 pub fn update_insets(host: &Host, pixels_per_point: f32) {
+    let p = pixels_per_point.max(0.1);
     if let Some((t, b, l, r)) = read_root_insets_px() {
-        let p = pixels_per_point.max(0.1);
         host.drv_set_safe_area(t / p, b / p, l / p, r / p);
+    }
+    host.drv_set_keyboard_height(keyboard_pts(host, p));
+}
+
+/// Show or hide the soft keyboard. Explicit (non-implicit) calls so winit's implicit-only IME
+/// hides don't cancel an app-requested keyboard.
+fn set_soft_keyboard(show: bool) {
+    let Some(app) = ANDROID_APP.get() else {
+        log::warn!("egui-android: SetKeyboard before the AndroidApp handle is registered");
+        return;
+    };
+    if show {
+        app.show_soft_input(false);
+    } else {
+        app.hide_soft_input(false);
+    }
+}
+
+// Keyboard occlusion in points: the WindowInsets IME inset when available, else the
+// window-height/content-rect delta (needs windowSoftInputMode=adjustResize; the delta equals
+// the nav-bar inset while the keyboard is hidden, so within 40pt of that reads as hidden).
+fn keyboard_pts(host: &Host, pixels_per_point: f32) -> f32 {
+    if let Some(px) = ime_inset_px() {
+        return px / pixels_per_point;
+    }
+    let Some(app) = ANDROID_APP.get() else { return 0.0 };
+    let Some(win) = app.native_window() else { return 0.0 };
+    let raw = (win.height() as f32 - app.content_rect().bottom as f32).max(0.0) / pixels_per_point;
+    if raw > host.safe_area_insets().bottom + 40.0 { raw } else { 0.0 }
+}
+
+// IME occlusion in px via `getCurrentWindowMetrics().getWindowInsets()` — WindowManager is a
+// system service, not a View, so this is render-thread safe. Latches off on API < 30 or the
+// first JNI failure and falls back to the content-rect path above.
+fn ime_inset_px() -> Option<f32> {
+    enum Probe {
+        Px(f32),
+        NotReady,
+        Unsupported,
+    }
+    static IME_INSET_OFF: AtomicBool = AtomicBool::new(false);
+    if IME_INSET_OFF.load(Ordering::Relaxed) {
+        return None;
+    }
+    let probe = with_activity(|env, activity| {
+        let sdk = env
+            .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?
+            .i()?;
+        if sdk < 30 {
+            return Ok(Probe::Unsupported);
+        }
+        let wm = env
+            .call_method(activity, "getWindowManager", "()Landroid/view/WindowManager;", &[])?
+            .l()?;
+        let metrics = env
+            .call_method(&wm, "getCurrentWindowMetrics", "()Landroid/view/WindowMetrics;", &[])?
+            .l()?;
+        let insets = env
+            .call_method(&metrics, "getWindowInsets", "()Landroid/view/WindowInsets;", &[])?
+            .l()?;
+        if insets.is_null() {
+            return Ok(Probe::NotReady);
+        }
+        let ime = env
+            .call_static_method("android/view/WindowInsets$Type", "ime", "()I", &[])?
+            .i()?;
+        let args = [JValue::Int(ime)];
+        let obj = env
+            .call_method(&insets, "getInsets", "(I)Landroid/graphics/Insets;", &args)?
+            .l()?;
+        Ok(Probe::Px(env.get_field(&obj, "bottom", "I")?.i()? as f32))
+    });
+    match probe {
+        Some(Probe::Px(px)) => Some(px),
+        Some(Probe::NotReady) => None,
+        Some(Probe::Unsupported) | None => {
+            IME_INSET_OFF.store(true, Ordering::Relaxed);
+            None
+        }
     }
 }
 

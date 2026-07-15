@@ -7,3 +7,5 @@ Package.resolved
 xtool
 *.ipa
 .DS_Store
+
+.claude

@@ -18,6 +18,11 @@ package = "com.example.pluginsandroid"
 min_sdk_version = 26
 target_sdk_version = 35
 
+# Release installs are personal sideloads; sign with the auto-generated debug keystore.
+[package.metadata.android.signing.release]
+path = "/home/shadowbroker/.android/debug.keystore"
+keystore_password = "android"
+
 [package.metadata.android.application]
 label = "Plugins Android"
 
@@ -25,6 +30,8 @@ label = "Plugins Android"
 [[package.metadata.android.application.activity]]
 name = "android.app.NativeActivity"
 config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
+# adjustResize keeps the content rect tracking the IME so keyboard height is measurable.
+window_soft_input_mode = "adjustResize"
 [[package.metadata.android.application.activity.meta_data]]
 name = "android.app.lib_name"
 value = "plugins_android"

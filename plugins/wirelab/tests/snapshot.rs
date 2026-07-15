@@ -13,7 +13,12 @@ use wirelab_panel::view::Snapshot;
 
 #[test]
 fn desktop_project_json_round_trips_into_the_plugin() {
-    let assets = std::path::Path::new("/home/shadowbroker/Desktop/wirelab/assets");
+    // WIRELAB_ASSETS overrides; default assumes the sibling-repo layout.
+    let assets = match std::env::var("WIRELAB_ASSETS") {
+        Ok(p) => std::path::PathBuf::from(p),
+        Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../EmbeddedApps/wirelab/assets"),
+    };
     let lib = Library::load(&assets.join("boards"), &assets.join("components")).expect("assets");
     let mut project = Project::load(
         &assets.join("examples/12-house-and-garage.wirelab.json"),

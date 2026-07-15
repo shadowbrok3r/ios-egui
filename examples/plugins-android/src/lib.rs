@@ -14,6 +14,7 @@ struct App {
     manager_ui: PluginManagerUi,
     selected: usize,
     show_manager: bool,
+    wants_keyboard: bool,
 }
 
 impl App {
@@ -24,6 +25,7 @@ impl App {
             manager_ui: PluginManagerUi::default(),
             selected: 0,
             show_manager: true,
+            wants_keyboard: false,
         }
     }
 }
@@ -105,6 +107,8 @@ impl EguiApp for App {
         // Poll dev-sync every frame (autoconnect + hot-reload pushes).
         self.manager_ui.tick(manager, ui.ctx());
 
+        // Desired keyboard state this frame; the manager view never wants it.
+        let mut wants_keyboard = false;
         if self.show_manager || manager.plugins.is_empty() {
             self.manager_ui.ui(ui, manager);
             if manager.plugins.is_empty() {
@@ -114,7 +118,28 @@ impl EguiApp for App {
             }
         } else {
             let index = self.selected.min(manager.plugins.len() - 1);
-            let _ = manager.show_plugin(ui, index);
+            // Shrink the viewport by the keyboard overlap beyond the already-inset nav bar.
+            let bottom = (host.keyboard_height() - host.safe_area_insets().bottom).max(0.0);
+            let avail = ui.available_size();
+            let size = egui::vec2(avail.x, (avail.y - bottom).max(64.0));
+            let response = ui.allocate_ui(size, |ui| manager.show_plugin(ui, index)).inner;
+            wants_keyboard = response.wants_keyboard;
+
+            // Cross-plugin hand-off: Devices asks the terminal to SSH into a host.
+            for ev in &response.events {
+                if ev.topic == egui_android::plugins::abi::net::EVENT_SSH_OPEN
+                    && manager.send_event_to("com.example.terminal", &ev.topic, &ev.payload)
+                {
+                    if let Some(t) = manager.index_of("com.example.terminal") {
+                        self.selected = t;
+                    }
+                }
+            }
+        }
+        // Reconcile on every path so leaving a plugin lowers the keyboard.
+        if wants_keyboard != self.wants_keyboard {
+            self.wants_keyboard = wants_keyboard;
+            host.request_keyboard(self.wants_keyboard);
         }
 
         // Apply queued plugin ops (haptics, notifications, …) via the Android host bridge.

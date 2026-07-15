@@ -34,7 +34,12 @@ impl Ops for NetOpsShim {
 }
 
 fn assets_dir() -> std::path::PathBuf {
-    std::path::Path::new("/home/shadowbroker/Desktop/wirelab/assets").to_path_buf()
+    // WIRELAB_ASSETS overrides; default assumes the sibling-repo layout.
+    match std::env::var("WIRELAB_ASSETS") {
+        Ok(p) => p.into(),
+        Err(_) => std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../EmbeddedApps/wirelab/assets"),
+    }
 }
 
 /// Serve one SimDevice over TCP on 127.0.0.1, mirroring the firmware/board_server
