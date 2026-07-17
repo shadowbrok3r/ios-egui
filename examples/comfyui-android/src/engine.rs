@@ -1038,6 +1038,9 @@ async fn ws_listener(
                 while let Some(message) = stream.next().await {
                     match message {
                         Ok(Message::Text(text)) => {
+                            if current.lock().unwrap().is_some() {
+                                log.info(format!("ws frame: {}", head(&text, 120)));
+                            }
                             if let Some(msg) = parse_ws_text(&text, &current) {
                                 if tx.send(msg).is_err() {
                                     return;

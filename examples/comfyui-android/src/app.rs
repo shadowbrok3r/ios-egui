@@ -2109,6 +2109,8 @@ impl EguiApp for ComfyApp {
         }
         if !self.loaded {
             self.loaded = true;
+            // The framework never calls EguiApp::theme, so apply the color scheme here.
+            crate::theme::apply(ui.ctx());
             egui_extras::install_image_loaders(ui.ctx());
             self.load_settings(host);
             if !self.server_url.trim().is_empty() {
