@@ -65,6 +65,8 @@ pub enum Msg {
     /// An album mutation finished; the note is for the status line and the UI re-lists albums.
     AlbumChanged(String),
     AlbumError(String),
+    /// A gallery mutation (delete) finished; the UI clears its selection and reloads the listing.
+    GalleryMutated(String),
     /// Which albums one image belongs to (`GET /gallery/api/meta`); `key` is `subfolder/filename`.
     ItemAlbums { key: String, albums: Vec<i64> },
 }
@@ -549,6 +551,41 @@ impl Engine {
                 Err(e) => {
                     log.error(format!("album op failed: {e}"));
                     Msg::AlbumError(e.to_string())
+                }
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Soft-delete images (comfy-gate moves them to `<ns>/.trash/`; recoverable, not a hard unlink).
+    /// Identified by `(subfolder, filename)` pairs, same as albums.
+    pub fn delete_images(&self, items: Vec<(String, String)>) {
+        let Some((http, url)) = self.authed_url("/gallery/api/delete", &[]) else { return };
+        let n = items.len();
+        let body = items_body(items);
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            log.info(format!("POST {url} (delete {n})"));
+            let msg = match http.post(url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let text = resp.text().await.unwrap_or_default();
+                    let trashed = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("trashed").and_then(Value::as_u64))
+                        .unwrap_or(n as u64);
+                    log.info(format!("-> trashed {trashed}"));
+                    Msg::GalleryMutated(format!("Moved {trashed} to trash"))
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    log.error(format!("delete failed: HTTP {status}: {}", head(&body, 200)));
+                    Msg::AlbumError(format!("Delete failed: HTTP {status}"))
+                }
+                Err(e) => {
+                    log.error(format!("delete failed: {e}"));
+                    Msg::AlbumError(format!("Delete failed: {e}"))
                 }
             };
             let _ = tx.send(msg);

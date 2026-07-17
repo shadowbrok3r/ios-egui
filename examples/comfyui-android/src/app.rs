@@ -155,6 +155,16 @@ struct ComfyApp {
     album_new_name: String,
     /// The image queued for "add to album" while the picker is open.
     album_target: Option<GalleryItem>,
+    /// Multi-select in the gallery grid: `selected` holds item keys (`subfolder/filename`).
+    select_mode: bool,
+    selected: HashSet<String>,
+    /// Long-press-to-paint gesture: (press start time, screen origin, cancelled-as-a-scroll).
+    sel_press: Option<(f64, egui::Pos2, bool)>,
+    sel_long_fired: bool,
+    /// A long-press-initiated paint-select drag is in progress (disables scroll so it doesn't pan).
+    sel_painting: bool,
+    /// Visible tile rects this frame `(rect, gallery index)`, for the paint gesture.
+    tile_hits: Vec<(egui::Rect, usize)>,
 }
 
 impl ComfyApp {
@@ -230,6 +240,12 @@ impl ComfyApp {
             facets: Facets::default(),
             album_new_name: String::new(),
             album_target: None,
+            select_mode: false,
+            selected: HashSet::new(),
+            sel_press: None,
+            sel_long_fired: false,
+            sel_painting: false,
+            tile_hits: Vec::new(),
         }
     }
 
@@ -297,6 +313,13 @@ impl ComfyApp {
             Msg::AlbumError(e) => {
                 self.gallery_status = elide(&e, 160);
                 host.haptic(Haptic::Error);
+            }
+            Msg::GalleryMutated(note) => {
+                self.gallery_status = note;
+                self.selected.clear();
+                self.select_mode = false;
+                self.refresh_gallery();
+                host.haptic(Haptic::Success);
             }
             Msg::ItemAlbums { key, albums } => {
                 if let Some(v) = &mut self.viewer
@@ -1514,6 +1537,13 @@ impl ComfyApp {
                     self.gallery_view.columns = n;
                 }
             }
+            if ui
+                .button(format!("{} Select", icons::CHECK))
+                .on_hover_text("Multi-select — or long-press a photo")
+                .clicked()
+            {
+                self.select_mode = true;
+            }
         });
         // Filters live in a bottom bar, so their popups must open upward (`up_menu`); an
         // `egui::ComboBox` only flips a short list up when egui thinks it won't fit, and egui's
@@ -1700,7 +1730,11 @@ impl ComfyApp {
         let mut refresh = false;
         egui::Panel::bottom("gallery-controls").show(ui, |ui| {
             ui.add_space(2.0);
-            refresh = self.gallery_controls(ui, connected);
+            if self.select_mode {
+                self.selection_bar(ui, host);
+            } else {
+                refresh = self.gallery_controls(ui, connected);
+            }
             ui.add_space(2.0);
         });
         if refresh && connected {
@@ -1720,8 +1754,15 @@ impl ComfyApp {
         let cols = self.gallery_view.columns.clamp(1, 3);
         let mut open: Option<usize> = None;
         let mut load_more = false;
+        self.tile_hits.clear();
 
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        // While a long-press paint-select is in progress, dragging must select tiles, not scroll.
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if self.sel_painting {
+            use egui::containers::scroll_area::{DragScroll, ScrollSource};
+            scroll = scroll.scroll_source(ScrollSource { drag: DragScroll::Never, ..Default::default() });
+        }
+        scroll.show(ui, |ui| {
             for group in &groups {
                 if group.label.is_empty() {
                     open = self.gallery_grid(ui, &group.items, cols).or(open);
@@ -1761,8 +1802,121 @@ impl ComfyApp {
                 &self.gallery_view,
             );
         }
+        // Tapping a tile opens it only in browse mode; in select mode the grid handled the toggle.
         if let Some(idx) = open {
             self.open_viewer(idx);
+        }
+        self.handle_gallery_gesture(ui, host);
+    }
+
+    /// The `(subfolder, filename)` pairs of the currently multi-selected images.
+    fn selected_items(&self) -> Vec<(String, String)> {
+        self.gallery
+            .iter()
+            .filter(|it| self.selected.contains(&it.key()))
+            .map(|it| (it.subfolder.clone(), it.filename.clone()))
+            .collect()
+    }
+
+    /// Actions on the multi-selection, shown in the bottom bar while selecting.
+    fn selection_bar(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let items = self.selected_items();
+        let n = items.len();
+        let mut add_to: Option<i64> = None;
+        let mut delete = false;
+        let mut clear = false;
+        let mut done = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(format!("{n} selected"));
+            ui.separator();
+            ui.add_enabled_ui(n > 0, |ui| {
+                up_menu(ui, format!("{} Add to album", icons::ALBUM), |ui| {
+                    if self.albums.is_empty() {
+                        ui.weak("No albums — create one in the Albums tab.");
+                    }
+                    for a in &self.albums {
+                        let label = format!("{} {}", icons::ALBUM, elide(&a.name, 28));
+                        if ui.selectable_label(false, label).clicked() {
+                            add_to = Some(a.id);
+                        }
+                    }
+                });
+                if ui.button(format!("{} Delete", icons::TRASH)).clicked() {
+                    delete = true;
+                }
+            });
+            if ui.button("Clear").clicked() {
+                clear = true;
+            }
+            if ui.button("Done").clicked() {
+                done = true;
+            }
+        });
+        if let Some(id) = add_to {
+            self.engine.as_ref().unwrap().album_add(id, items.clone());
+            self.selected.clear();
+            self.select_mode = false;
+            host.haptic(Haptic::Light);
+        } else if delete {
+            self.engine.as_ref().unwrap().delete_images(items);
+            host.haptic(Haptic::Warning);
+        } else if clear {
+            self.selected.clear();
+        } else if done {
+            self.select_mode = false;
+            self.selected.clear();
+        }
+    }
+
+    /// Long-press-then-drag paint selection over the gallery grid.
+    ///
+    /// A finger held ~0.4s still on a tile enters select mode and starts painting; dragging without
+    /// lifting then selects every tile it passes over (scroll is suppressed for that gesture). A
+    /// drag that moves before the hold completes is a normal scroll and never paints.
+    fn handle_gallery_gesture(&mut self, ui: &egui::Ui, host: &Host) {
+        let (down, pos, time) =
+            ui.input(|i| (i.pointer.any_down(), i.pointer.interact_pos(), i.time));
+        if !down {
+            self.sel_press = None;
+            self.sel_long_fired = false;
+            self.sel_painting = false;
+            return;
+        }
+        let Some(pos) = pos else { return };
+        let tile_at = |p: egui::Pos2, hits: &[(egui::Rect, usize)]| {
+            hits.iter().find(|(r, _)| r.contains(p)).map(|(_, i)| *i)
+        };
+        match self.sel_press {
+            None => self.sel_press = Some((time, pos, false)),
+            Some((start, origin, cancelled)) => {
+                if !cancelled && !self.sel_painting {
+                    if (origin - pos).length() > 18.0 {
+                        // Moved before the hold completed: it's a scroll, not a selection.
+                        self.sel_press = Some((start, origin, true));
+                    } else if time - start > 0.4 {
+                        if let Some(idx) = tile_at(origin, &self.tile_hits) {
+                            self.select_mode = true;
+                            self.sel_long_fired = true;
+                            self.sel_painting = true;
+                            if let Some(item) = self.gallery.get(idx) {
+                                self.selected.insert(item.key());
+                            }
+                            host.haptic(Haptic::Medium);
+                        } else {
+                            self.sel_press = Some((start, origin, true));
+                        }
+                    } else {
+                        // Still waiting for the hold; keep the clock running.
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+        }
+        if self.sel_painting
+            && let Some(idx) = tile_at(pos, &self.tile_hits)
+            && let Some(item) = self.gallery.get(idx)
+        {
+            self.selected.insert(item.key());
         }
     }
 
@@ -1777,15 +1931,20 @@ impl ComfyApp {
         let avail = ui.available_width();
         let tile = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(48.0);
         let size = self.gallery_view.thumb_size();
+        let select_mode = self.select_mode;
+        // A click that ends a long-press IS the select gesture, not a tap — don't also toggle/open.
+        let suppress_click = self.sel_long_fired;
 
         for row in indices.chunks(cols) {
             ui.horizontal(|ui| {
                 for &idx in row {
-                    let Some(item) = self.gallery.get(idx) else { continue };
-                    let key = item.thumb_key(size);
+                    let (item_key, thumb_key, subfolder, filename, is_video) = {
+                        let Some(item) = self.gallery.get(idx) else { continue };
+                        (item.key(), item.thumb_key(size), item.subfolder.clone(), item.filename.clone(), item.is_video)
+                    };
                     let dims = self
                         .thumbs
-                        .get(&key)
+                        .get(&thumb_key)
                         .map(|t| t.size_vec2())
                         .filter(|s| s.x > 0.0 && s.y > 0.0);
                     let alloc = match (cols, dims) {
@@ -1797,15 +1956,15 @@ impl ComfyApp {
                     if !ui.is_rect_visible(rect) {
                         continue;
                     }
-                    match self.thumbs.get(&key) {
+                    self.tile_hits.push((rect, idx));
+                    let selected = self.selected.contains(&item_key);
+                    let clicked = match self.thumbs.get(&thumb_key) {
                         Some(tex) => {
                             let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                                 .fit_to_exact_size(alloc)
                                 .sense(egui::Sense::click());
-                            if ui.put(rect, img).clicked() {
-                                open = Some(idx);
-                            }
-                            if item.is_video {
+                            let r = ui.put(rect, img);
+                            if is_video {
                                 ui.painter().text(
                                     rect.left_top() + egui::vec2(4.0, 2.0),
                                     egui::Align2::LEFT_TOP,
@@ -1814,19 +1973,27 @@ impl ComfyApp {
                                     egui::Color32::WHITE,
                                 );
                             }
+                            r.clicked()
                         }
                         None => {
-                            if self.thumbs.claim(&key) {
-                                self.engine.as_ref().unwrap().fetch_thumb(
-                                    item.subfolder.clone(),
-                                    item.filename.clone(),
-                                    size,
-                                );
+                            if self.thumbs.claim(&thumb_key) {
+                                self.engine.as_ref().unwrap().fetch_thumb(subfolder, filename, size);
                             }
-                            let btn = egui::Button::new(elide(&item.filename, 14)).wrap();
-                            if ui.put(rect, btn).clicked() {
-                                open = Some(idx);
+                            ui.put(rect, egui::Button::new(elide(&item_key, 14)).wrap()).clicked()
+                        }
+                    };
+                    if select_mode {
+                        selection_overlay(ui, rect, selected);
+                    }
+                    if clicked && !suppress_click {
+                        if select_mode {
+                            if selected {
+                                self.selected.remove(&item_key);
+                            } else {
+                                self.selected.insert(item_key);
                             }
+                        } else {
+                            open = Some(idx);
                         }
                     }
                 }
@@ -2266,6 +2433,34 @@ fn up_menu<R>(
 /// content shrinks for the IME.
 fn centered(window: egui::Window<'_>) -> egui::Window<'_> {
     window.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+}
+
+/// Draw the multi-select overlay on a gallery tile: a tint plus a corner check badge.
+fn selection_overlay(ui: &egui::Ui, rect: egui::Rect, selected: bool) {
+    let p = ui.painter();
+    let (tint, ring) = if selected {
+        (egui::Color32::from_rgba_unmultiplied(120, 70, 150, 110), egui::Color32::from_rgb(180, 150, 230))
+    } else {
+        (egui::Color32::from_black_alpha(70), egui::Color32::from_gray(120))
+    };
+    p.rect_filled(rect, 3.0, tint);
+    p.rect_stroke(rect, 3.0, egui::Stroke::new(2.0, ring), egui::StrokeKind::Inside);
+    let center = rect.right_top() + egui::vec2(-14.0, 14.0);
+    p.circle_filled(
+        center,
+        10.0,
+        if selected { egui::Color32::from_rgb(150, 90, 190) } else { egui::Color32::from_black_alpha(130) },
+    );
+    p.circle_stroke(center, 10.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+    if selected {
+        p.text(
+            center,
+            egui::Align2::CENTER_CENTER,
+            icons::CHECK,
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+    }
 }
 
 fn combo(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) {

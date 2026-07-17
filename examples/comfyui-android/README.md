@@ -76,6 +76,10 @@ sign-in, per-user gallery + albums, server-side model filtering).
   add/remove it from any **album** (membership shown with a check). The **Albums** sub-tab creates,
   renames, deletes, and selects the album the Images pane filters to. Albums and model facets are
   per-account, so they follow the signed-in credential.
+  - **Multi-select**: tap **Select** (or long-press any photo) to enter selection mode; then tap to
+    toggle, or **long-press and drag in one swipe** to paint a selection across many tiles (scroll is
+    suspended for that swipe). With a selection, **Add to album** (batch) or **Delete** them — delete
+    is comfy-gate's soft delete (moved to `<user>/.trash/`, recoverable), not a hard unlink.
 - **Logs tab**: every request, response status/size, parse count, and engine event is logged
   in-app with **Copy all** (system clipboard) and **Share** (share sheet), and mirrored to logcat.
 - **Settings tab** — server URL, API key, and account. **Sign in** with a comfy-gate username and
