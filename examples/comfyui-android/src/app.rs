@@ -21,6 +21,10 @@ use crate::types::{
 
 /// Gallery page size per `/gallery/api/list` request.
 const GALLERY_PAGE: u64 = 60;
+/// Page size when auto-loading the whole filtered/grouped set (comfy-gate clamps to 500).
+const GALLERY_PAGE_ALL: u64 = 500;
+/// Ceiling on auto-loaded items, so a huge namespace can't page forever.
+const GALLERY_LOAD_ALL_CAP: u64 = 5000;
 
 enum Conn {
     Disconnected,
@@ -54,13 +58,6 @@ impl Tab {
 enum GraphPane {
     Canvas,
     Props,
-}
-
-/// Panes within the Gallery tab.
-#[derive(PartialEq, Clone, Copy)]
-enum GalleryPane {
-    Images,
-    Albums,
 }
 
 /// Full-screen state for one opened gallery image.
@@ -147,12 +144,12 @@ struct ComfyApp {
     gallery_q: String,
     /// Query + layout of the Gallery tab (model filter, album, sort, grouping, columns).
     gallery_view: GalleryView,
-    gallery_pane: GalleryPane,
     thumbs: ThumbCache,
     viewer: Option<Viewer>,
     albums: Vec<Album>,
     facets: Facets,
     album_new_name: String,
+    album_manage_open: bool,
     /// The image queued for "add to album" while the picker is open.
     album_target: Option<GalleryItem>,
     /// Multi-select in the gallery grid: `selected` holds item keys (`subfolder/filename`).
@@ -233,12 +230,12 @@ impl ComfyApp {
             gallery_status: String::new(),
             gallery_q: String::new(),
             gallery_view: GalleryView::default(),
-            gallery_pane: GalleryPane::Images,
             thumbs: ThumbCache::default(),
             viewer: None,
             albums: Vec::new(),
             facets: Facets::default(),
             album_new_name: String::new(),
+            album_manage_open: false,
             album_target: None,
             select_mode: false,
             selected: HashSet::new(),
@@ -488,6 +485,22 @@ impl ComfyApp {
                     self.gallery.extend(page.items);
                 }
                 self.gallery_status.clear();
+                // With a model filter, album, or grouping active, the whole set has to be present
+                // for the groups/results to be complete — keep paging (in big chunks) instead of
+                // making the user tap "Load more". Capped so a huge namespace can't runaway.
+                let loaded = self.gallery.len() as u64;
+                if self.gallery_wants_all()
+                    && loaded < self.gallery_total
+                    && loaded < GALLERY_LOAD_ALL_CAP
+                {
+                    self.gallery_loading = true;
+                    self.engine.as_ref().unwrap().gallery_list(
+                        loaded,
+                        GALLERY_PAGE_ALL,
+                        &self.gallery_q,
+                        &self.gallery_view,
+                    );
+                }
             }
             Msg::GalleryError(e) => {
                 self.gallery_loading = false;
@@ -785,6 +798,9 @@ impl ComfyApp {
     }
 
     fn controls(&mut self, ui: &mut egui::Ui, host: &Host) {
+        // The theme's roomy button padding makes sliders/combos tall enough to graze the next grid
+        // row; trim the interactive height a little so each row keeps clear of the one below.
+        ui.spacing_mut().interact_size.y = 20.0;
         ui.horizontal(|ui| {
             let n = self.checkpoints.len();
             ui.label(if n > 0 { format!("Model ({n})") } else { "Model".to_string() });
@@ -844,7 +860,8 @@ impl ComfyApp {
 
         egui::Grid::new("params")
             .num_columns(2)
-            .spacing([8.0, 6.0])
+            .spacing([8.0, 10.0])
+            .min_row_height(24.0)
             .show(ui, |ui| {
                 ui.label("Steps");
                 ui.add(egui::DragValue::new(&mut self.params.steps).range(1..=150));
@@ -1512,31 +1529,35 @@ impl ComfyApp {
     /// The gallery's bottom control bar: search, model filter, sort, grouping and column count.
     /// Returns whether the listing must be re-queried — every control except the column count is
     /// applied server-side across the whole listing, not to the page already fetched.
+    /// Should the whole filtered/grouped set be auto-loaded (rather than paged by hand)?
+    fn gallery_wants_all(&self) -> bool {
+        self.gallery_view.group != GalleryGroup::None
+            || !self.gallery_view.model.is_empty()
+            || self.gallery_view.album.is_some()
+    }
+
     fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool) -> bool {
         let mut changed = false;
+        // Row 1: search (kept narrow so nothing on the row clips) + columns + Select.
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(connected, egui::Button::new(icons::REFRESH))
-                .on_hover_text("Refresh")
-                .clicked()
-            {
-                changed = true;
-            }
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.gallery_q)
                     .hint_text(format!("{} search", icons::SEARCH))
-                    .desired_width(ui.available_width() - 130.0),
+                    .desired_width((ui.available_width() - 210.0).max(96.0)),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 changed = true;
             }
-            // Column count only changes layout and thumb size — no re-query.
-            ui.weak("cols");
-            for n in 1..=3usize {
-                if ui.selectable_label(self.gallery_view.columns == n, format!("{n}")).clicked() {
-                    self.gallery_view.columns = n;
+            up_menu(ui, format!("Cols {}", self.gallery_view.columns), |ui| {
+                for n in 1..=3usize {
+                    if ui
+                        .selectable_label(self.gallery_view.columns == n, format!("{n} columns"))
+                        .clicked()
+                    {
+                        self.gallery_view.columns = n;
+                    }
                 }
-            }
+            });
             if ui
                 .button(format!("{} Select", icons::CHECK))
                 .on_hover_text("Multi-select — or long-press a photo")
@@ -1545,14 +1566,22 @@ impl ComfyApp {
                 self.select_mode = true;
             }
         });
-        // Filters live in a bottom bar, so their popups must open upward (`up_menu`); an
-        // `egui::ComboBox` only flips a short list up when egui thinks it won't fit, and egui's
-        // screen rect runs under the Android nav bar so short lists never flip.
-        ui.horizontal(|ui| {
+        // Row 2: refresh + the filter/sort/group/album dropdowns. In a bottom bar these must open
+        // upward (`up_menu`); an `egui::ComboBox` only flips a short list up when it wouldn't fit,
+        // and egui's screen rect runs under the Android nav bar so short lists never flip.
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(connected, egui::Button::new(icons::REFRESH))
+                .on_hover_text("Refresh")
+                .clicked()
+            {
+                changed = true;
+            }
+
             let model_label = if self.gallery_view.model.is_empty() {
                 format!("{} All models", icons::MODEL)
             } else {
-                format!("{} {}", icons::MODEL, elide(&self.gallery_view.model, 16))
+                format!("{} {}", icons::MODEL, elide(&self.gallery_view.model, 14))
             };
             up_menu(ui, model_label, |ui| {
                 changed |= ui
@@ -1566,6 +1595,30 @@ impl ComfyApp {
                 }
                 if self.facets.models.is_empty() {
                     ui.weak("no models indexed yet");
+                }
+            });
+
+            let album_label = match self.gallery_view.album {
+                None => format!("{} All images", icons::ALBUM),
+                Some(id) => self
+                    .albums
+                    .iter()
+                    .find(|a| a.id == id)
+                    .map(|a| format!("{} {}", icons::ALBUM, elide(&a.name, 14)))
+                    .unwrap_or_else(|| format!("{} Album", icons::ALBUM)),
+            };
+            up_menu(ui, album_label, |ui| {
+                changed |=
+                    ui.selectable_value(&mut self.gallery_view.album, None, "All images").clicked();
+                for a in &self.albums {
+                    let label = format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
+                    changed |= ui
+                        .selectable_value(&mut self.gallery_view.album, Some(a.id), label)
+                        .clicked();
+                }
+                ui.separator();
+                if ui.button(format!("{} Manage albums…", icons::FOLDER)).clicked() {
+                    self.album_manage_open = true;
                 }
             });
 
@@ -1586,91 +1639,69 @@ impl ComfyApp {
         changed
     }
 
-    /// Albums pane: pick which album the Images pane shows, and create/rename/delete albums.
-    fn albums_pane(&mut self, ui: &mut egui::Ui) {
-        let mut view_changed = false;
-        egui::Panel::bottom("album-controls").show(ui, |ui| {
-            ui.add_space(2.0);
-            let selected = self
-                .gallery_view
-                .album
-                .and_then(|id| self.albums.iter().find(|a| a.id == id))
-                .map(|a| (a.id, a.name.clone()));
-            ui.horizontal(|ui| {
+    /// Create / rename / delete albums. Album *selection* is the combobox in the controls; this
+    /// window is only management. Rename uses the text field's contents as the new name.
+    fn album_manage_window(&mut self, ctx: &egui::Context) {
+        if !self.album_manage_open {
+            return;
+        }
+        let mut open = true;
+        centered(egui::Window::new("Manage albums"))
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.album_new_name)
-                        .hint_text("album name")
-                        .desired_width(ui.available_width() - 190.0),
+                        .hint_text("album name (for Create / Rename)")
+                        .desired_width(f32::INFINITY),
                 );
                 let named = !self.album_new_name.trim().is_empty();
                 if ui
-                    .add_enabled(named, egui::Button::new(format!("{} Create", icons::ADD)))
+                    .add_enabled(named, egui::Button::new(format!("{} Create album", icons::ADD)))
                     .clicked()
                 {
-                    self.engine
-                        .as_ref()
-                        .unwrap()
-                        .album_create(self.album_new_name.trim().to_string());
+                    self.engine.as_ref().unwrap().album_create(self.album_new_name.trim().to_string());
                     self.album_new_name.clear();
                 }
-                if let Some((id, _)) = selected
-                    && ui
-                        .add_enabled(named, egui::Button::new("Rename"))
-                        .on_hover_text("Rename the selected album")
-                        .clicked()
-                {
-                    self.engine
-                        .as_ref()
-                        .unwrap()
-                        .album_rename(id, self.album_new_name.trim().to_string());
+                ui.separator();
+                let mut rename: Option<i64> = None;
+                let mut delete: Option<(i64, String)> = None;
+                egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, false]).show(
+                    ui,
+                    |ui| {
+                        if self.albums.is_empty() {
+                            ui.weak("No albums yet.");
+                        }
+                        for a in &self.albums {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 22), a.count));
+                                if ui.small_button(icons::TRASH).on_hover_text("Delete").clicked() {
+                                    delete = Some((a.id, a.name.clone()));
+                                }
+                                if ui
+                                    .add_enabled(named, egui::Button::new("Rename"))
+                                    .on_hover_text("Rename to the text above")
+                                    .clicked()
+                                {
+                                    rename = Some(a.id);
+                                }
+                            });
+                        }
+                    },
+                );
+                if let Some(id) = rename {
+                    self.engine.as_ref().unwrap().album_rename(id, self.album_new_name.trim().to_string());
                     self.album_new_name.clear();
+                }
+                if let Some((id, name)) = delete {
+                    self.engine.as_ref().unwrap().album_delete(id, name);
+                    if self.gallery_view.album == Some(id) {
+                        self.gallery_view.album = None;
+                    }
                 }
             });
-            ui.add_space(2.0);
-        });
-
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            let all = self.gallery_view.album.is_none();
-            if ui.selectable_label(all, format!("{} All images", icons::GALLERY)).clicked() {
-                self.gallery_view.album = None;
-                view_changed = true;
-            }
-            ui.separator();
-            if self.albums.is_empty() {
-                ui.add_space(12.0);
-                ui.vertical_centered(|ui| {
-                    ui.weak("No albums yet. Name one below and tap Create,");
-                    ui.weak("then add images from the viewer's Albums menu.");
-                });
-                return;
-            }
-            let mut delete: Option<(i64, String)> = None;
-            for a in &self.albums {
-                ui.horizontal(|ui| {
-                    let selected = self.gallery_view.album == Some(a.id);
-                    let label = format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
-                    if ui.selectable_label(selected, label).clicked() {
-                        self.gallery_view.album = Some(a.id);
-                        view_changed = true;
-                    }
-                    if ui.small_button(icons::TRASH).on_hover_text("Delete album").clicked() {
-                        delete = Some((a.id, a.name.clone()));
-                    }
-                });
-            }
-            if let Some((id, name)) = delete {
-                self.engine.as_ref().unwrap().album_delete(id, name);
-                if self.gallery_view.album == Some(id) {
-                    self.gallery_view.album = None;
-                }
-            }
-        });
-
-        // Picking an album is a different listing; show it straight away.
-        if view_changed {
-            self.gallery_pane = GalleryPane::Images;
-            self.refresh_gallery();
-        }
+        self.album_manage_open = open;
     }
 
     fn gallery_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -1681,19 +1712,14 @@ impl ComfyApp {
         }
 
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.gallery_pane, GalleryPane::Images, "Images");
-            ui.selectable_value(
-                &mut self.gallery_pane,
-                GalleryPane::Albums,
-                format!("{} Albums", icons::ALBUM),
-            );
-            ui.separator();
+            ui.strong(format!("{} Gallery", icons::GALLERY));
             if let Some(name) = self
                 .gallery_view
                 .album
                 .and_then(|id| self.albums.iter().find(|a| a.id == id))
                 .map(|a| a.name.clone())
             {
+                ui.separator();
                 ui.strong(format!("{} {}", icons::ALBUM, elide(&name, 20)));
             }
             if self.gallery_loading {
@@ -1722,10 +1748,7 @@ impl ComfyApp {
             return;
         }
 
-        if self.gallery_pane == GalleryPane::Albums {
-            self.albums_pane(ui);
-            return;
-        }
+        self.album_manage_window(ui.ctx());
 
         let mut refresh = false;
         egui::Panel::bottom("gallery-controls").show(ui, |ui| {

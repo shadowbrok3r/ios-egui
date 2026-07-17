@@ -864,16 +864,28 @@ async fn run_generate(
         };
         let name = "comfyui_android_input.png";
         log.info(format!("uploading img2img input ({} bytes)", bytes.len()));
-        if let Err(e) = client
+        let resp = match client
             .upload_image(name, bytes, rucomfyui::upload::UploadType::Input, true)
             .await
         {
-            log.error(format!("upload failed: {e}"));
-            let _ = tx.send(Msg::GenError(format!("Upload failed: {e}")));
-            ctx.request_repaint();
-            return;
-        }
-        Some(name.to_string())
+            Ok(r) => r,
+            Err(e) => {
+                log.error(format!("upload failed: {e}"));
+                let _ = tx.send(Msg::GenError(format!("Upload failed: {e}")));
+                ctx.request_repaint();
+                return;
+            }
+        };
+        // Reference the image where the server actually stored it. comfy-gate namespaces uploads
+        // into a per-user subfolder, so LoadImage needs "subfolder/name" — the bare filename gets
+        // "Invalid image file" because ComfyUI looks in the plain input dir.
+        let image_ref = if resp.subfolder.is_empty() {
+            resp.name.clone()
+        } else {
+            format!("{}/{}", resp.subfolder, resp.name)
+        };
+        log.info(format!("uploaded input as '{image_ref}'"));
+        Some(image_ref)
     } else {
         None
     };
