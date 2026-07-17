@@ -35,6 +35,7 @@ const K_SELF_UPDATE: i32 = 100;
 const K_REQ_INSTALL_PERM: i32 = 101;
 const K_REQ_OVERLAY_PERM: i32 = 102;
 const K_REQ_NOTIF_PERM: i32 = 103;
+const K_SAVE_GALLERY: i32 = 104;
 
 // Pending permission checks: (core permission index, android permission string, frames left).
 static PENDING_PERMS: Mutex<Vec<(usize, String, u32)>> = Mutex::new(Vec::new());
@@ -81,6 +82,12 @@ pub fn drain(host: &Host) {
             K_REQ_INSTALL_PERM => request_install_permission(),
             K_REQ_OVERLAY_PERM => request_overlay_permission(),
             K_REQ_NOTIF_PERM => request_permission(None, "android.permission.POST_NOTIFICATIONS"),
+            K_SAVE_GALLERY => {
+                if let (Some(path), Some(meta)) = (host.drv_str_a(), host.drv_str_b()) {
+                    let (name, mime) = meta.split_once('\t').unwrap_or((meta.as_str(), "image/png"));
+                    save_to_gallery(&path, name, mime);
+                }
+            }
             other => log::info!("egui-android: host request kind {other} not handled"),
         }
     }
@@ -305,6 +312,102 @@ fn share_text(text: &str) {
         )?;
         Ok(())
     });
+}
+
+/// Copy `path`'s bytes into the shared Photos gallery under `Pictures/ComfyUI` via MediaStore.
+/// Scoped-storage insert (API 29+), so no runtime storage permission is needed. Best-effort:
+/// failures are logged and swallowed, never crashing the render loop.
+fn save_to_gallery(path: &str, name: &str, mime: &str) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("save_to_gallery: reading {path} failed: {e}");
+            return;
+        }
+    };
+    let done = with_activity(|env, activity| {
+        let resolver = env
+            .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
+            .l()?;
+
+        let values = env.new_object("android/content/ContentValues", "()V", &[])?;
+        for (key, val) in
+            [("_display_name", name), ("mime_type", mime), ("relative_path", "Pictures/ComfyUI")]
+        {
+            let k = env.new_string(key)?;
+            let v = env.new_string(val)?;
+            env.call_method(
+                &values,
+                "put",
+                "(Ljava/lang/String;Ljava/lang/String;)V",
+                &[(&k).into(), (&v).into()],
+            )?;
+        }
+        // is_pending = 1 while writing, so nothing sees a half-written file.
+        let pending_key = env.new_string("is_pending")?;
+        let one = env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(1)])?;
+        env.call_method(
+            &values,
+            "put",
+            "(Ljava/lang/String;Ljava/lang/Integer;)V",
+            &[(&pending_key).into(), (&one).into()],
+        )?;
+
+        let collection = env
+            .get_static_field(
+                "android/provider/MediaStore$Images$Media",
+                "EXTERNAL_CONTENT_URI",
+                "Landroid/net/Uri;",
+            )?
+            .l()?;
+        let uri = env
+            .call_method(
+                &resolver,
+                "insert",
+                "(Landroid/net/Uri;Landroid/content/ContentValues;)Landroid/net/Uri;",
+                &[(&collection).into(), (&values).into()],
+            )?
+            .l()?;
+        if uri.is_null() {
+            log::error!("save_to_gallery: MediaStore insert returned null");
+            return Ok(());
+        }
+
+        let stream = env
+            .call_method(
+                &resolver,
+                "openOutputStream",
+                "(Landroid/net/Uri;)Ljava/io/OutputStream;",
+                &[(&uri).into()],
+            )?
+            .l()?;
+        let array = env.byte_array_from_slice(&bytes)?;
+        env.call_method(&stream, "write", "([B)V", &[(&array).into()])?;
+        env.call_method(&stream, "close", "()V", &[])?;
+
+        // Clear is_pending so the image becomes visible in the gallery.
+        let finalize = env.new_object("android/content/ContentValues", "()V", &[])?;
+        let pk = env.new_string("is_pending")?;
+        let zero = env.new_object("java/lang/Integer", "(I)V", &[JValue::Int(0)])?;
+        env.call_method(
+            &finalize,
+            "put",
+            "(Ljava/lang/String;Ljava/lang/Integer;)V",
+            &[(&pk).into(), (&zero).into()],
+        )?;
+        let null_obj = JObject::null();
+        env.call_method(
+            &resolver,
+            "update",
+            "(Landroid/net/Uri;Landroid/content/ContentValues;Ljava/lang/String;[Ljava/lang/String;)I",
+            &[(&uri).into(), (&finalize).into(), (&null_obj).into(), (&null_obj).into()],
+        )?;
+        log::info!("save_to_gallery: {name} -> Pictures/ComfyUI");
+        Ok(())
+    });
+    if done.is_none() {
+        log::error!("save_to_gallery: JNI call failed for {name}");
+    }
 }
 
 fn notify(title: &str, body: &str) {
@@ -829,6 +932,10 @@ pub trait HostExt {
     fn can_draw_overlays(&self) -> bool;
     /// Request the runtime `POST_NOTIFICATIONS` permission (Android 13+).
     fn request_notification_permission(&self);
+    /// Copy an image file on disk into the shared Photos gallery (`Pictures/<subdir>`) via
+    /// MediaStore. Scoped-storage insert — needs no runtime permission on Android 10+. `mime` is
+    /// e.g. `"image/png"` or `"video/mp4"`.
+    fn save_to_gallery(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>);
 }
 
 impl HostExt for Host {
@@ -852,5 +959,10 @@ impl HostExt for Host {
     }
     fn request_notification_permission(&self) {
         self.drv_enqueue(K_REQ_NOTIF_PERM, None, None, 0);
+    }
+    fn save_to_gallery(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>) {
+        // path in str_a, "name\tmime" in str_b (the request channel carries only two strings).
+        let meta = format!("{}\t{}", display_name.into(), mime.into());
+        self.drv_enqueue(K_SAVE_GALLERY, Some(path.into()), Some(meta), 0);
     }
 }

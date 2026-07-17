@@ -966,17 +966,16 @@ fn value_editor(ui: &mut egui::Ui, salt: egui::Id, input: &mut FlowInput, locked
             });
         }
         FlowValueType::String { value, multiline } => {
-            if *multiline {
-                ui.label(&input.name);
-                ui.add(
-                    egui::TextEdit::multiline(value).desired_rows(3).desired_width(f32::INFINITY),
-                );
+            // Label above, field below at full width. A `desired_width(INFINITY)` field inside a
+            // horizontal row expands past the panel's right edge and clips; on its own line it
+            // clamps to the available width.
+            ui.label(&input.name);
+            let edit = if *multiline {
+                egui::TextEdit::multiline(value).desired_rows(3)
             } else {
-                ui.horizontal(|ui| {
-                    ui.label(&input.name);
-                    ui.add(egui::TextEdit::singleline(value).desired_width(f32::INFINITY));
-                });
-            }
+                egui::TextEdit::singleline(value)
+            };
+            ui.add(edit.desired_width(f32::INFINITY));
         }
         FlowValueType::Float { value, min, max, step, .. } => {
             ui.horizontal(|ui| {

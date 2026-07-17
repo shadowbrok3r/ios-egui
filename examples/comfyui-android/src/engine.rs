@@ -54,6 +54,10 @@ pub enum Msg {
     Thumb { key: String, image: egui::ColorImage },
     /// A decoded full-resolution gallery image with its raw bytes.
     FullImage { key: String, image: egui::ColorImage, bytes: Vec<u8> },
+    /// A downloaded video's raw bytes (no decode — for the poster viewer + Save).
+    VideoReady { key: String, bytes: Vec<u8> },
+    /// One downloaded file to save to the device gallery (batch "Save all"); `name` is the filename.
+    SaveToGallery { name: String, bytes: Vec<u8> },
     /// A `POST /login` succeeded; `session` is the `cg_session` cookie token to send from now on.
     SignedIn { username: String, session: String },
     SignedOut,
@@ -676,6 +680,72 @@ impl Engine {
             {
                 let key = format!("{subfolder}/{filename}#{size}");
                 let _ = tx.send(Msg::Thumb { key, image });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Download the full files for a set of gallery items so the UI can save them to the device
+    /// gallery. Each finished download arrives as its own [`Msg::SaveToGallery`].
+    pub fn download_for_save(&self, items: Vec<(String, String)>) {
+        for (subfolder, filename) in items {
+            let Some((http, url)) = self.authed_url(
+                "/view",
+                &[("type", "output"), ("subfolder", &subfolder), ("filename", &filename)],
+            ) else {
+                return;
+            };
+            let (tx, ctx, log) = self.emitters();
+            self.rt.spawn(async move {
+                match get_ok_bytes(&http, url).await {
+                    Ok(bytes) => {
+                        let _ = tx.send(Msg::SaveToGallery { name: filename, bytes });
+                        ctx.request_repaint();
+                    }
+                    Err(e) => log.warn(format!("save-all download failed for {filename}: {e}")),
+                }
+            });
+        }
+    }
+
+    /// Download a video file's raw bytes (no image decode) for the poster viewer and Save.
+    pub fn fetch_video(&self, subfolder: String, filename: String) {
+        let Some((http, url)) = self.authed_url(
+            "/view",
+            &[("type", "output"), ("subfolder", &subfolder), ("filename", &filename)],
+        ) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            match get_ok_bytes(&http, url).await {
+                Ok(bytes) => {
+                    let _ = tx.send(Msg::VideoReady { key: format!("{subfolder}/{filename}"), bytes });
+                }
+                Err(e) => {
+                    log.error(format!("video download: {e}"));
+                    let _ = tx.send(Msg::GalleryError(e));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Fetch a server input image (for the LoadImage thumbnail picker), decoded and cached under
+    /// the key `input#<filename>`.
+    pub fn fetch_input_thumb(&self, filename: String) {
+        let Some((http, url)) = self.authed_url(
+            "/view",
+            &[("type", "input"), ("subfolder", ""), ("filename", &filename)],
+        ) else {
+            return;
+        };
+        let (tx, ctx, _log) = self.emitters();
+        self.rt.spawn(async move {
+            if let Ok(bytes) = get_ok_bytes(&http, url).await
+                && let Some(image) = decode(&bytes)
+            {
+                let _ = tx.send(Msg::Thumb { key: format!("input#{filename}"), image });
                 ctx.request_repaint();
             }
         });

@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use egui_mobile::{CreateContext, EguiApp, Haptic, Host, app, egui};
-use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData};
+use egui_mobile::{CreateContext, EguiApp, Haptic, Host, HostExt, app, egui};
+use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
 
 use crate::engine::{Engine, Msg};
 use crate::gallery::ThumbCache;
@@ -150,6 +150,8 @@ struct ComfyApp {
     facets: Facets,
     album_new_name: String,
     album_manage_open: bool,
+    /// Filter text for the LoadImage thumbnail picker in the Properties tab.
+    img_pick_filter: String,
     /// The image queued for "add to album" while the picker is open.
     album_target: Option<GalleryItem>,
     /// Multi-select in the gallery grid: `selected` holds item keys (`subfolder/filename`).
@@ -236,6 +238,7 @@ impl ComfyApp {
             facets: Facets::default(),
             album_new_name: String::new(),
             album_manage_open: false,
+            img_pick_filter: String::new(),
             album_target: None,
             select_mode: false,
             selected: HashSet::new(),
@@ -523,6 +526,17 @@ impl ComfyApp {
                     v.loading = false;
                 }
             }
+            Msg::VideoReady { key, bytes } => {
+                if let Some(v) = &mut self.viewer
+                    && v.item.key() == key
+                {
+                    v.bytes = Some(bytes);
+                    v.loading = false;
+                }
+            }
+            Msg::SaveToGallery { name, bytes } => {
+                self.gallery_status = self.save_bytes(host, &bytes, &name);
+            }
         }
     }
 
@@ -578,8 +592,17 @@ impl ComfyApp {
         match std::fs::write(&path, bytes) {
             Ok(()) => {
                 self.log.info(format!("saved image: {path}"));
+                // Also copy it into the phone's Photos gallery (Pictures/ComfyUI) via MediaStore.
+                let mime = if name.to_lowercase().ends_with(".mp4") {
+                    "video/mp4"
+                } else if name.to_lowercase().ends_with(".webp") {
+                    "image/webp"
+                } else {
+                    "image/png"
+                };
+                host.save_to_gallery(&path, name, mime);
                 host.haptic(Haptic::Success);
-                format!("Saved to {path}")
+                "Saved to Photos (Pictures/ComfyUI)".to_string()
             }
             Err(e) => {
                 self.log.error(format!("save failed: {e}"));
@@ -1329,11 +1352,11 @@ impl ComfyApp {
     }
 
     fn props_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(g) = self.graph.as_mut() else {
+        if self.graph.is_none() {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| ui.label("Connect to a server first."));
             return;
-        };
+        }
         let Some(node) = self.props_node else {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
@@ -1346,7 +1369,9 @@ impl ComfyApp {
         };
         ui.horizontal(|ui| {
             if ui.button("Show in graph").clicked() {
-                if let Some(info) = g.snarl.get_node_info(node) {
+                if let Some(g) = self.graph.as_ref()
+                    && let Some(info) = g.snarl.get_node_info(node)
+                {
                     self.view.center_on(info.pos);
                 }
                 self.graph_pane = GraphPane::Canvas;
@@ -1356,11 +1381,110 @@ impl ComfyApp {
         // Deliberate edits stay possible here even when the canvas is in view-only mode.
         let mut exists = true;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            exists = graphview::node_properties(ui, g, node, false);
+            if let Some(g) = self.graph.as_mut() {
+                exists = graphview::node_properties(ui, g, node, false);
+            }
+            // For LoadImage-style nodes, a thumbnail picker over the server's input images.
+            self.loadimage_picker(ui, node);
             ui.add_space(12.0);
         });
         if !exists {
             self.props_node = None;
+        }
+    }
+
+    /// If `node` has an `image` selector (LoadImage), render its options as a thumbnail grid so
+    /// you can see what you're choosing — the server input images, previewed via `/view?type=input`.
+    fn loadimage_picker(&mut self, ui: &mut egui::Ui, node: NodeId) {
+        let (input_idx, options, selected) = {
+            let Some(g) = self.graph.as_ref() else { return };
+            let Some(data) = g.snarl.get_node(node) else { return };
+            let found = data.inputs.iter().enumerate().find_map(|(i, inp)| {
+                if !inp.name.eq_ignore_ascii_case("image") {
+                    return None;
+                }
+                match &inp.value {
+                    FlowValueType::Array { options, selected } if !options.is_empty() => {
+                        Some((i, options.clone(), selected.clone()))
+                    }
+                    _ => None,
+                }
+            });
+            match found {
+                Some(v) => v,
+                None => return,
+            }
+        };
+
+        ui.separator();
+        ui.strong(format!("{} Choose image", icons::IMAGE));
+        ui.add(
+            egui::TextEdit::singleline(&mut self.img_pick_filter)
+                .hint_text("filter input images")
+                .desired_width(f32::INFINITY),
+        );
+        let filter = self.img_pick_filter.to_lowercase();
+        let matches: Vec<&String> = options
+            .iter()
+            .filter(|o| filter.is_empty() || o.to_lowercase().contains(&filter))
+            .take(120)
+            .collect();
+
+        let spacing = ui.spacing().item_spacing.x;
+        let avail = ui.available_width();
+        let cols = ((avail / 104.0).floor() as usize).clamp(2, 5);
+        let tile = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(64.0);
+        let mut picked: Option<String> = None;
+        for row in matches.chunks(cols) {
+            ui.horizontal(|ui| {
+                for name in row {
+                    let key = format!("input#{name}");
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let is_sel = **name == selected;
+                    match self.thumbs.get(&key) {
+                        Some(tex) => {
+                            let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                .fit_to_exact_size(egui::vec2(tile, tile))
+                                .sense(egui::Sense::click());
+                            if ui.put(rect, img).clicked() {
+                                picked = Some((*name).clone());
+                            }
+                        }
+                        None => {
+                            if self.thumbs.claim(&key) {
+                                self.engine.as_ref().unwrap().fetch_input_thumb((*name).clone());
+                            }
+                            if ui.put(rect, egui::Button::new(elide(name, 12)).wrap()).clicked() {
+                                picked = Some((*name).clone());
+                            }
+                        }
+                    }
+                    if is_sel {
+                        ui.painter().rect_stroke(
+                            rect,
+                            3.0,
+                            egui::Stroke::new(2.5, egui::Color32::from_rgb(150, 140, 226)),
+                            egui::StrokeKind::Inside,
+                        );
+                    }
+                }
+            });
+        }
+        if options.len() > matches.len() {
+            ui.weak(format!("… {} more — type to filter", options.len() - matches.len()));
+        }
+
+        if let Some(chosen) = picked
+            && let Some(g) = self.graph.as_mut()
+            && let Some(data) = g.snarl.get_node_mut(node)
+            && let Some(inp) = data.inputs.get_mut(input_idx)
+            && let FlowValueType::Array { selected, .. } = &mut inp.value
+        {
+            *selected = chosen;
         }
     }
 
@@ -1849,6 +1973,7 @@ impl ComfyApp {
         let mut delete = false;
         let mut clear = false;
         let mut done = false;
+        let mut save_all = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!("{n} selected"));
             ui.separator();
@@ -1864,6 +1989,9 @@ impl ComfyApp {
                         }
                     }
                 });
+                if ui.button(format!("{} Save all", icons::SAVE)).on_hover_text("Save to the phone's Photos").clicked() {
+                    save_all = true;
+                }
                 if ui.button(format!("{} Delete", icons::TRASH)).clicked() {
                     delete = true;
                 }
@@ -1875,7 +2003,11 @@ impl ComfyApp {
                 done = true;
             }
         });
-        if let Some(id) = add_to {
+        if save_all {
+            self.engine.as_ref().unwrap().download_for_save(items.clone());
+            self.gallery_status = format!("Saving {n} to Photos…");
+            host.haptic(Haptic::Light);
+        } else if let Some(id) = add_to {
             self.engine.as_ref().unwrap().album_add(id, items.clone());
             self.selected.clear();
             self.select_mode = false;
@@ -1986,17 +2118,7 @@ impl ComfyApp {
                             let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                                 .fit_to_exact_size(alloc)
                                 .sense(egui::Sense::click());
-                            let r = ui.put(rect, img);
-                            if is_video {
-                                ui.painter().text(
-                                    rect.left_top() + egui::vec2(4.0, 2.0),
-                                    egui::Align2::LEFT_TOP,
-                                    "video",
-                                    egui::FontId::proportional(12.0),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-                            r.clicked()
+                            ui.put(rect, img).clicked()
                         }
                         None => {
                             if self.thumbs.claim(&thumb_key) {
@@ -2005,6 +2127,11 @@ impl ComfyApp {
                             ui.put(rect, egui::Button::new(elide(&item_key, 14)).wrap()).clicked()
                         }
                     };
+                    // Videos (which the server may not thumbnail) get a play badge so they're
+                    // recognizable even as a blank tile.
+                    if is_video {
+                        video_badge(ui, rect);
+                    }
                     if select_mode {
                         selection_overlay(ui, rect, selected);
                     }
@@ -2027,12 +2154,14 @@ impl ComfyApp {
 
     fn open_viewer(&mut self, idx: usize) {
         let Some(item) = self.gallery.get(idx).cloned() else { return };
-        if item.is_video {
-            self.gallery_status = "Video playback isn't supported yet".into();
-            return;
-        }
         let engine = self.engine.as_ref().unwrap();
-        engine.fetch_full(item.subfolder.clone(), item.filename.clone());
+        // Videos can't be decoded/played in-app; download the raw file so the poster shows and Save
+        // works. Images decode as usual.
+        if item.is_video {
+            engine.fetch_video(item.subfolder.clone(), item.filename.clone());
+        } else {
+            engine.fetch_full(item.subfolder.clone(), item.filename.clone());
+        }
         engine.fetch_item_albums(item.subfolder.clone(), item.filename.clone());
         self.gallery_status.clear();
         self.viewer =
@@ -2107,6 +2236,9 @@ impl ComfyApp {
             ));
             if !v.item.models.is_empty() {
                 ui.weak(format!("{} {}", icons::MODEL, elide(&v.item.models.join(", "), 76)));
+            }
+            if v.item.is_video {
+                ui.weak(format!("{} Video — preview only (no in-app playback); Save to keep it", icons::RUN));
             }
             if !self.gallery_status.is_empty() {
                 ui.colored_label(
@@ -2456,6 +2588,21 @@ fn up_menu<R>(
 /// content shrinks for the IME.
 fn centered(window: egui::Window<'_>) -> egui::Window<'_> {
     window.anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+}
+
+/// Draw a play-button badge centered on a tile, marking it as a video.
+fn video_badge(ui: &egui::Ui, rect: egui::Rect) {
+    let c = rect.center();
+    let r = (rect.width().min(rect.height()) * 0.16).clamp(9.0, 26.0);
+    let p = ui.painter();
+    p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
+    let t = r * 0.55;
+    let tri = vec![
+        c + egui::vec2(-t * 0.55, -t),
+        c + egui::vec2(-t * 0.55, t),
+        c + egui::vec2(t, 0.0),
+    ];
+    p.add(egui::Shape::convex_polygon(tri, egui::Color32::WHITE, egui::Stroke::NONE));
 }
 
 /// Draw the multi-select overlay on a gallery tile: a tint plus a corner check badge.
