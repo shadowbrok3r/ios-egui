@@ -21,17 +21,18 @@ pub fn apply(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
 
     v.override_text_color = Some(text);
-    v.panel_fill = rgb(0, 0, 0);
-    v.window_fill = rgb(0, 0, 0);
-    v.window_stroke = Stroke::new(1.0, rgba(24, 24, 34, 73));
-    v.faint_bg_color = rgb(16, 16, 16);
+    // The page stays near-black; windows/menus sit a step brighter so they read as raised.
+    v.panel_fill = rgb(8, 8, 11);
+    v.window_fill = rgb(26, 26, 32);
+    v.window_stroke = Stroke::new(1.0, rgba(70, 72, 96, 180));
+    v.faint_bg_color = rgb(20, 20, 26);
     v.extreme_bg_color = rgb(13, 13, 18);
     v.code_bg_color = rgb(6, 6, 6);
-    v.hyperlink_color = rgb(84, 71, 226);
+    v.hyperlink_color = rgb(140, 128, 255);
     v.warn_fg_color = rgb(76, 219, 255);
     v.error_fg_color = rgb(255, 73, 137);
-    v.selection.bg_fill = rgba(108, 60, 118, 118);
-    v.selection.stroke = Stroke::new(1.0, rgba(76, 77, 103, 247));
+    v.selection.bg_fill = rgba(120, 70, 150, 150);
+    v.selection.stroke = Stroke::new(1.0, rgba(150, 130, 220, 255));
     v.window_shadow = egui::epaint::Shadow {
         offset: [0, 0],
         blur: 5,
@@ -47,35 +48,36 @@ pub fn apply(ctx: &egui::Context) {
     v.window_corner_radius = CornerRadius::same(4);
     v.menu_corner_radius = CornerRadius::same(6);
 
+    // Interactive widgets carry a visible border so they stand out against the dark page.
     let w = &mut v.widgets;
-    w.noninteractive.bg_fill = rgb(6, 6, 6);
-    w.noninteractive.weak_bg_fill = rgb(6, 6, 6);
-    w.noninteractive.bg_stroke = Stroke::new(1.0, rgba(17, 17, 21, 87));
+    w.noninteractive.bg_fill = rgb(20, 20, 26);
+    w.noninteractive.weak_bg_fill = rgb(20, 20, 26);
+    w.noninteractive.bg_stroke = Stroke::new(1.0, rgba(66, 68, 90, 160));
     w.noninteractive.fg_stroke = Stroke::new(1.0, text);
-    w.noninteractive.corner_radius = CornerRadius::same(2);
+    w.noninteractive.corner_radius = CornerRadius::same(3);
 
-    w.inactive.bg_fill = rgb(12, 12, 12);
-    w.inactive.weak_bg_fill = rgb(0, 0, 0);
-    w.inactive.bg_stroke = Stroke::new(0.6, rgba(50, 52, 77, 129));
+    w.inactive.bg_fill = rgb(30, 30, 38);
+    w.inactive.weak_bg_fill = rgb(22, 22, 28);
+    w.inactive.bg_stroke = Stroke::new(1.0, rgba(104, 108, 148, 210));
     w.inactive.fg_stroke = Stroke::new(1.0, text);
-    w.inactive.corner_radius = CornerRadius::same(2);
+    w.inactive.corner_radius = CornerRadius::same(3);
 
-    w.hovered.bg_fill = rgb(7, 7, 7);
-    w.hovered.weak_bg_fill = rgb(36, 34, 53);
-    w.hovered.bg_stroke = Stroke::new(0.5, rgba(116, 109, 187, 218));
-    w.hovered.fg_stroke = Stroke::new(1.5, text);
+    w.hovered.bg_fill = rgb(46, 42, 66);
+    w.hovered.weak_bg_fill = rgb(46, 42, 66);
+    w.hovered.bg_stroke = Stroke::new(1.2, rgba(150, 140, 226, 255));
+    w.hovered.fg_stroke = Stroke::new(1.5, rgb(245, 245, 245));
     w.hovered.corner_radius = CornerRadius::same(3);
 
-    w.active.bg_fill = rgb(0, 0, 0);
-    w.active.weak_bg_fill = rgba(118, 26, 60, 118);
-    w.active.bg_stroke = Stroke::new(1.0, rgb(11, 11, 11));
-    w.active.fg_stroke = Stroke::new(2.0, text);
-    w.active.corner_radius = CornerRadius::same(2);
+    w.active.bg_fill = rgb(70, 34, 74);
+    w.active.weak_bg_fill = rgba(150, 46, 92, 200);
+    w.active.bg_stroke = Stroke::new(1.4, rgba(190, 120, 210, 255));
+    w.active.fg_stroke = Stroke::new(2.0, rgb(255, 255, 255));
+    w.active.corner_radius = CornerRadius::same(3);
 
-    w.open.bg_fill = rgb(3, 3, 3);
-    w.open.weak_bg_fill = rgb(3, 3, 3);
-    w.open.bg_stroke = Stroke::new(1.0, rgba(48, 47, 64, 221));
-    w.open.corner_radius = CornerRadius::same(2);
+    w.open.bg_fill = rgb(30, 30, 38);
+    w.open.weak_bg_fill = rgb(30, 30, 38);
+    w.open.bg_stroke = Stroke::new(1.0, rgba(120, 116, 160, 230));
+    w.open.corner_radius = CornerRadius::same(3);
 
     v.striped = true;
     ctx.set_visuals(v);

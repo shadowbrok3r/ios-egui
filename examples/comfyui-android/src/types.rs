@@ -179,6 +179,9 @@ pub struct Settings {
     pub params: Params,
     #[serde(default)]
     pub gallery: GalleryView,
+    /// Auto-follow: pan/zoom the graph to whichever node is currently executing.
+    #[serde(default)]
+    pub auto_follow: bool,
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),

@@ -26,6 +26,8 @@ pub fn graph_id() -> egui::Id {
 pub enum ViewCmd {
     FitAll,
     Center(egui::Pos2),
+    /// Center on a point and zoom into a comfortable range (for auto-follow).
+    Focus(egui::Pos2),
 }
 
 /// View state and overlays for the graph canvas.
@@ -87,6 +89,11 @@ impl GraphView {
     /// Center the view on a node position (graph space).
     pub fn center_on(&mut self, node_pos: egui::Pos2) {
         self.cmd = Some(ViewCmd::Center(node_pos + NODE_CENTER_OFFSET));
+    }
+
+    /// Center on a node and zoom into a readable range — the auto-follow motion.
+    pub fn focus_on(&mut self, node_pos: egui::Pos2) {
+        self.cmd = Some(ViewCmd::Focus(node_pos + NODE_CENTER_OFFSET));
     }
 
     /// The graph-space point currently at the middle of the canvas.
@@ -382,12 +389,15 @@ impl GraphView {
 
 fn style() -> SnarlStyle {
     let mut s = SnarlStyle::new();
-    s.bg_frame = Some(egui::Frame::new().fill(egui::Color32::from_gray(14)));
+    s.bg_frame = Some(egui::Frame::new().fill(egui::Color32::from_rgb(10, 10, 13)));
     s.min_scale = Some(MIN_SCALE);
     s.max_scale = Some(MAX_SCALE);
     s.centering = Some(true);
     s
 }
+
+/// A node body fill a step brighter than the canvas, so nodes read as raised.
+const NODE_FILL: egui::Color32 = egui::Color32::from_rgb(34, 34, 42);
 
 /// Bounding box of all nodes in graph space (measured sizes where known).
 fn bounds(snarl: &Snarl<FlowNodeData>, sizes: &HashMap<NodeId, egui::Vec2>) -> Option<egui::Rect> {
@@ -418,51 +428,121 @@ pub fn arrange(
 
     let ids: Vec<NodeId> = snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();
     let mut successors: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-    let mut indegree: HashMap<NodeId, usize> = ids.iter().map(|&id| (id, 0)).collect();
+    let mut predecessors: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
     for (from, to) in snarl.wires() {
         if from.node == to.node {
             continue;
         }
         successors.entry(from.node).or_default().push(to.node);
-        *indegree.entry(to.node).or_default() += 1;
+        predecessors.entry(to.node).or_default().push(from.node);
     }
 
-    // Longest-path depth via Kahn's algorithm; cycle leftovers go one column past the deepest.
-    let mut depth: HashMap<NodeId, usize> = HashMap::new();
-    let mut queue: std::collections::VecDeque<NodeId> =
-        ids.iter().filter(|id| indegree[id] == 0).copied().collect();
-    while let Some(node) = queue.pop_front() {
-        let d = depth.get(&node).copied().unwrap_or(0);
+    // Pseudo-topological order via iterative DFS post-order — robust to cycles, which a converted
+    // workflow can contain (SetNode/GetNode and "Anything Everywhere" links reconstruct as
+    // back-edges). Kahn's-style layering would let one such cycle poison every downstream node's
+    // depth and collapse the whole graph into a single column.
+    let mut order: Vec<NodeId> = Vec::new();
+    let mut visited: HashSet<NodeId> = HashSet::new();
+    for &start in &ids {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((node, processed)) = stack.pop() {
+            if processed {
+                order.push(node);
+                continue;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            stack.push((node, true));
+            for &next in successors.get(&node).into_iter().flatten() {
+                if !visited.contains(&next) {
+                    stack.push((next, false));
+                }
+            }
+        }
+    }
+    order.reverse(); // producers before consumers
+    let topo: HashMap<NodeId, usize> = order.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+
+    // Longest-path layer over forward edges only (topo index increases); back-edges wrap around
+    // rather than shoving their target into a late column.
+    let mut depth: HashMap<NodeId, usize> = ids.iter().map(|&id| (id, 0)).collect();
+    for &node in &order {
+        let d = depth[&node];
         for &next in successors.get(&node).into_iter().flatten() {
-            let e = depth.entry(next).or_insert(0);
-            *e = (*e).max(d + 1);
-            let remaining = indegree.get_mut(&next).unwrap();
-            *remaining -= 1;
-            if *remaining == 0 {
-                queue.push_back(next);
+            if topo.get(&next).copied().unwrap_or(0) > topo[&node] {
+                let e = depth.entry(next).or_insert(0);
+                *e = (*e).max(d + 1);
             }
         }
     }
     let deepest = depth.values().copied().max().unwrap_or(0);
-    let mut columns: std::collections::BTreeMap<usize, Vec<NodeId>> = std::collections::BTreeMap::new();
-    for (id, pos, _) in snarl.nodes_pos_ids() {
-        let d = depth.get(&id).copied().unwrap_or(deepest + 1);
-        columns.entry(d).or_default().push(id);
-        // Keep each column's current vertical order for stability.
-        let _ = pos;
+    let mut columns: Vec<Vec<NodeId>> = vec![Vec::new(); deepest + 1];
+    for (id, _, _) in snarl.nodes_pos_ids() {
+        let d = depth.get(&id).copied().unwrap_or(0);
+        columns[d].push(id);
     }
-    for (_, column) in columns.iter_mut() {
+    // Seed each column's vertical order from the original layout, then reduce edge crossings with
+    // barycenter sweeps (each node drifts toward the average row of its neighbours) so wires run
+    // mostly straight left-to-right and the order of execution reads down each column.
+    for column in &mut columns {
         column.sort_by(|a, b| {
             let ya = snarl.get_node_info(*a).map(|n| n.pos.y).unwrap_or(0.0);
             let yb = snarl.get_node_info(*b).map(|n| n.pos.y).unwrap_or(0.0);
             ya.total_cmp(&yb)
         });
     }
+    let indices = |columns: &[Vec<NodeId>]| -> HashMap<NodeId, f32> {
+        let mut m = HashMap::new();
+        for column in columns {
+            for (i, &id) in column.iter().enumerate() {
+                m.insert(id, i as f32);
+            }
+        }
+        m
+    };
+    let barycenter = |id: NodeId, neighbors: &HashMap<NodeId, Vec<NodeId>>, idx: &HashMap<NodeId, f32>, fallback: f32| -> f32 {
+        match neighbors.get(&id) {
+            Some(ns) if !ns.is_empty() => {
+                ns.iter().filter_map(|n| idx.get(n)).sum::<f32>() / ns.len() as f32
+            }
+            _ => fallback,
+        }
+    };
+    let reorder = |column: &mut Vec<NodeId>, neighbors: &HashMap<NodeId, Vec<NodeId>>, idx: &HashMap<NodeId, f32>| {
+        let mut keyed: Vec<(NodeId, f32)> = column
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, barycenter(id, neighbors, idx, i as f32)))
+            .collect();
+        keyed.sort_by(|a, b| a.1.total_cmp(&b.1));
+        *column = keyed.into_iter().map(|(id, _)| id).collect();
+    };
+    for _ in 0..4 {
+        let idx = indices(&columns);
+        for d in 1..columns.len() {
+            let mut column = std::mem::take(&mut columns[d]);
+            reorder(&mut column, &predecessors, &idx);
+            columns[d] = column;
+        }
+        let idx = indices(&columns);
+        for d in (0..columns.len().saturating_sub(1)).rev() {
+            let mut column = std::mem::take(&mut columns[d]);
+            reorder(&mut column, &successors, &idx);
+            columns[d] = column;
+        }
+    }
 
     let size_of = |id: NodeId| sizes.get(&id).copied().unwrap_or(NOMINAL_NODE);
     let mut rects = Vec::new();
     let mut x = 0.0f32;
-    for (_, column) in columns {
+    for column in columns {
+        if column.is_empty() {
+            continue;
+        }
         let col_width = column.iter().map(|&id| size_of(id).x).fold(1.0f32, f32::max);
         let total_height: f32 = column.iter().map(|&id| size_of(id).y + V_GAP).sum::<f32>() - V_GAP;
         let mut y = -total_height / 2.0;
@@ -558,10 +638,10 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         outputs: &[OutPin],
         snarl: &Snarl<FlowNodeData>,
     ) -> egui::Frame {
-        let frame = self.inner.node_frame(default, node, inputs, outputs, snarl);
+        let frame = self.inner.node_frame(default, node, inputs, outputs, snarl).fill(NODE_FILL);
         // The executing highlight (green stroke from the inner viewer) wins over focus.
         if self.focus == Some(node) && frame.stroke.width < 2.0 {
-            frame.stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(110, 170, 255)))
+            frame.stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 140, 226)))
         } else {
             frame
         }
@@ -657,6 +737,14 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
             Some(ViewCmd::Center(p)) => {
                 if p.x.is_finite() && p.y.is_finite() && self.ui_rect.is_finite() {
                     let s = to_global.scaling;
+                    *to_global =
+                        TSTransform::new(self.ui_rect.center().to_vec2() - p.to_vec2() * s, s);
+                }
+            }
+            Some(ViewCmd::Focus(p)) => {
+                if p.x.is_finite() && p.y.is_finite() && self.ui_rect.is_finite() {
+                    // Zoom into a comfortable band: pull a far-out view in, leave a close one be.
+                    let s = to_global.scaling.clamp(0.7, 1.2);
                     *to_global =
                         TSTransform::new(self.ui_rect.center().to_vec2() - p.to_vec2() * s, s);
                 }
@@ -1086,8 +1174,31 @@ mod tests {
             // Sweep taps may have hit the minimap and panned away; re-fit first.
             view.request_fit();
             frame(&mut view, &mut graph, vec![]);
-            let (want, node_pos, _) = graph.snarl.nodes_pos_ids().next().unwrap();
-            let screen_pt = view.to_global * (node_pos + egui::vec2(40.0, 16.0));
+            // Tap a node whose interior point is on-screen, clear of the corner overlays (minimap
+            // top-left, lock top-right), and unambiguously that node (no earlier node covers it).
+            let sizes = view.sizes.clone();
+            let size_of = |id: NodeId| sizes.get(&id).copied().unwrap_or(NOMINAL_NODE);
+            let safe = |p: egui::Pos2| -> bool {
+                screen.shrink(8.0).contains(p)
+                    && !(p.x < 220.0 && p.y < 220.0)
+                    && !(p.x > screen.right() - 60.0 && p.y < 60.0)
+            };
+            let mut target = None;
+            for (id, node_pos, _) in graph.snarl.nodes_pos_ids() {
+                let size = size_of(id);
+                if size.x < 30.0 || size.y < 26.0 {
+                    continue;
+                }
+                let interior = node_pos + egui::vec2(size.x * 0.4, 13.0);
+                let first = graph.snarl.nodes_pos_ids().find(|(id2, p2, _)| {
+                    egui::Rect::from_min_size(*p2, size_of(*id2)).contains(interior)
+                });
+                if first.map(|(i, _, _)| i) == Some(id) && safe(view.to_global * interior) {
+                    target = Some((id, view.to_global * interior));
+                    break;
+                }
+            }
+            let (want, screen_pt) = target.expect("no unobstructed node to tap");
             let tapped = tap(&mut view, &mut graph, &mut frame, screen_pt);
             assert_eq!(tapped, Some(want), "{wf_path}: targeted tap missed its node");
             println!("{wf_path}: tap sweep ok");
@@ -1216,6 +1327,32 @@ mod tests {
                 rects.iter().any(|r| (r.min - pos).length() < 0.5) || sizes.get(&id).is_none()
             });
             assert!(applied, "{wf_path}: arrange did not move nodes");
+
+            // Execution flows left-to-right: a consumer sits right of its producer. A converted
+            // workflow can still contain back-edges (SetNode/GetNode and "Anything Everywhere"
+            // links reconstruct into cycles), so require forward flow to dominate rather than be
+            // absolute — the backbone reads as order of execution.
+            let pos_of: HashMap<NodeId, egui::Pos2> =
+                graph.snarl.nodes_pos_ids().map(|(id, pos, _)| (id, pos)).collect();
+            let (mut forward, mut total) = (0u32, 0u32);
+            for (from, to) in graph.snarl.wires() {
+                if from.node == to.node {
+                    continue;
+                }
+                let (Some(a), Some(b)) = (pos_of.get(&from.node), pos_of.get(&to.node)) else {
+                    continue;
+                };
+                total += 1;
+                if b.x > a.x {
+                    forward += 1;
+                }
+            }
+            if total > 0 {
+                assert!(
+                    forward * 10 >= total * 8,
+                    "{wf_path}: only {forward}/{total} wires flow left-to-right"
+                );
+            }
         }
     }
 

@@ -115,6 +115,7 @@ struct ComfyApp {
 
     graph: Option<ComfyUiNodeGraph>,
     graph_pane: GraphPane,
+    auto_follow: bool,
     graph_name: String,
     graph_status: String,
     view: GraphView,
@@ -193,6 +194,7 @@ impl ComfyApp {
             note: String::new(),
             graph: None,
             graph_pane: GraphPane::Canvas,
+            auto_follow: false,
             graph_name: String::new(),
             graph_status: String::new(),
             view: GraphView::default(),
@@ -357,10 +359,15 @@ impl ComfyApp {
                 }
                 self.executing = node.and_then(|n| self.node_map.get(&n).copied());
                 // Select the running node like ComfyUI does: it shows in Properties and (unless the
-                // green executing stroke wins) gets the focus border. No auto-pan — that would
-                // fight a user scrolling the canvas.
+                // green executing stroke wins) gets the focus border.
                 if let Some(nid) = self.executing {
                     self.props_node = Some(nid);
+                    // Auto-follow (opt-in) pans and zooms the canvas to the running node.
+                    if self.auto_follow
+                        && let Some(info) = self.graph.as_ref().and_then(|g| g.snarl.get_node_info(nid))
+                    {
+                        self.view.focus_on(info.pos);
+                    }
                 }
             }
             Msg::NodeExecuted { node, images } => {
@@ -564,6 +571,7 @@ impl ComfyApp {
             session: self.session.clone(),
             params: self.params.clone(),
             gallery: self.gallery_view.clone(),
+            auto_follow: self.auto_follow,
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -581,6 +589,7 @@ impl ComfyApp {
             self.session = saved.session;
             self.params = saved.params;
             self.gallery_view = saved.gallery;
+            self.auto_follow = saved.auto_follow;
             self.gallery_view.columns = self.gallery_view.columns.clamp(1, 3);
             self.last_saved = self.settings_json();
         }
@@ -1122,6 +1131,19 @@ impl ComfyApp {
                     {
                         self.view.center_on(pos);
                     }
+                }
+                ui.separator();
+                let follow = if self.auto_follow {
+                    format!("{} Auto-follow: on", icons::CHECK)
+                } else {
+                    "     Auto-follow: off".to_string()
+                };
+                if ui
+                    .selectable_label(self.auto_follow, follow)
+                    .on_hover_text("Pan and zoom to the running node during a queue")
+                    .clicked()
+                {
+                    self.auto_follow = !self.auto_follow;
                 }
             });
 
