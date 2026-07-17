@@ -3,20 +3,27 @@
 //! the UI with a cloned [`egui::Context`] and the UI applies effects (haptics, notifications).
 
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures::StreamExt as _;
-use rucomfyui::{Client, Event};
+use rucomfyui::workflow::WorkflowNodeId;
+use rucomfyui::{Client, Event, Workflow};
 use serde_json::Value;
 
 use crate::logger::Logger;
 use crate::schema::{self, SchemaSet};
-use crate::types::{Img2ImgSource, Mode, Params};
-use crate::workflow;
+use crate::types::{Album, AlbumList, Facets, GalleryPage, GalleryView, Img2ImgSource, Mode, Params};
+use crate::{uiwf, workflow};
+
+/// The prompt id currently executing, shared with the websocket listener so it can filter
+/// broadcast events down to our run.
+type CurrentPrompt = Arc<Mutex<Option<String>>>;
 
 /// A message from the async worker to the UI thread.
 pub enum Msg {
     Connected {
-        schemas: SchemaSet,
+        schemas: Arc<SchemaSet>,
         checkpoints: Vec<String>,
         samplers: Vec<String>,
         schedulers: Vec<String>,
@@ -27,9 +34,39 @@ pub enum Msg {
     Status(String),
     Preview(egui::ColorImage),
     Result { image: egui::ColorImage, bytes: Vec<u8> },
+    /// A node started executing (`None` = prompt finished). WebSocket transport only today.
+    NodeExecuting(Option<u32>),
+    /// A node finished and produced images (raw encoded bytes, for graph-node display).
+    NodeExecuted { node: u32, images: Vec<Vec<u8>> },
     Done,
     Cancelled,
     GenError(String),
+    /// Server-side workflow file names (`/userdata?dir=workflows`).
+    Workflows(Vec<String>),
+    /// A workflow fetched and converted to API format, ready for the graph editor.
+    WorkflowLoaded { name: String, workflow: Box<Workflow>, warnings: Vec<String> },
+    /// A workflow file written to the server.
+    WorkflowSaved(String),
+    WorkflowError(String),
+    Gallery(GalleryPage),
+    GalleryError(String),
+    /// A decoded gallery thumbnail; `key` is `subfolder/filename#size`.
+    Thumb { key: String, image: egui::ColorImage },
+    /// A decoded full-resolution gallery image with its raw bytes.
+    FullImage { key: String, image: egui::ColorImage, bytes: Vec<u8> },
+    /// A `POST /login` succeeded; `session` is the `cg_session` cookie token to send from now on.
+    SignedIn { username: String, session: String },
+    SignedOut,
+    AuthError(String),
+    /// The account's albums (`GET /gallery/api/albums`).
+    Albums(Vec<Album>),
+    /// Distinct model names across the account's gallery (`GET /gallery/api/facets`).
+    Facets(Facets),
+    /// An album mutation finished; the note is for the status line and the UI re-lists albums.
+    AlbumChanged(String),
+    AlbumError(String),
+    /// Which albums one image belongs to (`GET /gallery/api/meta`); `key` is `subfolder/filename`.
+    ItemAlbums { key: String, albums: Vec<i64> },
 }
 
 pub struct Engine {
@@ -39,7 +76,11 @@ pub struct Engine {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     client: Option<Client>,
+    http: Option<reqwest::Client>,
+    base: String,
     job: Option<tokio::task::JoinHandle<()>>,
+    ws_task: Option<tokio::task::JoinHandle<()>>,
+    current_prompt: CurrentPrompt,
 }
 
 impl Engine {
@@ -50,7 +91,19 @@ impl Engine {
             .build()
             .expect("build tokio runtime");
         let (tx, rx) = std::sync::mpsc::channel();
-        Self { rt, ctx, log, tx, rx, client: None, job: None }
+        Self {
+            rt,
+            ctx,
+            log,
+            tx,
+            rx,
+            client: None,
+            http: None,
+            base: String::new(),
+            job: None,
+            ws_task: None,
+            current_prompt: Arc::new(Mutex::new(None)),
+        }
     }
 
     pub fn is_connected(&self) -> bool {
@@ -66,15 +119,26 @@ impl Engine {
         v
     }
 
+    /// The authenticated `/view` URL for an output image (also usable as an img2img input URL).
+    pub fn view_url(&self, subfolder: &str, filename: &str) -> Option<String> {
+        let mut u = reqwest::Url::parse(&format!("{}/view", self.base)).ok()?;
+        u.query_pairs_mut()
+            .append_pair("type", "output")
+            .append_pair("subfolder", subfolder)
+            .append_pair("filename", filename);
+        Some(u.to_string())
+    }
+
     /// Point the client at `url` (with an optional API key), fetch `/object_info` raw, and parse
     /// it leniently into a [`SchemaSet`] (rucomfyui's typed parse fails whole-catalog on servers
     /// with slightly nonconforming custom nodes).
-    pub fn connect(&mut self, url: String, api_key: String) {
+    pub fn connect(&mut self, url: String, api_key: String, session: String) {
         let base = normalize_url(&url);
         let log = self.log.clone();
         let key_note = if api_key.trim().is_empty() { "no API key" } else { "with API key" };
-        log.info(format!("connect: {base} ({key_note})"));
-        let http = match apply_key(tls_builder(), &api_key).build() {
+        let sess_note = if session.trim().is_empty() { "" } else { " + signed-in session" };
+        log.info(format!("connect: {base} ({key_note}{sess_note})"));
+        let http = match apply_auth(tls_builder(), &api_key, &session).build() {
             Ok(c) => c,
             Err(e) => {
                 log.error(format!("HTTP client build failed: {e}"));
@@ -83,7 +147,30 @@ impl Engine {
                 return;
             }
         };
-        self.client = Some(Client::new_with_client(base.clone(), http.clone()));
+        let client = Client::new_with_client(base.clone(), http.clone());
+        // The ws MUST use the same clientId the client queues prompts with — ComfyUI routes
+        // executing/progress events only to the socket whose clientId matches the prompt's, so a
+        // separately-generated id would silently receive nothing.
+        let client_id = client.client_id().to_string();
+        self.client = Some(client);
+        self.http = Some(http.clone());
+        self.base = base.clone();
+
+        // Live progress listener: our own authenticated /ws connection (headers on the
+        // handshake), independent of the polling execution transport.
+        if let Some(task) = self.ws_task.take() {
+            task.abort();
+        }
+        self.ws_task = Some(self.rt.spawn(ws_listener(
+            base.clone(),
+            api_key.clone(),
+            client_id,
+            self.tx.clone(),
+            self.ctx.clone(),
+            self.log.clone(),
+            self.current_prompt.clone(),
+        )));
+
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.rt.spawn(async move {
             let msg = match fetch_object_info(&http, &base, &log).await {
@@ -100,7 +187,7 @@ impl Engine {
                     if checkpoints.is_empty() {
                         log.warn("no checkpoints found in any *CheckpointLoader* node");
                     }
-                    Msg::Connected { schemas, checkpoints, samplers, schedulers }
+                    Msg::Connected { schemas: Arc::new(schemas), checkpoints, samplers, schedulers }
                 }
                 Err(e) => {
                     log.error(format!("connect failed: {e}"));
@@ -112,8 +199,8 @@ impl Engine {
         });
     }
 
-    /// Queue a generation. `current` is the last result's encoded bytes, used as the img2img
-    /// source when the mode is "current result".
+    /// Queue a generation from the simple Generate tab. `current` is the last result's encoded
+    /// bytes, used as the img2img source when the mode is "current result".
     pub fn generate(&mut self, params: Params, current: Option<Vec<u8>>) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
@@ -133,8 +220,24 @@ impl Engine {
             params.denoise
         ));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
+        let authed = self.http.clone().map(|h| (self.base.clone(), h));
+        let current_prompt = self.current_prompt.clone();
         self.job = Some(self.rt.spawn(async move {
-            run_generate(client, params, current, tx, ctx, log).await;
+            run_generate(client, params, current, current_prompt, authed, tx, ctx, log).await;
+        }));
+    }
+
+    /// Queue an arbitrary API-format workflow (from the graph editor).
+    pub fn run_workflow(&mut self, wf: Workflow) {
+        let Some(client) = self.client.clone() else {
+            let _ = self.tx.send(Msg::GenError("Not connected".into()));
+            return;
+        };
+        self.log.info(format!("queue graph workflow: {} nodes", wf.0.len()));
+        let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
+        let current = self.current_prompt.clone();
+        self.job = Some(self.rt.spawn(async move {
+            stream_execution(client, wf, tx, ctx, log, current).await;
         }));
     }
 
@@ -143,9 +246,490 @@ impl Engine {
         if let Some(h) = self.job.take() {
             h.abort();
         }
+        *self.current_prompt.lock().unwrap() = None;
         self.log.warn("generation cancelled locally");
         let _ = self.tx.send(Msg::Cancelled);
         self.ctx.request_repaint();
+    }
+
+    /// List server-side workflow files (`/userdata?dir=workflows`, `.json` only).
+    pub fn list_workflows(&self) {
+        let Some((http, url)) = self.authed_url("/userdata", &[("dir", "workflows"), ("recurse", "true")]) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<Vec<String>>(&body) {
+                    Ok(names) => {
+                        let mut names: Vec<String> =
+                            names.into_iter().filter(|n| n.ends_with(".json")).collect();
+                        names.sort_by_key(|n| n.to_lowercase());
+                        log.info(format!("{} workflow files", names.len()));
+                        Msg::Workflows(names)
+                    }
+                    Err(e) => Msg::WorkflowError(format!("workflow list is not a name array: {e}")),
+                },
+                Err(e) => Msg::WorkflowError(e),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// `{base}/userdata/workflows%2F{name}` — the workflow path rides in one percent-encoded
+    /// segment, matching the web frontend.
+    fn workflow_url(&self, name: &str) -> Option<reqwest::Url> {
+        let mut url = reqwest::Url::parse(&format!("{}/userdata", self.base)).ok()?;
+        url.path_segments_mut().ok()?.push(&format!("workflows/{name}"));
+        Some(url)
+    }
+
+    /// Fetch a server workflow file and convert it for the graph editor.
+    pub fn open_workflow(&self, name: String, schemas: Arc<SchemaSet>) {
+        let Some(http) = self.http.clone() else { return };
+        let Some(url) = self.workflow_url(&name) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => workflow_msg(&name, &body, &schemas, &log),
+                Err(e) => Msg::WorkflowError(e),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Write a UI-format workflow file to the server (`POST /userdata`, overwriting).
+    pub fn save_workflow(&self, name: String, body: String) {
+        let Some(http) = self.http.clone() else { return };
+        let Some(mut url) = self.workflow_url(&name) else { return };
+        url.query_pairs_mut().append_pair("overwrite", "true");
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            log.info(format!("POST {url} ({} bytes)", body.len()));
+            let resp = http
+                .post(url)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await;
+            let msg = match resp {
+                Ok(resp) if resp.status().is_success() => {
+                    log.info(format!("saved workflow {name}"));
+                    Msg::WorkflowSaved(name)
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    log.error(format!("save failed: HTTP {status}: {}", head(&body, 200)));
+                    Msg::WorkflowError(format!("save failed: HTTP {status}"))
+                }
+                Err(e) => {
+                    log.error(format!("save failed: {e}"));
+                    Msg::WorkflowError(format!("save failed: {e}"))
+                }
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Fetch the workflow embedded in a gallery image and convert it for the graph editor.
+    pub fn open_gallery_workflow(&self, subfolder: String, filename: String, schemas: Arc<SchemaSet>) {
+        let Some((http, url)) = self.authed_url(
+            "/gallery/api/workflow",
+            &[("subfolder", &subfolder), ("filename", &filename)],
+        ) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => workflow_msg(&filename, &body, &schemas, &log),
+                Err(e) => Msg::WorkflowError(e),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Sign in to comfy-gate with a user account (`POST /login`, an HTML form flow). Redirects are
+    /// disabled deliberately: the gate answers both a good and a bad password with a 303, and only
+    /// the `cg_session` cookie distinguishes them — following the redirect would just fetch a page.
+    ///
+    /// Takes the URL explicitly so signing in works before (or instead of) a successful connect.
+    pub fn sign_in(&self, url: String, username: String, password: String) {
+        let base = normalize_url(&url);
+        let (tx, ctx, log) = self.emitters();
+        let builder = tls_builder().redirect(reqwest::redirect::Policy::none());
+        let http = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(Msg::AuthError(format!("HTTP client build failed: {e}")));
+                ctx.request_repaint();
+                return;
+            }
+        };
+        self.rt.spawn(async move {
+            let endpoint = format!("{base}/login");
+            log.info(format!("POST {endpoint} (sign in as {username})"));
+            let resp = http
+                .post(&endpoint)
+                .form(&[("username", username.as_str()), ("password", password.as_str())])
+                .send()
+                .await;
+            let msg = match resp {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let cookies: Vec<String> = resp
+                        .headers()
+                        .get_all(reqwest::header::SET_COOKIE)
+                        .iter()
+                        .filter_map(|v| v.to_str().ok().map(str::to_string))
+                        .collect();
+                    log.info(format!("-> {status}, {} cookie(s)", cookies.len()));
+                    match session_from_set_cookie(cookies.iter().map(String::as_str)) {
+                        Some(session) => {
+                            log.info(format!("signed in as {username}"));
+                            Msg::SignedIn { username, session }
+                        }
+                        None if status.as_u16() == 429 => {
+                            Msg::AuthError("Too many attempts — try again in a few minutes".into())
+                        }
+                        None if status.is_redirection() || status.is_success() => {
+                            Msg::AuthError("Wrong username or password".into())
+                        }
+                        None => Msg::AuthError(format!("Sign in failed: HTTP {status}")),
+                    }
+                }
+                Err(e) => {
+                    log.error(format!("sign in failed: {e}"));
+                    Msg::AuthError(format!("Sign in failed: {e}"))
+                }
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// End the server-side session (`POST /logout`). Any API key keeps working — it is a separate
+    /// credential the gate never revokes here.
+    pub fn sign_out(&self, url: String, session: String) {
+        let base = normalize_url(&url);
+        let (tx, ctx, log) = self.emitters();
+        let http = apply_auth(tls_builder().redirect(reqwest::redirect::Policy::none()), "", &session)
+            .build();
+        self.rt.spawn(async move {
+            if let Ok(http) = http {
+                let endpoint = format!("{base}/logout");
+                log.info(format!("POST {endpoint} (sign out)"));
+                match http.post(&endpoint).send().await {
+                    Ok(r) => log.info(format!("-> {}", r.status())),
+                    Err(e) => log.warn(format!("sign out: {e}")),
+                }
+            }
+            let _ = tx.send(Msg::SignedOut);
+            ctx.request_repaint();
+        });
+    }
+
+    /// The account's albums.
+    pub fn albums(&self) {
+        let Some((http, url)) = self.authed_url("/gallery/api/albums", &[]) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<AlbumList>(&body) {
+                    Ok(list) => Msg::Albums(list.albums),
+                    Err(e) => Msg::AlbumError(format!("album list decode: {e}")),
+                },
+                Err(e) => Msg::AlbumError(e),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Distinct model names across the account's gallery, for the model filter.
+    pub fn facets(&self) {
+        let Some((http, url)) = self.authed_url("/gallery/api/facets", &[]) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            // A cold server reindexes here, so this can be slow; a failure just leaves the filter
+            // empty rather than blocking the gallery.
+            match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<Facets>(&body) {
+                    Ok(f) => {
+                        log.info(format!("facets: {} distinct models", f.models.len()));
+                        let _ = tx.send(Msg::Facets(f));
+                    }
+                    Err(e) => log.warn(format!("facets decode: {e}")),
+                },
+                Err(e) => log.warn(format!("facets: {e}")),
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Create an album.
+    pub fn album_create(&self, name: String) {
+        let Some((http, url)) = self.authed_url("/gallery/api/albums", &[]) else { return };
+        self.album_post(http, url, serde_json::json!({ "name": name }), format!("Created {name}"));
+    }
+
+    pub fn album_rename(&self, id: i64, name: String) {
+        let Some((http, url)) = self.authed_url(&format!("/gallery/api/albums/{id}/rename"), &[])
+        else {
+            return;
+        };
+        self.album_post(http, url, serde_json::json!({ "name": name }), format!("Renamed to {name}"));
+    }
+
+    pub fn album_delete(&self, id: i64, name: String) {
+        let Some((http, url)) = self.authed_url(&format!("/gallery/api/albums/{id}/delete"), &[])
+        else {
+            return;
+        };
+        self.album_post(http, url, serde_json::json!({}), format!("Deleted {name}"));
+    }
+
+    /// Add images to an album. Items are identified by their `(subfolder, filename)` pair exactly
+    /// as the gallery listing returned them — the server has no image id, and it silently ignores
+    /// pairs it can't match to the caller's own files.
+    pub fn album_add(&self, id: i64, items: Vec<(String, String)>) {
+        let Some((http, url)) = self.authed_url(&format!("/gallery/api/albums/{id}/add"), &[])
+        else {
+            return;
+        };
+        let n = items.len();
+        let note = if n == 1 { "Added to album".to_string() } else { format!("Added {n} to album") };
+        self.album_post(http, url, items_body(items), note);
+    }
+
+    pub fn album_remove(&self, id: i64, items: Vec<(String, String)>) {
+        let Some((http, url)) = self.authed_url(&format!("/gallery/api/albums/{id}/remove"), &[])
+        else {
+            return;
+        };
+        self.album_post(http, url, items_body(items), "Removed from album".to_string());
+    }
+
+    /// POST an album mutation and report the outcome. The count in the reply matters: `add` filters
+    /// out items it doesn't recognise instead of erroring, so a 200 with `added: 0` means nothing
+    /// landed.
+    fn album_post(&self, http: reqwest::Client, url: reqwest::Url, body: Value, note: String) {
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            log.info(format!("POST {url}"));
+            let resp = http.post(url).json(&body).send().await;
+            let msg = match resp {
+                Ok(resp) if resp.status().is_success() => {
+                    let text = resp.text().await.unwrap_or_default();
+                    log.info(format!("-> {}", head(&text, 120)));
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(v) if v.get("added").and_then(Value::as_u64) == Some(0) => {
+                            Msg::AlbumError("Nothing was added — the server didn't match those images".into())
+                        }
+                        _ => Msg::AlbumChanged(note),
+                    }
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    log.error(format!("album op failed: HTTP {status}: {}", head(&body, 200)));
+                    // The gate reports errors as plain text, so surface the body, not a bare code.
+                    let detail = head(&body, 120);
+                    Msg::AlbumError(if detail.is_empty() {
+                        format!("HTTP {status}")
+                    } else {
+                        detail
+                    })
+                }
+                Err(e) => {
+                    log.error(format!("album op failed: {e}"));
+                    Msg::AlbumError(e.to_string())
+                }
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Which albums one image is in — the only endpoint that reports membership.
+    pub fn fetch_item_albums(&self, subfolder: String, filename: String) {
+        let Some((http, url)) = self.authed_url(
+            "/gallery/api/meta",
+            &[("subfolder", &subfolder), ("filename", &filename)],
+        ) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            if let Ok(body) = get_ok_text(&http, url, &log).await
+                && let Ok(v) = serde_json::from_str::<Value>(&body)
+            {
+                let albums = v
+                    .get("albums")
+                    .and_then(Value::as_array)
+                    .map(|a| a.iter().filter_map(|x| x.get("id").and_then(Value::as_i64)).collect())
+                    .unwrap_or_default();
+                let _ = tx.send(Msg::ItemAlbums { key: format!("{subfolder}/{filename}"), albums });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Fetch one page of the server's image gallery with the view's search, model filter, album,
+    /// sort and grouping applied server-side.
+    pub fn gallery_list(&self, offset: u64, limit: u64, q: &str, view: &GalleryView) {
+        let (offset_s, limit_s) = (offset.to_string(), limit.to_string());
+        let mut query = vec![
+            ("offset", offset_s.as_str()),
+            ("limit", limit_s.as_str()),
+            ("sort", view.sort.param()),
+            ("group", view.group.param()),
+        ];
+        let q = q.trim();
+        if !q.is_empty() {
+            query.push(("q", q));
+        }
+        if !view.model.is_empty() {
+            query.push(("model", view.model.as_str()));
+        }
+        let album_s;
+        if let Some(id) = view.album {
+            album_s = id.to_string();
+            query.push(("album", album_s.as_str()));
+        }
+        let Some((http, url)) = self.authed_url("/gallery/api/list", &query) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<GalleryPage>(&body) {
+                    Ok(mut page) => {
+                        page.offset = offset;
+                        log.info(format!("gallery: {} items of {}", page.items.len(), page.total));
+                        Msg::Gallery(page)
+                    }
+                    Err(e) => Msg::GalleryError(format!("gallery list decode: {e}")),
+                },
+                Err(e) => Msg::GalleryError(e),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Fetch and decode a gallery thumbnail at `size` (server-side downscale, clamped 64..=1024).
+    pub fn fetch_thumb(&self, subfolder: String, filename: String, size: u32) {
+        let size_s = size.to_string();
+        let Some((http, url)) = self.authed_url(
+            "/gallery/api/thumb",
+            &[("subfolder", &subfolder), ("filename", &filename), ("size", &size_s)],
+        ) else {
+            return;
+        };
+        let (tx, ctx, _log) = self.emitters();
+        self.rt.spawn(async move {
+            if let Ok(bytes) = get_ok_bytes(&http, url).await
+                && let Some(image) = decode(&bytes)
+            {
+                let key = format!("{subfolder}/{filename}#{size}");
+                let _ = tx.send(Msg::Thumb { key, image });
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    /// Fetch and decode a full-resolution gallery image.
+    pub fn fetch_full(&self, subfolder: String, filename: String) {
+        let Some((http, url)) = self.authed_url(
+            "/view",
+            &[("type", "output"), ("subfolder", &subfolder), ("filename", &filename)],
+        ) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            match get_ok_bytes(&http, url).await {
+                Ok(bytes) => {
+                    if let Some(image) = decode(&bytes) {
+                        let _ = tx.send(Msg::FullImage {
+                            key: format!("{subfolder}/{filename}"),
+                            image,
+                            bytes,
+                        });
+                    } else {
+                        let _ = tx.send(Msg::GalleryError("image decode failed".into()));
+                    }
+                }
+                Err(e) => {
+                    log.error(format!("full image: {e}"));
+                    let _ = tx.send(Msg::GalleryError(e));
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    fn emitters(&self) -> (Sender<Msg>, egui::Context, Logger) {
+        (self.tx.clone(), self.ctx.clone(), self.log.clone())
+    }
+
+    /// The authed client plus `base + path` with query pairs; `None` (with a log line) before a
+    /// connection exists.
+    fn authed_url(&self, path: &str, query: &[(&str, &str)]) -> Option<(reqwest::Client, reqwest::Url)> {
+        let Some(http) = self.http.clone() else {
+            self.log.warn(format!("{path}: not connected"));
+            return None;
+        };
+        let mut url = reqwest::Url::parse(&format!("{}{path}", self.base)).ok()?;
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query.iter().copied());
+        }
+        Some((http, url))
+    }
+}
+
+/// Build the Loaded/Error message from a fetched workflow body: UI-format bodies convert via
+/// [`uiwf`], API-format bodies parse directly.
+fn workflow_msg(name: &str, body: &str, schemas: &SchemaSet, log: &Logger) -> Msg {
+    let value: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return Msg::WorkflowError(format!("{name}: not JSON ({e})")),
+    };
+    // Some endpoints wrap the workflow in a field.
+    let value = value.get("workflow").cloned().unwrap_or(value);
+    let converted = if value.get("nodes").is_some() {
+        uiwf::convert(&value, schemas)
+    } else {
+        serde_json::from_value::<Workflow>(value)
+            .map(|workflow| uiwf::Converted { workflow, warnings: Vec::new() })
+            .map_err(|e| format!("neither UI- nor API-format workflow: {e}"))
+    };
+    match converted {
+        Ok(c) => {
+            log.info(format!(
+                "workflow {name}: {} nodes, {} warnings",
+                c.workflow.0.len(),
+                c.warnings.len()
+            ));
+            for w in &c.warnings {
+                log.warn(format!("{name}: {w}"));
+            }
+            Msg::WorkflowLoaded {
+                name: name.to_string(),
+                workflow: Box::new(c.workflow),
+                warnings: c.warnings,
+            }
+        }
+        Err(e) => {
+            log.error(format!("workflow {name}: {e}"));
+            Msg::WorkflowError(format!("{name}: {e}"))
+        }
     }
 }
 
@@ -186,37 +770,59 @@ async fn fetch_object_info(
     Ok(set)
 }
 
+/// GET a URL, log the exchange, and return the body when 2xx.
+async fn get_ok_text(
+    http: &reqwest::Client,
+    url: reqwest::Url,
+    log: &Logger,
+) -> Result<String, String> {
+    log.info(format!("GET {url}"));
+    let resp = http.get(url).send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("reading body failed: {e}"))?;
+    log.info(format!("-> {status} {} bytes", body.len()));
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {}", head(&body, 200)));
+    }
+    Ok(body)
+}
+
+/// GET a URL and return raw bytes when 2xx (no logging: used for bulk image fetches).
+async fn get_ok_bytes(http: &reqwest::Client, url: reqwest::Url) -> Result<Vec<u8>, String> {
+    let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
+}
+
 async fn run_generate(
     client: Client,
     params: Params,
     current: Option<Vec<u8>>,
+    current_prompt: CurrentPrompt,
+    authed: Option<(String, reqwest::Client)>,
     tx: Sender<Msg>,
     ctx: egui::Context,
     log: Logger,
 ) {
-    // Send a message and wake the UI.
-    macro_rules! send {
-        ($m:expr) => {{
-            let _ = tx.send($m);
-            ctx.request_repaint();
-        }};
-    }
-
     // Resolve and upload the img2img input, if any.
     let input_image = if params.mode == Mode::Img2Img {
         let bytes = match params.img2img_source {
             Img2ImgSource::CurrentOutput => current,
-            Img2ImgSource::Url => match fetch_bytes(&params.input_url, &log).await {
+            Img2ImgSource::Url => match fetch_bytes(&params.input_url, &authed, &log).await {
                 Ok(b) => Some(b),
                 Err(e) => {
                     log.error(format!("img2img input fetch failed: {e}"));
-                    send!(Msg::GenError(format!("Fetch input failed: {e}")));
+                    let _ = tx.send(Msg::GenError(format!("Fetch input failed: {e}")));
+                    ctx.request_repaint();
                     return;
                 }
             },
         };
         let Some(bytes) = bytes else {
-            send!(Msg::GenError("No input image for img2img".into()));
+            let _ = tx.send(Msg::GenError("No input image for img2img".into()));
+            ctx.request_repaint();
             return;
         };
         let name = "comfyui_android_input.png";
@@ -226,7 +832,8 @@ async fn run_generate(
             .await
         {
             log.error(format!("upload failed: {e}"));
-            send!(Msg::GenError(format!("Upload failed: {e}")));
+            let _ = tx.send(Msg::GenError(format!("Upload failed: {e}")));
+            ctx.request_repaint();
             return;
         }
         Some(name.to_string())
@@ -235,6 +842,28 @@ async fn run_generate(
     };
 
     let (wf, _out) = workflow::build(&params, input_image);
+    stream_execution(client, wf, tx, ctx, log, current_prompt).await;
+}
+
+/// Queue a workflow and forward its event stream to the UI. Shared by the Generate tab and the
+/// graph editor. A dropped event stream (one failed poll kills rucomfyui's whole stream) falls
+/// back to patiently reconciling results from the history endpoint instead of failing the run.
+async fn stream_execution(
+    client: Client,
+    wf: Workflow,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    log: Logger,
+    current_prompt: CurrentPrompt,
+) {
+    // Send a message and wake the UI.
+    macro_rules! send {
+        ($m:expr) => {{
+            let _ = tx.send($m);
+            ctx.request_repaint();
+        }};
+    }
+
     let mut execution = match client.execute(&wf).await {
         Ok(e) => e,
         Err(e) => {
@@ -243,9 +872,12 @@ async fn run_generate(
             return;
         }
     };
-    log.info(format!("queued prompt {}", execution.prompt_id()));
+    let prompt_id = execution.prompt_id().to_string();
+    log.info(format!("queued prompt {prompt_id}"));
+    *current_prompt.lock().unwrap() = Some(prompt_id.clone());
     send!(Msg::Queued);
 
+    let mut outcome = None;
     while let Some(event) = execution.next().await {
         match event {
             Ok(Event::Status { queue_remaining }) => {
@@ -255,16 +887,20 @@ async fn run_generate(
                 log.info("execution started");
                 send!(Msg::Status("Started".into()))
             }
+            Ok(Event::Executing { node, .. }) => {
+                send!(Msg::NodeExecuting(node.as_ref().map(|n| n.0)));
+            }
             Ok(Event::Progress { value, max, .. }) => {
-                send!(Msg::Progress { value: value as u32, max: max as u32 })
+                send!(Msg::Progress { value, max })
             }
             Ok(Event::Preview { image, .. }) => {
                 if let Some(ci) = decode(&image.data) {
                     send!(Msg::Preview(ci));
                 }
             }
-            Ok(Event::Executed { output, .. }) => {
-                log.info(format!("executed: {} image(s)", output.images.len()));
+            Ok(Event::Executed { node, output, .. }) => {
+                log.info(format!("node {} executed: {} image(s)", node.0, output.images.len()));
+                send!(Msg::NodeExecuted { node: node.0, images: output.images.clone() });
                 for bytes in output.images {
                     if let Some(ci) = decode(&bytes) {
                         send!(Msg::Result { image: ci, bytes });
@@ -273,26 +909,238 @@ async fn run_generate(
             }
             Ok(Event::Error { message, .. }) => {
                 log.error(format!("server error: {message}"));
-                send!(Msg::GenError(message));
-                return;
+                outcome = Some(Err(message));
+                break;
             }
-            Ok(Event::Completed { .. }) => break,
-            Ok(_) => {}
+            Ok(Event::Completed { .. }) => {
+                outcome = Some(Ok(()));
+                break;
+            }
             Err(e) => {
-                log.error(format!("execution stream error: {e}"));
-                send!(Msg::GenError(e.to_string()));
-                return;
+                // Transient transport failure: the server is still running the prompt.
+                log.warn(format!("execution stream dropped ({e}); waiting on history instead"));
+                break;
             }
         }
     }
-    log.info("generation done");
-    send!(Msg::Done);
+
+    let outcome = match outcome {
+        Some(o) => o,
+        // Stream ended without a verdict: reconcile from the history endpoint.
+        None => reconcile_from_history(&client, &prompt_id, &tx, &ctx, &log).await,
+    };
+    *current_prompt.lock().unwrap() = None;
+    match outcome {
+        Ok(()) => {
+            log.info("generation done");
+            send!(Msg::Done);
+        }
+        Err(message) => send!(Msg::GenError(message)),
+    }
 }
 
-/// Fetch raw bytes for an img2img input URL (http; https needs the `tls` feature).
-async fn fetch_bytes(url: &str, log: &Logger) -> Result<Vec<u8>, String> {
+/// Poll `/history` (gently, tolerating errors) until the prompt completes, then emit its outputs.
+async fn reconcile_from_history(
+    client: &Client,
+    prompt_id: &str,
+    tx: &Sender<Msg>,
+    ctx: &egui::Context,
+    log: &Logger,
+) -> Result<(), String> {
+    let mut errors = 0u32;
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match client.get_history_for_prompt(prompt_id).await {
+            Ok(history) => {
+                errors = 0;
+                let Some(data) = history.data.get(prompt_id) else { continue };
+                if !data.status.completed {
+                    if data.status.status_str == "error" {
+                        return Err("execution failed on the server — see its console".into());
+                    }
+                    continue;
+                }
+                for (name, node_output) in &data.outputs.nodes {
+                    let Ok(node) = name.parse::<WorkflowNodeId>() else { continue };
+                    let mut images = Vec::new();
+                    for image in &node_output.images {
+                        match image.download(client).await {
+                            Ok(bytes) => images.push(bytes),
+                            Err(e) => log.warn(format!("output download failed: {e}")),
+                        }
+                    }
+                    log.info(format!("node {} finished: {} image(s)", node.0, images.len()));
+                    let _ = tx.send(Msg::NodeExecuted { node: node.0, images: images.clone() });
+                    for bytes in images {
+                        if let Some(ci) = decode(&bytes) {
+                            let _ = tx.send(Msg::Result { image: ci, bytes });
+                        }
+                    }
+                    ctx.request_repaint();
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                errors += 1;
+                if errors == 1 {
+                    log.warn(format!("history poll failed (will retry): {e}"));
+                }
+                if errors > 120 {
+                    return Err("lost contact with the server while waiting for results".into());
+                }
+            }
+        }
+    }
+}
+
+/// Persistent authenticated `/ws` listener. ComfyUI broadcasts `executing`/`progress`/preview
+/// events for prompts queued without a client id (ours are), so this supplies the live progress
+/// the polling transport can't; execution results still come from polling/history. Reconnects
+/// forever with backoff; ends when the UI drops its receiver.
+async fn ws_listener(
+    base: String,
+    api_key: String,
+    client_id: String,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    log: Logger,
+    current: CurrentPrompt,
+) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    use tokio_tungstenite::tungstenite::protocol::Message;
+
+    let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+    let url = format!("{ws_base}/ws?clientId={client_id}");
+    let mut announced = false;
+    loop {
+        let mut request = match url.as_str().into_client_request() {
+            Ok(r) => r,
+            Err(e) => {
+                log.warn(format!("ws: invalid url: {e}"));
+                return;
+            }
+        };
+        let key = api_key.trim();
+        if !key.is_empty() {
+            if let Ok(v) = key.parse() {
+                request.headers_mut().insert("x-api-key", v);
+            }
+            if let Ok(v) = format!("Bearer {key}").parse() {
+                request.headers_mut().insert("authorization", v);
+            }
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok((mut stream, _)) => {
+                if !announced {
+                    log.info("ws: connected — live progress enabled");
+                    announced = true;
+                }
+                while let Some(message) = stream.next().await {
+                    match message {
+                        Ok(Message::Text(text)) => {
+                            if let Some(msg) = parse_ws_text(&text, &current) {
+                                if tx.send(msg).is_err() {
+                                    return;
+                                }
+                                ctx.request_repaint();
+                            }
+                        }
+                        Ok(Message::Binary(bytes)) => {
+                            if current.lock().unwrap().is_some()
+                                && let Some(image) = parse_ws_preview(&bytes)
+                                && let Some(ci) = decode(image)
+                            {
+                                if tx.send(Msg::Preview(ci)).is_err() {
+                                    return;
+                                }
+                                ctx.request_repaint();
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            log.warn(format!("ws: dropped ({e}); reconnecting"));
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                if !announced {
+                    log.warn(format!(
+                        "ws: connect failed ({e}) — live progress off, polling still works"
+                    ));
+                    announced = true;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Map a ComfyUI websocket text frame onto a UI message, filtered to the running prompt.
+fn parse_ws_text(text: &str, current: &CurrentPrompt) -> Option<Msg> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let data = v.get("data")?;
+    // Only while a prompt of ours is running. Accept an event whose prompt_id matches, or one that
+    // carries none at all — plain `progress` frames often omit it, and our ws already only receives
+    // events for our own clientId's prompts.
+    let cur = current.lock().unwrap().clone()?;
+    let pid = data.get("prompt_id").and_then(Value::as_str);
+    if pid.is_some_and(|p| p != cur.as_str()) {
+        return None;
+    }
+    match v.get("type")?.as_str()? {
+        "executing" => {
+            let node = data.get("node").and_then(Value::as_str).and_then(|s| s.parse().ok());
+            Some(Msg::NodeExecuting(node))
+        }
+        "progress" => Some(Msg::Progress {
+            value: data.get("value").and_then(Value::as_f64).unwrap_or(0.0) as u32,
+            max: data.get("max").and_then(Value::as_f64).unwrap_or(0.0) as u32,
+        }),
+        "progress_state" => {
+            let nodes = data.get("nodes")?.as_object()?;
+            let running = nodes.values().find(|n| {
+                n.get("state").and_then(Value::as_str) == Some("running")
+                    && n.get("max").and_then(Value::as_f64).unwrap_or(0.0) > 0.0
+            })?;
+            Some(Msg::Progress {
+                value: running.get("value").and_then(Value::as_f64).unwrap_or(0.0) as u32,
+                max: running.get("max").and_then(Value::as_f64).unwrap_or(0.0) as u32,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The image bytes of a binary preview frame (framing type 1 legacy, 4 with-metadata).
+fn parse_ws_preview(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let event = u32::from_be_bytes(bytes[0..4].try_into().ok()?);
+    match event {
+        1 => Some(&bytes[8..]),
+        4 => {
+            let metadata_len = u32::from_be_bytes(bytes[4..8].try_into().ok()?) as usize;
+            bytes.get(8usize.checked_add(metadata_len)?..)
+        }
+        _ => None,
+    }
+}
+
+/// Fetch raw bytes for an img2img input URL. Auth headers are attached only for the connected
+/// server's own origin, never leaked to third-party hosts.
+async fn fetch_bytes(
+    url: &str,
+    authed: &Option<(String, reqwest::Client)>,
+    log: &Logger,
+) -> Result<Vec<u8>, String> {
     log.info(format!("GET {url}"));
-    let client = tls_builder().build().map_err(|e| e.to_string())?;
+    let client = match authed {
+        Some((base, http)) if url.starts_with(base.as_str()) => http.clone(),
+        _ => tls_builder().build().map_err(|e| e.to_string())?,
+    };
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -316,22 +1164,70 @@ fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
 
 /// Attach the API key to a reqwest builder as both `X-Api-Key` and `Authorization: Bearer`
 /// default headers; they ride every HTTP call (object_info, queue, upload, history, view).
-fn apply_key(builder: reqwest::ClientBuilder, api_key: &str) -> reqwest::ClientBuilder {
-    let key = api_key.trim();
-    if key.is_empty() {
-        return builder;
-    }
-    use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
+/// Default headers for every request to the connected server: the API key (as both header spellings
+/// the gate accepts), the `cg_session` login cookie when signed in, and a JSON `Accept`.
+///
+/// The `Accept` matters: comfy-gate answers an unauthenticated request with a 303 to its HTML login
+/// page when `Accept` contains `text/html`, and a plain 401 otherwise — so asking for JSON turns an
+/// expired credential into an error we can report instead of a login page parsed as a workflow.
+///
+/// Both credentials only ever ride on the connected server's own origin, never a third-party host.
+fn apply_auth(builder: reqwest::ClientBuilder, api_key: &str, session: &str) -> reqwest::ClientBuilder {
+    builder.default_headers(auth_headers(api_key, session))
+}
+
+/// The default header set [`apply_auth`] installs.
+fn auth_headers(api_key: &str, session: &str) -> reqwest::header::HeaderMap {
+    use reqwest::header::{ACCEPT, AUTHORIZATION, COOKIE, HeaderMap, HeaderValue};
     let mut headers = HeaderMap::new();
-    if let Ok(mut v) = HeaderValue::from_str(key) {
-        v.set_sensitive(true);
-        headers.insert("x-api-key", v);
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json, */*"));
+    let key = api_key.trim();
+    if !key.is_empty() {
+        if let Ok(mut v) = HeaderValue::from_str(key) {
+            v.set_sensitive(true);
+            headers.insert("x-api-key", v);
+        }
+        if let Ok(mut v) = HeaderValue::from_str(&format!("Bearer {key}")) {
+            v.set_sensitive(true);
+            headers.insert(AUTHORIZATION, v);
+        }
     }
-    if let Ok(mut v) = HeaderValue::from_str(&format!("Bearer {key}")) {
+    let session = session.trim();
+    if !session.is_empty()
+        && let Ok(mut v) = HeaderValue::from_str(&format!("{SESSION_COOKIE}={session}"))
+    {
         v.set_sensitive(true);
-        headers.insert(AUTHORIZATION, v);
+        headers.insert(COOKIE, v);
     }
-    builder.default_headers(headers)
+    headers
+}
+
+/// comfy-gate's session cookie name.
+const SESSION_COOKIE: &str = "cg_session";
+
+/// `{"items":[{"subfolder":…,"filename":…}]}` — the album add/remove body shape.
+fn items_body(items: Vec<(String, String)>) -> Value {
+    let items: Vec<Value> = items
+        .into_iter()
+        .map(|(subfolder, filename)| serde_json::json!({ "subfolder": subfolder, "filename": filename }))
+        .collect();
+    serde_json::json!({ "items": items })
+}
+
+/// Pull the session token out of a login response's `Set-Cookie` headers.
+///
+/// A wrong password is not an HTTP error from comfy-gate — success and failure are both a 303, and
+/// only the presence of this cookie tells them apart.
+fn session_from_set_cookie<'a>(values: impl Iterator<Item = &'a str>) -> Option<String> {
+    for raw in values {
+        for part in raw.split(';') {
+            let Some((name, value)) = part.trim().split_once('=') else { continue };
+            if name.trim() == SESSION_COOKIE && !value.trim().is_empty() {
+                return Some(value.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// A reqwest builder configured for TLS. With the `tls` feature it preloads a rustls config using
@@ -350,12 +1246,18 @@ fn tls_builder() -> reqwest::ClientBuilder {
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    reqwest::Client::builder().use_preconfigured_tls(config)
+    with_timeouts(reqwest::Client::builder().use_preconfigured_tls(config))
 }
 
 #[cfg(not(feature = "tls"))]
 fn tls_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    with_timeouts(reqwest::Client::builder())
+}
+
+/// Connect and idle-read timeouts so a wedged server surfaces an error instead of hanging a
+/// request (and its spinner) forever. No total timeout: big-but-flowing downloads are fine.
+fn with_timeouts(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder.connect_timeout(Duration::from_secs(10)).read_timeout(Duration::from_secs(30))
 }
 
 /// Trim, drop a trailing slash, and default to http:// when no scheme is given.
@@ -374,4 +1276,142 @@ fn head(s: &str, max: usize) -> String {
         .take(max)
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn current(id: Option<&str>) -> CurrentPrompt {
+        Arc::new(Mutex::new(id.map(str::to_string)))
+    }
+
+    /// Sign-in hinges entirely on spotting this cookie: comfy-gate answers a wrong password with
+    /// the same 303 as a right one, so a miss here reads as "wrong password" on a good login.
+    #[test]
+    fn session_cookie_is_found_among_attributes_and_other_cookies() {
+        let real = "cg_session=abc123; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600";
+        assert_eq!(
+            session_from_set_cookie([real].into_iter()),
+            Some("abc123".to_string())
+        );
+        // Ordering must not matter, and unrelated cookies must not shadow it.
+        assert_eq!(
+            session_from_set_cookie(["other=1; Path=/", real].into_iter()),
+            Some("abc123".to_string())
+        );
+        // A failed login sets no cookie; the logout clear-cookie has an empty value.
+        assert_eq!(session_from_set_cookie(["other=1; Path=/"].into_iter()), None);
+        assert_eq!(
+            session_from_set_cookie(["cg_session=; Path=/; Max-Age=0"].into_iter()),
+            None
+        );
+        assert_eq!(session_from_set_cookie(std::iter::empty()), None);
+    }
+
+    /// A name that merely ends in the cookie's name is a different cookie.
+    #[test]
+    fn session_cookie_match_is_exact() {
+        assert_eq!(session_from_set_cookie(["xcg_session=nope; Path=/"].into_iter()), None);
+    }
+
+    #[test]
+    fn album_items_body_uses_subfolder_filename_pairs() {
+        let body = items_body(vec![("user_a/2026".into(), "out_1.png".into())]);
+        assert_eq!(
+            body,
+            serde_json::json!({"items":[{"subfolder":"user_a/2026","filename":"out_1.png"}]})
+        );
+    }
+
+    /// Auth rides only on default headers, so a client built without either credential must still
+    /// ask for JSON — that is what keeps a 401 from arriving as an HTML login page.
+    #[test]
+    fn auth_headers_carry_key_session_and_json_accept() {
+        use reqwest::header::{ACCEPT, AUTHORIZATION, COOKIE};
+        let headers = auth_headers;
+
+        let h = headers("k3y", "s3ss");
+        assert_eq!(h.get("x-api-key").unwrap(), "k3y");
+        assert_eq!(h.get(AUTHORIZATION).unwrap(), "Bearer k3y");
+        assert_eq!(h.get(COOKIE).unwrap(), "cg_session=s3ss");
+        assert_eq!(h.get(ACCEPT).unwrap(), "application/json, */*");
+
+        let h = headers("", "");
+        assert!(h.get("x-api-key").is_none());
+        assert!(h.get(AUTHORIZATION).is_none());
+        assert!(h.get(COOKIE).is_none());
+        assert_eq!(h.get(ACCEPT).unwrap(), "application/json, */*");
+
+        // Signed in with no API key: the cookie alone authenticates.
+        let h = headers("  ", "s3ss");
+        assert!(h.get("x-api-key").is_none());
+        assert_eq!(h.get(COOKIE).unwrap(), "cg_session=s3ss");
+    }
+
+    #[test]
+    fn ws_text_maps_progress_and_executing_for_our_prompt() {
+        let cur = current(Some("abc"));
+        let m = parse_ws_text(
+            r#"{"type":"progress","data":{"value":3,"max":8,"prompt_id":"abc"}}"#,
+            &cur,
+        );
+        assert!(matches!(m, Some(Msg::Progress { value: 3, max: 8 })));
+
+        let m = parse_ws_text(
+            r#"{"type":"executing","data":{"node":"14","prompt_id":"abc"}}"#,
+            &cur,
+        );
+        assert!(matches!(m, Some(Msg::NodeExecuting(Some(14)))));
+
+        let m = parse_ws_text(
+            r#"{"type":"progress_state","data":{"prompt_id":"abc","nodes":{
+                "3":{"state":"finished","value":1,"max":1},
+                "7":{"state":"running","value":5,"max":20}}}}"#,
+            &cur,
+        );
+        assert!(matches!(m, Some(Msg::Progress { value: 5, max: 20 })));
+    }
+
+    #[test]
+    fn ws_text_ignores_other_prompts_and_idle() {
+        let other = r#"{"type":"progress","data":{"value":1,"max":8,"prompt_id":"zzz"}}"#;
+        assert!(parse_ws_text(other, &current(Some("abc"))).is_none());
+        assert!(parse_ws_text(other, &current(None)).is_none());
+        assert!(parse_ws_text(r#"{"type":"status","data":{}}"#, &current(Some("abc"))).is_none());
+        // Idle: even a prompt-less progress frame is ignored when nothing is running.
+        assert!(parse_ws_text(r#"{"type":"progress","data":{"value":1,"max":8}}"#, &current(None)).is_none());
+    }
+
+    /// ComfyUI's plain `progress` frames often omit `prompt_id`; since our ws only receives events
+    /// for our own clientId's prompts, a prompt-less frame while running is ours.
+    #[test]
+    fn ws_text_accepts_progress_without_prompt_id_while_running() {
+        let cur = current(Some("abc"));
+        let m = parse_ws_text(r#"{"type":"progress","data":{"value":4,"max":10}}"#, &cur);
+        assert!(matches!(m, Some(Msg::Progress { value: 4, max: 10 })));
+    }
+
+    #[test]
+    fn ws_preview_framings() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&1u32.to_be_bytes());
+        legacy.extend_from_slice(&1u32.to_be_bytes());
+        legacy.extend_from_slice(b"jpegbytes");
+        assert_eq!(parse_ws_preview(&legacy), Some(b"jpegbytes".as_slice()));
+
+        let metadata = br#"{"image_type":"image/png"}"#;
+        let mut with_meta = Vec::new();
+        with_meta.extend_from_slice(&4u32.to_be_bytes());
+        with_meta.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
+        with_meta.extend_from_slice(metadata);
+        with_meta.extend_from_slice(b"pngbytes");
+        assert_eq!(parse_ws_preview(&with_meta), Some(b"pngbytes".as_slice()));
+
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(&4u32.to_be_bytes());
+        truncated.extend_from_slice(&9999u32.to_be_bytes());
+        truncated.extend_from_slice(b"short");
+        assert_eq!(parse_ws_preview(&truncated), None);
+    }
 }

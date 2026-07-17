@@ -75,6 +75,9 @@ struct BuildArgs {
     /// iOS: bundle an assets directory into the app (rsync, dereferencing symlinks).
     #[arg(long, conflicts_with = "android")]
     assets: Option<PathBuf>,
+    /// Android: cargo features to enable on the app crate (e.g. `tls`).
+    #[arg(long, value_delimiter = ',', conflicts_with = "ios")]
+    features: Vec<String>,
 }
 
 impl BuildArgs {
@@ -87,7 +90,7 @@ impl BuildArgs {
     }
 
     fn android(&self) -> cargo_egui_android::BuildArgs {
-        cargo_egui_android::BuildArgs { release: self.release }
+        cargo_egui_android::BuildArgs { release: self.release, features: self.features.clone() }
     }
 }
 

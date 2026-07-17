@@ -13,7 +13,12 @@ default = []
 # the ring provider — deliberately NOT reqwest's `rustls` feature, which forces
 # rustls-platform-verifier (it needs Android Java helper classes we don't bundle, and panics
 # uninitialized). Build with `cargo ndk ... --features tls`.
-tls = ["reqwest/rustls-no-provider", "dep:rustls", "dep:webpki-roots"]
+tls = [
+    "reqwest/rustls-no-provider",
+    "dep:rustls",
+    "dep:webpki-roots",
+    "tokio-tungstenite/rustls-tls-webpki-roots",
+]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
@@ -21,11 +26,21 @@ egui = "0.35"
 # default-features off drops the websocket transport: rucomfyui can't attach the auth header to its
 # progress ws, so an auth-gated server would reject it anyway — we poll /history instead.
 rucomfyui = { git = "https://github.com/philpax/rucomfyui", default-features = false, features = ["typed_nodes"] }
+# The ComfyUI node graph editor (egui-snarl based); fed typed Objects built from our lenient schemas.
+rucomfyui_node_graph = { git = "https://github.com/philpax/rucomfyui" }
+# Direct snarl access for the graph presentation layer (view transform, selection, custom viewer).
+egui-snarl = "0.11"
+# bytes:// image loader for output images / previews rendered inside graph nodes.
+egui_extras = { version = "0.35", default-features = false, features = ["image"] }
 # http-only by default: no TLS backend, so this cross-compiles cleanly. `tls` adds rustls below.
 # gzip/brotli/deflate: a real proxy compresses the large object_info response; without these reqwest
 # would hand the compressed bytes to the JSON parser.
-reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "gzip", "brotli", "deflate"] }
+# `form`: comfy-gate's /login is an HTML form post (application/x-www-form-urlencoded), not JSON.
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "multipart", "gzip", "brotli", "deflate"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+# Authenticated /ws listener for live progress + previews: rucomfyui's own websocket transport
+# can't attach auth headers to the handshake, so the engine runs its own socket alongside polling.
+tokio-tungstenite = "0.24"
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 serde = { version = "1", features = ["derive"] }
@@ -36,6 +51,9 @@ log = "0.4"
 # platform trust store / JNI. ring cross-compiles cleanly with the NDK.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
+
+[dev-dependencies]
+skrifa = "0.42"
 
 # cargo-apk2 reads this to generate the APK manifest.
 [package.metadata.android]

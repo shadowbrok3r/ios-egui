@@ -1,0 +1,11 @@
+# Android build environment for `cargo apk2` / cross `cargo check`, so builds work from a plain
+# shell. Values here do NOT override variables already set in the environment.
+[env]
+ANDROID_HOME = "/home/shadowbroker/Android/Sdk"
+ANDROID_NDK_ROOT = "/home/shadowbroker/Android/Sdk/ndk/28.0.12674087"
+# The system default java is 8 (breaks cargo-apk2's tooling); point at 26 and cap class output.
+JAVA_HOME = "/usr/lib/jvm/java-26-openjdk"
+JDK_JAVAC_OPTIONS = "--release 17"
+# ring's build script needs the NDK toolchain compilers by explicit path.
+CC_aarch64_linux_android = "/home/shadowbroker/Android/Sdk/ndk/28.0.12674087/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+AR_aarch64_linux_android = "/home/shadowbroker/Android/Sdk/ndk/28.0.12674087/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"

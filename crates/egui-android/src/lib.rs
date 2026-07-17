@@ -74,6 +74,15 @@ impl eframe::App for Adapter {
         rect.min.y += insets.top;
         rect.max.x -= insets.right;
         rect.max.y -= insets.bottom;
+        // `full_rect` (system-bar insets only) positions the floating text-actions bar; the app
+        // itself gets a rect shortened by the soft keyboard so bottom-anchored fields and panels
+        // reflow above it instead of hiding underneath.
+        let full_rect = rect;
+        let keyboard = self.host.keyboard_height();
+        if keyboard > 0.0 {
+            let overlap = (keyboard - insets.bottom).max(0.0);
+            rect.max.y = (rect.max.y - overlap).max(rect.min.y + 1.0);
+        }
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             self.app.update(ui, &self.host);
         });
@@ -91,7 +100,7 @@ impl eframe::App for Adapter {
         if let Some(text) = copied {
             self.host.copy_text(text);
         }
-        self.text_actions_bar(ui, rect);
+        self.text_actions_bar(ui, full_rect);
         crate::host::drain(&self.host);
     }
 }

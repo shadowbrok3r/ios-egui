@@ -9,9 +9,14 @@
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
 mod engine;
+mod gallery;
+mod graphview;
+mod icons;
 mod logger;
 mod schema;
+mod theme;
 mod types;
+mod uiwf;
 mod workflow;
 
 #[cfg(target_os = "android")]

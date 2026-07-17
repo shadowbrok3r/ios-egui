@@ -46,7 +46,14 @@ pub struct InputSchema {
 pub enum InputKind {
     /// Dropdown of choices; non-string options are stringified.
     Enum { options: Vec<String>, default: Option<String> },
-    Int { default: i64, min: Option<i64>, max: Option<i64>, step: Option<i64> },
+    Int {
+        default: i64,
+        min: Option<i64>,
+        max: Option<i64>,
+        step: Option<i64>,
+        /// The frontend appends a phantom `control_after_generate` widget value after this input.
+        control: bool,
+    },
     Float { default: f64, min: Option<f64>, max: Option<f64>, step: Option<f64> },
     Bool { default: bool },
     Text { default: String, multiline: bool },
@@ -204,6 +211,7 @@ fn parse_input(name: &str, required: bool, spec: &Value) -> InputSchema {
                 min: num_i64(meta.get("min")),
                 max: num_i64(meta.get("max")),
                 step: num_i64(meta.get("step")),
+                control: meta.contains_key("control_after_generate"),
             },
             "FLOAT" => InputKind::Float {
                 default: num_f64(meta.get("default")).unwrap_or(0.0),
@@ -298,6 +306,125 @@ fn kind_of(v: &Value) -> &'static str {
         Value::Array(_) => "an array",
         Value::Object(_) => "an object",
     }
+}
+
+// ── Bridge to rucomfyui's typed ObjectInfo ────────────────────────────────────
+
+use rucomfyui::object_info as oi;
+
+/// Construct typed [`oi::ObjectInfo`] from the lenient schemas for consumers that require the
+/// typed shape (the node graph editor). Every field rucomfyui's own parse would reject arrives
+/// here already normalized, so construction cannot fail.
+pub fn to_object_info(set: &SchemaSet) -> oi::ObjectInfo {
+    set.nodes.values().map(|n| (n.name.clone(), to_object(n))).collect()
+}
+
+fn to_object(n: &NodeSchema) -> oi::Object {
+    let mut required = BTreeMap::new();
+    let mut optional = BTreeMap::new();
+    let mut required_order = Vec::new();
+    let mut optional_order = Vec::new();
+    for i in &n.inputs {
+        let entry = to_input(i);
+        if i.required {
+            required_order.push(i.name.clone());
+            required.insert(i.name.clone(), entry);
+        } else {
+            optional_order.push(i.name.clone());
+            optional.insert(i.name.clone(), entry);
+        }
+    }
+    oi::Object {
+        name: n.name.clone(),
+        display_name: Some(n.display_name.clone()),
+        description: n.description.clone(),
+        python_module: String::new(),
+        category: n.category.clone(),
+        input: oi::ObjectInputBundle { required, optional: Some(optional) },
+        input_order: oi::ObjectInputBundle {
+            required: required_order,
+            optional: Some(optional_order),
+        },
+        output: n.outputs.iter().map(|o| object_type(&o.ty)).collect(),
+        output_is_list: n.outputs.iter().map(|o| Some(o.is_list)).collect(),
+        output_name: n.outputs.iter().map(|o| o.name.clone()).collect(),
+        output_node: n.output_node,
+        output_tooltips: Vec::new(),
+    }
+}
+
+fn to_input(i: &InputSchema) -> oi::ObjectInput {
+    let (ty, typed) = match &i.kind {
+        InputKind::Enum { options, .. } => (
+            oi::ObjectInputType::Array(
+                options.iter().cloned().map(oi::ObjectInputTypeArrayValue::String).collect(),
+            ),
+            None,
+        ),
+        InputKind::Int { default, min, max, step, .. } => {
+            let min = min.unwrap_or(i64::MIN + 1);
+            let mut max = max.unwrap_or(i64::MAX - 1);
+            // The editor's convert_i64 routes an input down its u64 path (wrapping negative
+            // values) when `min as u64 == 0` or `max as u64 >= i64::MAX`. Keep that path for
+            // true unsigned ranges (min == 0, e.g. seeds) and nudge signed ranges off it: a
+            // negative cap (CLIPSetLastLayer max -1) or an i64::MAX cap (PrimitiveInt) casts
+            // into the trigger zone.
+            if max < 0 {
+                max = 0;
+            } else if max == i64::MAX {
+                max = i64::MAX - 1;
+            }
+            (
+                oi::ObjectInputType::Typed(oi::ObjectType::Int),
+                Some(oi::ObjectInputMetaTyped::Number(oi::ObjectInputMetaTypedNumber {
+                    default: (*default).into(),
+                    display: None,
+                    max: max.into(),
+                    min: min.into(),
+                    round: None,
+                    step: step.map(Into::into),
+                })),
+            )
+        }
+        InputKind::Float { default, min, max, step } => (
+            oi::ObjectInputType::Typed(oi::ObjectType::Float),
+            Some(oi::ObjectInputMetaTyped::Number(oi::ObjectInputMetaTypedNumber {
+                default: (*default).into(),
+                display: None,
+                max: max.unwrap_or(f64::MAX).into(),
+                min: min.unwrap_or(f64::MIN).into(),
+                round: None,
+                step: step.map(Into::into),
+            })),
+        ),
+        InputKind::Bool { default } => (
+            oi::ObjectInputType::Typed(oi::ObjectType::Boolean),
+            Some(oi::ObjectInputMetaTyped::Boolean(oi::ObjectInputMetaTypedBoolean {
+                default: *default,
+            })),
+        ),
+        InputKind::Text { default, multiline } => (
+            oi::ObjectInputType::Typed(oi::ObjectType::String),
+            Some(oi::ObjectInputMetaTyped::String(oi::ObjectInputMetaTypedString {
+                dynamic_prompts: None,
+                multiline: Some(*multiline),
+                default: Some(default.clone()),
+            })),
+        ),
+        InputKind::Connection { ty } => (oi::ObjectInputType::Typed(object_type(ty)), None),
+        InputKind::Opaque => (oi::ObjectInputType::Typed(object_type("*")), None),
+    };
+    oi::ObjectInput::InputWithMeta(
+        ty,
+        oi::ObjectInputMeta { tooltip: i.tooltip.clone(), typed },
+    )
+}
+
+/// Map a type string onto [`oi::ObjectType`] via its serde renames (`"LATENT"` →
+/// `ObjectType::Latent`), falling back to `Other` for anything unknown.
+pub fn object_type(s: &str) -> oi::ObjectType {
+    serde_json::from_value(Value::String(s.to_string()))
+        .unwrap_or_else(|_| oi::ObjectType::Other(s.to_string()))
 }
 
 #[cfg(test)]
@@ -399,6 +526,43 @@ mod tests {
         assert_eq!(set.checkpoints(), vec!["a.ckpt", "b.ckpt"]);
     }
 
+    #[test]
+    fn bridge_builds_typed_objects() {
+        let set = parse_str(
+            r#"{"KSampler": {
+                "display_name": "KSampler", "category": "sampling",
+                "input": {"required": {
+                    "model": ["MODEL"],
+                    "seed": ["INT", {"default": 0, "min": 0, "max": 18446744073709551615}],
+                    "steps": ["INT", {"default": 20, "min": 1, "max": 10000}],
+                    "sampler_name": [["euler", "dpmpp_2m"]]
+                }},
+                "input_order": {"required": ["model", "seed", "steps", "sampler_name"]},
+                "output": ["LATENT"], "output_is_list": [false], "output_name": ["LATENT"],
+                "output_node": false
+            }}"#,
+        );
+        let info = to_object_info(&set);
+        let obj = &info["KSampler"];
+        assert_eq!(obj.display_name(), "KSampler");
+        assert_eq!(obj.output, vec![oi::ObjectType::Latent]);
+        let inputs: Vec<_> = obj.all_inputs().collect();
+        assert_eq!(
+            inputs.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(),
+            ["model", "seed", "steps", "sampler_name"]
+        );
+        assert!(matches!(
+            inputs[0].1.as_input_type(),
+            oi::ObjectInputType::Typed(oi::ObjectType::Model)
+        ));
+        assert!(matches!(
+            inputs[3].1.as_input_type(),
+            oi::ObjectInputType::Array(v) if v.len() == 2
+        ));
+        assert_eq!(object_type("weird_custom"), oi::ObjectType::Other("weird_custom".into()));
+        assert_eq!(object_type("*"), oi::ObjectType::Wildcard);
+    }
+
     /// Full-catalog test against a real server dump: set OBJECT_INFO_JSON to the fixture path.
     /// `OBJECT_INFO_JSON=/path/object_info.json cargo test -p comfyui_android -- --nocapture`
     #[test]
@@ -417,5 +581,7 @@ mod tests {
         let (cp, sa, sc) = (set.checkpoints(), set.samplers(), set.schedulers());
         println!("checkpoints={} samplers={} schedulers={}", cp.len(), sa.len(), sc.len());
         assert!(!cp.is_empty() && !sa.is_empty() && !sc.is_empty());
+        let info = to_object_info(&set);
+        assert_eq!(info.len(), set.nodes.len(), "bridge must cover every node");
     }
 }

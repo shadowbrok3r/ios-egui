@@ -20,6 +20,9 @@ pub struct BuildArgs {
     /// Build the release profile.
     #[arg(long)]
     pub release: bool,
+    /// Cargo features to enable on the app crate (e.g. `tls`).
+    #[arg(long, value_delimiter = ',')]
+    pub features: Vec<String>,
 }
 
 fn ident(name: &str) -> String {
@@ -170,8 +173,17 @@ fn cmd_apk(sub: &str, args: &BuildArgs) -> Result<()> {
     if args.release {
         cmd.arg("--release");
     }
+    let mut shown = String::new();
+    if !args.features.is_empty() {
+        let list = args.features.join(",");
+        cmd.arg("--features").arg(&list);
+        shown = format!(" --features {list}");
+    }
     env_for(&mut cmd)?;
-    println!("cargo apk2 {sub} --target aarch64-linux-android{}", if args.release { " --release" } else { "" });
+    println!(
+        "cargo apk2 {sub} --target aarch64-linux-android{}{shown}",
+        if args.release { " --release" } else { "" }
+    );
     let status = cmd.status().context("running cargo apk2 (is cargo-apk2 installed?)")?;
     if !status.success() {
         bail!("cargo apk2 {sub} failed");
