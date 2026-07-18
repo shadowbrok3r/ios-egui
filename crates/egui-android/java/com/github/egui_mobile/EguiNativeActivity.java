@@ -2,7 +2,11 @@ package com.github.egui_mobile;
 
 import android.app.NativeActivity;
 import android.content.Context;
+import android.os.SystemClock;
 import android.text.InputType;
+import android.view.ActionMode;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -16,7 +20,31 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public class EguiNativeActivity extends NativeActivity {
     private EditText imeEdit;
     private volatile boolean updatingFromNative;
+    private volatile boolean softImeRequested;
+    private long lastShowUptimeMs;
     private final ConcurrentLinkedQueue<String> pending = new ConcurrentLinkedQueue<>();
+
+    /** Suppress Android's selection/insertion ActionMode — it dismisses the soft keyboard. */
+    private static final ActionMode.Callback NO_ACTION_MODE =
+            new ActionMode.Callback() {
+                @Override
+                public boolean onCreateActionMode(ActionMode mode, Menu menu) {
+                    return false;
+                }
+
+                @Override
+                public boolean onPrepareActionMode(ActionMode mode, Menu menu) {
+                    return false;
+                }
+
+                @Override
+                public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+                    return false;
+                }
+
+                @Override
+                public void onDestroyActionMode(ActionMode mode) {}
+            };
 
     public void ensureImeView() {
         if (imeEdit != null) {
@@ -51,6 +79,9 @@ public class EguiNativeActivity extends NativeActivity {
         edit.setFocusableInTouchMode(true);
         edit.setCursorVisible(false);
         edit.setTextIsSelectable(true);
+        // egui draws Paste/Copy/Cut/Select-all; Android's ActionMode closes the IME on Select All.
+        edit.setCustomSelectionActionModeCallback(NO_ACTION_MODE);
+        edit.setCustomInsertionActionModeCallback(NO_ACTION_MODE);
         // 1×1 on-screen (not off-screen): some IMEs refuse InputConnection for views outside the window.
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
         addContentView(edit, params);
@@ -69,8 +100,7 @@ public class EguiNativeActivity extends NativeActivity {
                     try {
                         CharSequence curCs = edit.getText();
                         String cur = curCs != null ? curCs.toString() : "";
-                        boolean textChanged = !cur.equals(text);
-                        if (textChanged) {
+                        if (!cur.equals(text)) {
                             edit.setText(text);
                         }
                         CharSequence after = edit.getText();
@@ -80,19 +110,16 @@ public class EguiNativeActivity extends NativeActivity {
                         if (edit.getSelectionStart() != s || edit.getSelectionEnd() != e) {
                             edit.setSelection(s, e);
                         }
-                        if (textChanged && edit.hasFocus()) {
-                            InputMethodManager imm =
-                                    (InputMethodManager)
-                                            getSystemService(Context.INPUT_METHOD_SERVICE);
-                            imm.restartInput(edit);
-                        }
+                        // Do not restartInput / showSoftInput here — that fights the IME and
+                        // causes show/hide flicker when Select All expands the selection.
                     } finally {
                         updatingFromNative = false;
                     }
                 });
     }
 
-    public void showIme() {
+    /** Bind the hidden EditText without requesting a new IME show animation. */
+    public void bindIme() {
         runOnUiThread(
                 () -> {
                     ensureImeView();
@@ -104,11 +131,39 @@ public class EguiNativeActivity extends NativeActivity {
                     if (!edit.hasFocus()) {
                         edit.requestFocus();
                     }
-                    InputMethodManager imm =
-                            (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
-                    // Explicit show (flags=0) so winit's implicit-only hide on the decor view cannot dismiss it.
-                    imm.showSoftInput(edit, 0);
                 });
+    }
+
+    public void showIme() {
+        runOnUiThread(() -> showImeInner(false));
+    }
+
+    /** Bypass the show throttle — used when winit hid the IME under the EditText bridge. */
+    public void showImeForce() {
+        runOnUiThread(() -> showImeInner(true));
+    }
+
+    private void showImeInner(boolean force) {
+        ensureImeView();
+        EditText edit = imeEdit;
+        if (edit == null) {
+            return;
+        }
+        edit.setVisibility(View.VISIBLE);
+        if (!edit.hasFocus()) {
+            edit.requestFocus();
+        }
+        long now = SystemClock.uptimeMillis();
+        // Rising-edge / throttled show — calling showSoftInput every frame cancels
+        // the IME animation and flickers the keyboard (see logcat ImeTracker).
+        if (!force && softImeRequested && now - lastShowUptimeMs < 400) {
+            return;
+        }
+        softImeRequested = true;
+        lastShowUptimeMs = now;
+        InputMethodManager imm =
+                (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+        imm.showSoftInput(edit, 0);
     }
 
     public void hideIme() {
@@ -117,10 +172,13 @@ public class EguiNativeActivity extends NativeActivity {
                     EditText edit = imeEdit;
                     InputMethodManager imm =
                             (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                    softImeRequested = false;
+                    lastShowUptimeMs = 0;
                     if (edit != null) {
                         imm.hideSoftInputFromWindow(edit.getWindowToken(), 0);
-                        edit.clearFocus();
-                        edit.setVisibility(View.GONE);
+                        // Keep the view attached and focusable so the next showIme is reliable.
+                        // GONE + clearFocus drops the InputConnection and lets the DecorView steal
+                        // IME service, after which showSoftInput on the EditText is ignored.
                     }
                 });
     }

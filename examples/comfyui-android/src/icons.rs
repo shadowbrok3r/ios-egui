@@ -32,6 +32,8 @@ pub const KEY: &str = "🔑";
 pub const LINK: &str = "🔗";
 pub const IMAGE: &str = "🖼";
 pub const WARN: &str = "⚠";
+pub const UNDO: &str = "↩";
+pub const REDO: &str = "↪";
 pub const DOT: &str = "•";
 pub const CHECK: &str = "✔";
 pub const MENU: &str = "☰";
@@ -64,6 +66,8 @@ const ALL: &[(&str, &str)] = &[
     ("LINK", LINK),
     ("IMAGE", IMAGE),
     ("WARN", WARN),
+    ("UNDO", UNDO),
+    ("REDO", REDO),
     ("DOT", DOT),
     ("CHECK", CHECK),
     ("MENU", MENU),

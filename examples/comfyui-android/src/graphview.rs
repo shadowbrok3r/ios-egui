@@ -34,6 +34,9 @@ pub struct GraphView {
     arrange_queued: bool,
     /// Frames spent waiting for measured node sizes before a queued arrange runs.
     arrange_wait: u8,
+    /// Frames to keep reporting a layout as in-flight after it runs, so undo does not record
+    /// the settling positions as a user edit.
+    arrange_settling: u8,
     sizes: HashMap<NodeId, egui::Vec2>,
     to_global: TSTransform,
     pub view_rect: egui::Rect,
@@ -62,6 +65,7 @@ impl GraphView {
             cmd: None,
             arrange_queued: false,
             arrange_wait: 0,
+            arrange_settling: 0,
             sizes: HashMap::new(),
             to_global: TSTransform::IDENTITY,
             view_rect: egui::Rect::ZERO,
@@ -86,6 +90,14 @@ impl GraphView {
     }
 
     /// Queue a compact layout once measured sizes are available (or after a short wait).
+    /// An auto-layout is queued, or has just run. Undo treats the whole settling layout as part
+    /// of whatever asked for it, rather than a second step to undo separately. The grace frames
+    /// matter because `arrange_now` clears the queue flag *before* it moves anything, so without
+    /// them the move itself looks like a user edit.
+    pub fn arrange_pending(&self) -> bool {
+        self.arrange_queued || self.arrange_settling > 0
+    }
+
     pub fn request_arrange(&mut self) {
         self.arrange_queued = true;
         self.arrange_wait = 0;
@@ -97,6 +109,7 @@ impl GraphView {
     pub fn arrange_now(&mut self, snarl: &mut Snarl<FlowNodeData>) {
         self.arrange_queued = false;
         self.arrange_wait = 0;
+        self.arrange_settling = 3;
         if snarl.nodes_pos_ids().next().is_none() {
             return;
         }
@@ -140,6 +153,7 @@ impl GraphView {
         focus: Option<NodeId>,
     ) -> Option<NodeId> {
         self.sizes.retain(|id, _| g.snarl.get_node(*id).is_some());
+        self.arrange_settling = self.arrange_settling.saturating_sub(1);
 
         if self.arrange_queued {
             let ids: Vec<NodeId> = g.snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();

@@ -24,6 +24,11 @@ use crate::{uiwf, workflow};
 /// broadcast events down to our run.
 type CurrentPrompt = Arc<Mutex<Option<String>>>;
 
+/// Filename every img2img input is uploaded under. The LoadImage node cannot be built with the
+/// real reference until the upload returns (the server may namespace it into a subfolder), so a
+/// preview of the graph uses this bare name as a stand-in.
+pub const INPUT_IMAGE_NAME: &str = "comfyui_android_input.png";
+
 /// Catalogs the workflow builder needs. The UI owns both, so a generation carries them across.
 #[derive(Clone)]
 pub struct GenCtx {
@@ -1223,7 +1228,7 @@ async fn run_generate(
             ctx.request_repaint();
             return;
         };
-        let name = "comfyui_android_input.png";
+        let name = INPUT_IMAGE_NAME;
         log.info(format!("uploading img2img input ({} bytes)", bytes.len()));
         let resp = match client
             .upload_image(name, bytes, rucomfyui::upload::UploadType::Input, true)

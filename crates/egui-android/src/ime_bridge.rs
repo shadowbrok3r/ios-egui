@@ -64,7 +64,38 @@ pub fn set_soft_keyboard(show: bool) -> bool {
     })
     .unwrap_or(false);
     if ok {
-        log::debug!("egui-android ime: {method} via EditText", method = if show { "showIme" } else { "hideIme" });
+        log::debug!(
+            "egui-android ime: {method} via EditText",
+            method = if show { "showIme" } else { "hideIme" }
+        );
+    }
+    ok
+}
+
+/// Keep the hidden EditText focused/visible without requesting another IME show animation.
+pub fn bind_ime() -> bool {
+    crate::host::with_native_activity(|env, activity| {
+        if !is_egui_activity(env, activity)? {
+            return Ok(false);
+        }
+        env.call_method(activity, "bindIme", "()V", &[])?;
+        Ok(true)
+    })
+    .unwrap_or(false)
+}
+
+/// Re-show the soft keyboard on the EditText, bypassing the rising-edge throttle.
+pub fn show_ime_force() -> bool {
+    let ok = crate::host::with_native_activity(|env, activity| {
+        if !is_egui_activity(env, activity)? {
+            return Ok(false);
+        }
+        env.call_method(activity, "showImeForce", "()V", &[])?;
+        Ok(true)
+    })
+    .unwrap_or(false);
+    if ok {
+        log::debug!("egui-android ime: showImeForce via EditText");
     }
     ok
 }
@@ -284,6 +315,10 @@ fn key(k: egui::Key) -> egui::Event {
 }
 
 /// Sync focused `TextEdit` undoer text + cursor into the hidden EditText.
+///
+/// Non-collapsed egui selections are mirrored as a caret at the selection end. Pushing a full
+/// range into the selectable EditText puts Android into selection mode, which dismisses the
+/// keyboard (Select All). Gboard trackpad still updates egui via `onSelectionChanged`.
 pub fn sync_focused_text_edit(ctx: &egui::Context, focus: Option<egui::Id>) {
     let Some(id) = focus else { return };
     let Some(state) = egui::text_edit::TextEditState::load(ctx, id) else {
@@ -291,5 +326,6 @@ pub fn sync_focused_text_edit(ctx: &egui::Context, focus: Option<egui::Id>) {
     };
     let text = probe_undoer_text(&state).unwrap_or_default();
     let (start, end) = selection_chars(&state);
-    sync_to_ime(&text, start, end);
+    let caret = if start == end { start } else { end };
+    sync_to_ime(&text, caret, caret);
 }

@@ -24,8 +24,13 @@ pub fn build(
     apps: &AppSet,
     schemas: &SchemaSet,
 ) -> (Workflow, WorkflowNodeId, Report) {
-    let (g, mut ctx) = build_base(p, input_image);
-    let report = crate::apps::apply(&g, &mut ctx, &p.apps, apps, schemas, p);
+    // Enabled steps may adjust the Create settings (hi-res fix renders the base pass small and
+    // scales it up). Resolve that layer ONCE here so the base graph and every `$param:` inside an
+    // app read the same numbers the Create tab is showing.
+    let (p, notes) = crate::apps::effective_params(p, &p.apps, apps, Some(schemas));
+    let (g, mut ctx) = build_base(&p, input_image);
+    let mut report = crate::apps::apply(&g, &mut ctx, &p.apps, apps, schemas, &p);
+    report.params = notes;
     let out = g.add(SaveImage::new(ctx.image, "comfyui_android"));
     (g.into_workflow(), out, report)
 }
@@ -147,6 +152,31 @@ mod tests {
         assert_eq!(ids.len(), n, "duplicate node ids");
         // No holes: the dynamic nodes continued the typed allocator.
         assert_eq!(ids.last().unwrap() - ids[0] + 1, n as u32);
+    }
+
+    /// "Open as graph" builds with a placeholder filename rather than no input, because the tab
+    /// it produces can itself be queued — an EmptyLatentImage there is a silent txt2img.
+    #[test]
+    fn img2img_with_a_placeholder_name_still_has_the_img2img_shape() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = params();
+        p.mode = Mode::Img2Img;
+        p.denoise = 0.6;
+
+        let (wf, out, _) = build(&p, Some(crate::engine::INPUT_IMAGE_NAME.into()), &apps, &schemas);
+        let (dec, _) = wf.0[&out].inputs["images"].as_slot().unwrap();
+        let (ks, _) = wf.0[&dec].inputs["samples"].as_slot().unwrap();
+        let (latent, _) = wf.0[&ks].inputs["latent_image"].as_slot().unwrap();
+        assert_eq!(wf.0[&latent].class_type, "VAEEncode", "img2img collapsed to txt2img");
+        let (load, _) = wf.0[&latent].inputs["pixels"].as_slot().unwrap();
+        assert_eq!(wf.0[&load].class_type, "LoadImage");
+
+        // Without an input it is a txt2img graph, which is what made the preview misleading.
+        let (wf2, out2, _) = build(&p, None, &apps, &schemas);
+        let (dec2, _) = wf2.0[&out2].inputs["images"].as_slot().unwrap();
+        let (ks2, _) = wf2.0[&dec2].inputs["samples"].as_slot().unwrap();
+        let (lat2, _) = wf2.0[&ks2].inputs["latent_image"].as_slot().unwrap();
+        assert_eq!(wf2.0[&lat2].class_type, "EmptyLatentImage");
     }
 
     #[test]

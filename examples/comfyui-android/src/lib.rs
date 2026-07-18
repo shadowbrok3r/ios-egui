@@ -14,6 +14,7 @@ mod apps;
 mod engine;
 mod gallery;
 mod graphview;
+mod history;
 mod icons;
 mod logger;
 mod schema;

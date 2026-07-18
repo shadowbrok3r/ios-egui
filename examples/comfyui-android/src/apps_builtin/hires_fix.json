@@ -9,6 +9,10 @@
     { "class": "KSampler", "pack": "core" },
     { "class": "VAEDecode", "pack": "core" }
   ],
+  "overrides": [
+    { "param": "width", "op": { "DivideByKnob": "scale_by" }, "round_to": 64, "min": 384.0 },
+    { "param": "height", "op": { "DivideByKnob": "scale_by" }, "round_to": 64, "min": 384.0 }
+  ],
   "knobs": [
     {
       "id": "scale_by",

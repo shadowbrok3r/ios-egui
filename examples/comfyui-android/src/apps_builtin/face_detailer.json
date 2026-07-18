@@ -30,6 +30,21 @@
       "tooltip": "How much each face is redrawn. Above ~0.6 it stops looking like the same person."
     },
     {
+      "id": "face_prompt",
+      "label": "Face prompt",
+      "ty": { "Text": { "multiline": false } },
+      "default": "",
+      "tooltip": "Describes the face only. Leave blank to reuse the main prompt — but a scene-heavy prompt pushes background detail into the face crop."
+    },
+    {
+      "id": "steps",
+      "label": "Steps",
+      "ty": { "Int": { "min": 1, "max": 100, "step": 1 } },
+      "default": 20,
+      "advanced": true,
+      "tooltip": "Spent per detected face, so this multiplies. Independent of the main Steps slider."
+    },
+    {
       "id": "guide_size",
       "label": "Detail size",
       "ty": { "Int": { "min": 256, "max": 1024, "step": 64 } },
@@ -76,7 +91,7 @@
         "bbox_detector": "$node:det:0",
         "sam_model_opt": "$node:sam:0",
         "seed": "$seed+1",
-        "steps": "$param:steps",
+        "steps": "$knob:steps",
         "cfg": "$param:cfg",
         "sampler_name": "$param:sampler",
         "scheduler": "$param:scheduler",
@@ -97,7 +112,7 @@
         "sam_mask_hint_threshold": 0.7,
         "sam_mask_hint_use_negative": "False",
         "drop_size": 10,
-        "wildcard": "",
+        "wildcard": "$knob:face_prompt",
         "cycle": 1
       }
     }

@@ -15,7 +15,7 @@ use rucomfyui::{WorkflowGraph, workflow::WorkflowMeta};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::schema::{InputKind, SchemaSet};
+use crate::schema::{InputKind, InputSchema, SchemaSet};
 use crate::types::{AppStep, Params};
 
 fn one() -> u32 {
@@ -44,6 +44,10 @@ pub struct AppDef {
     pub requires: Vec<Require>,
     #[serde(default)]
     pub knobs: Vec<Knob>,
+    /// Create-tab settings this app adjusts while it is enabled. Applied as a layer over the
+    /// stored [`Params`] rather than written into them, so removing the step reverts by itself.
+    #[serde(default)]
+    pub overrides: Vec<Override>,
     pub nodes: Vec<NodeTpl>,
     /// Local node and slot producing the IMAGE handed to the next step.
     pub output: LocalRef,
@@ -79,6 +83,42 @@ pub struct LocalRef {
     pub node: String,
     #[serde(default)]
     pub slot: u32,
+}
+
+/// One Create-tab setting an app adjusts while enabled. Hi-res fix renders the base pass small
+/// and scales it up, so the size you ask for is the FINAL size and the base has to shrink — the
+/// user should not have to remember that.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Override {
+    /// Same names `$param:` uses: "width", "height", "steps", "cfg", "denoise", "batch_size".
+    pub param: String,
+    pub op: OverrideOp,
+    /// Snap the result down to a multiple of this. Latent sizes want 64.
+    #[serde(default)]
+    pub round_to: u32,
+    /// Floor, applied after rounding, so a big scale cannot collapse the base to nothing.
+    #[serde(default)]
+    pub min: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum OverrideOp {
+    Set(f64),
+    ClampMax(f64),
+    ClampMin(f64),
+    /// Divide by a knob's current value — the hi-res case: base = final / scale.
+    DivideByKnob(String),
+    MultiplyByKnob(String),
+}
+
+/// What an override did, for the Create tab to show next to the control it changed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamNote {
+    pub param: String,
+    pub from: f64,
+    pub to: f64,
+    /// The app that asked for it.
+    pub app: String,
 }
 
 /// A parameter promoted out of the fragment into the Create-tab card.
@@ -209,6 +249,15 @@ impl AppDef {
             }
             defined.push(&n.id);
         }
+        // Knob values live in one map keyed by id and `knob()` returns the first match, so a
+        // duplicate id would give two cards one shared slot, clamped to the first one's range.
+        let mut ids: Vec<&str> = Vec::new();
+        for k in &self.knobs {
+            if ids.contains(&k.id.as_str()) {
+                return Err(format!("duplicate knob id '{}'", k.id));
+            }
+            ids.push(&k.id);
+        }
         for k in &self.knobs {
             let bad = match &k.ty {
                 KnobTy::Int { min, max, .. } => min > max,
@@ -310,6 +359,16 @@ fn unescape(v: &Value) -> Option<Value> {
     s.strip_prefix("$$").map(|rest| Value::String(format!("${rest}")))
 }
 
+/// The inverse: make `v` survive a later [`as_ref`] as the literal it is. A prompt reading
+/// "$100 bill" is not a reference, and without this it would either fail to parse as one or —
+/// worse, for text like "$model" — resolve into a real wire.
+pub fn escape_literal(v: &Value) -> Value {
+    match v.as_str() {
+        Some(s) if s.starts_with('$') => Value::String(format!("${s}")),
+        _ => v.clone(),
+    }
+}
+
 impl Ref {
     /// Parse the text after the leading `$`.
     fn parse(body: &str) -> Result<Ref, String> {
@@ -393,6 +452,8 @@ pub struct NodeBuilder<'a> {
     dropped: Vec<String>,
     /// (input, wanted, used) where a COMBO value was replaced by an installed one.
     substituted: Vec<(String, String, String)>,
+    /// Inputs with no sendable value at all. Any entry here fails the step.
+    impossible: Vec<String>,
 }
 
 impl<'a> NodeBuilder<'a> {
@@ -403,6 +464,7 @@ impl<'a> NodeBuilder<'a> {
             inputs: HashMap::new(),
             dropped: Vec::new(),
             substituted: Vec::new(),
+            impossible: Vec::new(),
         }
     }
 
@@ -413,21 +475,45 @@ impl<'a> NodeBuilder<'a> {
             return;
         };
         // A COMBO value this server does not offer fails /prompt validation for the WHOLE graph,
-        // which would lose the base image too. Substitute an installed option and report it.
-        if let InputKind::Enum { options, .. } = kind
-            && !options.is_empty()
-            && let Some(want) = v.as_str()
-            && !options.iter().any(|o| o == want)
-        {
-            let used = options[0].clone();
-            self.substituted.push((name.to_string(), want.to_string(), used.clone()));
-            self.inputs.insert(name.to_string(), WorkflowInput::String(used));
-            return;
+        // which would lose the base image too. Substitute an installed option and report it — or,
+        // when the server offers none at all, refuse to emit the node rather than send a certain
+        // rejection. `status` gates this ahead of the build; this is the backstop.
+        match combo_fit(self.set, &self.class, name, v, None) {
+            ComboFit::AsIs => {}
+            ComboFit::Substitute(used) => {
+                let want = combo_text(v).unwrap_or_default();
+                self.substituted.push((name.to_string(), want, used.clone()));
+                self.inputs.insert(name.to_string(), WorkflowInput::String(used));
+                return;
+            }
+            ComboFit::Impossible => {
+                self.impossible.push(format!("{}.{name}: none installed", self.class));
+                return;
+            }
         }
         if let Some(w) = coerce(v, kind) {
             self.inputs.insert(name.to_string(), w);
         } else {
             self.dropped.push(name.to_string());
+        }
+    }
+
+    /// Supply any input this server requires that the fragment never mentioned, using the
+    /// schema's own default. A custom node that GAINS a required widget keeps working; one that
+    /// gains a required socket cannot be fixed here and is reported instead.
+    fn backfill_required(&mut self) {
+        let Some(schema) = self.set.nodes.get(&self.class) else { return };
+        let missing: Vec<(String, Option<Value>)> = schema
+            .inputs
+            .iter()
+            .filter(|i| i.required && !self.inputs.contains_key(&i.name))
+            .map(|i| (i.name.clone(), schema_default(&i.kind)))
+            .collect();
+        for (name, default) in missing {
+            match default {
+                Some(v) => self.set_value(&name, &v),
+                None => self.impossible.push(format!("{}.{name} has nothing to feed it", self.class)),
+            }
         }
     }
 
@@ -440,13 +526,24 @@ impl<'a> NodeBuilder<'a> {
         self.inputs.insert(name.to_string(), w);
     }
 
-    fn add(self, g: &WorkflowGraph) -> (WorkflowNodeId, Vec<String>, Vec<(String, String, String)>) {
+    /// Emit the node, or fail the whole step if any input has no sendable value. Nodes the step
+    /// already emitted are left behind as orphans: ComfyUI validates only what an output node
+    /// reaches, so an unreferenced node cannot fail the prompt.
+    #[allow(clippy::type_complexity)]
+    fn add(
+        mut self,
+        g: &WorkflowGraph,
+    ) -> Result<(WorkflowNodeId, Vec<String>, Vec<(String, String, String)>), String> {
+        self.backfill_required();
+        if !self.impossible.is_empty() {
+            return Err(self.impossible.join("; "));
+        }
         let id = g.add_dynamic(WorkflowNode {
             inputs: self.inputs,
             class_type: self.class.clone(),
             meta: Some(WorkflowMeta::new(self.class)),
         });
-        (id, self.dropped, self.substituted)
+        Ok((id, self.dropped, self.substituted))
     }
 }
 
@@ -500,6 +597,11 @@ pub enum Status {
     Degraded(Vec<String>),
     /// Class present but a knob's target input is gone: hide that control, drop the target.
     Mismatch(Vec<String>),
+    /// Every class is installed, but some input can never be given a valid value here — an empty
+    /// dropdown, a slot the source node does not have, a required socket nothing feeds. ComfyUI
+    /// rejects the WHOLE prompt over one bad input, which would lose the base image too, so the
+    /// step must be skipped rather than queued.
+    Unsatisfiable(Vec<String>),
     /// Required class absent from the catalog.
     Missing(Vec<Require>),
     /// Required class present in `/object_info` but its schema failed to parse.
@@ -510,7 +612,7 @@ pub enum Status {
 
 impl Status {
     pub fn runnable(&self) -> bool {
-        !matches!(self, Status::Missing(_) | Status::Broken(_))
+        !matches!(self, Status::Missing(_) | Status::Broken(_) | Status::Unsatisfiable(_))
     }
 
     /// Short chip text for the picker and card headers.
@@ -519,6 +621,7 @@ impl Status {
             Status::Ready => String::new(),
             Status::Degraded(w) => format!("check: {}", w.join(", ")),
             Status::Mismatch(w) => format!("{} option(s) unsupported", w.len()),
+            Status::Unsatisfiable(w) => format!("can't run here: {}", w.join(", ")),
             Status::Missing(r) => {
                 let packs: Vec<&str> = r.iter().map(|x| x.pack.as_str()).collect();
                 format!("needs {}", packs.join(", "))
@@ -544,9 +647,10 @@ pub fn status(def: &AppDef, step: Option<&AppStep>, schemas: Option<&SchemaSet>)
             None => missing.push(r.clone()),
         }
     }
-    // A class the fragment emits but never declared still has to exist.
+    // A class the fragment emits but never declared still has to exist. A gated node whose gate
+    // is unmet is dropped rather than missing — but one whose gate PASSED still needs its class.
     for n in &def.nodes {
-        if n.needs.is_some() || set.has_node(&n.class) {
+        if n.needs.as_deref().is_some_and(|r| !set.has_node(r)) || set.has_node(&n.class) {
             continue;
         }
         // Only a NON-optional require covers this: an optional one would let a missing class
@@ -572,6 +676,8 @@ pub fn status(def: &AppDef, step: Option<&AppStep>, schemas: Option<&SchemaSet>)
 
     let mut mismatch = Vec::new();
     let mut degraded = Vec::new();
+    let mut unsat = Vec::new();
+
     for k in &def.knobs {
         // A knob whose target input vanished can no longer be rendered or sent.
         if let Some(target) = knob_target(def, &k.id)
@@ -581,19 +687,104 @@ pub fn status(def: &AppDef, step: Option<&AppStep>, schemas: Option<&SchemaSet>)
             continue;
         }
         if let KnobTy::Enum { class, input, prefix } = &k.ty {
-            let opts = enum_options(set, class, input, prefix.as_deref());
-            let current = step
-                .and_then(|s| s.values.get(&k.id))
-                .unwrap_or(&k.default)
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            if opts.is_empty() {
-                degraded.push(format!("{}: none installed", k.label));
-            } else if !current.is_empty() && !opts.contains(&current) {
-                degraded.push(format!("{}: '{current}' not installed", k.label));
+            let current = step.and_then(|s| s.values.get(&k.id)).unwrap_or(&k.default);
+            match combo_fit(set, class, input, current, prefix.as_deref()) {
+                ComboFit::AsIs => {}
+                ComboFit::Substitute(used) => degraded.push(format!(
+                    "{}: '{}' not installed, will use '{used}'",
+                    k.label,
+                    combo_text(current).unwrap_or_default()
+                )),
+                // No options at all: nothing would pass validation, so do not queue the step.
+                ComboFit::Impossible => unsat.push(format!("{}: none installed", k.label)),
             }
         }
+    }
+
+    // Everything else the fragment will emit: plain literals, and `$node:` slots. A knob is
+    // covered above; a boundary ref (`$image`, `$param:…`) is always supplied by the base graph.
+    for n in &def.nodes {
+        if n.needs.as_deref().is_some_and(|r| !set.has_node(r)) {
+            continue;
+        }
+        let mut provided: Vec<&str> = Vec::new();
+        for (name, raw) in &n.inputs {
+            provided.push(name);
+            // An input the server declares a COMBO but offers nothing for cannot be satisfied by
+            // ANY value, whatever supplies it — a literal, a knob, `$param:`, or a back-filled
+            // default. Checking the input rather than the value keeps this verdict identical to
+            // the one `NodeBuilder` reaches at build time.
+            let knob_enum = matches!(as_ref(raw), Some(Ok(Ref::Knob(id)))
+                if matches!(def.knob(&id), Some(Knob { ty: KnobTy::Enum { .. }, .. })));
+            if !knob_enum
+                && let Some(InputSchema { kind: InputKind::Enum { options, .. }, .. }) =
+                    set.input(&n.class, name)
+                && options.is_empty()
+            {
+                // The knob loop above already reports its own, under the knob's label.
+                unsat.push(format!("{}.{name}: none installed", n.class));
+                continue;
+            }
+            match as_ref(raw) {
+                // A literal aimed at a COMBO gets the same treatment a knob does. Note the value
+                // may be a bool or a number — `coerce` stringifies those onto an Enum input, so
+                // they have to be checked too, not just strings.
+                None => match combo_fit(set, &n.class, name, raw, None) {
+                    ComboFit::AsIs => {}
+                    ComboFit::Substitute(used) => degraded.push(format!(
+                        "{}.{name}: '{}' not installed, will use '{used}'",
+                        n.class,
+                        combo_text(raw).unwrap_or_default()
+                    )),
+                    ComboFit::Impossible => {
+                        unsat.push(format!("{}.{name}: none installed", n.class))
+                    }
+                },
+                // A slot the source node does not have is a link ComfyUI rejects outright.
+                Some(Ok(Ref::Node(lr))) => {
+                    // A ref into a gated node that got dropped leaves this input unset instead.
+                    let dropped = def
+                        .nodes
+                        .iter()
+                        .find(|s| s.id == lr.node)
+                        .and_then(|s| s.needs.as_deref())
+                        .is_some_and(|r| !set.has_node(r));
+                    if dropped {
+                        provided.pop();
+                    } else if let Some(src) = def.nodes.iter().find(|s| s.id == lr.node)
+                        && let Some(outs) = set.nodes.get(&src.class).map(|s| s.outputs.len())
+                        && lr.slot as usize >= outs
+                    {
+                        unsat.push(format!(
+                            "{}.{name}: {} has no output {}",
+                            n.class, src.class, lr.slot
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // An input this server requires but the fragment never supplies. A widget can be
+        // back-filled from the schema's own default at build time; a socket cannot be invented,
+        // so the step would be rejected wholesale and must not be queued.
+        let Some(schema) = set.nodes.get(&n.class) else { continue };
+        for i in schema.inputs.iter().filter(|i| i.required) {
+            if !provided.contains(&i.name.as_str()) && schema_default(&i.kind).is_none() {
+                unsat.push(format!("{}.{} has nothing to feed it", n.class, i.name));
+            }
+        }
+    }
+
+    // The handle the next step (or SaveImage) reads has to exist as well.
+    if let Some(src) = def.nodes.iter().find(|n| n.id == def.output.node)
+        && let Some(outs) = set.nodes.get(&src.class).map(|s| s.outputs.len())
+        && def.output.slot as usize >= outs
+    {
+        unsat.push(format!("{} has no output {}", src.class, def.output.slot));
+    }
+
+    if !unsat.is_empty() {
+        return Status::Unsatisfiable(unsat);
     }
     if !mismatch.is_empty() {
         return Status::Mismatch(mismatch);
@@ -621,7 +812,10 @@ fn knob_target(def: &AppDef, knob: &str) -> Option<(String, String)> {
     None
 }
 
-/// Enum options for a knob, filtered by its prefix when it has one.
+/// Enum options for a knob, filtered by its prefix when it has one. A prefix matching nothing
+/// yields an EMPTY list, not the unfiltered one: a `bbox/` socket handed a `segm/` model passes
+/// `/prompt` validation and then dies mid-execution with no image at all, so the step has to be
+/// reported unrunnable rather than quietly mis-wired.
 pub fn enum_options(
     set: &SchemaSet,
     class: &str,
@@ -629,9 +823,72 @@ pub fn enum_options(
     prefix: Option<&str>,
 ) -> Vec<String> {
     let all = set.enum_options(class, input);
-    let Some(p) = prefix else { return all };
-    let filtered: Vec<String> = all.iter().filter(|o| o.starts_with(p)).cloned().collect();
-    if filtered.is_empty() { all } else { filtered }
+    match prefix {
+        Some(p) => all.into_iter().filter(|o| o.starts_with(p)).collect(),
+        None => all,
+    }
+}
+
+/// How a value destined for `class.input` fares against the connected catalog.
+#[derive(Debug, PartialEq)]
+pub enum ComboFit {
+    /// Send it unchanged — it is installed, or the input is not a COMBO at all.
+    AsIs,
+    /// Not installed; this installed option stands in for it.
+    Substitute(String),
+    /// The server declares this a COMBO with no options whatsoever (an empty model folder).
+    /// Nothing valid can be sent, and a bad COMBO fails validation for the WHOLE prompt.
+    Impossible,
+}
+
+/// The string `coerce` would send for `v` on an Enum input, so the check agrees with the build.
+fn combo_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether `want` can be sent to `class.input`. Shared by [`status`] and the build so the card's
+/// verdict and the emitted prompt can never disagree.
+pub fn combo_fit(
+    set: &SchemaSet,
+    class: &str,
+    input: &str,
+    want: &Value,
+    prefix: Option<&str>,
+) -> ComboFit {
+    let Some(InputSchema { kind: InputKind::Enum { .. }, .. }) = set.input(class, input) else {
+        return ComboFit::AsIs;
+    };
+    let opts = enum_options(set, class, input, prefix);
+    let Some(first) = opts.first() else { return ComboFit::Impossible };
+    match combo_text(want) {
+        // A shape `coerce` cannot send anyway; it drops the input and reports that instead.
+        None => ComboFit::AsIs,
+        Some(w) if opts.contains(&w) => ComboFit::AsIs,
+        Some(_) => ComboFit::Substitute(first.clone()),
+    }
+}
+
+/// The value the server would use for an input the fragment leaves out. `None` for a socket,
+/// which cannot be fabricated.
+fn schema_default(kind: &InputKind) -> Option<Value> {
+    Some(match kind {
+        // A declared default is no use when the server offers no options: sending it back is the
+        // same certain rejection as any other value, so treat it as unfillable.
+        InputKind::Enum { options, default } if !options.is_empty() => Value::from(
+            default.clone().or_else(|| options.first().cloned())?,
+        ),
+        InputKind::Enum { .. } => return None,
+        InputKind::Int { default, .. } => Value::from(*default),
+        InputKind::Float { default, .. } => Value::from(*default),
+        InputKind::Bool { default } => Value::from(*default),
+        InputKind::Text { default, .. } => Value::from(default.clone()),
+        InputKind::Connection { .. } | InputKind::Opaque => return None,
+    })
 }
 
 // ── Composition ──────────────────────────────────────────────────────────────
@@ -647,6 +904,8 @@ pub struct Report {
     pub substituted: Vec<(String, String, String)>,
     /// Chain-ordering problems that still produce a valid prompt.
     pub warnings: Vec<String>,
+    /// Create settings an enabled step adjusted for this run.
+    pub params: Vec<ParamNote>,
 }
 
 impl Report {
@@ -682,6 +941,91 @@ impl Report {
     }
 }
 
+/// Read one of the overridable [`Params`] fields as an f64.
+fn param_get(p: &Params, name: &str) -> Option<f64> {
+    Some(match name {
+        "width" => p.width as f64,
+        "height" => p.height as f64,
+        "steps" => p.steps as f64,
+        "cfg" => p.cfg as f64,
+        "denoise" => p.denoise as f64,
+        "batch_size" => p.batch_size as f64,
+        _ => return None,
+    })
+}
+
+/// Write one back, clamped into the field's own range.
+fn param_set(p: &mut Params, name: &str, v: f64) {
+    let u = |v: f64, lo: u32| v.max(lo as f64).min(u32::MAX as f64) as u32;
+    match name {
+        "width" => p.width = u(v, 64),
+        "height" => p.height = u(v, 64),
+        "steps" => p.steps = u(v, 1),
+        "cfg" => p.cfg = v.clamp(0.0, 100.0) as f32,
+        "denoise" => p.denoise = v.clamp(0.0, 1.0) as f32,
+        "batch_size" => p.batch_size = u(v, 1),
+        _ => {}
+    }
+}
+
+/// The params a generation actually runs with: the stored ones plus every enabled, runnable
+/// step's overrides, in chain order. This is a pure layer — nothing is written back into the
+/// user's settings, so removing a step reverts on its own and two apps touching one field cannot
+/// leave a stale value behind. Steps that would be skipped do not get a say.
+pub fn effective_params(
+    p: &Params,
+    steps: &[AppStep],
+    set: &AppSet,
+    schemas: Option<&SchemaSet>,
+) -> (Params, Vec<ParamNote>) {
+    let mut out = p.clone();
+    let mut notes = Vec::new();
+    for step in steps.iter().filter(|s| s.enabled) {
+        let Some(def) = set.by_id.get(&step.app) else { continue };
+        if schemas.is_some_and(|s| !status(def, Some(step), Some(s)).runnable()) {
+            continue;
+        }
+        for ov in &def.overrides {
+            let Some(before) = param_get(&out, &ov.param) else { continue };
+            let knob = |id: &str| {
+                step.value(def, id).and_then(|v| v.as_f64()).filter(|f| *f != 0.0)
+            };
+            let mut v = match &ov.op {
+                OverrideOp::Set(x) => *x,
+                OverrideOp::ClampMax(x) => before.min(*x),
+                OverrideOp::ClampMin(x) => before.max(*x),
+                // A knob that is missing or zero means there is nothing sane to scale by.
+                OverrideOp::DivideByKnob(id) => match knob(id) {
+                    Some(k) => before / k,
+                    None => continue,
+                },
+                OverrideOp::MultiplyByKnob(id) => match knob(id) {
+                    Some(k) => before * k,
+                    None => continue,
+                },
+            };
+            if ov.round_to > 0 {
+                let r = ov.round_to as f64;
+                v = (v / r).round() * r;
+            }
+            if let Some(m) = ov.min {
+                v = v.max(m);
+            }
+            param_set(&mut out, &ov.param, v);
+            let after = param_get(&out, &ov.param).unwrap_or(v);
+            if after != before {
+                notes.push(ParamNote {
+                    param: ov.param.clone(),
+                    from: before,
+                    to: after,
+                    app: def.name.clone(),
+                });
+            }
+        }
+    }
+    (out, notes)
+}
+
 /// Append each enabled step's fragment to `g`, rebinding `ctx.image` as the chain advances.
 /// Unrunnable steps are skipped and recorded rather than failing the generation.
 pub fn apply(
@@ -694,6 +1038,7 @@ pub fn apply(
 ) -> Report {
     let mut report = Report::default();
     let mut image_rebound = false;
+    let mut rerendered = false;
     for step in steps.iter().filter(|s| s.enabled) {
         let Some(def) = set.by_id.get(&step.app) else {
             report.skipped.push((step.app.clone(), "app not installed".into()));
@@ -707,11 +1052,23 @@ pub fn apply(
         // A step that re-renders from the base latent ignores whatever the image chain has
         // built so far, so anything above it is wasted work. Say so rather than silently
         // discarding it.
-        if image_rebound && reads_latent(def) {
-            report.warnings.push(format!(
-                "{} re-renders from the base image — move it above the other steps",
-                def.name
-            ));
+        if reads_latent(def) {
+            // Only the base latent is ever published, so a second re-render would start from the
+            // same place as the first and strand its whole sampler pass — real GPU time spent on
+            // nodes nothing reads. Skip it instead of queueing it.
+            if rerendered {
+                report.skipped.push((
+                    def.name.clone(),
+                    "only one re-render step can run — it would restart from the base image".into(),
+                ));
+                continue;
+            }
+            if image_rebound {
+                report.warnings.push(format!(
+                    "{} re-renders from the base image — move it above the other steps",
+                    def.name
+                ));
+            }
         }
         match apply_one(g, ctx, def, step, schemas, p) {
             Ok(out) => {
@@ -719,6 +1076,9 @@ pub fn apply(
                 report.dropped.extend(out.dropped);
                 report.substituted.extend(out.substituted);
                 image_rebound = true;
+                // Only a step that actually built consumes the single re-render slot; one that
+                // failed emitted nothing, so a later re-render is still the first.
+                rerendered |= reads_latent(def);
             }
             Err(e) => report.skipped.push((def.name.clone(), e)),
         }
@@ -783,7 +1143,7 @@ fn apply_one(
                 None => nb.set_value(name, &unescape(raw).unwrap_or_else(|| raw.clone())),
             }
         }
-        let (id, drop, subs) = nb.add(g);
+        let (id, drop, subs) = nb.add(g)?;
         out.dropped.extend(drop.into_iter().map(|i| (tpl.class.clone(), i)));
         out.substituted.extend(
             subs.into_iter().map(|(i, w, u)| (format!("{}.{i}", tpl.class), w, u)),
@@ -818,18 +1178,16 @@ fn knob_value(
     let Some(Knob { ty: KnobTy::Enum { class, input, prefix }, .. }) = def.knob(id) else {
         return Some(v);
     };
-    let want = v.as_str().unwrap_or_default();
-    let opts = enum_options(schemas, class, input, prefix.as_deref());
-    if opts.iter().any(|o| o == want) {
-        return Some(v);
-    }
-    // Empty options means the server does not describe this as a COMBO; send it verbatim.
-    match opts.first() {
-        Some(used) => {
-            subs.push((want.to_string(), used.clone()));
-            Some(Value::from(used.clone()))
+    match combo_fit(schemas, class, input, &v, prefix.as_deref()) {
+        ComboFit::AsIs => Some(v),
+        ComboFit::Substitute(used) => {
+            subs.push((combo_text(&v).unwrap_or_default(), used.clone()));
+            Some(Value::from(used))
         }
-        None => Some(v),
+        // Nothing installed to choose from. Returning None leaves the input unset, which
+        // `NodeBuilder::backfill_required` then reports as unsendable and fails the step —
+        // better than a value certain to have the whole prompt rejected.
+        ComboFit::Impossible => None,
     }
 }
 
@@ -1120,9 +1478,15 @@ mod tests {
 
         let wf = g.borrow();
         let fd = &wf.0[&c.image.0.node_id];
-        assert_eq!(fd.inputs["steps"], WorkflowInput::I64(25));
+        // Steps are the app's OWN knob, deliberately not the main slider: they are spent per
+        // detected face, so inheriting a high base step count multiplies the cost silently.
+        assert_eq!(fd.inputs["steps"], WorkflowInput::I64(20));
+        assert_ne!(fd.inputs["steps"], WorkflowInput::I64(params().steps as i64));
+        // cfg, sampler, scheduler and the seed offset DO come from the main tab.
         assert_eq!(fd.inputs["cfg"], WorkflowInput::F64(6.5));
         assert_eq!(fd.inputs["seed"], WorkflowInput::I64(43));
+        // Blank by default, so the face pass reuses the main prompt exactly as before.
+        assert_eq!(fd.inputs["wildcard"], WorkflowInput::String(String::new()));
         // MODEL/CLIP/VAE and both CONDITIONING handles come from the base graph.
         for socket in ["model", "clip", "vae", "positive", "negative"] {
             assert!(fd.inputs[socket].as_slot().is_some(), "{socket} not wired");
@@ -1138,8 +1502,8 @@ mod tests {
         let steps = vec![AppStep::new(set.get("face.detailer").unwrap())];
         apply(&g, &mut c, &steps, &set, &schemas, &params());
         let json = serde_json::to_string(&*g.borrow()).unwrap();
-        assert!(json.contains("\"steps\":25"), "steps not an integer: {json}");
-        assert!(!json.contains("\"steps\":25.0"));
+        assert!(json.contains("\"steps\":20"), "steps not an integer: {json}");
+        assert!(!json.contains("\"steps\":20.0"));
         // guide_size is declared FLOAT by Impact Pack even though the knob is an int slider,
         // so the schema wins over the knob's type.
         let fd = &g.borrow().0[&c.image.0.node_id];
@@ -1504,5 +1868,422 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Unsatisfiable steps ──────────────────────────────────────────────────
+    // ComfyUI rejects the ENTIRE prompt over one bad input, so a step that cannot be given a
+    // valid value has to be caught here and skipped. Queuing it forfeits the base image too.
+
+    /// A schema where `class.input` is a COMBO the server offers nothing for — an empty model
+    /// folder, which is what a fresh install looks like.
+    fn with_empty_combo(class: &str, input: &str) -> SchemaSet {
+        let mut s = schemas();
+        if let Some(node) = s.nodes.get_mut(class)
+            && let Some(i) = node.inputs.iter_mut().find(|i| i.name == input)
+        {
+            i.kind = InputKind::Enum { options: Vec::new(), default: None };
+        }
+        s
+    }
+
+    #[test]
+    fn an_empty_dropdown_makes_the_step_unrunnable_rather_than_substituting() {
+        let set = AppSet::builtin();
+        let def = set.get("upscale.model").unwrap();
+        let schemas = with_empty_combo("UpscaleModelLoader", "model_name");
+
+        let st = status(def, Some(&AppStep::new(def)), Some(&schemas));
+        assert!(matches!(st, Status::Unsatisfiable(_)), "got {st:?}");
+        assert!(!st.runnable(), "an empty combo must not be queued");
+    }
+
+    #[test]
+    fn an_unrunnable_step_is_skipped_loudly_and_the_base_image_survives() {
+        let set = AppSet::builtin();
+        let schemas = with_empty_combo("UpscaleModelLoader", "model_name");
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let before = c.image;
+
+        let steps = vec![AppStep::new(set.get("upscale.model").unwrap())];
+        let report = apply(&g, &mut c, &steps, &set, &schemas, &params());
+
+        assert!(report.applied.is_empty());
+        assert_eq!(report.skipped.len(), 1, "the skip must be reported: {report:?}");
+        assert_eq!(
+            c.image.0.node_id, before.0.node_id,
+            "the running image handle must be left on the base graph"
+        );
+    }
+
+    /// The whole point of the seam: a broken enhance step costs the enhancement, not the picture.
+    #[test]
+    fn the_save_still_hangs_off_the_decode_when_every_step_is_unrunnable() {
+        let set = AppSet::builtin();
+        let schemas = with_empty_combo("UpscaleModelLoader", "model_name");
+        let mut p = crate::types::Params {
+            checkpoint: "sd.safetensors".into(),
+            ..Default::default()
+        };
+        p.apps = vec![AppStep::new(set.get("upscale.model").unwrap())];
+
+        let (wf, out, report) = crate::workflow::build(&p, None, &set, &schemas);
+        assert_eq!(report.applied.len(), 0);
+        assert_eq!(report.skipped.len(), 1);
+        let (src, _) = wf.0[&out].inputs["images"].as_slot().unwrap();
+        assert_eq!(wf.0[&src].class_type, "VAEDecode", "the base image was lost");
+    }
+
+    #[test]
+    fn a_prefix_matching_nothing_does_not_fall_back_to_the_whole_list() {
+        // Impact Pack installed, but only segm/ detectors on disk. Feeding a segm/ model to a
+        // BBOX_DETECTOR socket passes /prompt and then dies mid-run with no image at all.
+        let set = AppSet::builtin();
+        let mut schemas = schemas();
+        schemas.nodes.remove("UltralyticsDetectorProvider");
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"UltralyticsDetectorProvider": {"input": {"required": {"model_name": [["segm/person_yolov8m.pt"]]}}, "output": ["BBOX_DETECTOR", "SEGM_DETECTOR"]}}"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        let def = set.get("face.detailer").unwrap();
+        let st = status(def, Some(&AppStep::new(def)), Some(&schemas));
+        assert!(matches!(st, Status::Unsatisfiable(_)), "got {st:?}");
+    }
+
+    #[test]
+    fn a_non_string_literal_on_a_combo_is_checked_too() {
+        // `coerce` stringifies bools and numbers onto an Enum input, so the installed-option
+        // check has to see them — a guard keyed on `as_str` lets them through unvalidated.
+        let mut schemas = schemas();
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"Widget": {"input": {"required": {"image": ["IMAGE"], "mode": [["1", "2"]]}}, "output": ["IMAGE"]}}"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        let fit = combo_fit(&schemas, "Widget", "mode", &Value::from(7), None);
+        assert_eq!(fit, ComboFit::Substitute("1".into()), "a numeric literal skipped the check");
+        assert_eq!(combo_fit(&schemas, "Widget", "mode", &Value::from(2), None), ComboFit::AsIs);
+    }
+
+    #[test]
+    fn a_slot_the_source_node_does_not_have_is_caught_before_queueing() {
+        let mut set = AppSet::default();
+        // ImageSharpen has exactly one output, so `:3` can never resolve.
+        set.insert_json(
+            "bad_slot.json",
+            r#"{"id":"bad.slot","name":"Bad slot","group":"Finish","version":1,
+                "nodes":[{"id":"a","class":"ImageSharpen","inputs":{"image":"$image"}},
+                         {"id":"b","class":"ImageSharpen","inputs":{"image":"$node:a:3"}}],
+                "output":{"node":"b","slot":0}}"#,
+        );
+        assert!(set.bad.is_empty(), "{:?}", set.bad);
+
+        let def = set.get("bad.slot").unwrap();
+        let st = status(def, None, Some(&schemas()));
+        assert!(matches!(st, Status::Unsatisfiable(_)), "got {st:?}");
+    }
+
+    #[test]
+    fn an_output_slot_past_the_end_is_caught_before_queueing() {
+        let mut set = AppSet::default();
+        set.insert_json(
+            "bad_out.json",
+            r#"{"id":"bad.out","name":"Bad out","group":"Finish","version":1,
+                "nodes":[{"id":"a","class":"ImageSharpen","inputs":{"image":"$image"}}],
+                "output":{"node":"a","slot":5}}"#,
+        );
+        let def = set.get("bad.out").unwrap();
+        assert!(matches!(status(def, None, Some(&schemas())), Status::Unsatisfiable(_)));
+    }
+
+    #[test]
+    fn a_required_widget_the_fragment_omits_is_backfilled_from_the_schema() {
+        // A custom node that GAINS a required widget must keep working: NodeBuilder is otherwise
+        // purely subtractive, so the input would simply be absent and the prompt rejected.
+        let mut set = AppSet::default();
+        set.insert_json(
+            "thin.json",
+            r#"{"id":"thin","name":"Thin","group":"Finish","version":1,
+                "nodes":[{"id":"a","class":"ImageSharpen","inputs":{"image":"$image"}}],
+                "output":{"node":"a","slot":0}}"#,
+        );
+        let schemas = schemas();
+        let def = set.get("thin").unwrap();
+        assert_eq!(status(def, None, Some(&schemas)), Status::Ready);
+
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let steps = vec![AppStep::new(def)];
+        let report = apply(&g, &mut c, &steps, &set, &schemas, &params());
+        assert_eq!(report.applied, vec!["Thin"]);
+
+        let wf = g.borrow();
+        let node = wf.0.values().find(|n| n.class_type == "ImageSharpen").unwrap();
+        // sharpen_radius/sigma/alpha are required with defaults, and none were declared.
+        assert_eq!(node.inputs["sharpen_radius"], WorkflowInput::I64(1));
+        assert_eq!(node.inputs["alpha"], WorkflowInput::F64(1.0));
+    }
+
+    #[test]
+    fn a_second_re_render_step_is_skipped_instead_of_stranding_a_sampler_pass() {
+        // Only the base latent is published, so two Hi-res steps would both start from it and the
+        // first one's whole KSampler pass would be unreachable from the save.
+        let set = AppSet::builtin();
+        let mut schemas = schemas();
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+                "LatentUpscaleBy": {"input": {"required": {"samples": ["LATENT"], "upscale_method": [["bislerp"]], "scale_by": ["FLOAT", {"default": 1.5}]}}, "output": ["LATENT"]},
+                "KSampler": {"input": {"required": {"model": ["MODEL"], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"], "latent_image": ["LATENT"], "seed": ["INT", {"default": 0}], "steps": ["INT", {"default": 20}], "cfg": ["FLOAT", {"default": 8.0}], "sampler_name": [["euler"]], "scheduler": [["normal"]], "denoise": ["FLOAT", {"default": 1.0}]}}, "output": ["LATENT"]},
+                "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}}, "output": ["IMAGE"]}
+            }"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        let hires = set.get("hires.fix").unwrap();
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let steps = vec![AppStep::new(hires), AppStep::new(hires)];
+        let report = apply(&g, &mut c, &steps, &set, &schemas, &params());
+
+        assert_eq!(report.applied, vec!["Hi-res fix"]);
+        assert_eq!(report.skipped.len(), 1, "the second pass must be skipped: {report:?}");
+        assert_eq!(
+            g.borrow().0.values().filter(|n| n.class_type == "KSampler").count(),
+            1,
+            "a stranded second sampler pass was emitted"
+        );
+    }
+
+    #[test]
+    fn an_empty_combo_with_a_declared_default_still_reports_unrunnable() {
+        // A COMBO whose options are served remotely parses as Enum{options:[], default:Some(..)}.
+        // The default is no more sendable than any other value, so the card must not say Ready
+        // and then have the queue drop the step.
+        let mut schemas = schemas();
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"Widgetize": {"input": {"required": {"image": ["IMAGE"], "mode": [[], {"default": "auto"}]}}, "output": ["IMAGE"]}}"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        let mut set = AppSet::default();
+        set.insert_json(
+            "w.json",
+            r#"{"id":"w","name":"W","group":"Finish","version":1,
+                "nodes":[{"id":"a","class":"Widgetize","inputs":{"image":"$image"}}],
+                "output":{"node":"a","slot":0}}"#,
+        );
+        let def = set.get("w").unwrap();
+
+        let st = status(def, None, Some(&schemas));
+        assert!(matches!(st, Status::Unsatisfiable(_)), "card said {st:?}");
+
+        // And the build agrees — the card's verdict and the queue's must never diverge.
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let report = apply(&g, &mut c, &[AppStep::new(def)], &set, &schemas, &params());
+        assert!(report.applied.is_empty() && report.skipped.len() == 1, "{report:?}");
+    }
+
+    #[test]
+    fn a_re_render_that_failed_to_build_does_not_consume_the_re_render_slot() {
+        // The first Hi-res step cannot build (LatentUpscaleBy absent), so the second one is still
+        // the first re-render and must be allowed to run.
+        let set = AppSet::builtin();
+        let mut schemas = schemas();
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+                "LatentUpscaleBy": {"input": {"required": {"samples": ["LATENT"], "upscale_method": [["bislerp"]], "scale_by": ["FLOAT", {"default": 1.5}]}}, "output": ["LATENT"]},
+                "KSampler": {"input": {"required": {"model": ["MODEL"], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"], "latent_image": ["LATENT"], "seed": ["INT", {"default": 0}], "steps": ["INT", {"default": 20}], "cfg": ["FLOAT", {"default": 8.0}], "sampler_name": [["euler"]], "scheduler": [["normal"]], "denoise": ["FLOAT", {"default": 1.0}]}}, "output": ["LATENT"]},
+                "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}}, "output": ["IMAGE"]}
+            }"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        // A latent-reading app that passes status() but fails in apply_one: its output node is
+        // gated on a class this server lacks, so nothing is emitted and no re-render happens.
+        let mut both = AppSet::builtin();
+        both.insert_json(
+            "ghost.json",
+            r#"{"id":"ghost","name":"Ghost","group":"Hi-res","version":1,
+                "requires":[{"class":"Nope","pack":"x","optional":true}],
+                "nodes":[{"id":"a","class":"LatentUpscaleBy","inputs":{"samples":"$latent","upscale_method":"bislerp","scale_by":1.5}},
+                         {"id":"b","class":"Nope","needs":"Nope","inputs":{}}],
+                "output":{"node":"b","slot":0}}"#,
+        );
+        assert!(both.bad.is_empty(), "{:?}", both.bad);
+        let ghost = both.get("ghost").unwrap();
+        assert_eq!(status(ghost, None, Some(&schemas)), Status::Ready, "precondition");
+
+        let hires = set.get("hires.fix").unwrap();
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let steps = vec![AppStep::new(ghost), AppStep::new(hires)];
+        let report = apply(&g, &mut c, &steps, &both, &schemas, &params());
+        assert_eq!(report.skipped.len(), 1, "{report:?}");
+        assert_eq!(report.applied, vec!["Hi-res fix"], "the real re-render was starved: {report:?}");
+    }
+
+    // ── Param overrides ──────────────────────────────────────────────────────
+
+    fn hires_schemas() -> SchemaSet {
+        let mut s = schemas();
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+                "LatentUpscaleBy": {"input": {"required": {"samples": ["LATENT"], "upscale_method": [["bislerp"]], "scale_by": ["FLOAT", {"default": 1.5}]}}, "output": ["LATENT"]},
+                "KSampler": {"input": {"required": {"model": ["MODEL"], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"], "latent_image": ["LATENT"], "seed": ["INT", {"default": 0}], "steps": ["INT", {"default": 20}], "cfg": ["FLOAT", {"default": 8.0}], "sampler_name": [["euler"]], "scheduler": [["normal"]], "denoise": ["FLOAT", {"default": 1.0}]}}, "output": ["LATENT"]},
+                "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}}, "output": ["IMAGE"]}
+            }"#,
+            )
+            .unwrap(),
+        );
+        s.nodes.extend(extra.nodes);
+        s
+    }
+
+    #[test]
+    fn hires_fix_shrinks_the_base_size_so_the_asked_for_size_is_the_final_one() {
+        let set = AppSet::builtin();
+        let schemas = hires_schemas();
+        let mut p = params();
+        p.width = 1152;
+        p.height = 1152;
+        let steps = vec![AppStep::new(set.get("hires.fix").unwrap())];
+
+        // 1152 / 1.5 = 768, already a multiple of 64.
+        let (eff, notes) = effective_params(&p, &steps, &set, Some(&schemas));
+        assert_eq!((eff.width, eff.height), (768, 768));
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].from, 1152.0);
+        assert_eq!(notes[0].to, 768.0);
+
+        // The stored params are untouched, which is what makes removal free.
+        assert_eq!((p.width, p.height), (1152, 1152));
+        let (back, notes) = effective_params(&p, &[], &set, Some(&schemas));
+        assert_eq!((back.width, back.height), (1152, 1152));
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn the_override_reaches_the_emitted_graph() {
+        let set = AppSet::builtin();
+        let schemas = hires_schemas();
+        let mut p = params();
+        p.width = 1152;
+        p.height = 1152;
+        p.apps = vec![AppStep::new(set.get("hires.fix").unwrap())];
+
+        let (wf, _, report) = crate::workflow::build(&p, None, &set, &schemas);
+        let latent = wf
+            .0
+            .values()
+            .find(|n| n.class_type == "EmptyLatentImage")
+            .expect("no base latent");
+        assert_eq!(latent.inputs["width"], WorkflowInput::U64(768));
+        assert_eq!(latent.inputs["height"], WorkflowInput::U64(768));
+        assert_eq!(report.params.len(), 2, "the change must be reported: {report:?}");
+    }
+
+    #[test]
+    fn a_disabled_or_unrunnable_step_does_not_get_a_say_in_the_params() {
+        let set = AppSet::builtin();
+        let schemas = hires_schemas();
+        let mut p = params();
+        p.width = 1152;
+
+        // Disabled.
+        let off = vec![AppStep { enabled: false, ..AppStep::new(set.get("hires.fix").unwrap()) }];
+        assert_eq!(effective_params(&p, &off, &set, Some(&schemas)).0.width, 1152);
+
+        // Enabled but unrunnable — the step will be skipped, so shrinking the base would just
+        // silently make a smaller picture for no reason.
+        let mut broken = hires_schemas();
+        broken.nodes.remove("LatentUpscaleBy");
+        let on = vec![AppStep::new(set.get("hires.fix").unwrap())];
+        assert!(!status(set.get("hires.fix").unwrap(), None, Some(&broken)).runnable());
+        assert_eq!(effective_params(&p, &on, &set, Some(&broken)).0.width, 1152);
+    }
+
+    #[test]
+    fn a_duplicate_knob_id_is_rejected_at_load() {
+        // Both cards would share one storage slot and clamp to the first knob's range.
+        let mut set = AppSet::default();
+        set.insert_json(
+            "dupe.json",
+            r#"{"id":"dupe","name":"Dupe","group":"Finish","version":1,
+                "knobs":[{"id":"amount","label":"A","ty":{"Int":{"min":1,"max":10,"step":1}},"default":1},
+                         {"id":"amount","label":"B","ty":{"Int":{"min":1,"max":99,"step":1}},"default":2}],
+                "nodes":[{"id":"a","class":"ImageSharpen","inputs":{"image":"$image","sharpen_radius":"$knob:amount"}}],
+                "output":{"node":"a","slot":0}}"#,
+        );
+        assert!(set.get("dupe").is_none());
+        assert!(set.bad[0].1.contains("duplicate knob id"), "{:?}", set.bad);
+    }
+
+    #[test]
+    fn a_literal_starting_with_a_dollar_round_trips_through_the_escape() {
+        // What "Save tab as app…" stores for a prompt reading "$100 bill".
+        let escaped = escape_literal(&Value::from("$100 bill"));
+        assert_eq!(escaped, Value::from("$$100 bill"));
+        // It must not read back as a reference...
+        assert!(as_ref(&escaped).is_none());
+        // ...and the build must send the original text.
+        assert_eq!(unescape(&escaped).unwrap(), Value::from("$100 bill"));
+        // Text that is not a reference is left alone.
+        assert_eq!(escape_literal(&Value::from("a cat")), Value::from("a cat"));
+    }
+
+    #[test]
+    fn a_required_socket_left_unfed_by_a_dropped_optional_node_is_unrunnable() {
+        // The gated node vanishes, so `$node:` into it resolves to nothing. If the consuming
+        // input is required server-side, the whole prompt would be rejected — skip instead.
+        let mut set = AppSet::default();
+        set.insert_json(
+            "gated.json",
+            r#"{"id":"gated","name":"Gated","group":"Finish","version":1,
+                "requires":[{"class":"Masker","pack":"x","optional":true}],
+                "nodes":[{"id":"m","class":"Masker","needs":"Masker","inputs":{}},
+                         {"id":"c","class":"Compose","inputs":{"image":"$image","mask":"$node:m:0"}}],
+                "output":{"node":"c","slot":0}}"#,
+        );
+        assert!(set.bad.is_empty(), "{:?}", set.bad);
+
+        let mut schemas = schemas();
+        // Compose exists and REQUIRES a mask socket; Masker is not installed.
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"Compose": {"input": {"required": {"image": ["IMAGE"], "mask": ["MASK"]}}, "output": ["IMAGE"]}}"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        let def = set.get("gated").unwrap();
+        let st = status(def, None, Some(&schemas));
+        assert!(matches!(st, Status::Unsatisfiable(_)), "got {st:?}");
+
+        // And the build refuses it even if the status gate were bypassed.
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let before = c.image;
+        let report = apply(&g, &mut c, &[AppStep::new(def)], &set, &schemas, &params());
+        assert!(report.applied.is_empty());
+        assert_eq!(c.image.0.node_id, before.0.node_id);
     }
 }
