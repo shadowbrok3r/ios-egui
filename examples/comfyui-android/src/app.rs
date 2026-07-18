@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui_mobile::{CreateContext, EguiApp, Haptic, Host, HostExt, app, egui};
+use egui_snarl::{InPinId, OutPinId};
 use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
 
 use crate::apps::{AppDef, AppSet, KnobTy, Status};
@@ -57,6 +58,36 @@ enum CreatePane {
 enum SettingsPane {
     Server,
     Logs,
+}
+
+/// Destination for the app picker's selection.
+#[derive(PartialEq, Clone, Copy)]
+enum AppPickTarget {
+    Enhance,
+    Canvas(egui::Pos2),
+}
+
+/// In-progress "Save tab as app": the derived definition plus which widgets to promote.
+struct PublishDraft {
+    id: String,
+    name: String,
+    group: String,
+    description: String,
+    /// One promotable widget. `local` identifies the exact node, so two nodes of the same class
+    /// yield two distinct knobs instead of colliding on one id.
+    widgets: Vec<PublishWidget>,
+    def: AppDef,
+    error: String,
+}
+
+struct PublishWidget {
+    /// `AppDef` node id ("n0"), not the class — a graph may hold several of one class.
+    local: String,
+    class: String,
+    input: String,
+    label: String,
+    value: serde_json::Value,
+    promote: bool,
 }
 
 impl Tab {
@@ -120,6 +151,8 @@ struct GraphDoc {
     outputs: HashMap<NodeId, Vec<Vec<u8>>>,
     node_map: HashMap<u32, NodeId>,
     props_node: Option<NodeId>,
+    /// Bumped whenever the snarl is replaced, so stale node ids can be detected.
+    epoch: u64,
 }
 
 impl GraphDoc {
@@ -132,6 +165,7 @@ impl GraphDoc {
             outputs: HashMap::new(),
             node_map: HashMap::new(),
             props_node: None,
+            epoch: 0,
         }
     }
 
@@ -146,6 +180,8 @@ impl GraphDoc {
         self.node_map.clear();
         self.props_node = None;
         self.view.reset();
+        // Snarl ids restart at 0 on a fresh graph, so anything holding old ids must be stale.
+        self.epoch += 1;
     }
 
     fn title(&self) -> String {
@@ -197,10 +233,16 @@ struct ComfyApp {
     preset_name_edit: String,
     /// Builtin enhance apps plus any under `{documents}/comfyui/apps`.
     apps: Arc<AppSet>,
-    app_picker_open: bool,
+    /// Where a picked app goes: the Create chain, or the canvas at a graph position.
+    app_picker: Option<AppPickTarget>,
     app_filter: String,
     /// Steps skipped or inputs dropped on the last build; pinned next to the result.
     enhance_note: String,
+    /// Nodes from the last `Insert app`, so a mis-tap is one undo rather than N deletes.
+    /// Keyed by (doc id, epoch): node ids are per-document AND restart when a tab is cleared
+    /// or reloaded, so undoing against either would delete unrelated nodes.
+    last_app_insert: Option<(u64, u64, Vec<NodeId>)>,
+    publish: Option<PublishDraft>,
 
     params: Params,
     last_saved: Option<String>,
@@ -378,9 +420,11 @@ impl ComfyApp {
             preset_save_open: false,
             preset_name_edit: String::new(),
             apps: Arc::new(AppSet::builtin()),
-            app_picker_open: false,
+            app_picker: None,
             app_filter: String::new(),
             enhance_note: String::new(),
+            last_app_insert: None,
+            publish: None,
             params: Params::default(),
             last_saved: None,
             last_save_check: 0.0,
@@ -522,6 +566,8 @@ impl ComfyApp {
         doc.node_map.clear();
         doc.props_node = None;
         doc.view.reset();
+        // load_api_workflow clears the snarl, so old node ids no longer mean anything.
+        doc.epoch += 1;
         doc.graph.load_api_workflow(workflow).map_err(|e| e.to_string())?;
         doc.name = name;
         if auto {
@@ -1238,6 +1284,13 @@ impl ComfyApp {
     }
 
     fn load_settings(&mut self, host: &Host) {
+        let apps = AppSet::load(host.documents_dir().as_deref());
+        for (file, why) in &apps.bad {
+            self.log.error(format!("app '{file}': {why}"));
+        }
+        self.log.info(format!("{} enhance app(s) loaded", apps.by_id.len()));
+        self.apps = Arc::new(apps);
+
         let Some(path) = Self::settings_path(host) else {
             return;
         };
@@ -2190,7 +2243,7 @@ impl ComfyApp {
             ui.label(format!("Steps ({})", self.params.apps.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("+ Add").clicked() {
-                    self.app_picker_open = true;
+                    self.app_picker = Some(AppPickTarget::Enhance);
                     self.app_filter.clear();
                 }
             });
@@ -2444,12 +2497,14 @@ impl ComfyApp {
 
     /// Add-step sheet: grouped, filterable, with availability shown before the tap.
     fn app_picker_window(&mut self, ctx: &egui::Context, host: &Host) {
-        if !self.app_picker_open {
-            return;
-        }
+        let Some(target) = self.app_picker else { return };
+        let title = match target {
+            AppPickTarget::Enhance => "Add enhance step",
+            AppPickTarget::Canvas(_) => "Insert app",
+        };
         let mut open = true;
         let mut pick: Option<String> = None;
-        centered(egui::Window::new("Add enhance step").open(&mut open)).show(ctx, |ui| {
+        centered(egui::Window::new(title).open(&mut open)).show(ctx, |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.app_filter)
                     .hint_text("filter")
@@ -2511,13 +2566,419 @@ impl ComfyApp {
             });
         });
         if let Some(id) = pick {
-            self.add_app_step(&id);
-            host.haptic(Haptic::Light);
-            self.app_picker_open = false;
+            match target {
+                AppPickTarget::Enhance => {
+                    self.add_app_step(&id);
+                    host.haptic(Haptic::Light);
+                }
+                AppPickTarget::Canvas(at) => self.insert_app_into_graph(&id, at, host),
+            }
+            self.app_picker = None;
         }
         if !open {
-            self.app_picker_open = false;
+            self.app_picker = None;
         }
+    }
+
+    /// Materialize an app's fragment as loose nodes on the active graph tab, wired to each other.
+    /// Boundary inputs (`$image`, `$model`) are left open for the user to connect.
+    fn insert_app_into_graph(&mut self, id: &str, at: egui::Pos2, host: &Host) {
+        let Some(def) = self.apps.get(id).cloned() else { return };
+        // Direct snarl mutation bypasses the FlowViewer lock gate, so check it here.
+        if self.active_doc().is_some_and(|d| d.view.locked) {
+            self.graph_status = "Graph is locked — unlock to insert".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let plan = def.plan(None);
+        let Some(doc) = self.active_doc_mut() else { return };
+
+        let mut made: HashMap<String, NodeId> = HashMap::new();
+        let mut inserted: Vec<NodeId> = Vec::new();
+        let mut missing: Vec<String> = Vec::new();
+        let mut open: Vec<String> = Vec::new();
+
+        for (i, p) in plan.iter().enumerate() {
+            let Some(object) = doc.graph.object_info.get(&p.class).cloned() else {
+                // An unmet optional node is expected; a required one is worth reporting.
+                if p.optional.is_none() {
+                    missing.push(p.class.clone());
+                }
+                continue;
+            };
+            let pos = at + egui::vec2(0.0, i as f32 * 140.0);
+            let node = doc.graph.snarl.insert_node(pos, FlowNodeData::new(object));
+            inserted.push(node);
+            made.insert(p.local.clone(), node);
+
+            if let Some(data) = doc.graph.snarl.get_node_mut(node) {
+                for (name, v) in &p.literals {
+                    if let Some(input) = data.inputs.iter_mut().find(|i| i.name == *name) {
+                        set_flow_value(&mut input.value, v);
+                    }
+                }
+            }
+            for (_, r) in &p.open {
+                let label = r.label();
+                if !open.contains(&label) {
+                    open.push(label);
+                }
+            }
+        }
+
+        // Wire by input NAME: FlowNodeData::new re-sorts inputs, so declaration order is not
+        // slot order. Disconnect first — an input holds a single wire.
+        for p in &plan {
+            let Some(&to_node) = made.get(&p.local) else { continue };
+            for (name, from_local, slot) in &p.links {
+                let Some(&from_node) = made.get(from_local) else { continue };
+                let Some(idx) = doc
+                    .graph
+                    .snarl
+                    .get_node(to_node)
+                    .and_then(|d| d.inputs.iter().position(|i| i.name == *name))
+                else {
+                    continue;
+                };
+                let to = InPinId { node: to_node, input: idx };
+                let from = OutPinId { node: from_node, output: *slot as usize };
+                for remote in doc.graph.snarl.in_pin(to).remotes.clone() {
+                    doc.graph.snarl.disconnect(remote, to);
+                }
+                doc.graph.snarl.connect(from, to);
+            }
+        }
+
+        doc.view.request_arrange();
+        let (doc_id, epoch) = (doc.id, doc.epoch);
+        let n_inserted = inserted.len();
+        self.last_app_insert = Some((doc_id, epoch, inserted));
+
+        self.graph_status = if !missing.is_empty() {
+            format!("Inserted {n_inserted} node(s) — missing: {}", missing.join(", "))
+        } else if !open.is_empty() {
+            format!("Inserted {n_inserted} node(s) — connect: {}", open.join(", "))
+        } else {
+            format!("Inserted {n_inserted} node(s)")
+        };
+        host.haptic(Haptic::Success);
+    }
+
+    /// Derive an [`AppDef`] from the active tab: wires become `$node:` refs, dangling typed
+    /// inputs become boundary refs, widgets become literals the publish dialog can promote.
+    fn derive_app_draft(&self) -> Option<PublishDraft> {
+        let doc = self.active_doc()?;
+        if doc.is_empty() {
+            return None;
+        }
+        let snarl = &doc.graph.snarl;
+
+        // (to node, to input index) -> (from node, from output slot).
+        let mut incoming: HashMap<(NodeId, usize), (NodeId, u32)> = HashMap::new();
+        let mut consumed: HashSet<(NodeId, usize)> = HashSet::new();
+        for (from, to) in snarl.wires() {
+            incoming.insert((to.node, to.input), (from.node, from.output as u32));
+            consumed.insert((from.node, from.output));
+        }
+
+        // Emit in dependency order so every `$node:` ref points backwards.
+        let mut order: Vec<NodeId> = snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();
+        order.sort_by_key(|id| id.0);
+        let order = toposort_nodes(&order, &incoming);
+        let local: HashMap<NodeId, String> =
+            order.iter().enumerate().map(|(i, id)| (*id, format!("n{i}"))).collect();
+
+        let mut nodes = Vec::new();
+        let mut unbound: Vec<String> = Vec::new();
+        let mut widgets = Vec::new();
+        let mut requires: Vec<crate::apps::Require> = Vec::new();
+
+        for id in &order {
+            let Some(data) = snarl.get_node(*id) else { continue };
+            let class = data.object.name.clone();
+            if !requires.iter().any(|r| r.class == class) {
+                requires.push(crate::apps::Require {
+                    class: class.clone(),
+                    pack: pack_guess(&data.object.category, &class),
+                    optional: false,
+                });
+            }
+            let mut inputs = std::collections::BTreeMap::new();
+            // Per node: a node's first dangling CONDITIONING is its positive, the second its
+            // negative. Counting across the whole fragment would mark every later node negative.
+            let mut cond_seen = 0;
+            for (i, input) in data.inputs.iter().enumerate() {
+                if let Some((from, slot)) = incoming.get(&(*id, i)) {
+                    if let Some(src) = local.get(from) {
+                        inputs.insert(
+                            input.name.clone(),
+                            serde_json::Value::from(format!("$node:{src}:{slot}")),
+                        );
+                    }
+                    continue;
+                }
+                if input.value.is_connection_only() {
+                    // Unwired socket: bind it to the matching handle the Create graph publishes.
+                    let ty = graphview::type_str(&input.typ);
+                    // Name wins over position: an explicit "negative" socket must not become
+                    // $positive just because it is declared first.
+                    let bound = match ty.as_str() {
+                        "IMAGE" => Some("$image"),
+                        "LATENT" => Some("$latent"),
+                        "MODEL" => Some("$model"),
+                        "CLIP" => Some("$clip"),
+                        "VAE" => Some("$vae"),
+                        "CONDITIONING" => Some(match input.name.as_str() {
+                            "positive" => "$positive",
+                            "negative" => "$negative",
+                            _ => {
+                                cond_seen += 1;
+                                if cond_seen == 1 { "$positive" } else { "$negative" }
+                            }
+                        }),
+                        _ => None,
+                    };
+                    match bound {
+                        Some(b) => {
+                            inputs.insert(input.name.clone(), serde_json::Value::from(b));
+                        }
+                        // Nothing in the Create graph can feed this socket, so the app would
+                        // queue with it unset and be rejected. Surface it instead of dropping it.
+                        None => unbound.push(format!("{class}.{} ({ty})", input.name)),
+                    }
+                    continue;
+                }
+                if let Some(v) = flow_value_json(&input.value) {
+                    widgets.push(PublishWidget {
+                        local: local[id].clone(),
+                        class: class.clone(),
+                        input: input.name.clone(),
+                        label: input.name.replace('_', " "),
+                        value: v.clone(),
+                        promote: false,
+                    });
+                    inputs.insert(input.name.clone(), v);
+                }
+            }
+            nodes.push(crate::apps::NodeTpl {
+                id: local[id].clone(),
+                class,
+                inputs,
+                needs: None,
+            });
+        }
+
+        // The output is the last node with an unconsumed IMAGE output.
+        let output = order.iter().rev().find_map(|id| {
+            let data = snarl.get_node(*id)?;
+            let slot = data.outputs.iter().position(|o| {
+                graphview::type_str(&o.typ) == "IMAGE"
+            })?;
+            (!consumed.contains(&(*id, slot))).then(|| crate::apps::LocalRef {
+                node: local[id].clone(),
+                slot: slot as u32,
+            })
+        })?;
+
+        let name = doc.name.trim_end_matches(".json").to_string();
+        let id = slug(&name);
+        Some(PublishDraft {
+            def: AppDef {
+                id: id.clone(),
+                name: name.clone(),
+                description: String::new(),
+                group: "Finish".into(),
+                version: 1,
+                requires,
+                knobs: Vec::new(),
+                nodes,
+                output,
+            },
+            id,
+            name,
+            group: "Finish".into(),
+            description: String::new(),
+            widgets,
+            error: String::new(),
+        })
+    }
+
+    /// Name the app, choose which widgets become knobs, and write it to the apps directory.
+    fn publish_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.publish.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut save = false;
+        let mut draft = self.publish.take().unwrap();
+        centered(egui::Window::new("Save tab as app").open(&mut open)).show(ctx, |ui| {
+            ui.label("Name");
+            ui.add(
+                egui::TextEdit::singleline(&mut draft.name).desired_width(ui.available_width()),
+            );
+            ui.label("Id");
+            ui.add(egui::TextEdit::singleline(&mut draft.id).desired_width(ui.available_width()));
+            ui.label("Group");
+            combo_full(
+                ui,
+                "publish_group",
+                &mut draft.group,
+                &crate::apps::GROUP_ORDER.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            ui.label("Description");
+            ui.add(
+                egui::TextEdit::multiline(&mut draft.description)
+                    .desired_rows(2)
+                    .desired_width(ui.available_width()),
+            );
+
+            ui.separator();
+            ui.label(format!(
+                "{} node(s) · output {}:{}",
+                draft.def.nodes.len(),
+                draft.def.output.node,
+                draft.def.output.slot
+            ));
+            ui.weak("Tick the settings to expose as controls in the Create tab.");
+            crate::theme::scroll_vertical().max_height(220.0).show(ui, |ui| {
+                for w in &mut draft.widgets {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut w.promote, "");
+                        ui.vertical(|ui| {
+                            ui.label(format!("{}.{} [{}]", w.class, w.input, w.local));
+                            if w.promote {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut w.label)
+                                        .desired_width(ui.available_width().min(200.0)),
+                                );
+                            } else {
+                                ui.weak(elide(&w.value.to_string(), 40));
+                            }
+                        });
+                    });
+                }
+            });
+            if !draft.error.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, &draft.error);
+            }
+            ui.separator();
+            if ui.button(format!("{} Save app", icons::SAVE)).clicked() {
+                save = true;
+            }
+        });
+
+        if save {
+            match self.write_app(&mut draft, host) {
+                Ok(path) => {
+                    self.graph_status = format!("Saved app to {path}");
+                    host.haptic(Haptic::Success);
+                    return;
+                }
+                Err(e) => {
+                    draft.error = e;
+                    host.haptic(Haptic::Error);
+                }
+            }
+        }
+        if open {
+            self.publish = Some(draft);
+        }
+    }
+
+    /// Build the final definition from the draft, validate it, and write it to disk.
+    fn write_app(&mut self, draft: &mut PublishDraft, host: &Host) -> Result<String, String> {
+        let id = slug(&draft.id);
+        if id.is_empty() {
+            return Err("Give the app an id".into());
+        }
+        let mut def = draft.def.clone();
+        def.id = id.clone();
+        def.name = draft.name.trim().to_string();
+        def.group = draft.group.clone();
+        def.description = draft.description.trim().to_string();
+        if def.name.is_empty() {
+            return Err("Give the app a name".into());
+        }
+
+        // Promote each ticked widget: the literal becomes a $knob: ref plus a Knob carrying the
+        // editor's own bounds and options. Keyed by node, so two nodes of one class stay distinct.
+        let doc = self.active_doc().ok_or("No graph tab")?;
+        def.knobs.clear();
+        for w in draft.widgets.iter().filter(|w| w.promote) {
+            let knob_id = slug(&format!("{}_{}", w.local, w.input)).replace('.', "_");
+            let ty = doc
+                .graph
+                .snarl
+                .nodes_pos_ids()
+                .find(|(_, _, d)| d.object.name == w.class)
+                .and_then(|(_, _, d)| d.inputs.iter().find(|i| i.name == w.input))
+                .map(|i| knob_ty_for(&w.class, &w.input, &i.value))
+                .ok_or_else(|| format!("{}.{} is no longer on the graph", w.class, w.input))?;
+            def.knobs.push(crate::apps::Knob {
+                id: knob_id.clone(),
+                label: if w.label.trim().is_empty() {
+                    w.input.replace('_', " ")
+                } else {
+                    w.label.trim().to_string()
+                },
+                ty,
+                default: w.value.clone(),
+                advanced: false,
+                tooltip: String::new(),
+            });
+            if let Some(node) = def.nodes.iter_mut().find(|n| n.id == w.local) {
+                node.inputs
+                    .insert(w.input.clone(), serde_json::Value::from(format!("$knob:{knob_id}")));
+            }
+        }
+
+        let body = serde_json::to_string_pretty(&def).map_err(|e| e.to_string())?;
+        // Round-trip through the loader so a bad app never reaches disk.
+        let mut probe = AppSet::default();
+        probe.insert_json("draft", &body);
+        if let Some((_, why)) = probe.bad.first() {
+            return Err(why.clone());
+        }
+
+        let dir = host.documents_dir().ok_or("No storage directory")?;
+        let folder = format!("{dir}/comfyui/apps");
+        std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+        let path = format!("{folder}/{id}.json");
+        std::fs::write(&path, &body).map_err(|e| e.to_string())?;
+
+        let apps = AppSet::load(Some(dir.as_str()));
+        self.log.info(format!("saved app '{id}' ({} total)", apps.by_id.len()));
+        self.apps = Arc::new(apps);
+        self.publish = None;
+        Ok(path)
+    }
+
+    /// Remove the nodes from the last `Insert app` — there is no general undo.
+    fn undo_app_insert(&mut self, host: &Host) {
+        if !self.can_undo_app_insert() {
+            return;
+        }
+        let Some((_, _, ids)) = self.last_app_insert.take() else { return };
+        let Some(doc) = self.active_doc_mut() else { return };
+        // Some may already be gone if the user deleted them by hand.
+        let mut gone = 0;
+        for id in &ids {
+            if doc.graph.snarl.get_node(*id).is_some() {
+                doc.graph.snarl.remove_node(*id);
+                gone += 1;
+            }
+        }
+        doc.props_node = None;
+        self.graph_status = format!("Removed {gone} inserted node(s)");
+        host.haptic(Haptic::Warning);
+    }
+
+    /// Whether the last `Insert app` is still undoable on the tab that received it.
+    fn can_undo_app_insert(&self) -> bool {
+        matches!(
+            (&self.last_app_insert, self.active_doc()),
+            (Some((id, epoch, _)), Some(d)) if *id == d.id && *epoch == d.epoch
+        )
     }
 
     /// Insert a step at its group's place in the pipeline so the common order needs no taps.
@@ -2798,6 +3259,20 @@ impl ComfyApp {
             }
         }
 
+        // Pinned rather than transient: a skipped upscale must outlive the status line.
+        if !self.enhance_note.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{} {}", icons::WARN, self.enhance_note),
+                );
+                if ui.small_button("Dismiss").clicked() {
+                    self.enhance_note.clear();
+                }
+            });
+        }
+
         if let Some(tex) = &self.preview {
             image_view(ui, tex);
         }
@@ -2950,12 +3425,15 @@ impl ComfyApp {
             || clip.as_deref().and_then(SamplerPack::from_clipboard_json).is_some();
         let has_loras = self.lora_clip.is_some()
             || clip.as_deref().and_then(LoraPack::from_clipboard_json).is_some();
+        let has_apps = clip.as_deref().and_then(AppPack::from_clipboard_json).is_some();
 
         enum FabAct {
             OpenGraph,
             PasteWf,
             PasteSampler,
             PasteLoras,
+            CopySteps,
+            PasteSteps,
             Toggle,
         }
         let mut act: Option<FabAct> = None;
@@ -2964,7 +3442,7 @@ impl ComfyApp {
         if open {
             egui::Area::new(egui::Id::new("create-fab-menu"))
                 .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(pos.x - 168.0, pos.y - 180.0))
+                .fixed_pos(egui::pos2(pos.x - 168.0, pos.y - 268.0))
                 .constrain_to(pane.expand(4.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
@@ -3011,6 +3489,27 @@ impl ComfyApp {
                                 .clicked()
                             {
                                 act = Some(FabAct::PasteLoras);
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(
+                                    !self.params.apps.is_empty(),
+                                    egui::Button::new(format!("{} Copy steps", icons::PROPS))
+                                        .min_size(egui::vec2(160.0, 34.0)),
+                                )
+                                .clicked()
+                            {
+                                act = Some(FabAct::CopySteps);
+                            }
+                            if ui
+                                .add_enabled(
+                                    has_apps,
+                                    egui::Button::new(format!("{} Paste steps", icons::PROPS))
+                                        .min_size(egui::vec2(160.0, 34.0)),
+                                )
+                                .clicked()
+                            {
+                                act = Some(FabAct::PasteSteps);
                             }
                         });
                 });
@@ -3065,8 +3564,39 @@ impl ComfyApp {
                 self.create_fab_open = false;
                 self.paste_lora_pack(host);
             }
+            Some(FabAct::CopySteps) => {
+                self.create_fab_open = false;
+                let pack = AppPack { apps: self.params.apps.clone() };
+                host.copy_text(pack.to_clipboard_json());
+                self.status = format!("Copied {} enhance step(s)", pack.apps.len());
+                host.haptic(Haptic::Success);
+            }
+            Some(FabAct::PasteSteps) => {
+                self.create_fab_open = false;
+                self.paste_app_pack(host);
+            }
             None => {}
         }
+    }
+
+    /// Replace the enhance chain from a `comfyui_android_apps_v1` clipboard payload.
+    fn paste_app_pack(&mut self, host: &Host) {
+        let Some(pack) = host.clipboard_text().as_deref().and_then(AppPack::from_clipboard_json)
+        else {
+            self.status = "No enhance steps on the clipboard".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let unknown = pack.apps.iter().filter(|s| self.apps.get(&s.app).is_none()).count();
+        let n = pack.apps.len();
+        self.params.apps = pack.apps;
+        self.status = if unknown > 0 {
+            format!("Pasted {n} step(s) — {unknown} not installed here")
+        } else {
+            format!("Pasted {n} enhance step(s)")
+        };
+        self.create_pane = CreatePane::Enhance;
+        host.haptic(Haptic::Success);
     }
 
     fn graph_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -3245,6 +3775,8 @@ impl ComfyApp {
         let mut close = false;
         let mut add = false;
         let mut paste = false;
+        let mut insert_app = false;
+        let mut undo_insert = false;
         let resp = egui::Area::new(egui::Id::new("graph-canvas-menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen)
@@ -3253,6 +3785,19 @@ impl ComfyApp {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     if ui.button(format!("{} Add node…", icons::ADD)).clicked() {
                         add = true;
+                    }
+                    if ui
+                        .button(format!("{} Insert app…", icons::ADD))
+                        .on_hover_text("Drop a saved app's nodes in, already wired together")
+                        .clicked()
+                    {
+                        insert_app = true;
+                    }
+                    if ui
+                        .add_enabled(self.can_undo_app_insert(), egui::Button::new("Undo insert"))
+                        .clicked()
+                    {
+                        undo_insert = true;
                     }
                     if ui
                         .add_enabled(has_clip, egui::Button::new(format!("{} Paste workflow", icons::PROPS)))
@@ -3275,6 +3820,15 @@ impl ComfyApp {
         if add {
             self.add_open = true;
             self.add_pos = graph_pos - egui::vec2(90.0, 50.0);
+            close = true;
+        }
+        if insert_app {
+            self.app_picker = Some(AppPickTarget::Canvas(graph_pos - egui::vec2(90.0, 50.0)));
+            self.app_filter.clear();
+            close = true;
+        }
+        if undo_insert {
+            self.undo_app_insert(host);
             close = true;
         }
         if paste {
@@ -3327,6 +3881,20 @@ impl ComfyApp {
                         }
                     })
                     .unwrap_or_else(|| "mobile/untitled.json".into());
+            }
+            // The active tab is the unit of publication — there is no selection model.
+            if ui
+                .add_enabled(has_nodes, egui::Button::new(format!("{} Save tab as app…", icons::ADD)))
+                .on_hover_text("Publish this graph as a reusable Create-tab enhance step")
+                .clicked()
+            {
+                match self.derive_app_draft() {
+                    Some(draft) => self.publish = Some(draft),
+                    None => {
+                        self.graph_status =
+                            "Needs a graph whose final IMAGE output is unconnected".into();
+                    }
+                }
             }
             ui.separator();
             if ui
@@ -5538,6 +6106,7 @@ impl EguiApp for ComfyApp {
             });
 
         self.app_picker_window(ui.ctx(), host);
+        self.publish_window(ui.ctx(), host);
 
         // Keep the server-wide queue in view even when jobs were started on the website.
         if matches!(self.conn, Conn::Connected) {
@@ -5994,6 +6563,142 @@ fn full_width_slider(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui:
         let w = ui.available_width();
         add(ui, w);
     });
+}
+
+/// Dependency order over `ids`, so an app's `$node:` refs only ever point backwards. Nodes in a
+/// cycle keep their original order — the loader rejects those, which is the honest outcome.
+fn toposort_nodes(
+    ids: &[NodeId],
+    incoming: &HashMap<(NodeId, usize), (NodeId, u32)>,
+) -> Vec<NodeId> {
+    let mut deps: HashMap<NodeId, HashSet<NodeId>> = HashMap::new();
+    for ((to, _), (from, _)) in incoming {
+        if ids.contains(to) && ids.contains(from) {
+            deps.entry(*to).or_default().insert(*from);
+        }
+    }
+    let mut out: Vec<NodeId> = Vec::new();
+    let mut left: Vec<NodeId> = ids.to_vec();
+    while !left.is_empty() {
+        let ready: Vec<NodeId> = left
+            .iter()
+            .copied()
+            .filter(|id| {
+                deps.get(id).is_none_or(|d| d.iter().all(|p| !left.contains(p)))
+            })
+            .collect();
+        if ready.is_empty() {
+            out.extend(left.drain(..));
+            break;
+        }
+        for id in ready {
+            out.push(id);
+            left.retain(|x| *x != id);
+        }
+    }
+    out
+}
+
+/// The custom-node pack a class most likely comes from, read off its `/object_info` category.
+fn pack_guess(category: &str, class: &str) -> String {
+    let head = category.split('/').next().unwrap_or_default().trim();
+    match head {
+        "" => class.to_string(),
+        // Stock ComfyUI categories; anything else names a pack closely enough to search for.
+        "image" | "latent" | "sampling" | "loaders" | "conditioning" | "mask" | "advanced"
+        | "_for_testing" | "utils" => "core".into(),
+        other => other.to_string(),
+    }
+}
+
+/// Lowercase, dot/dash-safe identifier derived from free text.
+fn slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_sep = true;
+    for c in s.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            last_sep = false;
+        } else if !last_sep && (c == '.' || c == '_' || c == '-' || c == ' ') {
+            out.push(if c == ' ' { '.' } else { c });
+            last_sep = true;
+        }
+    }
+    out.trim_matches(['.', '_', '-']).to_string()
+}
+
+/// Write a JSON literal into an editor widget, keeping the widget's own kind.
+fn set_flow_value(slot: &mut FlowValueType, v: &serde_json::Value) {
+    match slot {
+        FlowValueType::Array { options, selected } => {
+            if let Some(s) = v.as_str()
+                && (options.is_empty() || options.iter().any(|o| o == s))
+            {
+                *selected = s.to_string();
+            }
+        }
+        FlowValueType::String { value, .. } => match v {
+            serde_json::Value::String(s) => *value = s.clone(),
+            other => *value = other.to_string(),
+        },
+        FlowValueType::Float { value, min, max, .. } => {
+            if let Some(f) = v.as_f64() {
+                *value = f.clamp(*min, *max);
+            }
+        }
+        FlowValueType::SignedInt { value, min, max, .. } => {
+            if let Some(i) = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)) {
+                *value = i.clamp(*min, *max);
+            }
+        }
+        FlowValueType::UnsignedInt { value, min, max, .. } => {
+            if let Some(u) = v.as_u64().or_else(|| v.as_f64().map(|f| f.max(0.0) as u64)) {
+                *value = u.clamp(*min, *max);
+            }
+        }
+        FlowValueType::Boolean(value) => {
+            if let Some(b) = v.as_bool() {
+                *value = b;
+            }
+        }
+        // Connection-only inputs carry no literal.
+        _ => {}
+    }
+}
+
+/// Read an editor widget back out as JSON, for promoting it into a knob.
+fn flow_value_json(v: &FlowValueType) -> Option<serde_json::Value> {
+    Some(match v {
+        FlowValueType::Array { selected, .. } => serde_json::Value::from(selected.clone()),
+        FlowValueType::String { value, .. } => serde_json::Value::from(value.clone()),
+        FlowValueType::Float { value, .. } => serde_json::Value::from(*value),
+        FlowValueType::SignedInt { value, .. } => serde_json::Value::from(*value),
+        FlowValueType::UnsignedInt { value, .. } => serde_json::Value::from(*value),
+        FlowValueType::Boolean(value) => serde_json::Value::from(*value),
+        _ => return None,
+    })
+}
+
+/// The knob type matching an editor widget, with its live options and bounds.
+fn knob_ty_for(class: &str, input: &str, v: &FlowValueType) -> KnobTy {
+    match v {
+        FlowValueType::Array { .. } => {
+            KnobTy::Enum { class: class.into(), input: input.into(), prefix: None }
+        }
+        FlowValueType::String { multiline, .. } => KnobTy::Text { multiline: *multiline },
+        FlowValueType::Float { min, max, step, .. } => {
+            KnobTy::Float { min: *min, max: *max, step: *step }
+        }
+        FlowValueType::SignedInt { min, max, step, .. } => {
+            KnobTy::Int { min: *min, max: *max, step: (*step).max(1) }
+        }
+        FlowValueType::UnsignedInt { min, max, step, .. } => KnobTy::Int {
+            min: (*min).min(i64::MAX as u64) as i64,
+            max: (*max).min(i64::MAX as u64) as i64,
+            step: (*step).max(1) as i64,
+        },
+        _ => KnobTy::Bool,
+    }
 }
 
 /// [`full_width_slider`] returning the inner widget's response, for change detection.

@@ -924,7 +924,7 @@ impl GraphView {
 }
 
 /// The server-side name of an [`ObjectType`] (its serde rename; `Other` is untagged).
-fn type_str(typ: &rucomfyui::object_info::ObjectType) -> String {
+pub fn type_str(typ: &rucomfyui::object_info::ObjectType) -> String {
     serde_json::to_value(typ)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))

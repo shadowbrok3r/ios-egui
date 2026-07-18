@@ -132,13 +132,43 @@ impl AppDef {
         self.knobs.iter().find(|k| k.id == id)
     }
 
-    /// Distinct classes this app emits, in declaration order.
-    pub fn classes(&self) -> Vec<&str> {
-        let mut out: Vec<&str> = Vec::new();
-        for n in &self.nodes {
-            if !out.contains(&n.class.as_str()) {
-                out.push(&n.class);
+    /// How the graph editor should materialize this app: widget literals plus intra-app links.
+    /// Boundary references (`$image`, `$model`, `$param:…`) have no source outside a generation,
+    /// so they are reported as open inputs for the user to wire rather than guessed at.
+    pub fn plan(&self, step: Option<&AppStep>) -> Vec<PlannedNode> {
+        let mut out = Vec::new();
+        for tpl in &self.nodes {
+            let mut planned = PlannedNode {
+                local: tpl.id.clone(),
+                class: tpl.class.clone(),
+                optional: tpl.needs.clone(),
+                literals: BTreeMap::new(),
+                links: Vec::new(),
+                open: Vec::new(),
+            };
+            for (name, raw) in &tpl.inputs {
+                match as_ref(raw) {
+                    None => {
+                        planned
+                            .literals
+                            .insert(name.clone(), unescape(raw).unwrap_or_else(|| raw.clone()));
+                    }
+                    Some(Ok(Ref::Knob(id))) => {
+                        let v = step
+                            .and_then(|s| s.value(self, &id))
+                            .or_else(|| self.knob(&id).map(|k| k.default.clone()));
+                        if let Some(v) = v {
+                            planned.literals.insert(name.clone(), v);
+                        }
+                    }
+                    Some(Ok(Ref::Node(lr))) => {
+                        planned.links.push((name.clone(), lr.node.clone(), lr.slot))
+                    }
+                    Some(Ok(r)) => planned.open.push((name.clone(), r)),
+                    Some(Err(_)) => {}
+                }
             }
+            out.push(planned);
         }
         out
     }
@@ -191,6 +221,41 @@ impl AppDef {
             }
         }
         Ok(())
+    }
+}
+
+/// One node as the graph editor should create it.
+pub struct PlannedNode {
+    pub local: String,
+    pub class: String,
+    /// The optional requirement gating this node, if any.
+    pub optional: Option<String>,
+    /// Widget values to set, keyed by input name — never by index, since the editor re-sorts
+    /// a node's inputs when it builds it.
+    pub literals: BTreeMap<String, Value>,
+    /// (input name, source local id, source output slot).
+    pub links: Vec<(String, String, u32)>,
+    /// Inputs the app expects from the surrounding graph.
+    pub open: Vec<(String, Ref)>,
+}
+
+impl Ref {
+    /// Short label for an unwired boundary input, e.g. "image" or "param:steps".
+    pub fn label(&self) -> String {
+        match self {
+            Ref::Image => "image".into(),
+            Ref::Latent => "latent".into(),
+            Ref::Model => "model".into(),
+            Ref::Clip => "clip".into(),
+            Ref::Vae => "vae".into(),
+            Ref::Positive => "positive".into(),
+            Ref::Negative => "negative".into(),
+            Ref::Seed(0) => "seed".into(),
+            Ref::Seed(n) => format!("seed+{n}"),
+            Ref::Param(f) => format!("param:{f:?}").to_lowercase(),
+            Ref::Knob(k) => format!("knob:{k}"),
+            Ref::Node(n) => format!("node:{}", n.node),
+        }
     }
 }
 
@@ -326,11 +391,19 @@ pub struct NodeBuilder<'a> {
     class: String,
     inputs: HashMap<String, WorkflowInput>,
     dropped: Vec<String>,
+    /// (input, wanted, used) where a COMBO value was replaced by an installed one.
+    substituted: Vec<(String, String, String)>,
 }
 
 impl<'a> NodeBuilder<'a> {
     pub fn new(set: &'a SchemaSet, class: &str) -> Self {
-        Self { set, class: class.to_string(), inputs: HashMap::new(), dropped: Vec::new() }
+        Self {
+            set,
+            class: class.to_string(),
+            inputs: HashMap::new(),
+            dropped: Vec::new(),
+            substituted: Vec::new(),
+        }
     }
 
     /// Coerce `v` to the variant this server's schema declares. Ints must not serialize as `20.0`.
@@ -339,6 +412,18 @@ impl<'a> NodeBuilder<'a> {
             self.dropped.push(name.to_string());
             return;
         };
+        // A COMBO value this server does not offer fails /prompt validation for the WHOLE graph,
+        // which would lose the base image too. Substitute an installed option and report it.
+        if let InputKind::Enum { options, .. } = kind
+            && !options.is_empty()
+            && let Some(want) = v.as_str()
+            && !options.iter().any(|o| o == want)
+        {
+            let used = options[0].clone();
+            self.substituted.push((name.to_string(), want.to_string(), used.clone()));
+            self.inputs.insert(name.to_string(), WorkflowInput::String(used));
+            return;
+        }
         if let Some(w) = coerce(v, kind) {
             self.inputs.insert(name.to_string(), w);
         } else {
@@ -355,13 +440,13 @@ impl<'a> NodeBuilder<'a> {
         self.inputs.insert(name.to_string(), w);
     }
 
-    fn add(self, g: &WorkflowGraph) -> (WorkflowNodeId, Vec<String>) {
+    fn add(self, g: &WorkflowGraph) -> (WorkflowNodeId, Vec<String>, Vec<(String, String, String)>) {
         let id = g.add_dynamic(WorkflowNode {
             inputs: self.inputs,
             class_type: self.class.clone(),
             meta: Some(WorkflowMeta::new(self.class)),
         });
-        (id, self.dropped)
+        (id, self.dropped, self.substituted)
     }
 }
 
@@ -411,7 +496,7 @@ fn coerce(v: &Value, kind: &InputKind) -> Option<WorkflowInput> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
     Ready,
-    /// Runnable; a named model is absent so a knob fell back to another option.
+    /// Runnable; a named model is absent, so the build will substitute an installed one.
     Degraded(Vec<String>),
     /// Class present but a knob's target input is gone: hide that control, drop the target.
     Mismatch(Vec<String>),
@@ -464,7 +549,9 @@ pub fn status(def: &AppDef, step: Option<&AppStep>, schemas: Option<&SchemaSet>)
         if n.needs.is_some() || set.has_node(&n.class) {
             continue;
         }
-        if def.requires.iter().any(|r| r.class == n.class) {
+        // Only a NON-optional require covers this: an optional one would let a missing class
+        // pass as Ready and then get dropped mid-chain, leaving downstream sockets unset.
+        if def.requires.iter().any(|r| r.class == n.class && !r.optional) {
             continue;
         }
         match set.skipped.iter().find(|(s, _)| *s == n.class) {
@@ -556,6 +643,10 @@ pub struct Report {
     pub skipped: Vec<(String, String)>,
     /// (class, input) pairs this server did not declare.
     pub dropped: Vec<(String, String)>,
+    /// (class.input, wanted, used) where an uninstalled option was replaced.
+    pub substituted: Vec<(String, String, String)>,
+    /// Chain-ordering problems that still produce a valid prompt.
+    pub warnings: Vec<String>,
 }
 
 impl Report {
@@ -567,6 +658,15 @@ impl Report {
                 self.skipped.iter().map(|(n, w)| format!("{n} ({w})")).collect();
             parts.push(format!("Skipped {}: {}", self.skipped.len(), names.join("; ")));
         }
+        if !self.substituted.is_empty() {
+            let each: Vec<String> = self
+                .substituted
+                .iter()
+                .map(|(at, want, used)| format!("{at}: '{want}' not installed, used '{used}'"))
+                .collect();
+            parts.push(each.join("; "));
+        }
+        parts.extend(self.warnings.iter().cloned());
         if !self.dropped.is_empty() {
             let mut by_class: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
             for (c, i) in &self.dropped {
@@ -593,6 +693,7 @@ pub fn apply(
     p: &Params,
 ) -> Report {
     let mut report = Report::default();
+    let mut image_rebound = false;
     for step in steps.iter().filter(|s| s.enabled) {
         let Some(def) = set.by_id.get(&step.app) else {
             report.skipped.push((step.app.clone(), "app not installed".into()));
@@ -603,15 +704,39 @@ pub fn apply(
             report.skipped.push((def.name.clone(), st.chip()));
             continue;
         }
+        // A step that re-renders from the base latent ignores whatever the image chain has
+        // built so far, so anything above it is wasted work. Say so rather than silently
+        // discarding it.
+        if image_rebound && reads_latent(def) {
+            report.warnings.push(format!(
+                "{} re-renders from the base image — move it above the other steps",
+                def.name
+            ));
+        }
         match apply_one(g, ctx, def, step, schemas, p) {
-            Ok(dropped) => {
+            Ok(out) => {
                 report.applied.push(def.name.clone());
-                report.dropped.extend(dropped);
+                report.dropped.extend(out.dropped);
+                report.substituted.extend(out.substituted);
+                image_rebound = true;
             }
             Err(e) => report.skipped.push((def.name.clone(), e)),
         }
     }
     report
+}
+
+/// Whether the fragment consumes the base latent instead of the running image.
+fn reads_latent(def: &AppDef) -> bool {
+    def.nodes.iter().any(|n| {
+        n.inputs.values().any(|v| matches!(as_ref(v), Some(Ok(Ref::Latent))))
+    })
+}
+
+#[derive(Default)]
+struct Applied {
+    dropped: Vec<(String, String)>,
+    substituted: Vec<(String, String, String)>,
 }
 
 fn apply_one(
@@ -621,9 +746,9 @@ fn apply_one(
     step: &AppStep,
     schemas: &SchemaSet,
     p: &Params,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Applied, String> {
     let mut local: BTreeMap<String, WorkflowNodeId> = BTreeMap::new();
-    let mut dropped = Vec::new();
+    let mut out = Applied::default();
 
     for tpl in &def.nodes {
         // An unmet optional requirement drops its nodes; refs to them drop with it.
@@ -632,32 +757,45 @@ fn apply_one(
         {
             continue;
         }
+        // An UNGATED node whose class is absent would leave downstream sockets unset and get the
+        // whole prompt rejected, so fail the step here instead of emitting a broken fragment.
         if !schemas.has_node(&tpl.class) {
-            continue;
+            return Err(format!("{} is not installed on this server", tpl.class));
         }
         let mut nb = NodeBuilder::new(schemas, &tpl.class);
         for (name, raw) in &tpl.inputs {
             match as_ref(raw) {
-                Some(Ok(r)) => match resolve(&r, ctx, def, step, p, &local) {
-                    Some(Resolved::Input(w)) => nb.set_input(name, w),
-                    Some(Resolved::Value(v)) => nb.set_value(name, &v),
-                    // A reference into a skipped optional node: leave the input unset.
-                    None => {}
-                },
+                Some(Ok(r)) => {
+                    let mut subs = Vec::new();
+                    let got = resolve(&r, ctx, def, step, p, schemas, &local, &mut subs);
+                    out.substituted.extend(
+                        subs.into_iter()
+                            .map(|(w, u)| (format!("{}.{name}", tpl.class), w, u)),
+                    );
+                    match got {
+                        Some(Resolved::Input(w)) => nb.set_input(name, w),
+                        Some(Resolved::Value(v)) => nb.set_value(name, &v),
+                        // A reference into a skipped optional node: leave the input unset.
+                        None => {}
+                    }
+                }
                 Some(Err(e)) => return Err(format!("node '{}' input '{name}': {e}", tpl.id)),
                 None => nb.set_value(name, &unescape(raw).unwrap_or_else(|| raw.clone())),
             }
         }
-        let (id, drop) = nb.add(g);
-        dropped.extend(drop.into_iter().map(|i| (tpl.class.clone(), i)));
+        let (id, drop, subs) = nb.add(g);
+        out.dropped.extend(drop.into_iter().map(|i| (tpl.class.clone(), i)));
+        out.substituted.extend(
+            subs.into_iter().map(|(i, w, u)| (format!("{}.{i}", tpl.class), w, u)),
+        );
         local.insert(tpl.id.clone(), id);
     }
 
-    let out = local
+    let node = local
         .get(&def.output.node)
         .ok_or_else(|| format!("output node '{}' was not emitted", def.output.node))?;
-    ctx.image = ImageOut::from_dynamic(*out, def.output.slot);
-    Ok(dropped)
+    ctx.image = ImageOut::from_dynamic(*node, def.output.slot);
+    Ok(out)
 }
 
 enum Resolved {
@@ -667,13 +805,43 @@ enum Resolved {
     Value(Value),
 }
 
+/// A knob's effective value, with an enum knob naming an uninstalled option replaced by an
+/// installed one that still honours the knob's prefix. Records what it swapped.
+fn knob_value(
+    def: &AppDef,
+    step: &AppStep,
+    schemas: &SchemaSet,
+    id: &str,
+    subs: &mut Vec<(String, String)>,
+) -> Option<Value> {
+    let v = step.value(def, id)?;
+    let Some(Knob { ty: KnobTy::Enum { class, input, prefix }, .. }) = def.knob(id) else {
+        return Some(v);
+    };
+    let want = v.as_str().unwrap_or_default();
+    let opts = enum_options(schemas, class, input, prefix.as_deref());
+    if opts.iter().any(|o| o == want) {
+        return Some(v);
+    }
+    // Empty options means the server does not describe this as a COMBO; send it verbatim.
+    match opts.first() {
+        Some(used) => {
+            subs.push((want.to_string(), used.clone()));
+            Some(Value::from(used.clone()))
+        }
+        None => Some(v),
+    }
+}
+
 fn resolve(
     r: &Ref,
     ctx: &Ctx,
     def: &AppDef,
     step: &AppStep,
     p: &Params,
+    schemas: &SchemaSet,
     local: &BTreeMap<String, WorkflowNodeId>,
+    subs: &mut Vec<(String, String)>,
 ) -> Option<Resolved> {
     Some(match r {
         Ref::Image => Resolved::Input(ctx.image.into_input()),
@@ -697,7 +865,9 @@ fn resolve(
             ParamField::Checkpoint => Value::from(p.checkpoint.clone()),
             ParamField::BatchSize => Value::from(p.batch_size),
         }),
-        Ref::Knob(id) => Resolved::Value(step.value(def, id)?),
+        // Substitute here rather than leaving it to NodeBuilder so the knob's prefix filter
+        // applies — a face detector must fall back to another bbox/ model, not a segm/ one.
+        Ref::Knob(id) => Resolved::Value(knob_value(def, step, schemas, id, subs)?),
         Ref::Node(lr) => Resolved::Input(WorkflowInput::slot(*local.get(&lr.node)?, lr.slot)),
     })
 }
@@ -1116,6 +1286,202 @@ mod tests {
         // topological_sort_with_depth panics on a cycle.
         let wf = g.borrow().clone();
         assert_eq!(wf.topological_sort().len(), wf.0.len());
+    }
+
+    /// A preset carried from another server names a model this one lacks. Sending it verbatim
+    /// would fail /prompt validation for the WHOLE graph, losing the base image too.
+    #[test]
+    fn uninstalled_enum_value_is_substituted_not_sent() {
+        let set = AppSet::builtin();
+        let schemas = schemas(); // offers 4x-UltraSharp.pth and 4x_foolhardy.pth
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let mut step = AppStep::new(set.get("upscale.model").unwrap());
+        step.values.insert("model_name".into(), Value::from("4x-NotHere.pth"));
+        let report = apply(&g, &mut c, &[step], &set, &schemas, &params());
+
+        assert!(report.skipped.is_empty());
+        let wf = g.borrow();
+        let (loader, _) = wf.0[&c.image.0.node_id].inputs["upscale_model"].as_slot().unwrap();
+        assert_eq!(
+            wf.0[&loader].inputs["model_name"],
+            WorkflowInput::String("4x-UltraSharp.pth".into())
+        );
+        assert_eq!(report.substituted.len(), 1);
+        assert!(report.note().contains("4x-NotHere.pth"), "{}", report.note());
+    }
+
+    /// The fallback has to honour the knob's prefix — a face detector must not become a
+    /// person-segmentation model just because that option sorts first.
+    #[test]
+    fn enum_fallback_respects_the_knobs_prefix() {
+        let set = AppSet::builtin();
+        let mut schemas = schemas();
+        schemas.nodes.remove("UltralyticsDetectorProvider");
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"UltralyticsDetectorProvider": {"input": {"required": {"model_name": [["segm/person_yolov8m.pt", "bbox/face_yolov8n.pt"]]}}, "output": ["BBOX_DETECTOR", "SEGM_DETECTOR"]}}"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let steps = vec![AppStep::new(set.get("face.detailer").unwrap())];
+        apply(&g, &mut c, &steps, &set, &schemas, &params());
+
+        let wf = g.borrow();
+        let (det, _) = wf.0[&c.image.0.node_id].inputs["bbox_detector"].as_slot().unwrap();
+        assert_eq!(
+            wf.0[&det].inputs["model_name"],
+            WorkflowInput::String("bbox/face_yolov8n.pt".into()),
+            "fallback ignored the bbox/ prefix"
+        );
+    }
+
+    /// Plain literals on COMBO inputs get the same protection as knobs — FaceDetailer's
+    /// hardcoded SAM checkpoint is the real case.
+    #[test]
+    fn uninstalled_literal_on_a_combo_is_substituted() {
+        let mut schemas = schemas();
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"SAMLoader": {"input": {"required": {"model_name": [["sam_vit_h_other.pth"]], "device_mode": [["AUTO"]]}}, "output": ["SAM_MODEL"]}}"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+
+        let set = AppSet::builtin();
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let steps = vec![AppStep::new(set.get("face.detailer").unwrap())];
+        let report = apply(&g, &mut c, &steps, &set, &schemas, &params());
+
+        let wf = g.borrow();
+        let sam = wf.0.values().find(|n| n.class_type == "SAMLoader").expect("sam not emitted");
+        assert_eq!(
+            sam.inputs["model_name"],
+            WorkflowInput::String("sam_vit_h_other.pth".into())
+        );
+        assert!(report.substituted.iter().any(|(at, _, _)| at == "SAMLoader.model_name"));
+    }
+
+    /// hires.fix re-renders from the base latent, so anything above it is discarded.
+    #[test]
+    fn latent_step_after_an_image_step_warns() {
+        let set = AppSet::builtin();
+        let mut schemas = schemas();
+        let extra = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+                "LatentUpscaleBy": {"input": {"required": {"samples": ["LATENT"], "upscale_method": [["bislerp"]], "scale_by": ["FLOAT", {"default": 1.5}]}}, "output": ["LATENT"]},
+                "KSampler": {"input": {"required": {"model": ["MODEL"], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"], "latent_image": ["LATENT"], "seed": ["INT", {"default": 0}], "steps": ["INT", {"default": 20}], "cfg": ["FLOAT", {"default": 8.0}], "sampler_name": [["euler"]], "scheduler": [["normal"]], "denoise": ["FLOAT", {"default": 1.0}]}}, "output": ["LATENT"]},
+                "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}}, "output": ["IMAGE"]}
+            }"#,
+            )
+            .unwrap(),
+        );
+        schemas.nodes.extend(extra.nodes);
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+
+        // Wrong order: upscale first, then hi-res fix.
+        let steps = vec![
+            AppStep::new(set.get("upscale.model").unwrap()),
+            AppStep::new(set.get("hires.fix").unwrap()),
+        ];
+        let report = apply(&g, &mut c, &steps, &set, &schemas, &params());
+        assert!(report.skipped.is_empty());
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("Hi-res fix"));
+
+        // Right order raises nothing.
+        let g2 = WorkflowGraph::new();
+        let mut c2 = ctx(&g2);
+        let ok = apply(
+            &g2,
+            &mut c2,
+            &[
+                AppStep::new(set.get("hires.fix").unwrap()),
+                AppStep::new(set.get("upscale.model").unwrap()),
+            ],
+            &set,
+            &schemas,
+            &params(),
+        );
+        assert!(ok.warnings.is_empty(), "{:?}", ok.warnings);
+    }
+
+    /// An `optional: true` require must not excuse an ungated node from existing.
+    #[test]
+    fn optional_require_cannot_mask_an_ungated_missing_class() {
+        let mut set = AppSet::default();
+        set.insert_json(
+            "masked.json",
+            r#"{"id":"masked","name":"Masked","group":"Finish",
+              "requires":[{"class":"ImageSharpen","pack":"core","optional":true}],
+              "nodes":[
+                {"id":"a","class":"ImageSharpen","inputs":{"image":"$image"}},
+                {"id":"b","class":"ImageScaleBy","inputs":{"image":"$node:a:0","scale_by":0.5}}],
+              "output":{"node":"b"}}"#,
+        );
+        assert!(set.bad.is_empty(), "{:?}", set.bad);
+
+        // Server has ImageScaleBy but not ImageSharpen.
+        let mut schemas = schemas();
+        schemas.nodes.remove("ImageSharpen");
+        let def = set.get("masked").unwrap();
+        let st = status(def, None, Some(&schemas));
+        assert!(!st.runnable(), "ungated missing class reported as {st:?}");
+
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let base = c.image.0.node_id;
+        let report = apply(&g, &mut c, &[AppStep::new(def)], &set, &schemas, &params());
+        assert_eq!(report.skipped.len(), 1);
+        // The base image still saves rather than the whole prompt being rejected.
+        assert_eq!(c.image.0.node_id, base);
+    }
+
+    #[test]
+    fn plan_separates_literals_links_and_open_boundary_inputs() {
+        let set = AppSet::builtin();
+        let plan = set.get("face.detailer").unwrap().plan(None);
+        assert_eq!(plan.len(), 3);
+
+        let det = &plan[0];
+        assert_eq!(det.class, "UltralyticsDetectorProvider");
+        // The detector's model name is a knob, resolved to its default for the editor.
+        assert_eq!(det.literals["model_name"], Value::from("bbox/face_yolov8m.pt"));
+
+        let sam = &plan[1];
+        assert_eq!(sam.optional.as_deref(), Some("SAMLoader"));
+
+        let fd = &plan[2];
+        assert_eq!(fd.class, "FaceDetailer");
+        // Intra-app wires are links, not literals.
+        assert!(fd.links.contains(&("bbox_detector".into(), "det".into(), 0)));
+        assert!(!fd.literals.contains_key("bbox_detector"));
+        // Handles the surrounding graph must supply are reported, never guessed at.
+        let open: Vec<String> = fd.open.iter().map(|(_, r)| r.label()).collect();
+        for want in ["image", "model", "clip", "vae", "positive", "negative"] {
+            assert!(open.contains(&want.to_string()), "{want} not reported open");
+        }
+        // Plain literals survive as-is.
+        assert_eq!(fd.literals["cycle"], Value::from(1));
+        assert_eq!(fd.literals["wildcard"], Value::from(""));
+    }
+
+    #[test]
+    fn plan_prefers_a_steps_configured_value_over_the_default() {
+        let set = AppSet::builtin();
+        let def = set.get("upscale.model").unwrap();
+        let mut step = AppStep::new(def);
+        step.values.insert("model_name".into(), Value::from("4x_foolhardy.pth"));
+        let plan = def.plan(Some(&step));
+        assert_eq!(plan[0].literals["model_name"], Value::from("4x_foolhardy.pth"));
     }
 
     #[test]
