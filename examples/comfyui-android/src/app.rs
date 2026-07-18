@@ -97,6 +97,57 @@ struct Viewer {
     meta_loading: bool,
 }
 
+/// One open workflow editor document (multi-tab Graph workspace).
+struct GraphDoc {
+    #[allow(dead_code)]
+    id: u64,
+    name: String,
+    graph: ComfyUiNodeGraph,
+    view: GraphView,
+    outputs: HashMap<NodeId, Vec<Vec<u8>>>,
+    node_map: HashMap<u32, NodeId>,
+    props_node: Option<NodeId>,
+}
+
+impl GraphDoc {
+    fn new(id: u64, name: String, object_info: rucomfyui::object_info::ObjectInfo) -> Self {
+        Self {
+            id,
+            name,
+            graph: ComfyUiNodeGraph::new(object_info),
+            view: GraphView::default(),
+            outputs: HashMap::new(),
+            node_map: HashMap::new(),
+            props_node: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.graph.snarl.nodes_pos_ids().next().is_none()
+    }
+
+    fn clear_content(&mut self) {
+        self.graph.clear();
+        self.name.clear();
+        self.outputs.clear();
+        self.node_map.clear();
+        self.props_node = None;
+        self.view.reset();
+    }
+
+    fn title(&self) -> String {
+        if self.name.is_empty() {
+            if self.is_empty() {
+                "Untitled".into()
+            } else {
+                "Untitled graph".into()
+            }
+        } else {
+            elide(&self.name, 28)
+        }
+    }
+}
+
 struct ComfyApp {
     engine: Option<Engine>,
     loaded: bool,
@@ -138,6 +189,10 @@ struct ComfyApp {
     running: bool,
     progress: (u32, u32),
     status: String,
+    /// Server-wide queue depth (WS status / `/queue`), includes jobs from other clients.
+    queue_remaining: u32,
+    /// Last time we polled `GET /queue`.
+    last_queue_poll: f64,
 
     preview: Option<egui::TextureHandle>,
     result: Option<egui::TextureHandle>,
@@ -145,7 +200,10 @@ struct ComfyApp {
     save_counter: u32,
     note: String,
 
-    graph: Option<ComfyUiNodeGraph>,
+    /// Open workflow editor tabs (created on connect / when loading graphs).
+    graph_tabs: Vec<GraphDoc>,
+    active_graph: usize,
+    next_graph_id: u64,
     graph_pane: GraphPane,
     auto_follow: bool,
     /// Auto-arrange the canvas when a workflow finishes loading.
@@ -153,12 +211,10 @@ struct ComfyApp {
     fonts: FontSizes,
     /// Rows fetched per gallery page / Load more (clamped 20..=500).
     gallery_page: u64,
-    graph_name: String,
+    /// Transient graph editor note (errors / saving); not shown in the tab bar.
     graph_status: String,
     /// UI-format JSON restored after connect (from settings).
     restore_workflow: Option<(String, String)>,
-    view: GraphView,
-    props_node: Option<NodeId>,
     wf_names: Vec<String>,
     wf_open: bool,
     wf_loading: bool,
@@ -171,8 +227,6 @@ struct ComfyApp {
     add_pos: egui::Pos2,
     search_open: bool,
     search_filter: String,
-    node_map: HashMap<u32, NodeId>,
-    graph_outputs: HashMap<NodeId, Vec<Vec<u8>>>,
     executing: Option<NodeId>,
     run_seq: u64,
     /// Nodes in the running workflow and the ones seen executing, for the global progress bar.
@@ -246,6 +300,13 @@ struct ComfyApp {
     /// Long-press menu on empty graph canvas: `(graph_pos, screen_pos, armed)`.
     /// `armed` stays false until the opening press is released so that release doesn't dismiss.
     canvas_menu: Option<(egui::Pos2, egui::Pos2, bool)>,
+    /// Gallery list scroll offset (Y); kept across viewer open/close.
+    gallery_scroll_y: f32,
+    /// Apply this offset once when returning from the viewer.
+    gallery_scroll_restore: Option<f32>,
+    /// Create-tab floating action bubble position; `None` = default bottom-right.
+    create_fab_pos: Option<egui::Pos2>,
+    create_fab_open: bool,
 }
 
 impl ComfyApp {
@@ -287,22 +348,23 @@ impl ComfyApp {
             running: false,
             progress: (0, 0),
             status: String::new(),
+            queue_remaining: 0,
+            last_queue_poll: 0.0,
             preview: None,
             result: None,
             result_bytes: None,
             save_counter: 0,
             note: String::new(),
-            graph: None,
+            graph_tabs: Vec::new(),
+            active_graph: 0,
+            next_graph_id: 1,
             graph_pane: GraphPane::Canvas,
             auto_follow: false,
             auto_arrange: true,
             fonts: FontSizes::default(),
             gallery_page: 60,
-            graph_name: String::new(),
             graph_status: String::new(),
             restore_workflow: None,
-            view: GraphView::default(),
-            props_node: None,
             wf_names: Vec::new(),
             wf_open: false,
             wf_loading: false,
@@ -315,8 +377,6 @@ impl ComfyApp {
             add_pos: egui::pos2(80.0, 80.0),
             search_open: false,
             search_filter: String::new(),
-            node_map: HashMap::new(),
-            graph_outputs: HashMap::new(),
             executing: None,
             run_seq: 0,
             run_total: 0,
@@ -361,7 +421,103 @@ impl ComfyApp {
             img2img_url_pending: String::new(),
             img2img_url_pending_at: 0.0,
             canvas_menu: None,
+            gallery_scroll_y: 0.0,
+            gallery_scroll_restore: None,
+            create_fab_pos: None,
+            create_fab_open: false,
         }
+    }
+
+    fn active_doc(&self) -> Option<&GraphDoc> {
+        self.graph_tabs.get(self.active_graph)
+    }
+
+    fn active_doc_mut(&mut self) -> Option<&mut GraphDoc> {
+        self.graph_tabs.get_mut(self.active_graph)
+    }
+
+    fn has_graph_editor(&self) -> bool {
+        !self.graph_tabs.is_empty()
+    }
+
+    /// Ensure at least one empty tab exists once schemas are known.
+    fn ensure_graph_tab(&mut self) {
+        let Some(schemas) = self.schemas.as_ref() else { return };
+        if !self.graph_tabs.is_empty() {
+            return;
+        }
+        let object_info = schema::to_object_info(schemas);
+        let id = self.next_graph_id;
+        self.next_graph_id += 1;
+        self.graph_tabs.push(GraphDoc::new(id, String::new(), object_info));
+        self.active_graph = 0;
+    }
+
+    /// Open `workflow` in a new tab, or reuse the active tab when it is empty.
+    fn load_workflow_into_tab(
+        &mut self,
+        name: String,
+        workflow: &rucomfyui::Workflow,
+    ) -> Result<(), String> {
+        let schemas = self.schemas.as_ref().ok_or_else(|| "not connected".to_string())?;
+        let object_info = schema::to_object_info(schemas);
+        let reuse = self.active_doc().is_some_and(|d| d.is_empty());
+        if !reuse {
+            let id = self.next_graph_id;
+            self.next_graph_id += 1;
+            self.graph_tabs.push(GraphDoc::new(id, String::new(), object_info));
+            self.active_graph = self.graph_tabs.len() - 1;
+        } else if let Some(doc) = self.active_doc_mut() {
+            doc.graph.object_info = object_info;
+        }
+        let auto = self.auto_arrange;
+        let doc = self.active_doc_mut().ok_or_else(|| "no graph tab".to_string())?;
+        doc.outputs.clear();
+        doc.node_map.clear();
+        doc.props_node = None;
+        doc.view.reset();
+        doc.graph.load_api_workflow(workflow).map_err(|e| e.to_string())?;
+        doc.name = name;
+        if auto {
+            doc.view.request_arrange();
+        } else {
+            doc.view.request_fit();
+        }
+        Ok(())
+    }
+
+    fn close_graph_tab(&mut self, idx: usize) {
+        if idx >= self.graph_tabs.len() {
+            return;
+        }
+        if self.graph_tabs.len() == 1 {
+            self.graph_tabs[0].clear_content();
+            self.active_graph = 0;
+            self.executing = None;
+            return;
+        }
+        self.graph_tabs.remove(idx);
+        if self.active_graph >= self.graph_tabs.len() {
+            self.active_graph = self.graph_tabs.len() - 1;
+        } else if idx < self.active_graph {
+            self.active_graph -= 1;
+        }
+        self.executing = None;
+    }
+
+    fn close_all_graph_tabs(&mut self) {
+        let Some(schemas) = self.schemas.as_ref() else {
+            self.graph_tabs.clear();
+            self.active_graph = 0;
+            return;
+        };
+        let object_info = schema::to_object_info(schemas);
+        let id = self.next_graph_id;
+        self.next_graph_id += 1;
+        self.graph_tabs.clear();
+        self.graph_tabs.push(GraphDoc::new(id, String::new(), object_info));
+        self.active_graph = 0;
+        self.executing = None;
     }
 
     fn handle(&mut self, ctx: &egui::Context, host: &Host, m: Msg) {
@@ -460,8 +616,8 @@ impl ComfyApp {
             }
             Msg::InputUploaded { token, image_ref } => {
                 let target = self.pending_uploads.remove(&token);
-                if let (Some(node), Some(g)) = (target, self.graph.as_mut())
-                    && let Some(data) = g.snarl.get_node_mut(node)
+                if let (Some(node), Some(doc)) = (target, self.active_doc_mut())
+                    && let Some(data) = doc.graph.snarl.get_node_mut(node)
                 {
                     // Select the uploaded image on the node's `image` input, adding it to the
                     // option list so the picker and the node body show it.
@@ -521,15 +677,18 @@ impl ComfyApp {
                 self.engine.as_ref().unwrap().fetch_lora_catalog();
                 self.engine.as_ref().unwrap().fetch_checkpoint_catalog();
                 self.installed_loras = schemas.loras();
-                // Swap the node catalog in place so a reconnect keeps the graph canvas.
+                // Swap the node catalog in place so a reconnect keeps open tabs.
                 let object_info = schema::to_object_info(&schemas);
-                let had_nodes = self
-                    .graph
-                    .as_ref()
-                    .is_some_and(|g| g.snarl.nodes_pos_ids().next().is_some());
-                match &mut self.graph {
-                    Some(g) => g.object_info = object_info,
-                    None => self.graph = Some(ComfyUiNodeGraph::new(object_info)),
+                let had_nodes = self.graph_tabs.iter().any(|d| !d.is_empty());
+                if self.graph_tabs.is_empty() {
+                    let id = self.next_graph_id;
+                    self.next_graph_id += 1;
+                    self.graph_tabs.push(GraphDoc::new(id, String::new(), object_info));
+                    self.active_graph = 0;
+                } else {
+                    for doc in &mut self.graph_tabs {
+                        doc.graph.object_info = object_info.clone();
+                    }
                 }
                 self.schemas = Some(schemas.clone());
                 if !checkpoints.is_empty() {
@@ -552,7 +711,6 @@ impl ComfyApp {
                 if !had_nodes
                     && let Some((name, body)) = self.restore_workflow.take()
                 {
-                    self.graph_status = format!("Restoring {}…", elide(&name, 40));
                     self.wf_loading = true;
                     self.engine.as_ref().unwrap().load_workflow_json(name, body, schemas);
                 }
@@ -566,6 +724,19 @@ impl ComfyApp {
             Msg::Progress { value, max } => {
                 self.progress = (value, max);
                 self.status = format!("Sampling {value}/{max}");
+            }
+            Msg::QueueRemaining(n) => {
+                self.queue_remaining = n;
+                if n == 0 {
+                    if !self.running {
+                        self.progress = (0, 0);
+                        if self.status.starts_with("Server queue") {
+                            self.status = "Done".into();
+                        }
+                    }
+                } else if !self.running {
+                    self.status = format!("Server queue: {n}");
+                }
             }
             Msg::Status(s) => self.status = s,
             Msg::Preview(ci) => {
@@ -581,29 +752,33 @@ impl ComfyApp {
                 if let Some(n) = node {
                     self.run_seen.insert(n);
                 }
-                self.executing = node.and_then(|n| self.node_map.get(&n).copied());
+                let nid = self
+                    .active_doc()
+                    .and_then(|d| node.and_then(|n| d.node_map.get(&n).copied()));
+                self.executing = nid;
                 // Select the running node like ComfyUI does: it shows in Properties and (unless the
                 // green executing stroke wins) gets the focus border.
-                if let Some(nid) = self.executing {
-                    self.props_node = Some(nid);
-                    // Auto-follow (opt-in) pans and zooms the canvas to the running node.
-                    if self.auto_follow
-                        && let Some(info) = self.graph.as_ref().and_then(|g| g.snarl.get_node_info(nid))
-                    {
-                        self.view.focus_on(info.pos);
+                if let Some(nid) = nid {
+                    let follow = self.auto_follow;
+                    if let Some(doc) = self.active_doc_mut() {
+                        doc.props_node = Some(nid);
+                        if follow
+                            && let Some(info) = doc.graph.snarl.get_node_info(nid)
+                        {
+                            doc.view.focus_on(info.pos);
+                        }
                     }
                 }
             }
             Msg::NodeExecuted { node, images } => {
-                if let Some(&nid) = self.node_map.get(&node) {
-                    self.graph_outputs.entry(nid).or_default().extend(images);
-                    if let Some(g) = &mut self.graph {
-                        let prefix = format!("run{}", self.run_seq);
-                        g.populate_output_images(
-                            &prefix,
-                            self.graph_outputs.iter().map(|(k, v)| (*k, v.clone())),
-                        );
-                    }
+                let run_seq = self.run_seq;
+                if let Some(doc) = self.active_doc_mut()
+                    && let Some(&nid) = doc.node_map.get(&node)
+                {
+                    doc.outputs.entry(nid).or_default().extend(images);
+                    let prefix = format!("run{run_seq}");
+                    let imgs: Vec<_> = doc.outputs.iter().map(|(k, v)| (*k, v.clone())).collect();
+                    doc.graph.populate_output_images(&prefix, imgs.into_iter());
                 }
             }
             Msg::Done => {
@@ -644,53 +819,47 @@ impl ComfyApp {
             }
             Msg::WorkflowLoaded { name, workflow, warnings } => {
                 self.wf_loading = false;
-                if let Some(g) = &mut self.graph {
-                    self.graph_outputs.clear();
-                    self.node_map.clear();
-                    self.executing = None;
-                    self.props_node = None;
-                    self.view.reset();
-                    match g.load_api_workflow(&workflow) {
-                        Ok(()) => {
-                            self.graph_name = name;
-                            self.graph_status = if warnings.is_empty() {
-                                format!("{} nodes", workflow.0.len())
-                            } else {
-                                format!(
-                                    "{} nodes, {} warnings — see Logs",
-                                    workflow.0.len(),
-                                    warnings.len()
-                                )
-                            };
-                            self.wf_open = false;
-                            self.tab = Tab::Graph;
+                self.executing = None;
+                match self.load_workflow_into_tab(name, &workflow) {
+                    Ok(()) => {
+                        if !warnings.is_empty() {
+                            self.log.warn(format!(
+                                "workflow loaded with {} warning(s) — see earlier log lines",
+                                warnings.len()
+                            ));
+                        }
+                        self.graph_status.clear();
+                        self.wf_open = false;
+                        self.tab = Tab::Graph;
+                        self.graph_pane = GraphPane::Canvas;
+                        if self.viewer.is_some() {
+                            self.gallery_scroll_restore = Some(self.gallery_scroll_y);
                             self.viewer = None;
-                            if self.auto_arrange {
-                                self.view.request_arrange();
-                            } else {
-                                self.view.request_fit();
-                            }
-                            host.haptic(Haptic::Success);
                         }
-                        Err(e) => {
-                            self.graph_status = format!("Load failed: {e}");
-                            self.log.error(format!("graph load: {e}"));
-                            host.haptic(Haptic::Error);
-                        }
+                        host.haptic(Haptic::Success);
+                    }
+                    Err(e) => {
+                        self.graph_status = format!("Load failed: {e}");
+                        self.log.error(format!("graph load: {e}"));
+                        host.haptic(Haptic::Error);
                     }
                 }
             }
             Msg::WorkflowSaved(name) => {
                 self.saving = false;
                 self.save_open = false;
-                self.graph_name = name.clone();
-                self.graph_status = format!("Saved {}", elide(&name, 48));
+                if let Some(doc) = self.active_doc_mut() {
+                    doc.name = name.clone();
+                }
+                self.graph_status.clear();
+                self.log.info(format!("saved workflow {name}"));
                 host.haptic(Haptic::Success);
             }
             Msg::WorkflowError(e) => {
                 self.wf_loading = false;
                 self.saving = false;
                 self.graph_status = elide(&e, 200);
+                self.log.error(elide(&e, 200));
                 host.haptic(Haptic::Error);
             }
             Msg::Gallery { generation, page } => {
@@ -806,9 +975,8 @@ impl ComfyApp {
         }
     }
 
-    /// Start a Create-tab generation. When `queue_only`, an already-running job is left alone and
-    /// another prompt is added to the server queue.
-    fn start_generation(&mut self, host: &Host, queue_only: bool) {
+    /// Queue a Create-tab generation (adds to the server queue if something is already running).
+    fn start_generation(&mut self, host: &Host) {
         if self.params.checkpoint.is_empty() {
             self.status = "Pick a checkpoint first".into();
             return;
@@ -820,13 +988,12 @@ impl ComfyApp {
         if fresh {
             self.progress = (0, 0);
             self.preview = None;
-            self.node_map.clear();
             self.run_total = 0;
             self.run_seen.clear();
         }
         self.running = true;
         self.jobs_left += 1;
-        self.status = if queue_only && !fresh {
+        self.status = if !fresh {
             format!("Queued ({} in flight)", self.jobs_left)
         } else {
             "Queued".into()
@@ -838,20 +1005,21 @@ impl ComfyApp {
     }
 
     fn queue_graph(&mut self, ctx: &egui::Context, host: &Host) {
-        let Some(g) = &mut self.graph else { return };
-        let (wg, mapping) = g.as_workflow_graph_with_mapping();
+        let Some(doc) = self.active_doc_mut() else { return };
+        let (wg, mapping) = doc.graph.as_workflow_graph_with_mapping();
         let wf = wg.into_workflow();
         if wf.0.is_empty() {
             self.graph_status = "Graph is empty".into();
             return;
         }
-        self.node_map = mapping.into_iter().map(|(nid, wid)| (wid.0, nid)).collect();
-        self.graph_outputs.clear();
+        doc.node_map = mapping.into_iter().map(|(nid, wid)| (wid.0, nid)).collect();
+        doc.outputs.clear();
+        doc.graph.populate_output_images("none", std::iter::empty());
+        let n = wf.0.len();
         self.run_seq += 1;
-        self.run_total = wf.0.len();
+        self.run_total = n;
         self.run_seen.clear();
         ctx.forget_all_images();
-        g.populate_output_images("none", std::iter::empty());
         self.running = true;
         self.jobs_left += 1;
         self.status = "Queued".into();
@@ -863,36 +1031,27 @@ impl ComfyApp {
         host.haptic(Haptic::Medium);
     }
 
-    /// Load the current Create params into the node-graph editor.
+    /// Load the current Create params into a new (or empty) graph tab.
     fn open_create_as_graph(&mut self, host: &Host) {
         if self.params.checkpoint.is_empty() {
             self.status = "Pick a checkpoint first".into();
             host.haptic(Haptic::Warning);
             return;
         }
-        let Some(g) = self.graph.as_mut() else {
+        if self.schemas.is_none() {
             self.status = "Connect to the server first".into();
             host.haptic(Haptic::Warning);
             return;
-        };
+        }
+        self.ensure_graph_tab();
         let (wf, _) = crate::workflow::build(&self.params, None);
-        self.graph_outputs.clear();
-        self.node_map.clear();
         self.executing = None;
-        self.props_node = None;
-        self.view.reset();
-        match g.load_api_workflow(&wf) {
+        match self.load_workflow_into_tab("create.json".into(), &wf) {
             Ok(()) => {
-                self.graph_name = "create.json".into();
-                self.graph_status = format!("{} nodes from Create", wf.0.len());
+                self.graph_status.clear();
                 self.tab = Tab::Graph;
                 self.graph_pane = GraphPane::Canvas;
-                if self.auto_arrange {
-                    self.view.request_arrange();
-                } else {
-                    self.view.request_fit();
-                }
-                self.status = "Opened Create as graph".into();
+                self.status.clear();
                 host.haptic(Haptic::Success);
             }
             Err(e) => {
@@ -970,20 +1129,23 @@ impl ComfyApp {
         serde_json::to_string_pretty(&settings).ok()
     }
 
-    /// Current graph as UI-format JSON for persistence, when a schema-backed editor exists.
+    /// Active graph as UI-format JSON for persistence, when a schema-backed editor exists.
     fn snapshot_workflow(&self) -> (String, Option<String>) {
-        if let (Some(g), Some(schemas)) = (self.graph.as_ref(), self.schemas.as_ref()) {
-            if g.snarl.nodes_pos_ids().next().is_some() {
-                let exported = self.view.export_ui(g, schemas);
+        if let (Some(doc), Some(schemas)) = (self.active_doc(), self.schemas.as_ref()) {
+            if !doc.is_empty() {
+                let exported = doc.view.export_ui(&doc.graph, schemas);
                 if let Ok(body) = serde_json::to_string(&exported) {
-                    return (self.graph_name.clone(), Some(body));
+                    return (doc.name.clone(), Some(body));
                 }
             }
         }
         // Keep the last restored snapshot until a live graph replaces it.
         match &self.restore_workflow {
             Some((name, json)) => (name.clone(), Some(json.clone())),
-            None => (self.graph_name.clone(), None),
+            None => (
+                self.active_doc().map(|d| d.name.clone()).unwrap_or_default(),
+                None,
+            ),
         }
     }
 
@@ -1324,7 +1486,7 @@ impl ComfyApp {
         }
     }
 
-    fn create_main_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+    fn create_main_pane(&mut self, ui: &mut egui::Ui, _host: &Host) {
         let ckpt_label = if self.params.checkpoint.is_empty() {
             "no model".to_string()
         } else {
@@ -1389,7 +1551,12 @@ impl ComfyApp {
                         }
                     }
                 }
-                ui.add(egui::Slider::new(&mut self.params.denoise, 0.0..=1.0).text("Denoise"));
+                full_width_slider(ui, "Denoise", |ui, w| {
+                    ui.add_sized(
+                        [w, 24.0],
+                        egui::Slider::new(&mut self.params.denoise, 0.0..=1.0),
+                    );
+                });
             });
         }
 
@@ -1415,10 +1582,7 @@ impl ComfyApp {
                 .hint_text("what to avoid"),
         );
 
-        // Full-width sliders sit outside the param grid so they can use the whole pane.
-        ui.horizontal(|ui| {
-            ui.label("Steps");
-            let w = ui.available_width();
+        full_width_slider(ui, "Steps", |ui, w| {
             ui.add_sized(
                 [w, 24.0],
                 egui::Slider::new(&mut self.params.steps, 5..=150)
@@ -1426,52 +1590,44 @@ impl ComfyApp {
                     .clamping(egui::SliderClamping::Always),
             );
         });
-        ui.horizontal(|ui| {
-            ui.label("CFG");
-            let w = ui.available_width();
+        full_width_slider(ui, "CFG", |ui, w| {
             ui.add_sized(
                 [w, 24.0],
                 egui::Slider::new(&mut self.params.cfg, 1.0..=20.0)
                     .clamping(egui::SliderClamping::Always),
             );
         });
+        full_width_slider(ui, "Batch", |ui, w| {
+            ui.add_sized(
+                [w, 24.0],
+                egui::Slider::new(&mut self.params.batch_size, 1..=8).text("images"),
+            );
+        });
 
-        egui::Grid::new("params")
-            .num_columns(2)
-            .spacing([8.0, 10.0])
-            .min_row_height(24.0)
-            .show(ui, |ui| {
-                ui.label("Size");
-                ui.horizontal(|ui| {
-                    ui.add(egui::DragValue::new(&mut self.params.width).range(64..=2048).speed(8.0));
-                    ui.label("×");
-                    ui.add(egui::DragValue::new(&mut self.params.height).range(64..=2048).speed(8.0));
-                    size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
-                });
-                ui.end_row();
+        ui.add_space(4.0);
+        ui.label("Size");
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut self.params.width).range(64..=2048).speed(8.0));
+            ui.label("×");
+            ui.add(egui::DragValue::new(&mut self.params.height).range(64..=2048).speed(8.0));
+            size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
+        });
 
-                ui.label("Sampler");
-                combo(ui, "sampler", &mut self.params.sampler, &self.samplers);
-                ui.end_row();
+        ui.add_space(4.0);
+        ui.label("Sampler");
+        combo_full(ui, "sampler", &mut self.params.sampler, &self.samplers);
+        ui.label("Scheduler");
+        combo_full(ui, "scheduler", &mut self.params.scheduler, &self.schedulers);
 
-                ui.label("Scheduler");
-                combo(ui, "scheduler", &mut self.params.scheduler, &self.schedulers);
-                ui.end_row();
-
-                ui.label("Batch");
-                ui.add(egui::Slider::new(&mut self.params.batch_size, 1..=8).text("images"));
-                ui.end_row();
-
-                ui.label("Seed");
-                ui.horizontal(|ui| {
-                    ui.add_enabled(
-                        !self.params.randomize_seed,
-                        egui::DragValue::new(&mut self.params.seed).speed(1.0),
-                    );
-                    ui.checkbox(&mut self.params.randomize_seed, "random");
-                });
-                ui.end_row();
-            });
+        ui.add_space(4.0);
+        ui.label("Seed");
+        ui.horizontal(|ui| {
+            ui.add_enabled(
+                !self.params.randomize_seed,
+                egui::DragValue::new(&mut self.params.seed).speed(1.0),
+            );
+            ui.checkbox(&mut self.params.randomize_seed, "random");
+        });
 
         if !self.params.loras.is_empty() {
             ui.add_space(4.0);
@@ -1481,71 +1637,8 @@ impl ComfyApp {
             ));
         }
 
-        ui.add_space(6.0);
-        let can_gen = !self.params.checkpoint.is_empty();
-        ui.horizontal_wrapped(|ui| {
-            if self.running {
-                if ui.button("Cancel").clicked() {
-                    self.engine.as_mut().unwrap().cancel();
-                    host.haptic(Haptic::Warning);
-                }
-            } else {
-                let btn = egui::Button::new("Generate").min_size(egui::vec2(120.0, 34.0));
-                if ui.add_enabled(can_gen, btn).clicked() {
-                    self.start_generation(host, false);
-                }
-            }
-            if ui
-                .add_enabled(
-                    can_gen,
-                    egui::Button::new("Queue").min_size(egui::vec2(80.0, 34.0)),
-                )
-                .on_hover_text("Add another prompt to the server queue")
-                .clicked()
-            {
-                self.start_generation(host, true);
-            }
-            if ui
-                .add_enabled(can_gen, egui::Button::new(format!("{} Open as graph", icons::GRAPH)))
-                .on_hover_text("Load these Create settings into the node graph")
-                .clicked()
-            {
-                self.open_create_as_graph(host);
-            }
-        });
-        ui.horizontal_wrapped(|ui| {
-            let clip = host.clipboard_text();
-            let has_wf = self.workflow_clip.is_some()
-                || clip.as_deref().is_some_and(|t| {
-                    let t = t.trim();
-                    t.starts_with('{') || t.starts_with('[')
-                });
-            let has_sampler = self.sampler_clip.is_some()
-                || clip.as_deref().and_then(SamplerPack::from_clipboard_json).is_some();
-            let has_loras = self.lora_clip.is_some()
-                || clip.as_deref().and_then(LoraPack::from_clipboard_json).is_some();
-            if ui
-                .add_enabled(has_wf, egui::Button::new(format!("{} Paste workflow", icons::PROPS)))
-                .on_hover_text("Fill Create from a workflow copied in Gallery")
-                .clicked()
-            {
-                self.paste_workflow_into_create(host);
-            }
-            if ui
-                .add_enabled(has_sampler, egui::Button::new(format!("{} Paste sampler", icons::PROPS)))
-                .on_hover_text("Paste sampler / scheduler / steps / CFG")
-                .clicked()
-            {
-                self.paste_sampler_pack(host);
-            }
-            if ui
-                .add_enabled(has_loras, egui::Button::new(format!("{} Paste LoRAs", icons::PROPS)))
-                .on_hover_text("Paste LoRA stack and strengths")
-                .clicked()
-            {
-                self.paste_lora_pack(host);
-            }
-        });
+        // Room for the floating action bubble.
+        ui.add_space(72.0);
     }
 
     fn create_checkpoints_pane(&mut self, ui: &mut egui::Ui) {
@@ -2198,12 +2291,12 @@ impl ComfyApp {
     }
 
     fn output(&mut self, ui: &mut egui::Ui, host: &Host) {
-        if self.running || !self.status.is_empty() {
+        if self.running || self.queue_remaining > 0 || !self.status.is_empty() {
             ui.add_space(6.0);
             let (v, m) = self.progress;
-            if self.running && m > 0 {
+            if m > 0 && (self.running || self.queue_remaining > 0) {
                 ui.add(egui::ProgressBar::new(v as f32 / m as f32).text(elide(&self.status, 300)));
-            } else if self.running {
+            } else if self.running || self.queue_remaining > 0 {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(elide(&self.status, 300));
@@ -2241,6 +2334,7 @@ impl ComfyApp {
     fn generate_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.create_pane_bar(ui);
         ui.separator();
+        let pane = ui.available_rect_before_wrap();
         crate::theme::scroll_vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -2261,12 +2355,189 @@ impl ComfyApp {
                 self.output(ui, host);
                 ui.add_space(12.0);
             });
+        if self.create_pane == CreatePane::Main {
+            self.create_fab(ui.ctx(), host, pane);
+        }
+    }
+
+    /// Draggable Create-tab action bubble (queue / paste / open as graph).
+    fn create_fab(&mut self, ctx: &egui::Context, host: &Host, pane: egui::Rect) {
+        if !pane.is_finite() || pane.width() < 80.0 {
+            return;
+        }
+        let default = egui::pos2(pane.right() - 58.0, pane.bottom() - 58.0);
+        let mut pos = self.create_fab_pos.unwrap_or(default);
+        pos.x = pos.x.clamp(pane.left() + 8.0, pane.right() - 52.0);
+        pos.y = pos.y.clamp(pane.top() + 8.0, pane.bottom() - 52.0);
+
+        let can_gen = !self.params.checkpoint.is_empty()
+            && (matches!(self.conn, Conn::Connected) || self.engine.as_ref().is_some_and(|e| e.is_connected()));
+        let clip = host.clipboard_text();
+        let has_wf = self.workflow_clip.is_some()
+            || clip.as_deref().is_some_and(|t| {
+                let t = t.trim();
+                t.starts_with('{') || t.starts_with('[')
+            });
+        let has_sampler = self.sampler_clip.is_some()
+            || clip.as_deref().and_then(SamplerPack::from_clipboard_json).is_some();
+        let has_loras = self.lora_clip.is_some()
+            || clip.as_deref().and_then(LoraPack::from_clipboard_json).is_some();
+
+        enum FabAct {
+            Queue,
+            Cancel,
+            OpenGraph,
+            PasteWf,
+            PasteSampler,
+            PasteLoras,
+            Toggle,
+        }
+        let mut act: Option<FabAct> = None;
+        let open = self.create_fab_open;
+
+        if open {
+            egui::Area::new(egui::Id::new("create-fab-menu"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(pos.x - 168.0, pos.y - 220.0))
+                .constrain_to(pane.expand(4.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.set_min_width(160.0);
+                            if self.running {
+                                if ui
+                                    .add_sized(
+                                        [160.0, 36.0],
+                                        egui::Button::new(format!("{} Cancel", icons::STOP)),
+                                    )
+                                    .clicked()
+                                {
+                                    act = Some(FabAct::Cancel);
+                                }
+                            }
+                            if ui
+                                .add_enabled(
+                                    can_gen,
+                                    egui::Button::new(format!("{} Queue", icons::RUN))
+                                        .min_size(egui::vec2(160.0, 36.0)),
+                                )
+                                .on_hover_text("Queue this prompt (runs immediately if idle)")
+                                .clicked()
+                            {
+                                act = Some(FabAct::Queue);
+                            }
+                            if ui
+                                .add_enabled(
+                                    can_gen,
+                                    egui::Button::new(format!("{} Open as graph", icons::GRAPH))
+                                        .min_size(egui::vec2(160.0, 36.0)),
+                                )
+                                .clicked()
+                            {
+                                act = Some(FabAct::OpenGraph);
+                            }
+                            ui.separator();
+                            if ui
+                                .add_enabled(
+                                    has_wf,
+                                    egui::Button::new(format!("{} Paste workflow", icons::PROPS))
+                                        .min_size(egui::vec2(160.0, 34.0)),
+                                )
+                                .clicked()
+                            {
+                                act = Some(FabAct::PasteWf);
+                            }
+                            if ui
+                                .add_enabled(
+                                    has_sampler,
+                                    egui::Button::new(format!("{} Paste sampler", icons::PROPS))
+                                        .min_size(egui::vec2(160.0, 34.0)),
+                                )
+                                .clicked()
+                            {
+                                act = Some(FabAct::PasteSampler);
+                            }
+                            if ui
+                                .add_enabled(
+                                    has_loras,
+                                    egui::Button::new(format!("{} Paste LoRAs", icons::PROPS))
+                                        .min_size(egui::vec2(160.0, 34.0)),
+                                )
+                                .clicked()
+                            {
+                                act = Some(FabAct::PasteLoras);
+                            }
+                        });
+                });
+        }
+
+        egui::Area::new(egui::Id::new("create-fab"))
+            .order(egui::Order::Foreground)
+            .current_pos(pos)
+            .show(ctx, |ui| {
+                let fill = if open {
+                    egui::Color32::from_rgb(70, 90, 140)
+                } else {
+                    egui::Color32::from_rgb(45, 55, 85)
+                };
+                let label = if open {
+                    icons::CHECK
+                } else {
+                    icons::MENU
+                };
+                let btn = egui::Button::new(egui::RichText::new(label).size(22.0))
+                    .min_size(egui::vec2(48.0, 48.0))
+                    .corner_radius(24.0)
+                    .fill(fill);
+                let resp = ui.add(btn).on_hover_text("Actions — drag to move");
+                if resp.dragged() {
+                    let delta = resp.drag_delta();
+                    if delta != egui::Vec2::ZERO {
+                        pos += delta;
+                        self.create_fab_pos = Some(pos);
+                    }
+                }
+                if resp.clicked() {
+                    act = Some(FabAct::Toggle);
+                }
+            });
+
+        match act {
+            Some(FabAct::Toggle) => self.create_fab_open = !self.create_fab_open,
+            Some(FabAct::Queue) => {
+                self.create_fab_open = false;
+                self.start_generation(host);
+            }
+            Some(FabAct::Cancel) => {
+                self.create_fab_open = false;
+                self.engine.as_mut().unwrap().cancel();
+                host.haptic(Haptic::Warning);
+            }
+            Some(FabAct::OpenGraph) => {
+                self.create_fab_open = false;
+                self.open_create_as_graph(host);
+            }
+            Some(FabAct::PasteWf) => {
+                self.create_fab_open = false;
+                self.paste_workflow_into_create(host);
+            }
+            Some(FabAct::PasteSampler) => {
+                self.create_fab_open = false;
+                self.paste_sampler_pack(host);
+            }
+            Some(FabAct::PasteLoras) => {
+                self.create_fab_open = false;
+                self.paste_lora_pack(host);
+            }
+            None => {}
+        }
     }
 
     fn graph_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
-        let has_graph = self.graph.is_some();
+        let has_graph = self.has_graph_editor();
 
-        // Identity stays at the top; the controls sit at the bottom, in reach.
+        // Compact header: pane switch + open-tabs dropdown (no status/node-count clutter).
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.graph_pane, GraphPane::Canvas, "Canvas");
             ui.selectable_value(
@@ -2274,15 +2545,9 @@ impl ComfyApp {
                 GraphPane::Props,
                 format!("{} Properties", icons::PROPS),
             );
-            ui.separator();
-            if !self.graph_name.is_empty() {
-                ui.strong(elide(&self.graph_name, 28));
-            }
-            if self.running {
-                ui.spinner();
-                ui.label(elide(&self.status, 60));
-            } else if !self.graph_status.is_empty() {
-                ui.weak(elide(&self.graph_status, 90));
+            if has_graph {
+                ui.separator();
+                self.graph_tabs_menu(ui);
             }
         });
         ui.separator();
@@ -2310,13 +2575,60 @@ impl ComfyApp {
         }
     }
 
+    /// Dropdown of open workflow tabs, plus close-current / close-all.
+    fn graph_tabs_menu(&mut self, ui: &mut egui::Ui) {
+        let title = self
+            .active_doc()
+            .map(|d| d.title())
+            .unwrap_or_else(|| "Tabs".into());
+        let n = self.graph_tabs.len();
+        let label = if n > 1 {
+            format!("{title} ({n})")
+        } else {
+            title
+        };
+        let mut switch_to: Option<usize> = None;
+        let mut close_idx: Option<usize> = None;
+        let mut close_all = false;
+        up_menu(ui, label, |ui| {
+            for (i, doc) in self.graph_tabs.iter().enumerate() {
+                let mark = if i == self.active_graph {
+                    format!("{} {}", icons::CHECK, doc.title())
+                } else {
+                    format!("     {}", doc.title())
+                };
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(i == self.active_graph, mark).clicked() {
+                        switch_to = Some(i);
+                    }
+                    if ui.small_button(icons::TRASH).on_hover_text("Close tab").clicked() {
+                        close_idx = Some(i);
+                    }
+                });
+            }
+            ui.separator();
+            if ui.button("Close all").clicked() {
+                close_all = true;
+            }
+        });
+        if let Some(i) = switch_to {
+            self.active_graph = i;
+            self.executing = None;
+        }
+        if let Some(i) = close_idx {
+            self.close_graph_tab(i);
+        }
+        if close_all {
+            self.close_all_graph_tabs();
+        }
+    }
+
     fn graph_canvas(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.workflow_window(ui.ctx());
         self.add_node_window(ui.ctx());
         self.search_window(ui.ctx());
         self.save_window(ui.ctx());
 
-        let g = self.graph.as_mut().unwrap();
         let preview = self
             .running
             .then(|| {
@@ -2326,12 +2638,18 @@ impl ComfyApp {
             })
             .flatten();
         let progress = (self.running && self.progress.1 > 0).then_some(self.progress);
-        g.set_live_execution(self.executing, progress, preview);
-        if let Some(tapped) = self.view.show(ui, g, self.executing, self.props_node) {
-            self.props_node = Some(tapped);
-        }
+        let executing = self.executing;
+        let long_press = {
+            let Some(doc) = self.active_doc_mut() else { return };
+            let props = doc.props_node;
+            doc.graph.set_live_execution(executing, progress, preview);
+            if let Some(tapped) = doc.view.show(ui, &mut doc.graph, executing, props) {
+                doc.props_node = Some(tapped);
+            }
+            doc.view.take_long_press()
+        };
         // Long-press on empty canvas → Add node / Paste workflow menu.
-        if let Some(graph_pos) = self.view.take_long_press() {
+        if let Some(graph_pos) = long_press {
             let screen = ui
                 .ctx()
                 .input(|i| i.pointer.interact_pos())
@@ -2398,7 +2716,7 @@ impl ComfyApp {
         if paste {
             let body = self.workflow_clip.clone().or(sys_clip);
             if let (Some(body), Some(schemas)) = (body, self.schemas.clone()) {
-                self.graph_status = "Pasting workflow…".into();
+                self.graph_status.clear();
                 self.wf_loading = true;
                 self.engine.as_ref().unwrap().load_workflow_json(
                     "pasted.json".into(),
@@ -2415,9 +2733,9 @@ impl ComfyApp {
 
     fn graph_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
         let connected = matches!(self.conn, Conn::Connected);
-        let has_graph = self.graph.is_some();
-        let has_nodes =
-            self.graph.as_ref().is_some_and(|g| g.snarl.nodes_pos_ids().next().is_some());
+        let has_graph = self.has_graph_editor();
+        let has_nodes = self.active_doc().is_some_and(|d| !d.is_empty());
+        let locked = self.active_doc().is_some_and(|d| d.view.locked);
         ui.horizontal_wrapped(|ui| {
             up_menu(ui, format!("{} File", icons::FOLDER), |ui| {
                 if ui
@@ -2436,16 +2754,21 @@ impl ComfyApp {
                     .clicked()
                 {
                     self.save_open = true;
-                    self.save_name = if self.graph_name.is_empty() {
-                        "mobile/untitled.json".to_string()
-                    } else {
-                        self.graph_name.clone()
-                    };
+                    self.save_name = self
+                        .active_doc()
+                        .map(|d| {
+                            if d.name.is_empty() {
+                                "mobile/untitled.json".to_string()
+                            } else {
+                                d.name.clone()
+                            }
+                        })
+                        .unwrap_or_else(|| "mobile/untitled.json".into());
                 }
                 ui.separator();
                 if ui
                     .add_enabled(
-                        has_graph && !self.view.locked,
+                        has_graph && !locked,
                         egui::Button::new(format!("{} Clear canvas", icons::TRASH)),
                     )
                     .clicked()
@@ -2457,13 +2780,13 @@ impl ComfyApp {
             up_menu(ui, format!("{} Edit", icons::ADD), |ui| {
                 if ui
                     .add_enabled(
-                        has_graph && !self.view.locked,
+                        has_graph && !locked,
                         egui::Button::new(format!("{} Add node…", icons::ADD)),
                     )
                     .clicked()
                 {
                     self.add_open = true;
-                    if let Some(center) = self.view.center_in_graph() {
+                    if let Some(center) = self.active_doc().and_then(|d| d.view.center_in_graph()) {
                         self.add_pos = center - egui::vec2(90.0, 50.0);
                     }
                 }
@@ -2474,22 +2797,29 @@ impl ComfyApp {
                     self.search_open = true;
                 }
                 if ui
-                    .add_enabled(has_nodes && !self.view.locked, egui::Button::new("Auto-arrange"))
+                    .add_enabled(has_nodes && !locked, egui::Button::new("Auto-arrange"))
                     .clicked()
                 {
-                    self.view.request_arrange();
+                    if let Some(doc) = self.active_doc_mut() {
+                        doc.view.request_arrange();
+                    }
                 }
             });
 
             up_menu(ui, format!("{} View", icons::SEARCH), |ui| {
                 if ui.add_enabled(has_nodes, egui::Button::new("Fit to screen")).clicked() {
-                    self.view.request_fit();
+                    if let Some(doc) = self.active_doc_mut() {
+                        doc.view.request_fit();
+                    }
                 }
                 if ui.add_enabled(has_nodes, egui::Button::new("Go to first node")).clicked() {
-                    if let Some(pos) =
-                        self.graph.as_ref().and_then(|g| graphview::first_node_pos(&g.snarl))
+                    let pos = self
+                        .active_doc()
+                        .and_then(|d| graphview::first_node_pos(&d.graph.snarl));
+                    if let Some(pos) = pos
+                        && let Some(doc) = self.active_doc_mut()
                     {
-                        self.view.center_on(pos);
+                        doc.view.center_on(pos);
                     }
                 }
                 ui.separator();
@@ -2536,17 +2866,12 @@ impl ComfyApp {
     }
 
     fn clear_graph(&mut self) {
-        if let Some(g) = &mut self.graph {
-            g.clear();
+        if let Some(doc) = self.active_doc_mut() {
+            doc.clear_content();
         }
         self.restore_workflow = None;
-        self.graph_name.clear();
         self.graph_status.clear();
-        self.graph_outputs.clear();
-        self.node_map.clear();
         self.executing = None;
-        self.props_node = None;
-        self.view.reset();
         self.add_pos = egui::pos2(80.0, 80.0);
     }
 
@@ -2556,6 +2881,7 @@ impl ComfyApp {
         }
         let mut open = true;
         let mut submit = false;
+        let active_name = self.active_doc().map(|d| d.name.clone()).unwrap_or_default();
         centered(egui::Window::new("Save workflow"))
             .open(&mut open)
             .collapsible(false)
@@ -2576,29 +2902,32 @@ impl ComfyApp {
                     if self.saving {
                         ui.spinner();
                         ui.weak("saving…");
-                    } else if self.save_name.trim() == self.graph_name.trim()
-                        && !self.graph_name.is_empty()
+                    } else if self.save_name.trim() == active_name.trim() && !active_name.is_empty()
                     {
                         ui.weak("overwrites the opened workflow");
                     }
                 });
             });
-        if submit
-            && let (Some(g), Some(schemas)) = (self.graph.as_ref(), self.schemas.as_ref())
-        {
+        if submit {
             let mut name = self.save_name.trim().trim_matches('/').to_string();
             if !name.to_lowercase().ends_with(".json") {
                 name.push_str(".json");
             }
             self.save_name = name.clone();
-            let exported = self.view.export_ui(g, schemas);
-            match serde_json::to_string(&exported) {
-                Ok(body) => {
+            let exported = self.active_doc().and_then(|doc| {
+                let schemas = self.schemas.as_ref()?;
+                Some(doc.view.export_ui(&doc.graph, schemas))
+            });
+            match exported.and_then(|v| serde_json::to_string(&v).ok()) {
+                Some(body) => {
                     self.saving = true;
-                    self.graph_status = format!("Saving {}…", elide(&name, 40));
+                    self.graph_status.clear();
                     self.engine.as_ref().unwrap().save_workflow(name, body);
                 }
-                Err(e) => self.graph_status = format!("Export failed: {e}"),
+                None => {
+                    self.graph_status = "Export failed".into();
+                    self.log.error("workflow export failed");
+                }
             }
         }
         self.save_open = open && self.save_open;
@@ -2610,6 +2939,7 @@ impl ComfyApp {
         }
         let mut open = true;
         let mut jump: Option<(NodeId, egui::Pos2)> = None;
+        let props = self.active_doc().and_then(|d| d.props_node);
         centered(egui::Window::new("Find node"))
             .open(&mut open)
             .collapsible(false)
@@ -2621,11 +2951,11 @@ impl ComfyApp {
                         .desired_width(f32::INFINITY),
                 );
                 ui.separator();
-                let Some(g) = self.graph.as_ref() else { return };
+                let Some(doc) = self.active_doc() else { return };
                 let filter = self.search_filter.to_lowercase();
                 crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let mut shown = 0usize;
-                    for (id, pos, data) in g.snarl.nodes_pos_ids() {
+                    for (id, pos, data) in doc.graph.snarl.nodes_pos_ids() {
                         let title = data.object.display_name();
                         if !filter.is_empty()
                             && !title.to_lowercase().contains(&filter)
@@ -2639,7 +2969,7 @@ impl ComfyApp {
                         }
                         shown += 1;
                         let label = format!("{}  ({})", elide(title, 36), elide(&data.object.name, 24));
-                        if ui.selectable_label(self.props_node == Some(id), label).clicked() {
+                        if ui.selectable_label(props == Some(id), label).clicked() {
                             jump = Some((id, pos));
                         }
                     }
@@ -2649,20 +2979,22 @@ impl ComfyApp {
                 });
             });
         if let Some((id, pos)) = jump {
-            self.props_node = Some(id);
-            self.view.center_on(pos);
+            if let Some(doc) = self.active_doc_mut() {
+                doc.props_node = Some(id);
+                doc.view.center_on(pos);
+            }
             open = false;
         }
         self.search_open = open;
     }
 
     fn props_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
-        if self.graph.is_none() {
+        if !self.has_graph_editor() {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| ui.label("Connect to a server first."));
             return;
         }
-        let Some(node) = self.props_node else {
+        let Some(node) = self.active_doc().and_then(|d| d.props_node) else {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
                 ui.label("Tap a node on the canvas (or use Find) to inspect it.");
@@ -2674,10 +3006,10 @@ impl ComfyApp {
         };
         ui.horizontal(|ui| {
             if ui.button("Show in graph").clicked() {
-                if let Some(g) = self.graph.as_ref()
-                    && let Some(info) = g.snarl.get_node_info(node)
+                if let Some(doc) = self.active_doc_mut()
+                    && let Some(info) = doc.graph.snarl.get_node_info(node)
                 {
-                    self.view.center_on(info.pos);
+                    doc.view.center_on(info.pos);
                 }
                 self.graph_pane = GraphPane::Canvas;
             }
@@ -2694,15 +3026,17 @@ impl ComfyApp {
             .show(ui, |ui| {
                 ui.set_width(content_width);
                 ui.set_max_width(content_width);
-                if let Some(g) = self.graph.as_mut() {
-                    exists = graphview::node_properties(ui, g, node, false);
+                if let Some(doc) = self.active_doc_mut() {
+                    exists = graphview::node_properties(ui, &mut doc.graph, node, false);
                 }
                 // For LoadImage-style nodes, a thumbnail picker over the server inputs or the phone.
                 self.loadimage_picker(ui, host, node);
                 ui.add_space(12.0);
             });
-        if !exists {
-            self.props_node = None;
+        if !exists
+            && let Some(doc) = self.active_doc_mut()
+        {
+            doc.props_node = None;
         }
     }
 
@@ -2711,8 +3045,8 @@ impl ComfyApp {
     /// phone's own photo gallery (MediaStore), uploaded to the server on tap.
     fn loadimage_picker(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId) {
         let (input_idx, options, selected) = {
-            let Some(g) = self.graph.as_ref() else { return };
-            let Some(data) = g.snarl.get_node(node) else { return };
+            let Some(doc) = self.active_doc() else { return };
+            let Some(data) = doc.graph.snarl.get_node(node) else { return };
             let found = data.inputs.iter().enumerate().find_map(|(i, inp)| {
                 if !inp.name.eq_ignore_ascii_case("image") {
                     return None;
@@ -2828,8 +3162,8 @@ impl ComfyApp {
         }
 
         if let Some(chosen) = picked
-            && let Some(g) = self.graph.as_mut()
-            && let Some(data) = g.snarl.get_node_mut(node)
+            && let Some(doc) = self.active_doc_mut()
+            && let Some(data) = doc.graph.snarl.get_node_mut(node)
             && let Some(inp) = data.inputs.get_mut(input_idx)
             && let FlowValueType::Array { selected, .. } = &mut inp.value
         {
@@ -3026,7 +3360,7 @@ impl ComfyApp {
             && let Some(schemas) = self.schemas.clone()
         {
             self.wf_loading = true;
-            self.graph_status = format!("Loading {name}…");
+            self.graph_status.clear();
             self.engine.as_ref().unwrap().open_workflow(name, schemas);
         }
         self.wf_open = open;
@@ -3038,6 +3372,7 @@ impl ComfyApp {
         }
         let mut open = true;
         let mut inserted = false;
+        let insert_pos = self.add_pos;
         centered(egui::Window::new("Add node"))
             .open(&mut open)
             .collapsible(false)
@@ -3050,14 +3385,14 @@ impl ComfyApp {
                 );
                 ui.separator();
                 let filter = self.add_filter.to_lowercase();
-                let g = self.graph.as_mut().unwrap();
+                let Some(doc) = self.active_doc_mut() else { return };
                 let mut pick = None;
                 {
                     // Group the matching node types by category (nested categories keep their
                     // prefix), so the picker is browsable headers rather than one 2800-row list.
                     let mut cats: std::collections::BTreeMap<&str, Vec<_>> =
                         std::collections::BTreeMap::new();
-                    for object in g.object_info.values() {
+                    for object in doc.graph.object_info.values() {
                         if !filter.is_empty()
                             && !object.name.to_lowercase().contains(&filter)
                             && !object.display_name().to_lowercase().contains(&filter)
@@ -3097,15 +3432,15 @@ impl ComfyApp {
                     });
                 }
                 if let Some(object) = pick {
-                    g.snarl.insert_node(self.add_pos, FlowNodeData::new(object));
-                    self.add_pos += egui::vec2(48.0, 48.0);
-                    if self.add_pos.y > 800.0 {
-                        self.add_pos = egui::pos2(120.0, 80.0);
-                    }
+                    doc.graph.snarl.insert_node(insert_pos, FlowNodeData::new(object));
                     inserted = true;
                 }
             });
         if inserted {
+            self.add_pos += egui::vec2(48.0, 48.0);
+            if self.add_pos.y > 800.0 {
+                self.add_pos = egui::pos2(120.0, 80.0);
+            }
             open = false;
         }
         self.add_open = open;
@@ -3143,136 +3478,166 @@ impl ComfyApp {
 
     fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool) -> bool {
         let mut changed = false;
-        // Row 1: search (kept narrow so nothing on the row clips) + columns + Select.
+        // One row: View menu + search + refresh (right). Filters live in View submenus so the
+        // bottom bar stays a single line on a phone.
         ui.horizontal(|ui| {
+            up_menu(ui, format!("{} View", icons::GALLERY), |ui| {
+                if ui
+                    .button(format!("{} Select", icons::CHECK))
+                    .on_hover_text("Multi-select — or long-press a photo")
+                    .clicked()
+                {
+                    self.select_mode = true;
+                }
+                ui.separator();
+
+                ui.menu_button(
+                    format!("{} Sort · {}", icons::SORT, self.gallery_view.sort.label()),
+                    |ui| {
+                        for s in GallerySort::ALL {
+                            changed |= ui
+                                .selectable_value(&mut self.gallery_view.sort, *s, s.label())
+                                .clicked();
+                        }
+                    },
+                );
+
+                ui.menu_button(format!("Group · {}", self.gallery_view.group.label()), |ui| {
+                    for g in GalleryGroup::ALL {
+                        changed |= ui
+                            .selectable_value(&mut self.gallery_view.group, *g, g.label())
+                            .clicked();
+                    }
+                    if self.gallery_view.group != GalleryGroup::None {
+                        ui.separator();
+                        let open_label = if self.gallery_view.groups_open {
+                            format!("{} Headers open", icons::CHECK)
+                        } else {
+                            "     Headers closed".to_string()
+                        };
+                        if ui
+                            .selectable_label(self.gallery_view.groups_open, open_label)
+                            .on_hover_text("Default open/closed state for group headers")
+                            .clicked()
+                        {
+                            self.gallery_view.groups_open = !self.gallery_view.groups_open;
+                        }
+                    }
+                });
+
+                ui.menu_button(format!("Columns · {}", self.gallery_view.columns), |ui| {
+                    for n in 1..=3usize {
+                        if ui
+                            .selectable_label(
+                                self.gallery_view.columns == n,
+                                format!("{n} column{}", if n == 1 { "" } else { "s" }),
+                            )
+                            .clicked()
+                        {
+                            self.gallery_view.columns = n;
+                        }
+                    }
+                });
+
+                let media_label = match self.gallery_view.media {
+                    GalleryMedia::All => format!("{} Media · All", icons::GALLERY),
+                    GalleryMedia::Images => format!("{} Media · Images", icons::IMAGE),
+                    GalleryMedia::Videos => format!("{} Media · Videos", icons::RUN),
+                };
+                ui.menu_button(media_label, |ui| {
+                    for m in GalleryMedia::ALL {
+                        changed |= ui
+                            .selectable_value(&mut self.gallery_view.media, *m, m.label())
+                            .clicked();
+                    }
+                });
+
+                let model_label = if self.gallery_view.model.is_empty() {
+                    format!("{} Model · All", icons::MODEL)
+                } else {
+                    format!("{} Model · {}", icons::MODEL, elide(&self.gallery_view.model, 18))
+                };
+                ui.menu_button(model_label, |ui| {
+                    crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(
+                                &mut self.gallery_view.model,
+                                String::new(),
+                                "All models",
+                            )
+                            .clicked();
+                        for m in &self.facets.models {
+                            let label = format!("{}  ({})", elide(&m.name, 40), m.count);
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.gallery_view.model,
+                                    m.name.clone(),
+                                    label,
+                                )
+                                .clicked();
+                        }
+                        if self.facets.models.is_empty() {
+                            ui.weak("no models indexed yet");
+                        }
+                    });
+                });
+
+                let album_label = match self.gallery_view.album {
+                    None => format!("{} Album · All", icons::ALBUM),
+                    Some(id) => self
+                        .albums
+                        .iter()
+                        .find(|a| a.id == id)
+                        .map(|a| format!("{} Album · {}", icons::ALBUM, elide(&a.name, 18)))
+                        .unwrap_or_else(|| format!("{} Album", icons::ALBUM)),
+                };
+                ui.menu_button(album_label, |ui| {
+                    crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(&mut self.gallery_view.album, None, "All images")
+                            .clicked();
+                        for a in &self.albums {
+                            let label =
+                                format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
+                            changed |= ui
+                                .selectable_value(
+                                    &mut self.gallery_view.album,
+                                    Some(a.id),
+                                    label,
+                                )
+                                .clicked();
+                        }
+                        ui.separator();
+                        if ui.button(format!("{} Manage albums…", icons::FOLDER)).clicked() {
+                            self.album_manage_open = true;
+                        }
+                    });
+                });
+            });
+
+            let refresh_w = 40.0;
+            let search_w = (ui.available_width() - refresh_w - 4.0).max(96.0);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.gallery_q)
                     .hint_text(format!("{} search", icons::SEARCH))
-                    .desired_width((ui.available_width() - 210.0).max(96.0)),
+                    .desired_width(search_w),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 changed = true;
             }
-            up_menu(ui, format!("Cols {}", self.gallery_view.columns), |ui| {
-                for n in 1..=3usize {
-                    if ui
-                        .selectable_label(self.gallery_view.columns == n, format!("{n} columns"))
-                        .clicked()
-                    {
-                        self.gallery_view.columns = n;
-                    }
-                }
-            });
             if ui
-                .button(format!("{} Select", icons::CHECK))
-                .on_hover_text("Multi-select — or long-press a photo")
-                .clicked()
-            {
-                self.select_mode = true;
-            }
-        });
-        // Row 2: refresh + the filter/sort/group/album dropdowns. In a bottom bar these must open
-        // upward (`up_menu`); an `egui::ComboBox` only flips a short list up when it wouldn't fit,
-        // and egui's screen rect runs under the Android nav bar so short lists never flip.
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(connected, egui::Button::new(icons::REFRESH))
+                .add_enabled(connected, egui::Button::new(icons::REFRESH).min_size(egui::vec2(36.0, 28.0)))
                 .on_hover_text("Refresh")
                 .clicked()
             {
                 changed = true;
             }
-
-            let model_label = if self.gallery_view.model.is_empty() {
-                format!("{} All models", icons::MODEL)
-            } else {
-                format!("{} {}", icons::MODEL, elide(&self.gallery_view.model, 14))
-            };
-            up_menu(ui, model_label, |ui| {
-                changed |= ui
-                    .selectable_value(&mut self.gallery_view.model, String::new(), "All models")
-                    .clicked();
-                for m in &self.facets.models {
-                    let label = format!("{}  ({})", elide(&m.name, 40), m.count);
-                    changed |= ui
-                        .selectable_value(&mut self.gallery_view.model, m.name.clone(), label)
-                        .clicked();
-                }
-                if self.facets.models.is_empty() {
-                    ui.weak("no models indexed yet");
-                }
-            });
-
-            let album_label = match self.gallery_view.album {
-                None => format!("{} All images", icons::ALBUM),
-                Some(id) => self
-                    .albums
-                    .iter()
-                    .find(|a| a.id == id)
-                    .map(|a| format!("{} {}", icons::ALBUM, elide(&a.name, 14)))
-                    .unwrap_or_else(|| format!("{} Album", icons::ALBUM)),
-            };
-            up_menu(ui, album_label, |ui| {
-                changed |=
-                    ui.selectable_value(&mut self.gallery_view.album, None, "All images").clicked();
-                for a in &self.albums {
-                    let label = format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
-                    changed |= ui
-                        .selectable_value(&mut self.gallery_view.album, Some(a.id), label)
-                        .clicked();
-                }
-                ui.separator();
-                if ui.button(format!("{} Manage albums…", icons::FOLDER)).clicked() {
-                    self.album_manage_open = true;
-                }
-            });
-
-            up_menu(ui, format!("{} {}", icons::SORT, self.gallery_view.sort.label()), |ui| {
-                for s in GallerySort::ALL {
-                    changed |=
-                        ui.selectable_value(&mut self.gallery_view.sort, *s, s.label()).clicked();
-                }
-            });
-
-            up_menu(ui, self.gallery_view.group.label().to_string(), |ui| {
-                for g in GalleryGroup::ALL {
-                    changed |=
-                        ui.selectable_value(&mut self.gallery_view.group, *g, g.label()).clicked();
-                }
-                if self.gallery_view.group != GalleryGroup::None {
-                    ui.separator();
-                    let open_label = if self.gallery_view.groups_open {
-                        format!("{} Headers open", icons::CHECK)
-                    } else {
-                        "     Headers closed".to_string()
-                    };
-                    if ui
-                        .selectable_label(self.gallery_view.groups_open, open_label)
-                        .on_hover_text("Default open/closed state for group headers")
-                        .clicked()
-                    {
-                        self.gallery_view.groups_open = !self.gallery_view.groups_open;
-                    }
-                }
-            });
-
-            let media_label = match self.gallery_view.media {
-                GalleryMedia::All => format!("{} All media", icons::GALLERY),
-                GalleryMedia::Images => format!("{} Images", icons::IMAGE),
-                GalleryMedia::Videos => format!("{} Videos", icons::RUN),
-            };
-            up_menu(ui, media_label, |ui| {
-                for m in GalleryMedia::ALL {
-                    changed |=
-                        ui.selectable_value(&mut self.gallery_view.media, *m, m.label()).clicked();
-                }
-            });
         });
         changed
     }
 
-    /// Create / rename / delete albums. Album *selection* is the combobox in the controls; this
-    /// window is only management. Rename uses the text field's contents as the new name.
+    /// Create / rename / delete albums. Album *selection* is under View → Album; this window is
+    /// only management. Rename uses the text field's contents as the new name.
     fn album_manage_window(&mut self, ctx: &egui::Context) {
         if !self.album_manage_open {
             return;
@@ -3434,12 +3799,17 @@ impl ComfyApp {
         self.tile_hits.clear();
 
         // While a long-press paint-select is in progress, dragging must select tiles, not scroll.
-        let mut scroll = crate::theme::scroll_vertical().auto_shrink([false, false]);
+        let mut scroll = crate::theme::scroll_vertical()
+            .id_salt("gallery_list")
+            .auto_shrink([false, false]);
         if self.sel_painting {
             use egui::containers::scroll_area::{DragScroll, ScrollSource};
             scroll = scroll.scroll_source(ScrollSource { drag: DragScroll::Never, ..Default::default() });
         }
-        scroll.show(ui, |ui| {
+        if let Some(y) = self.gallery_scroll_restore.take() {
+            scroll = scroll.vertical_scroll_offset(y);
+        }
+        let scroll_out = scroll.show(ui, |ui| {
             for group in &groups {
                 if group.label.is_empty() {
                     open = self.gallery_grid(ui, &group.items, cols).or(open);
@@ -3469,6 +3839,7 @@ impl ComfyApp {
             }
             ui.add_space(12.0);
         });
+        self.gallery_scroll_y = scroll_out.state.offset.y;
 
         if load_more {
             self.gallery_loading = true;
@@ -3482,6 +3853,7 @@ impl ComfyApp {
         }
         // Tapping a tile opens it only in browse mode; in select mode the grid handled the toggle.
         if let Some(idx) = open {
+            self.gallery_scroll_restore = Some(self.gallery_scroll_y);
             self.open_viewer(idx, host);
         }
         self.handle_gallery_gesture(ui, host);
@@ -3937,6 +4309,7 @@ impl ComfyApp {
         }
         match act {
             Some(Act::Close) => {
+                self.gallery_scroll_restore = Some(self.gallery_scroll_y);
                 self.viewer = None;
                 self.player = None;
                 self.gallery_status.clear();
@@ -3985,7 +4358,7 @@ impl ComfyApp {
             Some(Act::OpenWorkflow) => {
                 let v = self.viewer.as_ref().unwrap();
                 if let Some(schemas) = self.schemas.clone() {
-                    self.graph_status = format!("Loading workflow of {}…", elide(&v.item.filename, 40));
+                    self.graph_status.clear();
                     self.wf_loading = true;
                     // Prefer the already-fetched body so we don't wait on a second download.
                     if let Some(body) = v.workflow_json.clone() {
@@ -4347,13 +4720,12 @@ impl EguiApp for ComfyApp {
         // central content so the tab bar always keeps its height on a short screen.
         egui::Panel::bottom("nav").show(ui, |ui| {
             ui.add_space(2.0);
-            // Global run progress, visible from every tab: real step progress when the server
-            // streams it, node completion otherwise.
-            if self.running {
+            // Global run progress (local jobs and server-wide queue from other clients).
+            if self.running || self.queue_remaining > 0 {
                 let (v, m) = self.progress;
                 let (frac, label) = if m > 0 {
                     (v as f32 / m as f32, format!("{} {v}/{m}", elide(&self.status, 40)))
-                } else if self.run_total > 0 {
+                } else if self.running && self.run_total > 0 {
                     let done = self.run_seen.len().saturating_sub(1).min(self.run_total);
                     (
                         done as f32 / self.run_total as f32,
@@ -4361,6 +4733,15 @@ impl EguiApp for ComfyApp {
                             "node {} of {}",
                             self.run_seen.len().min(self.run_total),
                             self.run_total
+                        ),
+                    )
+                } else if self.queue_remaining > 0 {
+                    (
+                        0.0,
+                        format!(
+                            "{} · {} in queue",
+                            elide(&self.status, 32),
+                            self.queue_remaining
                         ),
                     )
                 } else {
@@ -4388,7 +4769,16 @@ impl EguiApp for ComfyApp {
                 Tab::Logs => self.logs_tab(ui, host),
             });
 
-        if self.running {
+        // Keep the server-wide queue in view even when jobs were started on the website.
+        if matches!(self.conn, Conn::Connected) {
+            let now = ui.ctx().input(|i| i.time);
+            if now - self.last_queue_poll > 2.5 {
+                self.last_queue_poll = now;
+                self.engine.as_ref().unwrap().poll_queue();
+            }
+        }
+
+        if self.running || self.queue_remaining > 0 {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
     }
@@ -4732,6 +5122,26 @@ fn combo(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) 
                 ui.selectable_value(current, opt.clone(), elide(opt, 56));
             }
         });
+}
+
+fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) {
+    let w = ui.available_width().max(80.0);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(if current.is_empty() { "—".to_string() } else { elide(current, 48) })
+        .width(w)
+        .show_ui(ui, |ui| {
+            for opt in options.iter().take(300) {
+                ui.selectable_value(current, opt.clone(), elide(opt, 56));
+            }
+        });
+}
+
+fn full_width_slider(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, f32)) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let w = ui.available_width();
+        add(ui, w);
+    });
 }
 
 const SIZE_PRESETS: &[(&str, u32, u32)] = &[

@@ -34,6 +34,7 @@ pub const IMAGE: &str = "🖼";
 pub const WARN: &str = "⚠";
 pub const DOT: &str = "•";
 pub const CHECK: &str = "✔";
+pub const MENU: &str = "☰";
 
 /// Every icon constant, for the font-coverage test.
 #[cfg(test)]
@@ -65,6 +66,7 @@ const ALL: &[(&str, &str)] = &[
     ("WARN", WARN),
     ("DOT", DOT),
     ("CHECK", CHECK),
+    ("MENU", MENU),
 ];
 
 #[cfg(test)]

@@ -90,7 +90,7 @@ pub fn apply(ctx: &egui::Context) {
         // 1px button padding / 18px interact size would be too small to tap reliably).
         s.spacing.item_spacing = egui::vec2(6.0, 6.0);
         s.spacing.button_padding = egui::vec2(8.0, 6.0);
-        // Solid (non-floating) bars so AlwaysVisible actually stays painted; wider for touch.
+        // Solid (non-floating) bars — wider for touch; visibility is per-ScrollArea below.
         let mut scroll = egui::style::ScrollStyle::solid();
         scroll.bar_width = 14.0;
         scroll.handle_min_length = 28.0;
@@ -115,17 +115,17 @@ pub fn apply_fonts(ctx: &egui::Context, fonts: &FontSizes) {
     });
 }
 
-/// Vertical scroll area with a permanently visible scrollbar.
+/// Vertical scroll area; scrollbar only when content overflows.
 pub fn scroll_vertical() -> egui::ScrollArea {
-    egui::ScrollArea::vertical().scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+    egui::ScrollArea::vertical().scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
 }
 
-/// Bidirectional scroll area with permanently visible scrollbars.
+/// Bidirectional scroll area; scrollbars only when content overflows.
 pub fn scroll_both() -> egui::ScrollArea {
-    egui::ScrollArea::both().scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+    egui::ScrollArea::both().scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
 }
 
-/// Horizontal scroll area with a permanently visible scrollbar.
+/// Horizontal scroll area; scrollbar only when content overflows.
 pub fn scroll_horizontal() -> egui::ScrollArea {
-    egui::ScrollArea::horizontal().scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+    egui::ScrollArea::horizontal().scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
 }

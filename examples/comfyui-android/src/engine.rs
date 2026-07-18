@@ -36,6 +36,8 @@ pub enum Msg {
     Queued,
     Progress { value: u32, max: u32 },
     Status(String),
+    /// Server-wide queue depth from the WS `status` broadcast (includes jobs from other clients).
+    QueueRemaining(u32),
     Preview(egui::ColorImage),
     Result { image: egui::ColorImage, bytes: Vec<u8> },
     /// A node started executing (`None` = prompt finished). WebSocket transport only today.
@@ -309,6 +311,22 @@ impl Engine {
 
     fn reap_jobs(&mut self) {
         self.jobs.retain(|h| !h.is_finished());
+    }
+
+    /// Snapshot the server queue (`GET /queue`) so the UI can show jobs started elsewhere.
+    pub fn poll_queue(&self) {
+        let Some((http, url)) = self.authed_url("/queue", &[]) else { return };
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.rt.spawn(async move {
+            let Ok(resp) = http.get(url).send().await else { return };
+            let Ok(body) = resp.text().await else { return };
+            let Ok(v) = serde_json::from_str::<Value>(&body) else { return };
+            let running = v.get("queue_running").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+            let pending = v.get("queue_pending").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
+            let remaining = (running + pending) as u32;
+            let _ = tx.send(Msg::QueueRemaining(remaining));
+            ctx.request_repaint();
+        });
     }
 
     /// Download and decode an img2img input URL for the Create-tab thumbnail.
@@ -1510,19 +1528,32 @@ async fn ws_listener(
     }
 }
 
-/// Map a ComfyUI websocket text frame onto a UI message, filtered to the running prompt.
+/// Map a ComfyUI websocket text frame onto a UI message.
+///
+/// `status` is broadcast to every client (website jobs included). Progress / executing stay scoped
+/// to our `clientId`; when we have a current prompt, non-matching `prompt_id`s are dropped.
 fn parse_ws_text(text: &str, current: &CurrentPrompt) -> Option<Msg> {
     let v: Value = serde_json::from_str(text).ok()?;
     let data = v.get("data")?;
-    // Only while a prompt of ours is running. Accept an event whose prompt_id matches, or one that
-    // carries none at all — plain `progress` frames often omit it, and our ws already only receives
-    // events for our own clientId's prompts.
-    let cur = current.lock().unwrap().clone()?;
-    let pid = data.get("prompt_id").and_then(Value::as_str);
-    if pid.is_some_and(|p| p != cur.as_str()) {
-        return None;
+    let kind = v.get("type")?.as_str()?;
+    if kind == "status" {
+        let remaining = data
+            .pointer("/status/exec_info/queue_remaining")
+            .and_then(Value::as_u64)
+            .or_else(|| data.get("queue_remaining").and_then(Value::as_u64))?;
+        return Some(Msg::QueueRemaining(remaining as u32));
     }
-    match v.get("type")?.as_str()? {
+    let cur = current.lock().unwrap().clone();
+    let pid = data.get("prompt_id").and_then(Value::as_str);
+    if let Some(cur) = cur.as_deref() {
+        if pid.is_some_and(|p| p != cur) {
+            return None;
+        }
+    } else if pid.is_some() {
+        // Idle: still surface progress/executing for any prompt our socket receives (same clientId
+        // re-queued from elsewhere, or a server that broadcasts execution events).
+    }
+    match kind {
         "executing" => {
             let node = data.get("node").and_then(Value::as_str).and_then(|s| s.parse().ok());
             Some(Msg::NodeExecuting(node))
@@ -1807,13 +1838,18 @@ mod tests {
     }
 
     #[test]
-    fn ws_text_ignores_other_prompts_and_idle() {
+    fn ws_text_ignores_other_prompts_when_ours_is_running() {
         let other = r#"{"type":"progress","data":{"value":1,"max":8,"prompt_id":"zzz"}}"#;
         assert!(parse_ws_text(other, &current(Some("abc"))).is_none());
-        assert!(parse_ws_text(other, &current(None)).is_none());
-        assert!(parse_ws_text(r#"{"type":"status","data":{}}"#, &current(Some("abc"))).is_none());
-        // Idle: even a prompt-less progress frame is ignored when nothing is running.
-        assert!(parse_ws_text(r#"{"type":"progress","data":{"value":1,"max":8}}"#, &current(None)).is_none());
+    }
+
+    #[test]
+    fn ws_text_status_broadcast_works_while_idle() {
+        let m = parse_ws_text(
+            r#"{"type":"status","data":{"status":{"exec_info":{"queue_remaining":3}}}}"#,
+            &current(None),
+        );
+        assert!(matches!(m, Some(Msg::QueueRemaining(3))));
     }
 
     /// ComfyUI's plain `progress` frames often omit `prompt_id`; since our ws only receives events
@@ -1823,6 +1859,12 @@ mod tests {
         let cur = current(Some("abc"));
         let m = parse_ws_text(r#"{"type":"progress","data":{"value":4,"max":10}}"#, &cur);
         assert!(matches!(m, Some(Msg::Progress { value: 4, max: 10 })));
+    }
+
+    #[test]
+    fn ws_text_accepts_progress_while_idle() {
+        let m = parse_ws_text(r#"{"type":"progress","data":{"value":1,"max":8}}"#, &current(None));
+        assert!(matches!(m, Some(Msg::Progress { value: 1, max: 8 })));
     }
 
     #[test]

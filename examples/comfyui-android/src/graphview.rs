@@ -127,7 +127,9 @@ impl GraphView {
                 arrange(&mut g.snarl, &self.sizes);
                 self.cmd = Some(ViewCmd::FitAll);
             } else {
-                // Sizes measure while the pending fit keeps every node on screen.
+                // Re-fit each frame until every node has measured (first FitAll alone is not enough
+                // when sizes start empty after a load).
+                self.cmd = Some(ViewCmd::FitAll);
                 ui.ctx().request_repaint();
             }
         }
