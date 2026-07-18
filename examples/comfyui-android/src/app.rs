@@ -78,6 +78,8 @@ struct PublishDraft {
     widgets: Vec<PublishWidget>,
     def: AppDef,
     error: String,
+    /// A socket no Create-graph handle can supply; saving is refused until it is wired.
+    blocked: bool,
 }
 
 struct PublishWidget {
@@ -2399,10 +2401,15 @@ impl ComfyApp {
     /// Render one knob over the pane's existing widget helpers, writing back into the step.
     fn knob_widget(&mut self, ui: &mut egui::Ui, i: usize, def: &AppDef, knob: &crate::apps::Knob) {
         let salt = format!("knob_{i}_{}_{}", def.id, knob.id);
-        let current = self.params.apps[i]
+        let stored = self.params.apps[i]
             .value(def, &knob.id)
             .unwrap_or_else(|| knob.default.clone());
-        let mut next: Option<serde_json::Value> = None;
+        // Sliders clamp and type-mismatches fall back without marking the response changed, so a
+        // pasted or hand-edited value could display corrected while the stored one is still sent.
+        // Normalise up front and write back, so what the card shows is what the build uses.
+        let current = coerce_knob(&stored, &knob.ty);
+        let mut next: Option<serde_json::Value> =
+            (current != stored).then(|| current.clone());
 
         let resp = match &knob.ty {
             KnobTy::Enum { class, input, prefix } => {
@@ -2799,7 +2806,15 @@ impl ComfyApp {
             group: "Finish".into(),
             description: String::new(),
             widgets,
-            error: String::new(),
+            error: if unbound.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Nothing can feed: {} — wire these before saving.",
+                    unbound.join(", ")
+                )
+            },
+            blocked: !unbound.is_empty(),
         })
     }
 
@@ -2862,7 +2877,10 @@ impl ComfyApp {
                 ui.colored_label(ui.visuals().error_fg_color, &draft.error);
             }
             ui.separator();
-            if ui.button(format!("{} Save app", icons::SAVE)).clicked() {
+            if ui
+                .add_enabled(!draft.blocked, egui::Button::new(format!("{} Save app", icons::SAVE)))
+                .clicked()
+            {
                 save = true;
             }
         });
@@ -6677,6 +6695,31 @@ fn flow_value_json(v: &FlowValueType) -> Option<serde_json::Value> {
         FlowValueType::Boolean(value) => serde_json::Value::from(*value),
         _ => return None,
     })
+}
+
+/// Normalise a stored knob value to its declared type and range.
+fn coerce_knob(v: &serde_json::Value, ty: &KnobTy) -> serde_json::Value {
+    use serde_json::Value;
+    match ty {
+        KnobTy::Int { min, max, .. } => {
+            let n = v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).unwrap_or(*min);
+            Value::from(n.clamp(*min, *max))
+        }
+        KnobTy::Float { min, max, .. } => {
+            let f = v.as_f64().unwrap_or(*min);
+            Value::from(if f.is_finite() { f.clamp(*min, *max) } else { *min })
+        }
+        KnobTy::Bool => Value::from(v.as_bool().unwrap_or(false)),
+        KnobTy::Choice { options } => match v.as_str() {
+            Some(s) if options.iter().any(|o| o == s) => v.clone(),
+            _ => Value::from(options.first().cloned().unwrap_or_default()),
+        },
+        // Enum options come from the live catalog, so the build layer does that substitution.
+        KnobTy::Enum { .. } | KnobTy::Text { .. } => match v {
+            Value::String(_) => v.clone(),
+            other => Value::from(other.to_string()),
+        },
+    }
 }
 
 /// The knob type matching an editor widget, with its live options and bounds.
