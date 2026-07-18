@@ -52,6 +52,71 @@ pub struct Params {
     pub input_url: String,
     #[serde(default)]
     pub loras: Vec<ActiveLora>,
+    /// Ordered enhance chain appended after the base graph's VAE decode.
+    #[serde(default)]
+    pub apps: Vec<AppStep>,
+}
+
+/// One configured app in the Create tab's enhance chain.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppStep {
+    /// [`crate::apps::AppDef::id`].
+    pub app: String,
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// The def version this step was configured against.
+    #[serde(default)]
+    pub version: u32,
+    /// Knob overrides, keyed by knob id. Missing entries fall back to the def's default.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl AppStep {
+    /// A step seeded with every knob's default, so the card renders without the def present.
+    pub fn new(def: &crate::apps::AppDef) -> Self {
+        Self {
+            app: def.id.clone(),
+            enabled: true,
+            version: def.version,
+            values: def.knobs.iter().map(|k| (k.id.clone(), k.default.clone())).collect(),
+        }
+    }
+
+    /// Effective value for `id`: the stored override, else the def's default.
+    pub fn value(&self, def: &crate::apps::AppDef, id: &str) -> Option<serde_json::Value> {
+        self.values
+            .get(id)
+            .cloned()
+            .or_else(|| def.knob(id).map(|k| k.default.clone()))
+    }
+}
+
+/// Enhance chain copied from the Create tab for sharing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AppPack {
+    pub apps: Vec<AppStep>,
+}
+
+impl AppPack {
+    pub const CLIP_TYPE: &'static str = "comfyui_android_apps_v1";
+
+    pub fn to_clipboard_json(&self) -> String {
+        serde_json::json!({ "type": Self::CLIP_TYPE, "apps": self.apps }).to_string()
+    }
+
+    pub fn from_clipboard_json(raw: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) != Some(Self::CLIP_TYPE) {
+            return None;
+        }
+        let apps: Vec<AppStep> = serde_json::from_value(v.get("apps")?.clone()).ok()?;
+        (!apps.is_empty()).then_some(Self { apps })
+    }
 }
 
 impl Default for Params {
@@ -75,6 +140,7 @@ impl Default for Params {
             img2img_source: Img2ImgSource::CurrentOutput,
             input_url: String::new(),
             loras: Vec::new(),
+            apps: Vec::new(),
         }
     }
 }
@@ -546,6 +612,7 @@ pub enum GalleryGroup {
     None,
     Folder,
     Model,
+    Date,
 }
 
 impl GalleryGroup {
@@ -554,6 +621,7 @@ impl GalleryGroup {
             Self::None => "none",
             Self::Folder => "folder",
             Self::Model => "model",
+            Self::Date => "date",
         }
     }
 
@@ -562,10 +630,11 @@ impl GalleryGroup {
             Self::None => "No grouping",
             Self::Folder => "Folder",
             Self::Model => "Model",
+            Self::Date => "Date",
         }
     }
 
-    pub const ALL: &'static [Self] = &[Self::Folder, Self::Model, Self::None];
+    pub const ALL: &'static [Self] = &[Self::Folder, Self::Model, Self::Date, Self::None];
 }
 
 /// Media-type filter for the gallery listing. Applied client-side (the listing API has no media
@@ -772,6 +841,9 @@ pub struct GalleryItem {
     pub has_workflow: bool,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Unix mtime seconds when the gallery API provides it.
+    #[serde(default)]
+    pub mtime: Option<f64>,
 }
 
 impl GalleryItem {
@@ -806,6 +878,56 @@ impl GalleryItem {
             _ => "Output".to_string(),
         }
     }
+
+    /// Group header when grouping by date: `YYYY-MM-DD` from mtime, path, or filename.
+    pub fn date_label(&self) -> String {
+        if let Some(secs) = self.mtime.filter(|s| s.is_finite() && *s > 0.0) {
+            return unix_ymd(secs as i64);
+        }
+        extract_ymd(&self.subfolder)
+            .or_else(|| extract_ymd(&self.filename))
+            .unwrap_or_else(|| "Unknown date".into())
+    }
+}
+
+/// First `YYYY-MM-DD` substring in `s`, if any.
+fn extract_ymd(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i + 10 <= b.len() {
+        if b[i].is_ascii_digit()
+            && b[i + 1].is_ascii_digit()
+            && b[i + 2].is_ascii_digit()
+            && b[i + 3].is_ascii_digit()
+            && b[i + 4] == b'-'
+            && b[i + 5].is_ascii_digit()
+            && b[i + 6].is_ascii_digit()
+            && b[i + 7] == b'-'
+            && b[i + 8].is_ascii_digit()
+            && b[i + 9].is_ascii_digit()
+        {
+            return Some(s[i..i + 10].to_string());
+        }
+        i += 1;
+    }
+    None
+}
+
+/// UTC calendar date for a unix timestamp (`YYYY-MM-DD`).
+fn unix_ymd(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 #[cfg(test)]
@@ -821,11 +943,26 @@ mod tests {
             is_video: false,
             has_workflow: false,
             models: Vec::new(),
+            mtime: None,
         };
         assert_eq!(item("user_abc/Character/2026-07-16").group_label(), "Character/2026-07-16");
         // A bare namespace is the account's output root — never show the raw account id.
         assert_eq!(item("shadowbroker_531d823e-4a3b-46c8-9550-2e8f").group_label(), "Output");
         assert_eq!(item("").group_label(), "Output");
+        assert_eq!(item("user_abc/Character/2026-07-16").date_label(), "2026-07-16");
+        assert_eq!(
+            GalleryItem {
+                subfolder: "u1".into(),
+                filename: "shot_2026-01-02_x.png".into(),
+                size: 0,
+                is_video: false,
+                has_workflow: false,
+                models: Vec::new(),
+                mtime: None,
+            }
+            .date_label(),
+            "2026-01-02"
+        );
     }
 
     #[test]

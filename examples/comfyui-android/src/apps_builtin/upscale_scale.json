@@ -1,0 +1,35 @@
+{
+  "id": "upscale.scale",
+  "name": "Resize",
+  "group": "Upscale",
+  "description": "Plain resample. Use after a model upscale to land on a size your phone likes.",
+  "version": 1,
+  "requires": [{ "class": "ImageScaleBy", "pack": "core" }],
+  "knobs": [
+    {
+      "id": "scale_by",
+      "label": "Scale",
+      "ty": { "Float": { "min": 0.25, "max": 4.0, "step": 0.05 } },
+      "default": 0.5
+    },
+    {
+      "id": "upscale_method",
+      "label": "Method",
+      "ty": { "Enum": { "class": "ImageScaleBy", "input": "upscale_method" } },
+      "default": "lanczos",
+      "advanced": true
+    }
+  ],
+  "nodes": [
+    {
+      "id": "scale",
+      "class": "ImageScaleBy",
+      "inputs": {
+        "image": "$image",
+        "upscale_method": "$knob:upscale_method",
+        "scale_by": "$knob:scale_by"
+      }
+    }
+  ],
+  "output": { "node": "scale", "slot": 0 }
+}

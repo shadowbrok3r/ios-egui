@@ -23,8 +23,12 @@ struct Adapter {
     last_focus: Option<egui::Id>,
     /// Text-actions bar rect from the previous frame.
     bar_rect: Option<egui::Rect>,
-    /// A pointer press that began inside the bar has not been released yet.
+    /// A pointer press that began inside the bar (cleared only after the frame that handles release).
     bar_touch: bool,
+    /// Extra frames to pin focus + soft keyboard after a bar action (avoids IME flicker).
+    ime_hold_frames: u8,
+    /// Previous frame had the hidden-EditText IME bridge active (for hide-on-dismiss).
+    ime_bridge_hot: bool,
 }
 
 impl eframe::App for Adapter {
@@ -41,6 +45,8 @@ impl eframe::App for Adapter {
         crate::host::update_insets(&self.host, ui.ctx().pixels_per_point());
         // While a tap is on the bar, disable click-away focus surrender so the focused text
         // field (or plugin viewport) still has focus when the queued event lands.
+        // Do NOT clear `bar_touch` on pointer-up here: the click is processed on the release
+        // frame, and clearing early would re-enable surrender and collapse the keyboard.
         let pressed_in_bar = self.bar_rect.is_some_and(|r| {
             ui.ctx().input(|i| {
                 i.events.iter().any(|e| {
@@ -49,7 +55,7 @@ impl eframe::App for Adapter {
             })
         });
         self.bar_touch |= pressed_in_bar;
-        let hold = self.bar_touch;
+        let hold = self.bar_touch || self.ime_hold_frames > 0;
         ui.ctx().options_mut(|o| {
             o.input_options.surrender_focus_on = if hold {
                 egui::SurrenderFocusOn::Never
@@ -57,9 +63,27 @@ impl eframe::App for Adapter {
                 egui::SurrenderFocusOn::Clicks
             };
         });
-        if ui.ctx().input(|i| !i.pointer.any_down()) {
-            self.bar_touch = false;
+        if hold {
+            self.pin_text_ime(ui.ctx());
         }
+        // InputConnection → egui before the app frame. Re-bind the hidden EditText only while
+        // egui wants IME or during the brief bar-tap hold — not while a sticky keyboard_requested
+        // flag would keep showIme forever after click-away. Plugins get show/hide via drain.
+        let ime_wanted = ui.ctx().output(|o| o.ime.is_some());
+        let guest_kb = crate::host::keyboard_requested();
+        let bridge_hot = hold || ime_wanted;
+        if bridge_hot {
+            let _ = crate::ime_bridge::set_soft_keyboard(true);
+            crate::ime_bridge::apply_pending(
+                ui.ctx(),
+                self.last_focus,
+                &mut self.pending_events,
+            );
+        } else if self.ime_bridge_hot && !guest_kb {
+            // Host TextEdit dismissed; do not clear guest plugin keyboard requests.
+            let _ = crate::ime_bridge::set_soft_keyboard(false);
+        }
+        self.ime_bridge_hot = bridge_hot;
         if !self.pending_events.is_empty() {
             let events = std::mem::take(&mut self.pending_events);
             // Extend `raw` too: the plugin viewport forwards guest input from `raw.events`.
@@ -86,8 +110,15 @@ impl eframe::App for Adapter {
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             self.app.update(ui, &self.host);
         });
-        if let Some(id) = ui.ctx().memory(|m| m.focused()) {
+        let focused = ui.ctx().memory(|m| m.focused());
+        if let Some(id) = focused {
             self.last_focus = Some(id);
+        } else if !hold {
+            self.last_focus = None;
+        }
+        // egui → hidden EditText so Gboard setSelection matches the focused field.
+        if bridge_hot || (keyboard > 0.0 && self.last_focus.is_some()) {
+            crate::ime_bridge::sync_focused_text_edit(ui.ctx(), self.last_focus);
         }
         // Mirror this frame's egui copies (host widgets and plugin viewports alike) into the
         // system clipboard; winit has no Android clipboard backend.
@@ -100,22 +131,42 @@ impl eframe::App for Adapter {
         if let Some(text) = copied {
             self.host.copy_text(text);
         }
-        self.text_actions_bar(ui, full_rect);
+        self.text_actions_bar(ui, full_rect, focused.is_some());
+        // Clear bar_touch only after the bar has handled this frame's release/click.
+        if self.bar_touch && ui.ctx().input(|i| !i.pointer.any_down()) {
+            self.bar_touch = false;
+        }
+        if self.ime_hold_frames > 0 {
+            self.pin_text_ime(ui.ctx());
+            self.ime_hold_frames -= 1;
+        }
         crate::host::drain(&self.host);
     }
 }
 
 impl Adapter {
+    /// Restore text-field focus and force the soft keyboard to stay up.
+    fn pin_text_ime(&self, ctx: &egui::Context) {
+        if let Some(id) = self.last_focus {
+            ctx.memory_mut(|m| m.request_focus(id));
+        }
+        crate::host::keep_soft_keyboard();
+    }
+
     /// Floating Paste/Copy/Cut/Select-all bar shown while a text field is being edited — the
     /// Android equivalent of the selection context menu, since egui draws its own text widgets.
-    fn text_actions_bar(&mut self, ui: &egui::Ui, rect: egui::Rect) {
+    fn text_actions_bar(&mut self, ui: &egui::Ui, rect: egui::Rect, has_focus: bool) {
         let ctx = ui.ctx().clone();
         let keyboard = self.host.keyboard_height();
-        // ime is set while a host-side TextEdit has focus; keyboard_requested covers guest
-        // (plugin) text fields, and a nonzero measured height covers everything else.
-        let show = keyboard > 0.0
-            || ctx.output(|o| o.ime.is_some())
-            || crate::host::keyboard_requested();
+        let ime_wanted = ctx.output(|o| o.ime.is_some());
+        let guest_kb = crate::host::keyboard_requested();
+        let hold = self.bar_touch || self.ime_hold_frames > 0;
+        // Hide on click-away: require an active edit signal (IME/focus/guest), not merely a
+        // lingering keyboard inset or a sticky flag from a prior bar tap.
+        let show = hold
+            || guest_kb
+            || (ime_wanted && has_focus)
+            || (keyboard > 0.0 && (has_focus || guest_kb));
         if !show {
             self.next_clip_poll = 0;
             self.bar_rect = None;
@@ -146,22 +197,27 @@ impl Adapter {
             .constrain_to(rect)
             .show(&ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.spacing_mut().button_padding = egui::vec2(10.0, 8.0);
                     ui.horizontal(|ui| {
-                        if ui.add_enabled(self.has_clip, egui::Button::new("Paste")).clicked()
+                        let icon = |s: &str| egui::RichText::new(s).size(20.0);
+                        if ui
+                            .add_enabled(self.has_clip, egui::Button::new(icon("📋")))
+                            .on_hover_text("Paste")
+                            .clicked()
                             && let Some(text) = crate::host::read_clipboard_text()
                         {
                             self.pending_events.push(egui::Event::Paste(text));
                             acted = true;
                         }
-                        if ui.button("Copy").clicked() {
+                        if ui.button(icon("📄")).on_hover_text("Copy").clicked() {
                             self.pending_events.push(egui::Event::Copy);
                             acted = true;
                         }
-                        if ui.button("Cut").clicked() {
+                        if ui.button(icon("✂")).on_hover_text("Cut").clicked() {
                             self.pending_events.push(egui::Event::Cut);
                             acted = true;
                         }
-                        if ui.button("Select all").clicked() {
+                        if ui.button(icon("Aa")).on_hover_text("Select all").clicked() {
                             self.pending_events.push(egui::Event::Key {
                                 key: egui::Key::A,
                                 physical_key: None,
@@ -175,10 +231,10 @@ impl Adapter {
                 });
             });
         self.bar_rect = Some(area.response.rect);
-        // Backstop for a tap that landed before the bar rect was known: hand focus back so
-        // the queued event reaches the field next frame.
-        if acted && let Some(id) = self.last_focus {
-            ctx.memory_mut(|m| m.request_focus(id));
+        // Pin focus + IME so the soft keyboard does not collapse for a frame on tap.
+        if acted {
+            self.ime_hold_frames = self.ime_hold_frames.max(12);
+            self.pin_text_ime(&ctx);
         }
     }
 }
@@ -226,6 +282,8 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
                 last_focus: None,
                 bar_rect: None,
                 bar_touch: false,
+                ime_hold_frames: 0,
+                ime_bridge_hot: false,
             }))
         }),
     );
@@ -235,6 +293,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
 }
 
 pub mod host;
+pub mod ime_bridge;
 pub mod video;
 pub use host::HostExt;
 

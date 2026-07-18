@@ -17,11 +17,6 @@ const NOMINAL_NODE: egui::Vec2 = egui::vec2(180.0, 100.0);
 /// Rough half-node offset so centering lands mid-node rather than on its corner.
 const NODE_CENTER_OFFSET: egui::Vec2 = egui::vec2(90.0, 50.0);
 
-/// The stable snarl widget id: selection state is read back through it.
-pub fn graph_id() -> egui::Id {
-    egui::Id::new("comfy-graph-canvas")
-}
-
 /// A one-shot view command applied on the next rendered frame.
 pub enum ViewCmd {
     FitAll,
@@ -33,11 +28,15 @@ pub enum ViewCmd {
 /// View state and overlays for the graph canvas.
 pub struct GraphView {
     pub locked: bool,
+    /// Per-tab snarl widget id (shared ids leak draw-order / node state across tabs).
+    widget_id: egui::Id,
     cmd: Option<ViewCmd>,
     arrange_queued: bool,
+    /// Frames spent waiting for measured node sizes before a queued arrange runs.
+    arrange_wait: u8,
     sizes: HashMap<NodeId, egui::Vec2>,
     to_global: TSTransform,
-    view_rect: egui::Rect,
+    pub view_rect: egui::Rect,
     /// Whether the in-progress drag started on top of a node. In locked mode that drag pans the
     /// canvas instead of doing nothing, so panning never depends on finding empty space.
     drag_from_node: bool,
@@ -51,10 +50,18 @@ pub struct GraphView {
 
 impl Default for GraphView {
     fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl GraphView {
+    pub fn new(doc_id: u64) -> Self {
         Self {
             locked: false,
+            widget_id: egui::Id::new(("comfy-graph-canvas", doc_id)),
             cmd: None,
             arrange_queued: false,
+            arrange_wait: 0,
             sizes: HashMap::new(),
             to_global: TSTransform::IDENTITY,
             view_rect: egui::Rect::ZERO,
@@ -64,14 +71,13 @@ impl Default for GraphView {
             long_press: None,
         }
     }
-}
 
-impl GraphView {
     /// Forget cached geometry and pending commands (snarl node ids restart when a new graph is
     /// loaded, so stale sizes would attach to the wrong nodes).
     pub fn reset(&mut self) {
         self.cmd = None;
         self.arrange_queued = false;
+        self.arrange_wait = 0;
         self.sizes.clear();
     }
 
@@ -79,11 +85,31 @@ impl GraphView {
         self.cmd = Some(ViewCmd::FitAll);
     }
 
-    /// Compact the layout once every node's real size has been measured (fit first so
-    /// everything renders and measures), then fit the result.
+    /// Queue a compact layout once measured sizes are available (or after a short wait).
     pub fn request_arrange(&mut self) {
         self.arrange_queued = true;
+        self.arrange_wait = 0;
         self.cmd = Some(ViewCmd::FitAll);
+    }
+
+    /// Arrange immediately. Uses measured sizes when present, else [`NOMINAL_NODE`].
+    /// Does not invent size cache entries — placeholders would fake "measured" and skip refine.
+    pub fn arrange_now(&mut self, snarl: &mut Snarl<FlowNodeData>) {
+        self.arrange_queued = false;
+        self.arrange_wait = 0;
+        if snarl.nodes_pos_ids().next().is_none() {
+            return;
+        }
+        arrange(snarl, &self.sizes);
+        self.cmd = Some(ViewCmd::FitAll);
+    }
+
+    /// Load-time layout: nominal arrange + fit so every node paints, then queue a refine pass
+    /// once `final_node_rect` has filled real sizes.
+    pub fn arrange_on_load(&mut self, snarl: &mut Snarl<FlowNodeData>) {
+        self.arrange_now(snarl);
+        self.arrange_queued = true;
+        self.arrange_wait = 0;
     }
 
     /// Center the view on a node position (graph space).
@@ -113,26 +139,31 @@ impl GraphView {
         executing: Option<NodeId>,
         focus: Option<NodeId>,
     ) -> Option<NodeId> {
-        let saved: Option<Vec<(NodeId, egui::Pos2)>> = self
-            .locked
-            .then(|| g.snarl.nodes_pos_ids().map(|(id, pos, _)| (id, pos)).collect());
         self.sizes.retain(|id, _| g.snarl.get_node(*id).is_some());
 
         if self.arrange_queued {
-            let mut ids = g.snarl.nodes_pos_ids().map(|(id, _, _)| id).peekable();
-            if ids.peek().is_none() {
+            let ids: Vec<NodeId> = g.snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();
+            if ids.is_empty() {
                 self.arrange_queued = false;
-            } else if ids.all(|id| self.sizes.contains_key(&id)) {
-                self.arrange_queued = false;
-                arrange(&mut g.snarl, &self.sizes);
-                self.cmd = Some(ViewCmd::FitAll);
+                self.arrange_wait = 0;
             } else {
-                // Re-fit each frame until every node has measured (first FitAll alone is not enough
-                // when sizes start empty after a load).
-                self.cmd = Some(ViewCmd::FitAll);
-                ui.ctx().request_repaint();
+                let ready = ids.iter().all(|id| self.sizes.contains_key(id));
+                self.arrange_wait = self.arrange_wait.saturating_add(1);
+                // Prefer real measures; after a few FitAll frames, arrange with what we have so a
+                // never-drawn node cannot stall the queue forever.
+                if ready || self.arrange_wait >= 3 {
+                    self.arrange_now(&mut g.snarl);
+                } else {
+                    self.cmd = Some(ViewCmd::FitAll);
+                    ui.ctx().request_repaint();
+                }
             }
         }
+
+        // Snapshot after arrange so lock-restore cannot undo a fresh layout.
+        let saved: Option<Vec<(NodeId, egui::Pos2)>> = self
+            .locked
+            .then(|| g.snarl.nodes_pos_ids().map(|(id, pos, _)| (id, pos)).collect());
 
         // The snarl response rect is unbounded (scene ui); measure the canvas region ourselves.
         let canvas = ui.available_rect_before_wrap();
@@ -152,7 +183,10 @@ impl GraphView {
             sizes: &mut self.sizes,
             out_transform: &mut self.to_global,
         };
-        SnarlWidget::new().id(graph_id()).style(style()).show(&mut g.snarl, &mut viewer, ui);
+        SnarlWidget::new()
+            .id(self.widget_id)
+            .style(style())
+            .show(&mut g.snarl, &mut viewer, ui);
 
         if let Some(saved) = saved {
             for (id, pos) in saved {
@@ -292,7 +326,7 @@ impl GraphView {
         if self.drag_from_node && delta.is_finite() { delta } else { egui::Vec2::ZERO }
     }
 
-    /// Floating lock toggle in the canvas's top-right corner.
+    /// Floating lock toggle in the canvas's bottom-right (left of the queue FAB).
     fn lock_button(&mut self, ui: &mut egui::Ui) {
         let view = self.view_rect;
         if !view.is_finite() || view.width() < 80.0 {
@@ -303,13 +337,15 @@ impl GraphView {
         } else {
             (crate::icons::UNLOCKED, "Editing — tap to lock")
         };
+        // Primary queue FAB sits at (right-58, bottom-58); lock is one slot left.
         egui::Area::new(egui::Id::new("comfy-lock"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(view.right() - 46.0, view.top() + 10.0))
+            .fixed_pos(egui::pos2(view.right() - 58.0 - 56.0, view.bottom() - 58.0))
             .show(ui.ctx(), |aui| {
-                let btn = egui::Button::new(egui::RichText::new(icon).size(18.0))
-                    .min_size(egui::vec2(36.0, 36.0))
-                    .fill(egui::Color32::from_black_alpha(170));
+                let btn = egui::Button::new(egui::RichText::new(icon).size(22.0))
+                    .min_size(egui::vec2(48.0, 48.0))
+                    .corner_radius(24.0)
+                    .fill(egui::Color32::from_rgb(45, 55, 85));
                 if aui.add(btn).on_hover_text(tip).clicked() {
                     self.locked = !self.locked;
                 }
@@ -1466,6 +1502,74 @@ mod tests {
         assert_eq!(fit_transform(tiny, ui).scaling, MAX_SCALE);
         let huge = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1e6, 1e6));
         assert_eq!(fit_transform(huge, ui).scaling, MIN_SCALE);
+    }
+
+    /// `arrange_now` must move nodes without waiting for canvas size measures.
+    #[test]
+    fn arrange_now_compacts_without_measured_sizes() {
+        let oi = crate::schema::to_object_info(&crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"A": {"input": {"required": {"in": ["MODEL"]}},
+                     "output": ["MODEL"], "output_name": ["MODEL"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        ));
+        let obj = oi.values().next().unwrap().clone();
+        let mut snarl: Snarl<FlowNodeData> = Snarl::new();
+        let a = snarl.insert_node(egui::pos2(0.0, 0.0), FlowNodeData::new(obj.clone()));
+        let b = snarl.insert_node(egui::pos2(0.0, 400.0), FlowNodeData::new(obj.clone()));
+        let c = snarl.insert_node(egui::pos2(600.0, 0.0), FlowNodeData::new(obj));
+        snarl.connect(
+            egui_snarl::OutPinId { node: a, output: 0 },
+            egui_snarl::InPinId { node: c, input: 0 },
+        );
+        snarl.connect(
+            egui_snarl::OutPinId { node: b, output: 0 },
+            egui_snarl::InPinId { node: c, input: 0 },
+        );
+        let before: HashMap<NodeId, egui::Pos2> =
+            snarl.nodes_pos_ids().map(|(id, pos, _)| (id, pos)).collect();
+        let mut view = GraphView::new(1);
+        view.arrange_now(&mut snarl);
+        let moved = snarl.nodes_pos_ids().any(|(id, pos, _)| before.get(&id) != Some(&pos));
+        assert!(moved, "arrange_now left every node in place");
+        assert!(view.sizes.is_empty(), "arrange_now must not fake measured sizes");
+        // Consumer sits to the right of its producers.
+        let pos = |id| snarl.get_node_info(id).unwrap().pos;
+        assert!(pos(c).x > pos(a).x);
+        assert!(pos(c).x > pos(b).x);
+    }
+
+    /// Load path must queue a refine pass; seeding nominal sizes used to make that pass a no-op.
+    #[test]
+    fn arrange_on_load_queues_refine_without_faking_sizes() {
+        let oi = crate::schema::to_object_info(&crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"A": {"input": {"required": {"in": ["MODEL"]}},
+                     "output": ["MODEL"], "output_name": ["MODEL"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        ));
+        let obj = oi.values().next().unwrap().clone();
+        let mut snarl: Snarl<FlowNodeData> = Snarl::new();
+        let a = snarl.insert_node(egui::pos2(0.0, 0.0), FlowNodeData::new(obj.clone()));
+        let c = snarl.insert_node(egui::pos2(800.0, 0.0), FlowNodeData::new(obj));
+        snarl.connect(
+            egui_snarl::OutPinId { node: a, output: 0 },
+            egui_snarl::InPinId { node: c, input: 0 },
+        );
+        let mut view = GraphView::new(2);
+        view.arrange_on_load(&mut snarl);
+        assert!(view.arrange_queued, "load must queue a measured refine pass");
+        assert!(view.sizes.is_empty(), "nominal placeholders must not mark sizes ready");
+        // Simulate canvas measures, then the refine arrange that show() would run.
+        view.sizes.insert(a, egui::vec2(220.0, 360.0));
+        view.sizes.insert(c, egui::vec2(220.0, 360.0));
+        let before = snarl.get_node_info(c).unwrap().pos;
+        view.arrange_now(&mut snarl);
+        let after = snarl.get_node_info(c).unwrap().pos;
+        assert_ne!(before, after, "refine with tall measured sizes must re-pack");
+        assert!(after.x > snarl.get_node_info(a).unwrap().pos.x);
     }
 
     #[test]

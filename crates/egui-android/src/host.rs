@@ -101,16 +101,46 @@ pub fn drain(host: &Host) {
     }
 }
 
-/// Run `f` with a JNIEnv attached to the current thread and the Activity (Context). Logs and
-/// swallows JNI errors so a failed capability never crashes the render loop.
+/// Run `f` with a JNIEnv attached to the current thread and the real `Activity`.
+///
+/// Prefer this over [`ndk_context`]: android-activity stores the `Application` there, not the
+/// `Activity`, so `instanceof EguiNativeActivity` and Activity-only APIs fail.
+pub(crate) fn with_native_activity<R>(
+    f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jni::errors::Result<R>,
+) -> Option<R> {
+    let app = ANDROID_APP.get()?;
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
+    let mut env = vm.attach_current_thread().ok()?;
+    // Unowned JNI global ref from AndroidApp — must not DeleteLocalRef on drop.
+    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+    let out = match f(&mut env, &activity) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_describe();
+            }
+            let _ = env.exception_clear();
+            log::error!("egui-android JNI error: {e:?}");
+            None
+        }
+    };
+    std::mem::forget(activity);
+    out
+}
+
+/// Run `f` with a JNIEnv and a Context. Uses the real Activity when registered; falls back to
+/// `ndk_context`'s Application (enough for `getSystemService` / `startActivity` + NEW_TASK).
 fn with_activity<R>(
     f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jni::errors::Result<R>,
 ) -> Option<R> {
+    if ANDROID_APP.get().is_some() {
+        return with_native_activity(f);
+    }
     let ctx = ndk_context::android_context();
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    match f(&mut env, &activity) {
+    let out = match f(&mut env, &activity) {
         Ok(r) => Some(r),
         Err(e) => {
             // Surface the Java exception's stack to logcat, then clear it so it can't poison the
@@ -122,7 +152,9 @@ fn with_activity<R>(
             log::error!("egui-android JNI error: {e:?}");
             None
         }
-    }
+    };
+    std::mem::forget(activity);
+    out
 }
 
 fn package_name(env: &mut jni::JNIEnv, activity: &JObject) -> jni::errors::Result<String> {
@@ -792,8 +824,12 @@ pub fn update_insets(host: &Host, pixels_per_point: f32) {
 }
 
 /// Show or hide the soft keyboard. Explicit (non-implicit) calls so winit's implicit-only IME
-/// hides don't cancel an app-requested keyboard.
+/// hides don't cancel an app-requested keyboard. Prefers the hidden EditText on
+/// `EguiNativeActivity` so Gboard attaches a real InputConnection (spacebar trackpad).
 fn set_soft_keyboard(show: bool) {
+    if crate::ime_bridge::set_soft_keyboard(show) {
+        return;
+    }
     let Some(app) = ANDROID_APP.get() else {
         log::warn!("egui-android: SetKeyboard before the AndroidApp handle is registered");
         return;
@@ -803,6 +839,13 @@ fn set_soft_keyboard(show: bool) {
     } else {
         app.hide_soft_input(false);
     }
+}
+
+/// Keep the soft keyboard up (e.g. while the text-actions bar is handling a tap).
+/// Does not set [`KEYBOARD_REQUESTED`] — that flag is only for explicit `Host::request_keyboard`
+/// (plugins); pinning it here left the text-actions bar stuck after click-away.
+pub(crate) fn keep_soft_keyboard() {
+    set_soft_keyboard(true);
 }
 
 // Keyboard occlusion in points: the WindowInsets IME inset when available, else the

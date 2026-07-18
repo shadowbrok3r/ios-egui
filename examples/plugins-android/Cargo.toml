@@ -13,6 +13,7 @@ egui = "0.35"
 
 [package.metadata.android]
 package = "com.example.pluginsandroid"
+java_sources = "../../crates/egui-android/java"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -25,10 +26,11 @@ keystore_password = "android"
 
 [package.metadata.android.application]
 label = "Plugins Android"
+has_code = true
 
-# Launcher activity (NativeActivity loads libplugins_android.so via android-activity).
+# EguiNativeActivity hosts a hidden EditText for real IME InputConnection (spacebar cursor).
 [[package.metadata.android.application.activity]]
-name = "android.app.NativeActivity"
+name = "com.github.egui_mobile.EguiNativeActivity"
 config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
 # adjustResize keeps the content rect tracking the IME so keyboard height is measurable.
 window_soft_input_mode = "adjustResize"

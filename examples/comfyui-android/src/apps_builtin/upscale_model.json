@@ -1,0 +1,32 @@
+{
+  "id": "upscale.model",
+  "name": "Upscale (model)",
+  "group": "Upscale",
+  "description": "ESRGAN-style model upscale of the finished image.",
+  "version": 1,
+  "requires": [
+    { "class": "UpscaleModelLoader", "pack": "core" },
+    { "class": "ImageUpscaleWithModel", "pack": "core" }
+  ],
+  "knobs": [
+    {
+      "id": "model_name",
+      "label": "Upscale model",
+      "ty": { "Enum": { "class": "UpscaleModelLoader", "input": "model_name" } },
+      "default": "4x-UltraSharp.pth"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "loader",
+      "class": "UpscaleModelLoader",
+      "inputs": { "model_name": "$knob:model_name" }
+    },
+    {
+      "id": "up",
+      "class": "ImageUpscaleWithModel",
+      "inputs": { "upscale_model": "$node:loader:0", "image": "$image" }
+    }
+  ],
+  "output": { "node": "up", "slot": 0 }
+}

@@ -24,6 +24,13 @@ use crate::{uiwf, workflow};
 /// broadcast events down to our run.
 type CurrentPrompt = Arc<Mutex<Option<String>>>;
 
+/// Catalogs the workflow builder needs. The UI owns both, so a generation carries them across.
+#[derive(Clone)]
+pub struct GenCtx {
+    pub apps: Arc<crate::apps::AppSet>,
+    pub schemas: Arc<SchemaSet>,
+}
+
 /// A message from the async worker to the UI thread.
 pub enum Msg {
     Connected {
@@ -33,6 +40,8 @@ pub enum Msg {
         schedulers: Vec<String>,
     },
     ConnectError(String),
+    /// Enhance-chain steps that were skipped or inputs dropped while building the prompt.
+    EnhanceNote(String),
     Queued,
     Progress { value: u32, max: u32 },
     Status(String),
@@ -247,13 +256,13 @@ impl Engine {
     /// Queue a generation from the simple Generate tab. `current` is the last result's encoded
     /// bytes, used as the img2img source when the mode is "current result".
     /// Does not cancel other in-flight jobs — use [`Self::cancel`] for that.
-    pub fn generate(&mut self, params: Params, current: Option<Vec<u8>>) {
+    pub fn generate(&mut self, params: Params, current: Option<Vec<u8>>, gcx: GenCtx) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
             return;
         };
         self.log.info(format!(
-            "generate: {:?} ckpt={} {}x{} batch={} steps={} cfg={} {}/{} seed={} denoise={} loras={}",
+            "generate: {:?} ckpt={} {}x{} batch={} steps={} cfg={} {}/{} seed={} denoise={} loras={} apps={}",
             params.mode,
             params.checkpoint,
             params.width,
@@ -265,7 +274,8 @@ impl Engine {
             params.scheduler,
             params.seed,
             params.denoise,
-            params.loras.len()
+            params.loras.len(),
+            params.apps.iter().filter(|a| a.enabled).count()
         ));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
         let authed = self.http.clone().map(|h| (self.base.clone(), h));
@@ -274,7 +284,7 @@ impl Engine {
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
-            run_generate(client, params, current, current_prompt, authed, tx, ctx, log).await;
+            run_generate(client, params, current, gcx, current_prompt, authed, tx, ctx, log).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
@@ -1187,6 +1197,7 @@ async fn run_generate(
     client: Client,
     params: Params,
     current: Option<Vec<u8>>,
+    gcx: GenCtx,
     current_prompt: CurrentPrompt,
     authed: Option<(String, reqwest::Client)>,
     tx: Sender<Msg>,
@@ -1240,7 +1251,12 @@ async fn run_generate(
         None
     };
 
-    let (wf, _out) = workflow::build(&params, input_image);
+    let (wf, _out, report) = workflow::build(&params, input_image, &gcx.apps, &gcx.schemas);
+    let note = report.note();
+    if !note.is_empty() {
+        log.info(format!("enhance: {note}"));
+        let _ = tx.send(Msg::EnhanceNote(note));
+    }
     stream_execution(client, wf, tx, ctx, log, current_prompt).await;
 }
 

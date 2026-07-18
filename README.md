@@ -59,8 +59,9 @@ Android (gradle-free APKs via [cargo-apk2](https://crates.io/crates/cargo-apk2))
 ```bash
 cargo install cargo-apk2
 rustup target add aarch64-linux-android
-# plus an SDK + NDK under ~/Android/Sdk (sdkmanager: platform-tools, platforms, build-tools, ndk)
-# and a JDK 17..21 on the system (auto-detected)
+# plus an SDK + NDK under ~/Android/Sdk (sdkmanager: platform-tools, platforms, build-tools, ndk),
+# a JDK 17..21. Prefer `cargo egui-mobile … -a` (auto-sets ANDROID_*/JAVA_HOME).
+# Bare `cargo apk2`: eval "$(cargo egui-mobile env -a)"
 ```
 
 ## Create and run an app
@@ -70,13 +71,17 @@ cargo egui-mobile new my-app --android     # or --ios / -i / -a
 cd my-app
 #   edit src/lib.rs
 cargo egui-mobile run -a                   # build APK + adb install + launch
+cargo egui-mobile run -a --tcp 192.168.1.20  # wireless adb (default port 5555)
 cargo egui-mobile run -i                   # cross-compile + xtool dev → on device
 ```
 
 `build`/`run` accept `--release` on both platforms; iOS additionally `--simulator` (macOS
-host only) and `--assets <DIR>`. Android release builds need a signing entry in the app's
-Cargo.toml (`[package.metadata.android.signing.release]` with `path` + `keystore_password`;
-pointing at `~/.android/debug.keystore` with password `android` is fine for sideloads).
+host only) and `--assets <DIR>`. Android `run` accepts `--tcp HOST[:PORT]` for wireless
+debugging (one-time phone setup in [ANDROID_SETUP.md](ANDROID_SETUP.md));
+`cargo egui-mobile adb-connect HOST` is the bare connect helper. Android release builds need a
+signing entry in the app's Cargo.toml (`[package.metadata.android.signing.release]` with `path` +
+`keystore_password`; pointing at `~/.android/debug.keystore` with password `android` is fine for
+sideloads).
 
 ## Host capabilities
 
@@ -88,9 +93,13 @@ mic level (iOS), plus reads like `safe_area_insets()`, `keyboard_height()`, and
 
 Android specifics handled by the runtime:
 
-- **Soft keyboard**: `host.request_keyboard(..)` shows/hides the IME; `keyboard_height()`
-  is measured from the window/content-rect delta (declare
-  `window_soft_input_mode = "adjustResize"` on the activity, as the templates do).
+- **Soft keyboard**: `host.request_keyboard(..)` shows/hides the IME on a hidden
+  `EditText` (`EguiNativeActivity`) so Gboard gets a real `InputConnection` — this is what
+  enables hold-space trackpad cursor movement. Measure height with
+  `keyboard_height()` (`window_soft_input_mode = "adjustResize"`). Apps must set
+  `has_code = true`, `java_sources` → `egui-android/java`, and activity
+  `com.github.egui_mobile.EguiNativeActivity` (plain `NativeActivity` falls back to the
+  old show/hide path without spacebar cursor).
 - **Clipboard + text actions**: egui has no Android selection menu, so while a text field
   is being edited the runtime overlays a floating **Paste / Copy / Cut / Select all** bar,
   bridges egui copies into the system clipboard via JNI, and injects clipboard text back
@@ -136,9 +145,11 @@ dev-sync, and native `net.http.*`/`net.tcp.*`/`net.udp.*`/`ssh.*` ops on both). 
   The host gives the first frames of each plugin a long "cold" deadline (font-atlas build)
   and a ~2 s steady-state deadline on mobile targets; a hung plugin still traps into an
   error panel instead of freezing the app.
-- **Android IME path.** Text input rides eframe/winit on NativeActivity; the runtime adds
-  explicit keyboard control and the text-actions bar on top. Complex IME composition
-  (swipe typing) may vary by keyboard app.
+- **Android IME path.** Text input uses a hidden `EditText` on `EguiNativeActivity` for a
+  real `InputConnection` (Gboard spacebar trackpad + text commits). The text-actions bar
+  still pins focus/`keep_soft_keyboard`. Host `TextEdit` is in scope; WASM plugin guest
+  fields may lack spacebar cursor until they share the same bridge. Swipe-typing polish
+  is best-effort.
 - **ABI stability (iOS).** `egui_ios.h` is append-only and version-checked at startup;
   the Rust runtime and `EguiKit` are released in lockstep.
 

@@ -114,10 +114,17 @@ for the device target (no NDK link, fast):
 cargo ndk -t arm64-v8a check -p comfyui_android --features tls
 ```
 
-Bare `cargo apk2 run -p comfyui_android` also works once the environment is set. The repo's
-`.cargo/config.toml` exports `ANDROID_HOME` / `ANDROID_NDK_ROOT` and the NDK compilers so cross
-`cargo check` resolves, but cargo-apk2's dex step still needs a JDK 17–21 ahead of the system JDK 8
-on `PATH` — which is exactly what `cargo egui-mobile` handles for you.
+Bare `cargo apk2` also works after loading the same env the wrapper injects (includes
+`KOTLIN_HOME` — required by cargo-apk2, unset by default on Manjaro):
+
+```bash
+eval "$(cargo egui-mobile env -a)"
+cargo apk2 run --target aarch64-linux-android --release --features tls
+```
+
+The repo's `.cargo/config.toml` exports `ANDROID_HOME` / `ANDROID_NDK_ROOT` and the NDK compilers
+so cross `cargo check` resolves, but it does **not** set `KOTLIN_HOME` or fix JDK 8 on `PATH` —
+use `cargo egui-mobile` or the `eval` line above.
 
 ## Debugging & testing
 
@@ -160,7 +167,8 @@ For a server reached directly over **`https://`**, build with the `tls` feature:
 
 ```bash
 cargo ndk -t arm64-v8a check -p comfyui_android --features tls
-cargo apk2 run -p comfyui_android --features tls
+cargo egui-mobile run -a --release --features tls
+# or: eval "$(cargo egui-mobile env -a)" && cargo apk2 run --target aarch64-linux-android --features tls
 ```
 
 This uses **rustls with a bundled webpki-roots CA set and the ring provider** — deliberately *not*

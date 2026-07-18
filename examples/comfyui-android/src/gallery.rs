@@ -637,7 +637,8 @@ pub fn group_selected(items: &[GalleryItem], sel: &[usize], group: GalleryGroup)
         let item = &items[i];
         let key = match group {
             GalleryGroup::Model => item.model_label(),
-            _ => item.subfolder.clone(),
+            GalleryGroup::Date => item.date_label(),
+            GalleryGroup::Folder | GalleryGroup::None => item.subfolder.clone(),
         };
         match index.get(&key) {
             Some(&g) => groups[g].items.push(i),
@@ -645,7 +646,8 @@ pub fn group_selected(items: &[GalleryItem], sel: &[usize], group: GalleryGroup)
                 index.insert(key.clone(), groups.len());
                 let label = match group {
                     GalleryGroup::Model => item.model_label(),
-                    _ => item.group_label(),
+                    GalleryGroup::Date => item.date_label(),
+                    GalleryGroup::Folder | GalleryGroup::None => item.group_label(),
                 };
                 groups.push(Group { key, label, items: vec![i] });
             }
@@ -728,6 +730,7 @@ mod tests {
             is_video: false,
             has_workflow: false,
             models: models.iter().map(|m| m.to_string()).collect(),
+            mtime: None,
         }
     }
 
@@ -875,6 +878,22 @@ mod tests {
         let groups = group_items(&items, GalleryGroup::None);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].items, vec![0, 1]);
+    }
+
+    #[test]
+    fn groups_by_date_from_subfolder_path() {
+        let items = vec![
+            item("u1/out/2026-07-16", "a.png", &[]),
+            item("u1/out/2026-07-15", "b.png", &[]),
+            item("u1/out/2026-07-16", "c.png", &[]),
+            item("u1/out", "plain.png", &[]),
+        ];
+        let groups = group_items(&items, GalleryGroup::Date);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].label, "2026-07-16");
+        assert_eq!(groups[0].items, vec![0, 2]);
+        assert_eq!(groups[1].label, "2026-07-15");
+        assert_eq!(groups[2].label, "Unknown date");
     }
 
     #[test]

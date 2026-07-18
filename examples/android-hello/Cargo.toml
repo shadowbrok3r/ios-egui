@@ -14,6 +14,7 @@ egui = "0.35"
 # cargo-apk2 reads this to generate the APK manifest.
 [package.metadata.android]
 package = "com.example.androidhello"
+java_sources = "../../crates/egui-android/java"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -21,6 +22,7 @@ target_sdk_version = 35
 
 [package.metadata.android.application]
 label = "Android Hello"
+has_code = true
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.VIBRATE"
@@ -35,11 +37,11 @@ name = "android.permission.CAMERA"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.RECORD_AUDIO"
 
-# The launcher activity. android-activity's native-activity glue is loaded by NativeActivity;
-# lib_name points at the cdylib (libandroid_hello.so).
+# EguiNativeActivity hosts a hidden EditText for real IME InputConnection (spacebar cursor).
 [[package.metadata.android.application.activity]]
-name = "android.app.NativeActivity"
+name = "com.github.egui_mobile.EguiNativeActivity"
 config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
+window_soft_input_mode = "adjustResize"
 [[package.metadata.android.application.activity.meta_data]]
 name = "android.app.lib_name"
 value = "android_hello"

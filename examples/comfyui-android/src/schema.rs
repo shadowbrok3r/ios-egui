@@ -72,6 +72,14 @@ pub struct OutputSchema {
 }
 
 impl SchemaSet {
+    pub fn has_node(&self, class: &str) -> bool {
+        self.nodes.contains_key(class)
+    }
+
+    pub fn input(&self, class: &str, name: &str) -> Option<&InputSchema> {
+        self.nodes.get(class)?.inputs.iter().find(|i| i.name == name)
+    }
+
     pub fn enum_options(&self, node: &str, input: &str) -> Vec<String> {
         self.nodes
             .get(node)

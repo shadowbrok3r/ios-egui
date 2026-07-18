@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use cargo_egui_android::{BuildArgs, cmd_build, cmd_new, cmd_run};
+use cargo_egui_android::{BuildArgs, RunArgs, cmd_adb_connect, cmd_build, cmd_env, cmd_new, cmd_run};
 
 #[derive(Parser)]
 #[command(bin_name = "cargo")]
@@ -33,7 +33,14 @@ enum Cmd {
     /// Cross-compile + package the APK.
     Build(BuildArgs),
     /// Build, install (adb), and launch on a connected device/emulator.
-    Run(BuildArgs),
+    Run(RunArgs),
+    /// `adb connect host[:port]` for wireless debugging (default port 5555).
+    AdbConnect {
+        /// Phone address, e.g. `192.168.1.20` or `192.168.1.20:5555`.
+        host: String,
+    },
+    /// Print shell exports for SDK/NDK/JDK/Kotlin (for bare `cargo apk2`).
+    Env,
 }
 
 fn main() -> Result<()> {
@@ -46,5 +53,7 @@ fn main() -> Result<()> {
         } => cmd_new(&name, package_id, display_name),
         Cmd::Build(a) => cmd_build(&a),
         Cmd::Run(a) => cmd_run(&a),
+        Cmd::AdbConnect { host } => cmd_adb_connect(&host),
+        Cmd::Env => cmd_env(),
     }
 }

@@ -53,7 +53,8 @@ keytool -genkeypair -v -keystore ~/.android/debug.keystore \
 ```bash
 cd /path/to/EguiMobile
 
-# Install this repo's cargo subcommand (finds the SDK/NDK/JDK and sets the env for you)
+# Install this repo's cargo subcommand (finds the SDK/NDK/JDK/Kotlin and sets the env for you).
+# Re-run after pulling CLI changes — `~/.cargo/bin/cargo-egui-mobile` is a snapshot, not a symlink.
 cargo install --path crates/cargo-egui-mobile
 
 # The `tls` feature builds ring against the NDK, whose build script wants the compiler by explicit
@@ -85,10 +86,38 @@ cargo egui-mobile build -a --release --features tls
 
 # …or build, install, and launch on a USB-connected phone (adb debugging on)
 cargo egui-mobile run -a --release --features tls
+
+# Wireless (same Wi‑Fi as the phone; see “Wireless adb” below)
+cargo egui-mobile run -a --tcp 192.168.1.20 --release --features tls
 ```
 
 First `--features tls` build compiles ring + rustls from source, so it's slow; later builds are
 incremental. The debug keystore for signing is auto-generated at `~/.android/debug.keystore`.
+
+## Wireless adb
+
+`--tcp` runs `adb connect host:port` (default port **5555**), checks `adb devices`, then passes
+`--device host:port` to `cargo apk2` so install/launch targets that phone even if a USB device is
+also attached. Omitting `--tcp` keeps the usual USB/default adb behavior.
+
+**One-time phone setup** (pick one):
+
+1. **USB once, then TCP** — with USB debugging on and the phone plugged in:
+   ```bash
+   adb tcpip 5555          # phone stays in TCP mode until reboot
+   adb connect 192.168.1.20:5555
+   ```
+   Unplug USB; use `cargo egui-mobile run -a --tcp 192.168.1.20` afterwards.
+
+2. **Android 11+ Wireless debugging** — Developer options → Wireless debugging → pair with the
+   pairing code once (`adb pair ip:pairing-port`), then note the **IP and port** shown (often not
+   5555). Connect with that address, or:
+   ```bash
+   cargo egui-mobile adb-connect 192.168.1.20:37123
+   cargo egui-mobile run -a --tcp 192.168.1.20:37123
+   ```
+
+`cargo egui-android` accepts the same `--tcp` / `adb-connect` flags.
 
 ## Notes / gotchas
 
