@@ -28,3 +28,7 @@ pub use egui_android::app;
 /// behind `#[cfg(target_os = "android")]` in shared app code.
 #[cfg(target_os = "android")]
 pub use egui_android::HostExt;
+
+/// Android-only frame-accurate video decoding (MediaMetadataRetriever) for in-app playback.
+#[cfg(target_os = "android")]
+pub use egui_android::video;

@@ -966,16 +966,19 @@ fn value_editor(ui: &mut egui::Ui, salt: egui::Id, input: &mut FlowInput, locked
             });
         }
         FlowValueType::String { value, multiline } => {
-            // Label above, field below at full width. A `desired_width(INFINITY)` field inside a
-            // horizontal row expands past the panel's right edge and clips; on its own line it
-            // clamps to the available width.
+            // Label above, field to the visible right edge. Prefer clip_rect over available_width:
+            // inside a vertical ScrollArea the latter grows with content and the field overruns.
             ui.label(&input.name);
+            let width = (ui.clip_rect().right() - ui.cursor().left() - 8.0).max(48.0);
             let edit = if *multiline {
                 egui::TextEdit::multiline(value).desired_rows(3)
             } else {
                 egui::TextEdit::singleline(value)
             };
-            ui.add(edit.desired_width(f32::INFINITY));
+            ui.scope(|ui| {
+                ui.set_max_width(width);
+                ui.add(edit.desired_width(width).clip_text(true));
+            });
         }
         FlowValueType::Float { value, min, max, step, .. } => {
             ui.horizontal(|ui| {
@@ -1051,6 +1054,59 @@ pub fn elide(s: &str, max: usize) -> String {
     } else {
         let head: String = s.chars().take(max).collect();
         format!("{head}…")
+    }
+}
+
+/// Drop control chars and replace glyphs the active font cannot draw.
+pub fn sanitize_ui_text(ui: &egui::Ui, s: &str) -> String {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    ui.ctx().fonts_mut(|fonts| {
+        s.chars()
+            .map(|c| {
+                if c.is_control() {
+                    ' '
+                } else if fonts.has_glyph(&font, c) {
+                    c
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    })
+}
+
+/// Truncate `s` so its laid-out width fits within `max_width` (appends `…` when cut).
+pub fn elide_width(ui: &egui::Ui, s: &str, max_width: f32) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    if max_width <= 12.0 {
+        return "…".into();
+    }
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let measure = |text: &str| {
+        ui.ctx()
+            .fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE).size().x)
+    };
+    if measure(s) <= max_width {
+        return s.to_string();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let candidate: String = chars[..mid].iter().chain(std::iter::once(&'…')).collect();
+        if measure(&candidate) <= max_width {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    if lo == 0 {
+        "…".into()
+    } else {
+        chars[..lo].iter().chain(std::iter::once(&'…')).collect()
     }
 }
 

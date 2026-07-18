@@ -5,7 +5,10 @@
 //! `mastertech_color_scheme.json`: a near-black theme with purple hovers, magenta actives, cyan
 //! warnings and pink errors. Spacing stays touch-sized rather than the source's desktop density.
 
-use egui::{Color32, CornerRadius, Stroke};
+use egui::containers::scroll_area::ScrollBarVisibility;
+use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
+
+use crate::types::FontSizes;
 
 fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
@@ -87,5 +90,42 @@ pub fn apply(ctx: &egui::Context) {
         // 1px button padding / 18px interact size would be too small to tap reliably).
         s.spacing.item_spacing = egui::vec2(6.0, 6.0);
         s.spacing.button_padding = egui::vec2(8.0, 6.0);
+        // Solid (non-floating) bars so AlwaysVisible actually stays painted; wider for touch.
+        let mut scroll = egui::style::ScrollStyle::solid();
+        scroll.bar_width = 14.0;
+        scroll.handle_min_length = 28.0;
+        scroll.bar_inner_margin = 2.0;
+        s.spacing.scroll = scroll;
     });
+}
+
+/// Apply persisted font sizes onto egui's text styles.
+pub fn apply_fonts(ctx: &egui::Context, fonts: &FontSizes) {
+    let styles = [
+        (TextStyle::Heading, FontId::new(fonts.heading, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(fonts.body, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(fonts.button, FontFamily::Proportional)),
+        (TextStyle::Small, FontId::new(fonts.small, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(fonts.monospace, FontFamily::Monospace)),
+    ];
+    ctx.all_styles_mut(|s| {
+        for (style, id) in &styles {
+            s.text_styles.insert(style.clone(), id.clone());
+        }
+    });
+}
+
+/// Vertical scroll area with a permanently visible scrollbar.
+pub fn scroll_vertical() -> egui::ScrollArea {
+    egui::ScrollArea::vertical().scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+}
+
+/// Bidirectional scroll area with permanently visible scrollbars.
+pub fn scroll_both() -> egui::ScrollArea {
+    egui::ScrollArea::both().scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
+}
+
+/// Horizontal scroll area with a permanently visible scrollbar.
+pub fn scroll_horizontal() -> egui::ScrollArea {
+    egui::ScrollArea::horizontal().scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)
 }

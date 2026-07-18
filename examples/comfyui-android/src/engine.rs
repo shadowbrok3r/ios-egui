@@ -2,6 +2,7 @@
 //! over an mpsc channel. [`Host`] is main-thread only, so the worker never touches it — it wakes
 //! the UI with a cloned [`egui::Context`] and the UI applies effects (haptics, notifications).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,7 +14,10 @@ use serde_json::Value;
 
 use crate::logger::Logger;
 use crate::schema::{self, SchemaSet};
-use crate::types::{Album, AlbumList, Facets, GalleryPage, GalleryView, Img2ImgSource, Mode, Params};
+use crate::types::{
+    Album, AlbumList, CheckpointCatalog, Facets, GalleryPage, GalleryView, Img2ImgSource,
+    LoraCatalog, Mode, Params,
+};
 use crate::{uiwf, workflow};
 
 /// The prompt id currently executing, shared with the websocket listener so it can filter
@@ -48,7 +52,8 @@ pub enum Msg {
     /// A workflow file written to the server.
     WorkflowSaved(String),
     WorkflowError(String),
-    Gallery(GalleryPage),
+    /// One page of the gallery listing; `generation` echoes the query generation it answers.
+    Gallery { generation: u64, page: GalleryPage },
     GalleryError(String),
     /// A decoded gallery thumbnail; `key` is `subfolder/filename#size`.
     Thumb { key: String, image: egui::ColorImage },
@@ -73,6 +78,29 @@ pub enum Msg {
     GalleryMutated(String),
     /// Which albums one image belongs to (`GET /gallery/api/meta`); `key` is `subfolder/filename`.
     ItemAlbums { key: String, albums: Vec<i64> },
+    /// Raw embedded workflow JSON for a gallery image (`GET /gallery/api/workflow`).
+    ItemWorkflow { key: String, json: String },
+    /// Fetching the embedded workflow failed (image may still have `has_workflow: false` scrapes).
+    ItemWorkflowError { key: String, error: String },
+    /// A device-gallery image was uploaded to the server as a LoadImage input; `image_ref` is the
+    /// `subfolder/name` (or bare name) to select on the node. `token` correlates the result to the
+    /// specific pick so a slow upload lands on the node it was chosen for.
+    InputUploaded { token: u64, image_ref: String },
+    /// Uploading a device-gallery image to the server failed; `token` identifies the pick.
+    InputUploadError { token: u64, error: String },
+    /// Server LoRA catalog (`GET /comfyui-android/lora-catalog.json`).
+    LoraCatalog(LoraCatalog),
+    /// Catalog missing or invalid — Create LoRAs fall back to installed names only.
+    LoraCatalogError(String),
+    /// Server checkpoint catalog (`GET /checkpoint-catalog.json`).
+    CheckpointCatalog(CheckpointCatalog),
+    CheckpointCatalogError(String),
+    /// Decoded preview for Create img2img "From URL" (or an error string).
+    Img2ImgUrlPreview {
+        url: String,
+        image: Option<egui::ColorImage>,
+        error: Option<String>,
+    },
 }
 
 pub struct Engine {
@@ -84,7 +112,10 @@ pub struct Engine {
     client: Option<Client>,
     http: Option<reqwest::Client>,
     base: String,
-    job: Option<tokio::task::JoinHandle<()>>,
+    /// In-flight generate / graph-run tasks (more than one when Create Queue is used).
+    jobs: Vec<tokio::task::JoinHandle<()>>,
+    /// How many generate/graph jobs have not finished yet (UI uses this for multi-queue).
+    inflight: Arc<AtomicUsize>,
     ws_task: Option<tokio::task::JoinHandle<()>>,
     current_prompt: CurrentPrompt,
 }
@@ -106,10 +137,15 @@ impl Engine {
             client: None,
             http: None,
             base: String::new(),
-            job: None,
+            jobs: Vec::new(),
+            inflight: Arc::new(AtomicUsize::new(0)),
             ws_task: None,
             current_prompt: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(Ordering::SeqCst)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -170,6 +206,7 @@ impl Engine {
         self.ws_task = Some(self.rt.spawn(ws_listener(
             base.clone(),
             api_key.clone(),
+            session.clone(),
             client_id,
             self.tx.clone(),
             self.ctx.clone(),
@@ -207,29 +244,36 @@ impl Engine {
 
     /// Queue a generation from the simple Generate tab. `current` is the last result's encoded
     /// bytes, used as the img2img source when the mode is "current result".
+    /// Does not cancel other in-flight jobs — use [`Self::cancel`] for that.
     pub fn generate(&mut self, params: Params, current: Option<Vec<u8>>) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
             return;
         };
         self.log.info(format!(
-            "generate: {:?} ckpt={} {}x{} steps={} cfg={} {}/{} seed={} denoise={}",
+            "generate: {:?} ckpt={} {}x{} batch={} steps={} cfg={} {}/{} seed={} denoise={} loras={}",
             params.mode,
             params.checkpoint,
             params.width,
             params.height,
+            params.batch_size,
             params.steps,
             params.cfg,
             params.sampler,
             params.scheduler,
             params.seed,
-            params.denoise
+            params.denoise,
+            params.loras.len()
         ));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
         let authed = self.http.clone().map(|h| (self.base.clone(), h));
         let current_prompt = self.current_prompt.clone();
-        self.job = Some(self.rt.spawn(async move {
+        let inflight = self.inflight.clone();
+        inflight.fetch_add(1, Ordering::SeqCst);
+        self.reap_jobs();
+        self.jobs.push(self.rt.spawn(async move {
             run_generate(client, params, current, current_prompt, authed, tx, ctx, log).await;
+            inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
 
@@ -242,20 +286,142 @@ impl Engine {
         self.log.info(format!("queue graph workflow: {} nodes", wf.0.len()));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
         let current = self.current_prompt.clone();
-        self.job = Some(self.rt.spawn(async move {
+        let inflight = self.inflight.clone();
+        inflight.fetch_add(1, Ordering::SeqCst);
+        self.reap_jobs();
+        self.jobs.push(self.rt.spawn(async move {
             stream_execution(client, wf, tx, ctx, log, current).await;
+            inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
 
-    /// Abort the running generation locally (the server may keep finishing its current prompt).
+    /// Abort all local generate/graph jobs (the server may keep finishing queued prompts).
     pub fn cancel(&mut self) {
-        if let Some(h) = self.job.take() {
+        for h in self.jobs.drain(..) {
             h.abort();
         }
+        self.inflight.store(0, Ordering::SeqCst);
         *self.current_prompt.lock().unwrap() = None;
         self.log.warn("generation cancelled locally");
         let _ = self.tx.send(Msg::Cancelled);
         self.ctx.request_repaint();
+    }
+
+    fn reap_jobs(&mut self) {
+        self.jobs.retain(|h| !h.is_finished());
+    }
+
+    /// Download and decode an img2img input URL for the Create-tab thumbnail.
+    pub fn fetch_img2img_url_preview(&self, url: String) {
+        let (tx, ctx, log) = self.emitters();
+        let authed = self.http.clone().map(|h| (self.base.clone(), h));
+        self.rt.spawn(async move {
+            let msg = match fetch_bytes(&url, &authed, &log).await {
+                Ok(bytes) => match decode(&bytes) {
+                    Some(image) => Msg::Img2ImgUrlPreview {
+                        url,
+                        image: Some(image),
+                        error: None,
+                    },
+                    None => Msg::Img2ImgUrlPreview {
+                        url,
+                        image: None,
+                        error: Some("Could not decode image".into()),
+                    },
+                },
+                Err(e) => Msg::Img2ImgUrlPreview {
+                    url,
+                    image: None,
+                    error: Some(e),
+                },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Fetch the Create-tab LoRA catalog. Tries `/comfyui-android/lora-catalog.json`, then
+    /// `/lora-catalog.json`. Soft-fails so generation still works without it.
+    pub fn fetch_lora_catalog(&self) {
+        let Some(http) = self.http.clone() else { return };
+        let base = self.base.clone();
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let paths = [
+                "/comfyui-android/lora-catalog.json",
+                "/lora-catalog.json",
+            ];
+            for path in paths {
+                let Ok(url) = reqwest::Url::parse(&format!("{base}{path}")) else {
+                    continue;
+                };
+                match get_ok_text(&http, url, &log).await {
+                    Ok(body) => match serde_json::from_str::<LoraCatalog>(&body) {
+                        Ok(catalog) => {
+                            log.info(format!(
+                                "lora catalog: {} entries (from {path})",
+                                catalog.loras.len()
+                            ));
+                            let _ = tx.send(Msg::LoraCatalog(catalog));
+                            ctx.request_repaint();
+                            return;
+                        }
+                        Err(e) => {
+                            log.warn(format!("lora catalog {path}: parse error: {e}"));
+                            let _ = tx.send(Msg::LoraCatalogError(format!("parse error: {e}")));
+                            ctx.request_repaint();
+                            return;
+                        }
+                    },
+                    Err(_) => continue,
+                }
+            }
+            log.warn("lora catalog: not found");
+            let _ = tx.send(Msg::LoraCatalogError("catalog not found".into()));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Fetch checkpoint metadata (`/checkpoint-catalog.json`, then android-prefixed path).
+    pub fn fetch_checkpoint_catalog(&self) {
+        let Some(http) = self.http.clone() else { return };
+        let base = self.base.clone();
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let paths = [
+                "/checkpoint-catalog.json",
+                "/comfyui-android/checkpoint-catalog.json",
+            ];
+            for path in paths {
+                let Ok(url) = reqwest::Url::parse(&format!("{base}{path}")) else {
+                    continue;
+                };
+                match get_ok_text(&http, url, &log).await {
+                    Ok(body) => match serde_json::from_str::<CheckpointCatalog>(&body) {
+                        Ok(catalog) => {
+                            log.info(format!(
+                                "checkpoint catalog: {} entries (from {path})",
+                                catalog.checkpoints.len()
+                            ));
+                            let _ = tx.send(Msg::CheckpointCatalog(catalog));
+                            ctx.request_repaint();
+                            return;
+                        }
+                        Err(e) => {
+                            log.warn(format!("checkpoint catalog {path}: parse error: {e}"));
+                            let _ =
+                                tx.send(Msg::CheckpointCatalogError(format!("parse error: {e}")));
+                            ctx.request_repaint();
+                            return;
+                        }
+                    },
+                    Err(_) => continue,
+                }
+            }
+            log.warn("checkpoint catalog: not found");
+            let _ = tx.send(Msg::CheckpointCatalogError("catalog not found".into()));
+            ctx.request_repaint();
+        });
     }
 
     /// List server-side workflow files (`/userdata?dir=workflows`, `.json` only).
@@ -355,6 +521,36 @@ impl Engine {
                 Ok(body) => workflow_msg(&filename, &body, &schemas, &log),
                 Err(e) => Msg::WorkflowError(e),
             };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Fetch the raw embedded workflow JSON for the viewer's metadata panel / copy button.
+    pub fn fetch_item_workflow(&self, subfolder: String, filename: String) {
+        let Some((http, url)) = self.authed_url(
+            "/gallery/api/workflow",
+            &[("subfolder", &subfolder), ("filename", &filename)],
+        ) else {
+            return;
+        };
+        let key = format!("{subfolder}/{filename}");
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(json) => Msg::ItemWorkflow { key, json },
+                Err(e) => Msg::ItemWorkflowError { key, error: e },
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Convert a workflow JSON string (clipboard / gallery copy) for the graph editor.
+    pub fn load_workflow_json(&self, name: String, body: String, schemas: Arc<SchemaSet>) {
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = workflow_msg(&name, &body, &schemas, &log);
             let _ = tx.send(msg);
             ctx.request_repaint();
         });
@@ -598,6 +794,9 @@ impl Engine {
     }
 
     /// Which albums one image is in — the only endpoint that reports membership.
+    ///
+    /// Also forwards any embedded workflow / prompt JSON the meta payload may carry (some gate
+    /// builds put the graph here instead of exposing `/gallery/api/workflow`).
     pub fn fetch_item_albums(&self, subfolder: String, filename: String) {
         let Some((http, url)) = self.authed_url(
             "/gallery/api/meta",
@@ -610,12 +809,28 @@ impl Engine {
             if let Ok(body) = get_ok_text(&http, url, &log).await
                 && let Ok(v) = serde_json::from_str::<Value>(&body)
             {
+                let key = format!("{subfolder}/{filename}");
                 let albums = v
                     .get("albums")
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(|x| x.get("id").and_then(Value::as_i64)).collect())
                     .unwrap_or_default();
-                let _ = tx.send(Msg::ItemAlbums { key: format!("{subfolder}/{filename}"), albums });
+                let _ = tx.send(Msg::ItemAlbums { key: key.clone(), albums });
+                // Prefer an embedded graph on the meta payload when present.
+                let embedded = v
+                    .get("workflow")
+                    .or_else(|| v.get("prompt"))
+                    .or_else(|| v.get("graph"));
+                if let Some(graph) = embedded {
+                    let json = match graph {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    if json.contains("class_type") || json.contains("\"nodes\"") {
+                        log.info(format!("meta {key}: embedded workflow ({} bytes)", json.len()));
+                        let _ = tx.send(Msg::ItemWorkflow { key, json });
+                    }
+                }
                 ctx.request_repaint();
             }
         });
@@ -623,7 +838,9 @@ impl Engine {
 
     /// Fetch one page of the server's image gallery with the view's search, model filter, album,
     /// sort and grouping applied server-side.
-    pub fn gallery_list(&self, offset: u64, limit: u64, q: &str, view: &GalleryView) {
+    /// `generation` is echoed back in [`Msg::Gallery`] so the UI can discard pages from a query that a
+    /// filter change has since superseded (auto-load chains keep several requests in flight).
+    pub fn gallery_list(&self, generation: u64, offset: u64, limit: u64, q: &str, view: &GalleryView) {
         let (offset_s, limit_s) = (offset.to_string(), limit.to_string());
         let mut query = vec![
             ("offset", offset_s.as_str()),
@@ -653,7 +870,7 @@ impl Engine {
                     Ok(mut page) => {
                         page.offset = offset;
                         log.info(format!("gallery: {} items of {}", page.items.len(), page.total));
-                        Msg::Gallery(page)
+                        Msg::Gallery { generation, page }
                     }
                     Err(e) => Msg::GalleryError(format!("gallery list decode: {e}")),
                 },
@@ -751,8 +968,54 @@ impl Engine {
         });
     }
 
+    /// Upload a locally-picked image (from the device gallery) to the server as a LoadImage input,
+    /// then report the resulting `subfolder/name` reference so the node can select it. Mirrors the
+    /// img2img upload path (comfy-gate namespaces uploads into a per-user subfolder).
+    pub fn upload_input_image(&self, token: u64, filename: String, bytes: Vec<u8>) {
+        let Some(client) = self.client.clone() else {
+            let _ = self.tx.send(Msg::InputUploadError { token, error: "Not connected".into() });
+            self.ctx.request_repaint();
+            return;
+        };
+        let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
+        log.info(format!("uploading device image '{filename}' ({} bytes)", bytes.len()));
+        self.rt.spawn(async move {
+            match client
+                .upload_image(&filename, bytes, rucomfyui::upload::UploadType::Input, true)
+                .await
+            {
+                Ok(resp) => {
+                    let image_ref = if resp.subfolder.is_empty() {
+                        resp.name.clone()
+                    } else {
+                        format!("{}/{}", resp.subfolder, resp.name)
+                    };
+                    log.info(format!("uploaded device image as '{image_ref}'"));
+                    let _ = tx.send(Msg::InputUploaded { token, image_ref });
+                }
+                Err(e) => {
+                    log.error(format!("device image upload failed: {e}"));
+                    let _ = tx.send(Msg::InputUploadError { token, error: format!("Upload failed: {e}") });
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
     /// Fetch and decode a full-resolution gallery image.
-    pub fn fetch_full(&self, subfolder: String, filename: String) {
+    ///
+    /// When `cache_dir` is set, a prior download is served from disk immediately and the network
+    /// fetch is skipped. Successful downloads are written back into that directory.
+    pub fn fetch_full(&self, subfolder: String, filename: String, cache_dir: Option<String>) {
+        let key = format!("{subfolder}/{filename}");
+        if let Some(dir) = cache_dir.as_ref()
+            && let Some(bytes) = crate::gallery::read_full_cache(dir, &key)
+            && let Some(image) = decode(&bytes)
+        {
+            let _ = self.tx.send(Msg::FullImage { key: key.clone(), image, bytes });
+            self.ctx.request_repaint();
+            return;
+        }
         let Some((http, url)) = self.authed_url(
             "/view",
             &[("type", "output"), ("subfolder", &subfolder), ("filename", &filename)],
@@ -764,11 +1027,10 @@ impl Engine {
             match get_ok_bytes(&http, url).await {
                 Ok(bytes) => {
                     if let Some(image) = decode(&bytes) {
-                        let _ = tx.send(Msg::FullImage {
-                            key: format!("{subfolder}/{filename}"),
-                            image,
-                            bytes,
-                        });
+                        if let Some(dir) = cache_dir.as_ref() {
+                            crate::gallery::write_full_cache(dir, &key, &bytes);
+                        }
+                        let _ = tx.send(Msg::FullImage { key, image, bytes });
                     } else {
                         let _ = tx.send(Msg::GalleryError("image decode failed".into()));
                     }
@@ -1113,24 +1375,32 @@ async fn reconcile_from_history(
 }
 
 /// Persistent authenticated `/ws` listener. ComfyUI broadcasts `executing`/`progress`/preview
-/// events for prompts queued without a client id (ours are), so this supplies the live progress
-/// the polling transport can't; execution results still come from polling/history. Reconnects
-/// forever with backoff; ends when the UI drops its receiver.
+/// events for our `clientId`; execution results still come from polling/history. Cloudflare
+/// tunnels idle-cap ~100s TCP sessions, so this sends keepalive pings, refreshes before that
+/// cap, and reconnects forever with exponential backoff. Ends when the UI drops its receiver.
 async fn ws_listener(
     base: String,
     api_key: String,
+    session: String,
     client_id: String,
     tx: Sender<Msg>,
     ctx: egui::Context,
     log: Logger,
     current: CurrentPrompt,
 ) {
+    use futures::SinkExt as _;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
     use tokio_tungstenite::tungstenite::protocol::Message;
 
+    // Keep under Cloudflare's ~100s idle/session cap on free tunnels.
+    const KEEPALIVE: Duration = Duration::from_secs(25);
+    const MAX_SESSION: Duration = Duration::from_secs(90);
+    const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
     let ws_base = base.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
     let url = format!("{ws_base}/ws?clientId={client_id}");
-    let mut announced = false;
+    let mut ever_ok = false;
+    let mut backoff = Duration::from_secs(1);
     loop {
         let mut request = match url.as_str().into_client_request() {
             Ok(r) => r,
@@ -1148,51 +1418,95 @@ async fn ws_listener(
                 request.headers_mut().insert("authorization", v);
             }
         }
+        let sess = session.trim();
+        if !sess.is_empty()
+            && let Ok(v) = format!("{SESSION_COOKIE}={sess}").parse()
+        {
+            request.headers_mut().insert("cookie", v);
+        }
         match tokio_tungstenite::connect_async(request).await {
-            Ok((mut stream, _)) => {
-                if !announced {
+            Ok((stream, _)) => {
+                if ever_ok {
+                    log.info("ws: reconnected");
+                } else {
                     log.info("ws: connected — live progress enabled");
-                    announced = true;
+                    ever_ok = true;
                 }
-                while let Some(message) = stream.next().await {
-                    match message {
-                        Ok(Message::Text(text)) => {
-                            if let Some(msg) = parse_ws_text(&text, &current) {
-                                if tx.send(msg).is_err() {
-                                    return;
-                                }
-                                ctx.request_repaint();
-                            }
-                        }
-                        Ok(Message::Binary(bytes)) => {
-                            if current.lock().unwrap().is_some()
-                                && let Some(image) = parse_ws_preview(&bytes)
-                                && let Some(ci) = decode(image)
-                            {
-                                if tx.send(Msg::Preview(ci)).is_err() {
-                                    return;
-                                }
-                                ctx.request_repaint();
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            log.warn(format!("ws: dropped ({e}); reconnecting"));
+                backoff = Duration::from_secs(1);
+                let (mut write, mut read) = stream.split();
+                let mut ping = tokio::time::interval(KEEPALIVE);
+                ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ping.tick().await;
+                let refresh_at = tokio::time::Instant::now() + MAX_SESSION;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(refresh_at) => {
+                            log.info("ws: refreshing before tunnel session limit");
+                            let _ = write.close().await;
                             break;
+                        }
+                        _ = ping.tick() => {
+                            if write.send(Message::Ping(Vec::new())).await.is_err() {
+                                log.warn("ws: ping failed; reconnecting");
+                                break;
+                            }
+                        }
+                        message = read.next() => {
+                            match message {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Some(msg) = parse_ws_text(&text, &current) {
+                                        if tx.send(msg).is_err() {
+                                            return;
+                                        }
+                                        ctx.request_repaint();
+                                    }
+                                }
+                                Some(Ok(Message::Binary(bytes))) => {
+                                    if current.lock().unwrap().is_some()
+                                        && let Some(image) = parse_ws_preview(&bytes)
+                                        && let Some(ci) = decode(image)
+                                    {
+                                        if tx.send(Msg::Preview(ci)).is_err() {
+                                            return;
+                                        }
+                                        ctx.request_repaint();
+                                    }
+                                }
+                                Some(Ok(Message::Ping(payload))) => {
+                                    if write.send(Message::Pong(payload)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                                Some(Ok(Message::Close(_))) => {
+                                    log.warn("ws: closed; reconnecting");
+                                    break;
+                                }
+                                Some(Err(e)) => {
+                                    log.warn(format!("ws: dropped ({e}); reconnecting"));
+                                    break;
+                                }
+                                None => {
+                                    log.warn("ws: ended; reconnecting");
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
             }
             Err(e) => {
-                if !announced {
+                if ever_ok {
+                    log.warn(format!("ws: reconnect failed ({e}); retry in {backoff:?}"));
+                } else {
                     log.warn(format!(
-                        "ws: connect failed ({e}) — live progress off, polling still works"
+                        "ws: connect failed ({e}) — live progress off until reconnect, polling still works"
                     ));
-                    announced = true;
                 }
             }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff.saturating_mul(2)).min(MAX_BACKOFF);
     }
 }
 
@@ -1271,7 +1585,7 @@ async fn fetch_bytes(
 }
 
 /// Decode encoded image bytes (PNG/JPEG) into an egui image for display.
-fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();

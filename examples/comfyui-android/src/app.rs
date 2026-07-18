@@ -3,28 +3,30 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use egui_mobile::{CreateContext, EguiApp, Haptic, Host, HostExt, app, egui};
 use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
 
 use crate::engine::{Engine, Msg};
-use crate::gallery::ThumbCache;
-use crate::graphview::{self, GraphView, elide};
+use crate::gallery::{self, ImageMeta, ThumbCache};
+use crate::graphview::{self, GraphView, elide, elide_width, sanitize_ui_text};
 use crate::icons;
 use crate::logger::{self, Logger};
+use crate::player::Player;
 use crate::schema::{self, SchemaSet};
 use crate::types::{
-    Album, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, GalleryGroup, GalleryItem, GallerySort,
-    GalleryView, Img2ImgSource, Mode, Params, Settings, fallback_vec,
+    ActiveLora, Album, CheckpointCatalog, CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS,
+    Facets, FontSizes, GalleryGroup, GalleryItem, GalleryMedia, GallerySort, GalleryView,
+    Img2ImgSource, LoraCatalog, LoraPack, Mode, Params, SamplerPack, Settings, append_negatives,
+    fallback_vec, merge_triggers, strip_injected,
 };
 
-/// Gallery page size per `/gallery/api/list` request.
-const GALLERY_PAGE: u64 = 60;
-/// Page size when auto-loading the whole filtered/grouped set (comfy-gate clamps to 500).
-const GALLERY_PAGE_ALL: u64 = 500;
-/// Ceiling on auto-loaded items, so a huge namespace can't page forever.
+/// Ceiling on auto-loaded gallery items, so a huge namespace can't page forever.
 const GALLERY_LOAD_ALL_CAP: u64 = 5000;
+/// comfy-gate clamps `/gallery/api/list` `limit` at this.
+const GALLERY_PAGE_MAX: u64 = 500;
 
 enum Conn {
     Disconnected,
@@ -40,6 +42,14 @@ enum Tab {
     Gallery,
     Settings,
     Logs,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum CreatePane {
+    Main,
+    Checkpoints,
+    Loras,
+    Presets,
 }
 
 impl Tab {
@@ -60,6 +70,14 @@ enum GraphPane {
     Props,
 }
 
+/// Source for the LoadImage image picker: the server's uploaded inputs, or the phone's gallery.
+#[derive(PartialEq, Clone, Copy, Default)]
+enum ImgPickSource {
+    #[default]
+    Server,
+    Device,
+}
+
 /// Full-screen state for one opened gallery image.
 struct Viewer {
     item: GalleryItem,
@@ -70,6 +88,13 @@ struct Viewer {
     loading: bool,
     /// Album ids this image belongs to; `None` until `/gallery/api/meta` answers.
     albums: Option<Vec<i64>>,
+    /// Floating metadata header expanded over the image.
+    meta_open: bool,
+    /// Raw embedded workflow JSON (for Copy); `None` until fetched or unavailable.
+    workflow_json: Option<String>,
+    /// Parsed prompts / LoRAs / sampler summary from the workflow.
+    meta: Option<ImageMeta>,
+    meta_loading: bool,
 }
 
 struct ComfyApp {
@@ -95,6 +120,16 @@ struct ComfyApp {
     samplers: Vec<String>,
     schedulers: Vec<String>,
     ckpt_filter: String,
+    create_pane: CreatePane,
+    lora_catalog: LoraCatalog,
+    checkpoint_catalog: CheckpointCatalog,
+    /// Installed LoRA filenames from `object_info` (`LoraLoader.lora_name`).
+    installed_loras: Vec<String>,
+    lora_filter: String,
+    presets: Vec<CreatePreset>,
+    selected_preset: String,
+    preset_save_open: bool,
+    preset_name_edit: String,
 
     params: Params,
     last_saved: Option<String>,
@@ -113,8 +148,15 @@ struct ComfyApp {
     graph: Option<ComfyUiNodeGraph>,
     graph_pane: GraphPane,
     auto_follow: bool,
+    /// Auto-arrange the canvas when a workflow finishes loading.
+    auto_arrange: bool,
+    fonts: FontSizes,
+    /// Rows fetched per gallery page / Load more (clamped 20..=500).
+    gallery_page: u64,
     graph_name: String,
     graph_status: String,
+    /// UI-format JSON restored after connect (from settings).
+    restore_workflow: Option<(String, String)>,
     view: GraphView,
     props_node: Option<NodeId>,
     wf_names: Vec<String>,
@@ -146,12 +188,30 @@ struct ComfyApp {
     gallery_view: GalleryView,
     thumbs: ThumbCache,
     viewer: Option<Viewer>,
+    /// Live video playback for the opened viewer item, when it's a video.
+    player: Option<Player>,
+    /// Distinguishes each playback's cache file, so a new video never truncates the file a
+    /// still-winding-down decode thread is reading.
+    playback_seq: u64,
+    /// Ignore gallery pages from queries older than this (filter changed mid auto-load chain).
+    gallery_gen: u64,
     albums: Vec<Album>,
     facets: Facets,
     album_new_name: String,
     album_manage_open: bool,
     /// Filter text for the LoadImage thumbnail picker in the Properties tab.
     img_pick_filter: String,
+    /// LoadImage picker source: the server's input images vs the phone's photo gallery.
+    img_pick_source: ImgPickSource,
+    /// Cached device gallery listing `(MediaStore id, display name)`, newest first (Android only).
+    device_images: Vec<(i64, String)>,
+    /// Whether `device_images` has been queried this session (avoids re-querying every frame).
+    device_images_loaded: bool,
+    /// In-flight device-image uploads: token → the LoadImage node the pick targets. The token is
+    /// echoed back in the result message so a slow upload lands on the node it was chosen for.
+    pending_uploads: HashMap<u64, NodeId>,
+    /// Monotonic id handed to each device-image upload.
+    next_upload_id: u64,
     /// The image queued for "add to album" while the picker is open.
     album_target: Option<GalleryItem>,
     /// Multi-select in the gallery grid: `selected` holds item keys (`subfolder/filename`).
@@ -164,6 +224,28 @@ struct ComfyApp {
     sel_painting: bool,
     /// Visible tile rects this frame `(rect, gallery index)`, for the paint gesture.
     tile_hits: Vec<(egui::Rect, usize)>,
+    /// Last workflow JSON copied from a gallery image (also written to the system clipboard).
+    workflow_clip: Option<String>,
+    /// Sampler / steps / CFG copied from a gallery image (also on the system clipboard).
+    sampler_clip: Option<SamplerPack>,
+    /// LoRA stack copied from a gallery image (also on the system clipboard).
+    lora_clip: Option<LoraPack>,
+    /// Create/graph prompts still being tracked locally (supports Queue while running).
+    jobs_left: usize,
+    /// Thumbnail for Create img2img "From URL".
+    img2img_url_tex: Option<egui::TextureHandle>,
+    /// URL currently shown in `img2img_url_tex` (or last failed fetch).
+    img2img_url_key: String,
+    /// URL of the in-flight preview fetch.
+    img2img_url_req: String,
+    img2img_url_loading: bool,
+    img2img_url_err: String,
+    /// Debounce: last seen input_url and when it changed.
+    img2img_url_pending: String,
+    img2img_url_pending_at: f64,
+    /// Long-press menu on empty graph canvas: `(graph_pos, screen_pos, armed)`.
+    /// `armed` stays false until the opening press is released so that release doesn't dismiss.
+    canvas_menu: Option<(egui::Pos2, egui::Pos2, bool)>,
 }
 
 impl ComfyApp {
@@ -190,6 +272,15 @@ impl ComfyApp {
             samplers: fallback_vec(FALLBACK_SAMPLERS),
             schedulers: fallback_vec(FALLBACK_SCHEDULERS),
             ckpt_filter: String::new(),
+            create_pane: CreatePane::Main,
+            lora_catalog: LoraCatalog::default(),
+            checkpoint_catalog: CheckpointCatalog::default(),
+            installed_loras: Vec::new(),
+            lora_filter: String::new(),
+            presets: Vec::new(),
+            selected_preset: String::new(),
+            preset_save_open: false,
+            preset_name_edit: String::new(),
             params: Params::default(),
             last_saved: None,
             last_save_check: 0.0,
@@ -204,8 +295,12 @@ impl ComfyApp {
             graph: None,
             graph_pane: GraphPane::Canvas,
             auto_follow: false,
+            auto_arrange: true,
+            fonts: FontSizes::default(),
+            gallery_page: 60,
             graph_name: String::new(),
             graph_status: String::new(),
+            restore_workflow: None,
             view: GraphView::default(),
             props_node: None,
             wf_names: Vec::new(),
@@ -234,11 +329,19 @@ impl ComfyApp {
             gallery_view: GalleryView::default(),
             thumbs: ThumbCache::default(),
             viewer: None,
+            player: None,
+            playback_seq: 0,
+            gallery_gen: 0,
             albums: Vec::new(),
             facets: Facets::default(),
             album_new_name: String::new(),
             album_manage_open: false,
             img_pick_filter: String::new(),
+            img_pick_source: ImgPickSource::default(),
+            device_images: Vec::new(),
+            device_images_loaded: false,
+            pending_uploads: HashMap::new(),
+            next_upload_id: 0,
             album_target: None,
             select_mode: false,
             selected: HashSet::new(),
@@ -246,6 +349,18 @@ impl ComfyApp {
             sel_long_fired: false,
             sel_painting: false,
             tile_hits: Vec::new(),
+            workflow_clip: None,
+            sampler_clip: None,
+            lora_clip: None,
+            jobs_left: 0,
+            img2img_url_tex: None,
+            img2img_url_key: String::new(),
+            img2img_url_req: String::new(),
+            img2img_url_loading: false,
+            img2img_url_err: String::new(),
+            img2img_url_pending: String::new(),
+            img2img_url_pending_at: 0.0,
+            canvas_menu: None,
         }
     }
 
@@ -328,18 +443,95 @@ impl ComfyApp {
                     v.albums = Some(albums);
                 }
             }
+            Msg::Img2ImgUrlPreview { url, image, error } => {
+                if url != self.img2img_url_req {
+                    return;
+                }
+                self.img2img_url_loading = false;
+                self.img2img_url_key = url.clone();
+                if let Some(ci) = image {
+                    self.img2img_url_tex =
+                        Some(ctx.load_texture("img2img_url", ci, egui::TextureOptions::LINEAR));
+                    self.img2img_url_err.clear();
+                } else {
+                    self.img2img_url_tex = None;
+                    self.img2img_url_err = error.unwrap_or_else(|| "Preview failed".into());
+                }
+            }
+            Msg::InputUploaded { token, image_ref } => {
+                let target = self.pending_uploads.remove(&token);
+                if let (Some(node), Some(g)) = (target, self.graph.as_mut())
+                    && let Some(data) = g.snarl.get_node_mut(node)
+                {
+                    // Select the uploaded image on the node's `image` input, adding it to the
+                    // option list so the picker and the node body show it.
+                    for inp in data.inputs.iter_mut() {
+                        if inp.name.eq_ignore_ascii_case("image")
+                            && let FlowValueType::Array { options, selected } = &mut inp.value
+                        {
+                            if !options.iter().any(|o| o == &image_ref) {
+                                options.insert(0, image_ref.clone());
+                            }
+                            *selected = image_ref.clone();
+                            break;
+                        }
+                    }
+                    self.note = format!("Loaded {} from device", elide(&image_ref, 40));
+                    host.haptic(Haptic::Success);
+                }
+            }
+            Msg::InputUploadError { token, error } => {
+                if self.pending_uploads.remove(&token).is_some() {
+                    self.note = elide(&error, 120);
+                    host.haptic(Haptic::Error);
+                }
+            }
+            Msg::LoraCatalog(catalog) => {
+                self.lora_catalog = catalog;
+            }
+            Msg::LoraCatalogError(err) => {
+                self.log.warn(format!("lora catalog: {err}"));
+            }
+            Msg::CheckpointCatalog(catalog) => {
+                // Feed base tags into the LoRA filter map (file + basename keys).
+                for e in &catalog.checkpoints {
+                    if e.bases.is_empty() {
+                        continue;
+                    }
+                    self.lora_catalog
+                        .checkpoints
+                        .insert(e.file.clone(), e.bases.clone());
+                    let base = crate::types::file_basename(&e.file);
+                    if base != e.file {
+                        self.lora_catalog
+                            .checkpoints
+                            .insert(base.to_string(), e.bases.clone());
+                    }
+                }
+                self.checkpoint_catalog = catalog;
+            }
+            Msg::CheckpointCatalogError(err) => {
+                self.log.warn(format!("checkpoint catalog: {err}"));
+            }
             Msg::Connected { schemas, checkpoints, samplers, schedulers } => {
                 self.conn = Conn::Connected;
                 // Albums and model facets are per-account, so they follow the credential.
                 self.engine.as_ref().unwrap().albums();
                 self.engine.as_ref().unwrap().facets();
+                self.engine.as_ref().unwrap().fetch_lora_catalog();
+                self.engine.as_ref().unwrap().fetch_checkpoint_catalog();
+                self.installed_loras = schemas.loras();
                 // Swap the node catalog in place so a reconnect keeps the graph canvas.
                 let object_info = schema::to_object_info(&schemas);
+                let had_nodes = self
+                    .graph
+                    .as_ref()
+                    .is_some_and(|g| g.snarl.nodes_pos_ids().next().is_some());
                 match &mut self.graph {
                     Some(g) => g.object_info = object_info,
                     None => self.graph = Some(ComfyUiNodeGraph::new(object_info)),
                 }
-                self.schemas = Some(schemas);
+                self.schemas = Some(schemas.clone());
                 if !checkpoints.is_empty() {
                     if self.params.checkpoint.is_empty()
                         || !checkpoints.contains(&self.params.checkpoint)
@@ -355,6 +547,15 @@ impl ComfyApp {
                     self.schedulers = schedulers;
                 }
                 self.status.clear();
+                // Restore the last opened graph once schemas are available (skip if canvas already
+                // has nodes from this session).
+                if !had_nodes
+                    && let Some((name, body)) = self.restore_workflow.take()
+                {
+                    self.graph_status = format!("Restoring {}…", elide(&name, 40));
+                    self.wf_loading = true;
+                    self.engine.as_ref().unwrap().load_workflow_json(name, body, schemas);
+                }
                 host.haptic(Haptic::Success);
             }
             Msg::ConnectError(e) => {
@@ -406,14 +607,21 @@ impl ComfyApp {
                 }
             }
             Msg::Done => {
-                self.running = false;
+                self.jobs_left = self.jobs_left.saturating_sub(1);
                 self.progress = (0, 0);
                 self.executing = None;
-                self.status = "Done".into();
-                host.haptic(Haptic::Success);
-                host.notify("ComfyUI", "Generation finished");
+                if self.jobs_left == 0 {
+                    self.running = false;
+                    self.status = "Done".into();
+                    host.haptic(Haptic::Success);
+                    host.notify("ComfyUI", "Generation finished");
+                } else {
+                    self.status = format!("{} still in queue", self.jobs_left);
+                    host.haptic(Haptic::Light);
+                }
             }
             Msg::Cancelled => {
+                self.jobs_left = 0;
                 self.running = false;
                 self.progress = (0, 0);
                 self.executing = None;
@@ -421,9 +629,12 @@ impl ComfyApp {
                 self.status = "Cancelled".into();
             }
             Msg::GenError(e) => {
-                self.running = false;
+                self.jobs_left = self.jobs_left.saturating_sub(1);
                 self.progress = (0, 0);
                 self.executing = None;
+                if self.jobs_left == 0 {
+                    self.running = false;
+                }
                 self.status = format!("Error: {e}");
                 host.haptic(Haptic::Error);
             }
@@ -454,8 +665,11 @@ impl ComfyApp {
                             self.wf_open = false;
                             self.tab = Tab::Graph;
                             self.viewer = None;
-                            // Compact the frontend's sprawling saved layout once sizes measure.
-                            self.view.request_arrange();
+                            if self.auto_arrange {
+                                self.view.request_arrange();
+                            } else {
+                                self.view.request_fit();
+                            }
                             host.haptic(Haptic::Success);
                         }
                         Err(e) => {
@@ -479,7 +693,12 @@ impl ComfyApp {
                 self.graph_status = elide(&e, 200);
                 host.haptic(Haptic::Error);
             }
-            Msg::Gallery(page) => {
+            Msg::Gallery { generation, page } => {
+                // A filter change bumps the generation and clears the listing; pages answering
+                // the old query may still land afterwards and must not corrupt the fresh one.
+                if generation != self.gallery_gen {
+                    return;
+                }
                 self.gallery_loading = false;
                 self.gallery_total = page.total;
                 if page.offset == 0 {
@@ -498,8 +717,9 @@ impl ComfyApp {
                 {
                     self.gallery_loading = true;
                     self.engine.as_ref().unwrap().gallery_list(
+                        self.gallery_gen,
                         loaded,
-                        GALLERY_PAGE_ALL,
+                        self.gallery_page_size(),
                         &self.gallery_q,
                         &self.gallery_view,
                     );
@@ -526,12 +746,58 @@ impl ComfyApp {
                     v.loading = false;
                 }
             }
+            Msg::ItemWorkflow { key, json } => {
+                if let Some(v) = &mut self.viewer
+                    && v.item.key() == key
+                {
+                    let meta =
+                        gallery::parse_workflow_meta_for(&json, Some(v.item.filename.as_str()));
+                    self.log.info(format!(
+                        "workflow meta {}: {} models, {} loras, prompt={}",
+                        elide(&key, 48),
+                        meta.models.len(),
+                        meta.loras.len(),
+                        meta.positive.as_ref().map(|p| p.len()).unwrap_or(0)
+                    ));
+                    v.meta = Some(meta);
+                    v.workflow_json = Some(json);
+                    v.item.has_workflow = true;
+                    v.meta_loading = false;
+                }
+            }
+            Msg::ItemWorkflowError { key, error } => {
+                if let Some(v) = &mut self.viewer
+                    && v.item.key() == key
+                {
+                    v.meta_loading = false;
+                    self.log.warn(format!("workflow meta {key}: {error}"));
+                }
+            }
             Msg::VideoReady { key, bytes } => {
                 if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
-                    v.bytes = Some(bytes);
+                    v.bytes = Some(bytes.clone());
                     v.loading = false;
+                    // Write the file where MediaMetadataRetriever can open it, then start playback.
+                    // A fresh name per playback: the previous player's decode thread may still be
+                    // winding down with its file open, and truncating that in place would yank the
+                    // data out from under its decoder. (Player::drop unlinks its own file.)
+                    if let Some(dir) = host.documents_dir() {
+                        self.playback_seq += 1;
+                        let path = format!("{dir}/playback_{}.mp4", self.playback_seq);
+                        match std::fs::write(&path, &bytes) {
+                            Ok(()) => {
+                                self.player = Some(Player::start(
+                                    path,
+                                    key,
+                                    ctx.clone(),
+                                    self.log.clone(),
+                                ));
+                            }
+                            Err(e) => self.log.error(format!("video cache write failed: {e}")),
+                        }
+                    }
                 }
             }
             Msg::SaveToGallery { name, bytes } => {
@@ -540,17 +806,31 @@ impl ComfyApp {
         }
     }
 
-    fn start_generation(&mut self, host: &Host) {
+    /// Start a Create-tab generation. When `queue_only`, an already-running job is left alone and
+    /// another prompt is added to the server queue.
+    fn start_generation(&mut self, host: &Host, queue_only: bool) {
+        if self.params.checkpoint.is_empty() {
+            self.status = "Pick a checkpoint first".into();
+            return;
+        }
         if self.params.randomize_seed {
             self.params.seed = random_seed();
         }
+        let fresh = !self.running;
+        if fresh {
+            self.progress = (0, 0);
+            self.preview = None;
+            self.node_map.clear();
+            self.run_total = 0;
+            self.run_seen.clear();
+        }
         self.running = true;
-        self.status = "Queued".into();
-        self.progress = (0, 0);
-        self.preview = None;
-        self.node_map.clear();
-        self.run_total = 0;
-        self.run_seen.clear();
+        self.jobs_left += 1;
+        self.status = if queue_only && !fresh {
+            format!("Queued ({} in flight)", self.jobs_left)
+        } else {
+            "Queued".into()
+        };
         let params = self.params.clone();
         let current = self.result_bytes.clone();
         self.engine.as_mut().unwrap().generate(params, current);
@@ -573,6 +853,7 @@ impl ComfyApp {
         ctx.forget_all_images();
         g.populate_output_images("none", std::iter::empty());
         self.running = true;
+        self.jobs_left += 1;
         self.status = "Queued".into();
         self.progress = (0, 0);
         self.preview = None;
@@ -580,6 +861,46 @@ impl ComfyApp {
         self.graph_status.clear();
         self.engine.as_mut().unwrap().run_workflow(wf);
         host.haptic(Haptic::Medium);
+    }
+
+    /// Load the current Create params into the node-graph editor.
+    fn open_create_as_graph(&mut self, host: &Host) {
+        if self.params.checkpoint.is_empty() {
+            self.status = "Pick a checkpoint first".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let Some(g) = self.graph.as_mut() else {
+            self.status = "Connect to the server first".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let (wf, _) = crate::workflow::build(&self.params, None);
+        self.graph_outputs.clear();
+        self.node_map.clear();
+        self.executing = None;
+        self.props_node = None;
+        self.view.reset();
+        match g.load_api_workflow(&wf) {
+            Ok(()) => {
+                self.graph_name = "create.json".into();
+                self.graph_status = format!("{} nodes from Create", wf.0.len());
+                self.tab = Tab::Graph;
+                self.graph_pane = GraphPane::Canvas;
+                if self.auto_arrange {
+                    self.view.request_arrange();
+                } else {
+                    self.view.request_fit();
+                }
+                self.status = "Opened Create as graph".into();
+                host.haptic(Haptic::Success);
+            }
+            Err(e) => {
+                self.status = format!("Open as graph failed: {e}");
+                self.log.error(format!("open create as graph: {e}"));
+                host.haptic(Haptic::Error);
+            }
+        }
     }
 
     fn save_bytes(&mut self, host: &Host, bytes: &[u8], name: &str) -> String {
@@ -622,7 +943,13 @@ impl ComfyApp {
         host.documents_dir().map(|d| format!("{d}/comfyui_settings.json"))
     }
 
+    /// Page size for gallery list / Load more, clamped to the server's accepted range.
+    fn gallery_page_size(&self) -> u64 {
+        self.gallery_page.clamp(20, GALLERY_PAGE_MAX)
+    }
+
     fn settings_json(&self) -> Option<String> {
+        let (workflow_name, workflow_json) = self.snapshot_workflow();
         let settings = Settings {
             server_url: self.server_url.clone(),
             api_key: self.api_key.clone(),
@@ -630,9 +957,34 @@ impl ComfyApp {
             session: self.session.clone(),
             params: self.params.clone(),
             gallery: self.gallery_view.clone(),
+            gallery_q: self.gallery_q.clone(),
+            gallery_page: self.gallery_page_size(),
             auto_follow: self.auto_follow,
+            auto_arrange: self.auto_arrange,
+            fonts: self.fonts.clone(),
+            workflow_name,
+            workflow_json,
+            presets: self.presets.clone(),
+            selected_preset: self.selected_preset.clone(),
         };
         serde_json::to_string_pretty(&settings).ok()
+    }
+
+    /// Current graph as UI-format JSON for persistence, when a schema-backed editor exists.
+    fn snapshot_workflow(&self) -> (String, Option<String>) {
+        if let (Some(g), Some(schemas)) = (self.graph.as_ref(), self.schemas.as_ref()) {
+            if g.snarl.nodes_pos_ids().next().is_some() {
+                let exported = self.view.export_ui(g, schemas);
+                if let Ok(body) = serde_json::to_string(&exported) {
+                    return (self.graph_name.clone(), Some(body));
+                }
+            }
+        }
+        // Keep the last restored snapshot until a live graph replaces it.
+        match &self.restore_workflow {
+            Some((name, json)) => (name.clone(), Some(json.clone())),
+            None => (self.graph_name.clone(), None),
+        }
     }
 
     fn load_settings(&mut self, host: &Host) {
@@ -648,8 +1000,18 @@ impl ComfyApp {
             self.session = saved.session;
             self.params = saved.params;
             self.gallery_view = saved.gallery;
+            self.gallery_q = saved.gallery_q;
+            self.gallery_page = saved.gallery_page.clamp(20, GALLERY_PAGE_MAX);
             self.auto_follow = saved.auto_follow;
+            self.auto_arrange = saved.auto_arrange;
+            self.fonts = saved.fonts;
+            self.fonts.clamp();
             self.gallery_view.columns = self.gallery_view.columns.clamp(1, 3);
+            self.presets = saved.presets;
+            self.selected_preset = saved.selected_preset;
+            if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
+                self.restore_workflow = Some((saved.workflow_name, json));
+            }
             self.last_saved = self.settings_json();
         }
     }
@@ -709,7 +1071,7 @@ impl ComfyApp {
     }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             ui.heading(format!("{} Server", icons::LINK));
             ui.group(|ui| {
@@ -815,8 +1177,102 @@ impl ComfyApp {
                 }
             });
             ui.add_space(12.0);
+            ui.heading(format!("{} Gallery", icons::GALLERY));
+            ui.group(|ui| {
+                ui.label("Images per page");
+                ui.add(
+                    egui::Slider::new(&mut self.gallery_page, 20..=GALLERY_PAGE_MAX)
+                        .suffix(" images")
+                        .logarithmic(true),
+                );
+                ui.weak("How many rows Load more / preload fetches at once.");
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.gallery_view.groups_open, "Open group headers by default");
+            });
+
+            ui.add_space(12.0);
+            ui.heading("Text size");
+            ui.group(|ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Heading");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.fonts.heading).range(12.0..=36.0).speed(0.5))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Body");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.fonts.body).range(10.0..=28.0).speed(0.5))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Button");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.fonts.button).range(10.0..=28.0).speed(0.5))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Small");
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut self.fonts.small).range(8.0..=20.0).speed(0.5))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Mono");
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.fonts.monospace)
+                                .range(9.0..=24.0)
+                                .speed(0.5),
+                        )
+                        .changed();
+                });
+                if changed {
+                    self.fonts.clamp();
+                    crate::theme::apply_fonts(ui.ctx(), &self.fonts);
+                }
+                if ui.button("Reset text sizes").clicked() {
+                    self.fonts = FontSizes::default();
+                    crate::theme::apply_fonts(ui.ctx(), &self.fonts);
+                }
+            });
+
+            ui.add_space(12.0);
+            ui.heading(format!("{} Graph", icons::GRAPH));
+            ui.group(|ui| {
+                ui.checkbox(&mut self.auto_follow, "Auto-follow executing node");
+                ui.checkbox(&mut self.auto_arrange, "Auto-arrange when a workflow loads");
+                ui.weak("The open workflow is saved automatically and restored after connect.");
+            });
+
+            ui.add_space(12.0);
             ui.weak("Server, key, account and generation settings save automatically.");
             ui.add_space(12.0);
+        });
+    }
+
+    fn create_pane_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.create_pane, CreatePane::Main, "Main");
+            let ckpt_n = self.checkpoints.len();
+            ui.selectable_value(
+                &mut self.create_pane,
+                CreatePane::Checkpoints,
+                if ckpt_n > 0 { format!("Checkpoints ({ckpt_n})") } else { "Checkpoints".into() },
+            );
+            let lora_n = self.params.loras.len();
+            ui.selectable_value(
+                &mut self.create_pane,
+                CreatePane::Loras,
+                if lora_n > 0 { format!("LoRAs ({lora_n})") } else { "LoRAs".into() },
+            );
+            let preset_n = self.presets.len();
+            ui.selectable_value(
+                &mut self.create_pane,
+                CreatePane::Presets,
+                if preset_n > 0 { format!("Presets ({preset_n})") } else { "Presets".into() },
+            );
         });
     }
 
@@ -824,11 +1280,65 @@ impl ComfyApp {
         // The theme's roomy button padding makes sliders/combos tall enough to graze the next grid
         // row; trim the interactive height a little so each row keeps clear of the one below.
         ui.spacing_mut().interact_size.y = 20.0;
-        ui.horizontal(|ui| {
-            let n = self.checkpoints.len();
-            ui.label(if n > 0 { format!("Model ({n})") } else { "Model".to_string() });
-            self.checkpoint_combo(ui);
-        });
+        match self.create_pane {
+            CreatePane::Main => self.create_main_pane(ui, host),
+            CreatePane::Checkpoints => self.create_checkpoints_pane(ui),
+            CreatePane::Loras => self.create_loras_pane(ui),
+            CreatePane::Presets => self.create_presets_pane(ui, host),
+        }
+    }
+
+    /// Debounced fetch of the img2img "From URL" preview thumbnail.
+    fn tick_img2img_url_preview(&mut self, ctx: &egui::Context) {
+        let url = self.params.input_url.trim().to_string();
+        let now = ctx.input(|i| i.time);
+        if url != self.img2img_url_pending {
+            self.img2img_url_pending = url.clone();
+            self.img2img_url_pending_at = now;
+        }
+        if url.is_empty() {
+            self.img2img_url_tex = None;
+            self.img2img_url_key.clear();
+            self.img2img_url_req.clear();
+            self.img2img_url_loading = false;
+            self.img2img_url_err.clear();
+            return;
+        }
+        if url == self.img2img_url_key || url == self.img2img_url_req {
+            return;
+        }
+        let looks_ok = (url.starts_with("http://") || url.starts_with("https://")) && url.len() > 12;
+        if !looks_ok {
+            return;
+        }
+        let wait = 0.45 - (now - self.img2img_url_pending_at);
+        if wait > 0.0 {
+            ctx.request_repaint_after(Duration::from_secs_f64(wait));
+            return;
+        }
+        self.img2img_url_req = url.clone();
+        self.img2img_url_loading = true;
+        self.img2img_url_err.clear();
+        if let Some(engine) = self.engine.as_ref() {
+            engine.fetch_img2img_url_preview(url);
+        }
+    }
+
+    fn create_main_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let ckpt_label = if self.params.checkpoint.is_empty() {
+            "no model".to_string()
+        } else {
+            self.checkpoint_catalog
+                .entry(&self.params.checkpoint)
+                .map(|e| e.display_name().to_string())
+                .unwrap_or_else(|| elide(&self.params.checkpoint, 40))
+        };
+        let preset_label = if self.selected_preset.is_empty() {
+            "custom".to_string()
+        } else {
+            elide(&self.selected_preset, 24)
+        };
+        ui.weak(format!("{ckpt_label} · {preset_label}"));
 
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
@@ -856,11 +1366,28 @@ impl ComfyApp {
                                 .hint_text("https://…/image.png — or pick from Gallery")
                                 .desired_width(f32::INFINITY),
                         );
+                        self.tick_img2img_url_preview(ui.ctx());
+                        ui.horizontal(|ui| {
+                            if let Some(tex) = &self.img2img_url_tex {
+                                let sized = egui::load::SizedTexture::from_handle(tex);
+                                ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                            } else if self.img2img_url_loading {
+                                ui.spinner();
+                                ui.weak("loading preview…");
+                            } else if !self.img2img_url_err.is_empty() {
+                                ui.weak(elide(&self.img2img_url_err, 64));
+                            }
+                        });
                     }
                     Img2ImgSource::CurrentOutput if self.result_bytes.is_none() => {
                         ui.weak("Generate an image first to use it as input.");
                     }
-                    Img2ImgSource::CurrentOutput => {}
+                    Img2ImgSource::CurrentOutput => {
+                        if let Some(tex) = &self.result {
+                            let sized = egui::load::SizedTexture::from_handle(tex);
+                            ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                        }
+                    }
                 }
                 ui.add(egui::Slider::new(&mut self.params.denoise, 0.0..=1.0).text("Denoise"));
             });
@@ -873,6 +1400,13 @@ impl ComfyApp {
                 .desired_width(f32::INFINITY)
                 .hint_text("what you want to see"),
         );
+        ui.label("LoRA triggers");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.params.lora_triggers)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("trigger words from LoRAs (auto-filled on Add)"),
+        );
         ui.label("Negative");
         ui.add(
             egui::TextEdit::multiline(&mut self.params.negative)
@@ -881,24 +1415,38 @@ impl ComfyApp {
                 .hint_text("what to avoid"),
         );
 
+        // Full-width sliders sit outside the param grid so they can use the whole pane.
+        ui.horizontal(|ui| {
+            ui.label("Steps");
+            let w = ui.available_width();
+            ui.add_sized(
+                [w, 24.0],
+                egui::Slider::new(&mut self.params.steps, 5..=150)
+                    .step_by(5.0)
+                    .clamping(egui::SliderClamping::Always),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("CFG");
+            let w = ui.available_width();
+            ui.add_sized(
+                [w, 24.0],
+                egui::Slider::new(&mut self.params.cfg, 1.0..=20.0)
+                    .clamping(egui::SliderClamping::Always),
+            );
+        });
+
         egui::Grid::new("params")
             .num_columns(2)
             .spacing([8.0, 10.0])
             .min_row_height(24.0)
             .show(ui, |ui| {
-                ui.label("Steps");
-                ui.add(egui::DragValue::new(&mut self.params.steps).range(1..=150));
-                ui.end_row();
-
-                ui.label("CFG");
-                ui.add(egui::Slider::new(&mut self.params.cfg, 1.0..=20.0));
-                ui.end_row();
-
                 ui.label("Size");
                 ui.horizontal(|ui| {
                     ui.add(egui::DragValue::new(&mut self.params.width).range(64..=2048).speed(8.0));
                     ui.label("×");
                     ui.add(egui::DragValue::new(&mut self.params.height).range(64..=2048).speed(8.0));
+                    size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
                 });
                 ui.end_row();
 
@@ -908,6 +1456,10 @@ impl ComfyApp {
 
                 ui.label("Scheduler");
                 combo(ui, "scheduler", &mut self.params.scheduler, &self.schedulers);
+                ui.end_row();
+
+                ui.label("Batch");
+                ui.add(egui::Slider::new(&mut self.params.batch_size, 1..=8).text("images"));
                 ui.end_row();
 
                 ui.label("Seed");
@@ -921,60 +1473,728 @@ impl ComfyApp {
                 ui.end_row();
             });
 
+        if !self.params.loras.is_empty() {
+            ui.add_space(4.0);
+            ui.weak(format!(
+                "{} LoRA(s) active — edit on the LoRAs tab",
+                self.params.loras.len()
+            ));
+        }
+
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        let can_gen = !self.params.checkpoint.is_empty();
+        ui.horizontal_wrapped(|ui| {
             if self.running {
                 if ui.button("Cancel").clicked() {
                     self.engine.as_mut().unwrap().cancel();
                     host.haptic(Haptic::Warning);
                 }
             } else {
-                let can_gen = !self.params.checkpoint.is_empty();
-                let btn = egui::Button::new("Generate").min_size(egui::vec2(140.0, 34.0));
+                let btn = egui::Button::new("Generate").min_size(egui::vec2(120.0, 34.0));
                 if ui.add_enabled(can_gen, btn).clicked() {
-                    self.start_generation(host);
+                    self.start_generation(host, false);
                 }
+            }
+            if ui
+                .add_enabled(
+                    can_gen,
+                    egui::Button::new("Queue").min_size(egui::vec2(80.0, 34.0)),
+                )
+                .on_hover_text("Add another prompt to the server queue")
+                .clicked()
+            {
+                self.start_generation(host, true);
+            }
+            if ui
+                .add_enabled(can_gen, egui::Button::new(format!("{} Open as graph", icons::GRAPH)))
+                .on_hover_text("Load these Create settings into the node graph")
+                .clicked()
+            {
+                self.open_create_as_graph(host);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let clip = host.clipboard_text();
+            let has_wf = self.workflow_clip.is_some()
+                || clip.as_deref().is_some_and(|t| {
+                    let t = t.trim();
+                    t.starts_with('{') || t.starts_with('[')
+                });
+            let has_sampler = self.sampler_clip.is_some()
+                || clip.as_deref().and_then(SamplerPack::from_clipboard_json).is_some();
+            let has_loras = self.lora_clip.is_some()
+                || clip.as_deref().and_then(LoraPack::from_clipboard_json).is_some();
+            if ui
+                .add_enabled(has_wf, egui::Button::new(format!("{} Paste workflow", icons::PROPS)))
+                .on_hover_text("Fill Create from a workflow copied in Gallery")
+                .clicked()
+            {
+                self.paste_workflow_into_create(host);
+            }
+            if ui
+                .add_enabled(has_sampler, egui::Button::new(format!("{} Paste sampler", icons::PROPS)))
+                .on_hover_text("Paste sampler / scheduler / steps / CFG")
+                .clicked()
+            {
+                self.paste_sampler_pack(host);
+            }
+            if ui
+                .add_enabled(has_loras, egui::Button::new(format!("{} Paste LoRAs", icons::PROPS)))
+                .on_hover_text("Paste LoRA stack and strengths")
+                .clicked()
+            {
+                self.paste_lora_pack(host);
             }
         });
     }
 
-    /// Checkpoint dropdown, hardened against very large / very long server lists: the popup filters
-    /// by substring and caps how many rows it lays out, so no amount of `object_info` data can
-    /// overflow the GPU vertex buffer.
-    fn checkpoint_combo(&mut self, ui: &mut egui::Ui) {
-        let selected = if self.params.checkpoint.is_empty() {
-            "—".to_string()
+    fn create_checkpoints_pane(&mut self, ui: &mut egui::Ui) {
+        let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
+        ui.set_max_width(list_w);
+
+        let catalog_n = self.checkpoint_catalog.checkpoints.len();
+        if catalog_n == 0 {
+            ui.weak("No checkpoint catalog yet — showing installed models.");
         } else {
-            elide(&self.params.checkpoint, 40)
-        };
-        egui::ComboBox::from_id_salt("ckpt")
-            .selected_text(selected)
-            .show_ui(ui, |ui| {
+            ui.weak(format!("Catalog: {catalog_n} entries"));
+        }
+
+        ui.add(
+            egui::TextEdit::singleline(&mut self.ckpt_filter)
+                .hint_text("filter checkpoints")
+                .desired_width(list_w - 8.0),
+        );
+
+        let filter = self.ckpt_filter.to_lowercase();
+        let current = self.params.checkpoint.clone();
+
+        // Group installed checkpoints by display name; versions nest under each name.
+        let mut groups: std::collections::BTreeMap<String, Vec<(String, Option<crate::types::CheckpointEntry>)>> =
+            std::collections::BTreeMap::new();
+        for file in &self.checkpoints {
+            let meta = self.checkpoint_catalog.entry(file).cloned();
+            let group = meta
+                .as_ref()
+                .map(|e| e.display_name().to_string())
+                .unwrap_or_else(|| crate::types::file_basename(file).to_string());
+            let hay = format!(
+                "{group} {file} {}",
+                meta.as_ref()
+                    .and_then(|e| e.version.as_deref())
+                    .unwrap_or("")
+            )
+            .to_lowercase();
+            if !filter.is_empty() && !hay.contains(&filter) {
+                continue;
+            }
+            groups.entry(group).or_default().push((file.clone(), meta));
+        }
+        for versions in groups.values_mut() {
+            versions.sort_by(|a, b| {
+                let av = a
+                    .1
+                    .as_ref()
+                    .map(|e| e.version_label())
+                    .unwrap_or_else(|| a.0.clone());
+                let bv = b
+                    .1
+                    .as_ref()
+                    .map(|e| e.version_label())
+                    .unwrap_or_else(|| b.0.clone());
+                av.to_lowercase().cmp(&bv.to_lowercase())
+            });
+        }
+
+        let mut pick: Option<String> = None;
+        let mut group_n = 0usize;
+        for (group_name, versions) in &groups {
+            if group_n >= 80 {
+                ui.weak(format!("… {} more groups — type to filter", groups.len() - group_n));
+                break;
+            }
+            group_n += 1;
+            let any_selected = versions.iter().any(|(f, _)| *f == current);
+            let group_header = if any_selected {
+                format!("{} {group_name}", icons::CHECK)
+            } else {
+                group_name.clone()
+            };
+            egui::CollapsingHeader::new(group_header)
+                .id_salt(("ckpt_group", group_name.as_str()))
+                .default_open(any_selected || versions.len() == 1)
+                .show(ui, |ui| {
+                    ui.set_max_width(list_w - 8.0);
+                    for (file, meta) in versions {
+                        let selected = current == *file;
+                        let ver = meta
+                            .as_ref()
+                            .map(|e| e.version_label())
+                            .unwrap_or_else(|| crate::types::file_basename(file).to_string());
+                        let ver_header = if selected {
+                            format!("{} {ver}", icons::CHECK)
+                        } else {
+                            ver
+                        };
+                        ui.horizontal(|ui| {
+                            ui.set_max_width(list_w - 8.0);
+                            let clicked = ui
+                                .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                                    let clicked = ui
+                                        .add_enabled(!selected, egui::Button::new("Use").small())
+                                        .clicked();
+                                    // Remaining width goes to the header (no char elide).
+                                    egui::CollapsingHeader::new(ver_header)
+                                        .id_salt(("ckpt_ver", file.as_str()))
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            ui.set_max_width((list_w - 64.0).max(100.0));
+                                            checkpoint_meta_body(ui, file, meta.as_ref());
+                                        });
+                                    clicked
+                                })
+                                .inner;
+                            if clicked {
+                                pick = Some(file.clone());
+                            }
+                        });
+                    }
+                });
+        }
+        if let Some(file) = pick {
+            self.select_checkpoint(&file);
+        }
+        if groups.is_empty() {
+            ui.weak(if self.checkpoints.is_empty() {
+                "No checkpoints on the server."
+            } else {
+                "No matches."
+            });
+        }
+    }
+
+    fn create_presets_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
+        ui.set_max_width(list_w);
+
+        ui.horizontal(|ui| {
+            if ui.button(icons::SAVE).on_hover_text("Save current Create settings as a preset").clicked()
+            {
+                self.preset_name_edit = self.selected_preset.clone();
+                self.preset_save_open = true;
+            }
+            let can_del = !self.selected_preset.is_empty();
+            if ui
+                .add_enabled(can_del, egui::Button::new(icons::TRASH))
+                .on_hover_text("Delete selected preset")
+                .clicked()
+            {
+                self.delete_selected_preset();
+                host.haptic(Haptic::Warning);
+            }
+        });
+
+        if self.preset_save_open {
+            ui.horizontal(|ui| {
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.ckpt_filter)
-                        .hint_text("filter")
-                        .desired_width(220.0),
+                    egui::TextEdit::singleline(&mut self.preset_name_edit)
+                        .hint_text("preset name")
+                        .desired_width((list_w - 100.0).max(100.0)),
                 );
-                let filter = self.ckpt_filter.to_lowercase();
-                let mut shown = 0usize;
-                let mut hidden = 0usize;
-                for opt in &self.checkpoints {
-                    if !filter.is_empty() && !opt.to_lowercase().contains(&filter) {
-                        continue;
-                    }
-                    if shown >= 200 {
-                        hidden += 1;
-                        continue;
-                    }
-                    ui.selectable_value(&mut self.params.checkpoint, opt.clone(), elide(opt, 56));
-                    shown += 1;
+                let named = !self.preset_name_edit.trim().is_empty();
+                if ui.add_enabled(named, egui::Button::new(icons::CHECK)).clicked() {
+                    self.save_preset(self.preset_name_edit.trim().to_string());
+                    self.preset_save_open = false;
+                    host.haptic(Haptic::Success);
                 }
-                if hidden > 0 {
-                    ui.weak(format!("… {hidden} more — type to filter"));
-                } else if shown == 0 {
-                    ui.weak("no matches");
+                if ui.button("Cancel").clicked() {
+                    self.preset_save_open = false;
                 }
             });
+        }
+
+        if self.presets.is_empty() {
+            ui.weak("No presets yet — tap 💾 to save the current Create settings.");
+            return;
+        }
+
+        let mut apply: Option<String> = None;
+        let mut delete: Option<String> = None;
+        for preset in self.presets.clone() {
+            let selected = self.selected_preset == preset.name;
+            let header = if selected {
+                format!("{} {}", icons::CHECK, elide(&preset.name, 28))
+            } else {
+                elide(&preset.name, 32)
+            };
+            ui.horizontal(|ui| {
+                ui.set_max_width(list_w);
+                let (use_clicked, trash_clicked) = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        let trash = ui.small_button(icons::TRASH).clicked();
+                        let use_btn = ui
+                            .add_enabled(!selected, egui::Button::new("Use").small())
+                            .clicked();
+                        egui::CollapsingHeader::new(header)
+                            .id_salt(("preset_row", preset.name.as_str()))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.set_max_width((list_w - 80.0).max(100.0));
+                                preset_meta_body(ui, &preset);
+                            });
+                        (use_btn, trash)
+                    })
+                    .inner;
+                if use_clicked {
+                    apply = Some(preset.name.clone());
+                }
+                if trash_clicked {
+                    delete = Some(preset.name.clone());
+                }
+            });
+        }
+        if let Some(name) = apply {
+            self.apply_preset(&name);
+            host.haptic(Haptic::Light);
+        }
+        if let Some(name) = delete {
+            self.presets.retain(|p| p.name != name);
+            if self.selected_preset == name {
+                self.selected_preset.clear();
+            }
+            host.haptic(Haptic::Warning);
+        }
+    }
+
+    fn select_checkpoint(&mut self, file: &str) {
+        self.params.checkpoint = file.to_string();
+        if let Some(rec) = self
+            .checkpoint_catalog
+            .entry(file)
+            .and_then(|e| e.recommended.as_ref())
+            .cloned()
+        {
+            if let Some(v) = rec.steps {
+                self.params.steps = v;
+            }
+            if let Some(v) = rec.cfg {
+                self.params.cfg = v;
+            }
+            if let Some(v) = rec.width {
+                self.params.width = v;
+            }
+            if let Some(v) = rec.height {
+                self.params.height = v;
+            }
+            if let Some(name) = rec.sampler.as_ref().and_then(|s| match_sampler_name(s, &self.samplers))
+            {
+                self.params.sampler = name;
+            }
+            if let Some(name) =
+                rec.scheduler.as_ref().and_then(|s| match_sampler_name(s, &self.schedulers))
+            {
+                self.params.scheduler = name;
+            }
+        }
+        self.selected_preset.clear();
+    }
+
+    /// Base tags for the selected checkpoint (checkpoint catalog first, then LoRA catalog map).
+    fn model_bases_for(&self, checkpoint: &str) -> Vec<String> {
+        let from_ckpt = self.checkpoint_catalog.bases_for(checkpoint);
+        if !from_ckpt.is_empty() {
+            return from_ckpt;
+        }
+        self.lora_catalog.bases_for_checkpoint(checkpoint)
+    }
+
+    fn create_loras_pane(&mut self, ui: &mut egui::Ui) {
+        // ScrollArea can report infinite width; pin to the clip so trailing buttons stay visible.
+        let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
+        ui.set_max_width(list_w);
+
+        let catalog_n = self.lora_catalog.loras.len();
+        let model_bases = self.model_bases_for(&self.params.checkpoint);
+        if catalog_n == 0 {
+            ui.weak("No LoRA catalog on the server yet — showing installed LoRAs with default strength.");
+        } else if self.params.checkpoint.is_empty() {
+            ui.weak("Pick a checkpoint to filter LoRAs by base tags.");
+        } else if model_bases.is_empty() {
+            ui.weak("Selected checkpoint has no base tags — only universal LoRAs are shown.");
+        } else {
+            ui.weak(format!(
+                "Filtered to bases: {} ({} catalog entries)",
+                model_bases.join(", "),
+                catalog_n
+            ));
+        }
+
+        if !self.params.loras.is_empty() {
+            ui.label("Active");
+            let mut remove: Option<usize> = None;
+            for (i, lora) in self.params.loras.clone().iter().enumerate() {
+                let title = self
+                    .lora_catalog
+                    .entry(&lora.file)
+                    .map(|e| e.display_name().to_string())
+                    .unwrap_or_else(|| lora.file.clone());
+                let meta = self.lora_catalog.entry(&lora.file).cloned();
+                ui.group(|ui| {
+                    ui.set_max_width(list_w - 8.0);
+                    ui.horizontal(|ui| {
+                        let kill = ui
+                            .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let kill = ui.small_button("Remove").clicked();
+                                ui.add_space(6.0);
+                                let max_w = (ui.available_width() - 4.0).max(32.0);
+                                let title = elide_width(ui, &sanitize_ui_text(ui, &title), max_w);
+                                ui.strong(title);
+                                kill
+                            })
+                            .inner;
+                        if kill {
+                            remove = Some(i);
+                        }
+                    });
+                    if let Some(slot) = self.params.loras.get_mut(i) {
+                        let (lo, hi) = meta
+                            .as_ref()
+                            .map(|e| {
+                                let lo = e.strength_model_min.unwrap_or(-2.0);
+                                let hi = e.strength_model_max.unwrap_or(2.0);
+                                (lo.min(hi), lo.max(hi).max(lo + 0.01))
+                            })
+                            .unwrap_or((-2.0, 2.0));
+                        ui.add(egui::Slider::new(&mut slot.strength_model, lo..=hi).text("Model"));
+                        ui.add(egui::Slider::new(&mut slot.strength_clip, lo..=hi).text("CLIP"));
+                    }
+                    egui::CollapsingHeader::new("Details")
+                        .id_salt(("lora_active", i, lora.file.as_str()))
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            ui.set_max_width(list_w - 24.0);
+                            lora_meta_body(ui, &lora.file, meta.as_ref());
+                        });
+                });
+            }
+            if let Some(i) = remove {
+                self.remove_lora_at(i);
+            }
+            ui.separator();
+        }
+
+        ui.label("Add");
+        ui.add(
+            egui::TextEdit::singleline(&mut self.lora_filter)
+                .hint_text("filter LoRAs")
+                .desired_width(list_w - 8.0),
+        );
+
+        let filter = self.lora_filter.to_lowercase();
+        let ckpt = self.params.checkpoint.clone();
+        let active: HashSet<String> = self.params.loras.iter().map(|l| l.file.clone()).collect();
+        let rows: Vec<(String, String, Option<crate::types::LoraEntry>)> = self
+            .compatible_loras(&ckpt)
+            .into_iter()
+            .filter(|(file, _)| !active.contains(file))
+            .map(|(file, entry)| {
+                let label = entry
+                    .map(|e| e.display_name().to_string())
+                    .unwrap_or_else(|| file.clone());
+                (file, label, entry.cloned())
+            })
+            .filter(|(file, label, _)| {
+                filter.is_empty() || format!("{label} {file}").to_lowercase().contains(&filter)
+            })
+            .collect();
+        let mut shown = 0usize;
+        let mut hidden = 0usize;
+        let mut add: Option<String> = None;
+        for (file, label, meta) in &rows {
+            if shown >= 80 {
+                hidden += 1;
+                continue;
+            }
+            ui.horizontal(|ui| {
+                ui.set_max_width(list_w);
+                let clicked = ui
+                    .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        let clicked = ui.small_button("Add").clicked();
+                        ui.add_space(6.0);
+                        // Collapse arrow (~18px) + gap; keep the label clear of Add.
+                        let max_w = (ui.available_width() - 22.0).max(32.0);
+                        let header = elide_width(ui, &sanitize_ui_text(ui, label), max_w);
+                        egui::CollapsingHeader::new(header)
+                            .id_salt(("lora_add", file.as_str()))
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                ui.set_max_width((list_w - 56.0).max(100.0));
+                                lora_meta_body(ui, file, meta.as_ref());
+                            });
+                        clicked
+                    })
+                    .inner;
+                if clicked {
+                    add = Some(file.clone());
+                }
+            });
+            shown += 1;
+        }
+        if let Some(file) = add {
+            self.add_lora(&file);
+        }
+        if shown == 0 {
+            ui.weak(if self.installed_loras.is_empty() {
+                "No LoRAs installed on the server (or object_info has none)."
+            } else {
+                "No matching LoRAs for this model / filter."
+            });
+        } else if hidden > 0 {
+            ui.weak(format!("… {hidden} more — type to filter"));
+        }
+    }
+
+    /// Installed LoRAs compatible with `checkpoint`, with optional catalog metadata.
+    fn compatible_loras(&self, checkpoint: &str) -> Vec<(String, Option<&crate::types::LoraEntry>)> {
+        let has_catalog = !self.lora_catalog.loras.is_empty();
+        let model_bases = self.model_bases_for(checkpoint);
+        let mut out = Vec::new();
+        for file in &self.installed_loras {
+            let entry = self.lora_catalog.entry(file);
+            if has_catalog {
+                match entry {
+                    Some(e) if e.matches_checkpoint(checkpoint, &model_bases) => {
+                        out.push((file.clone(), Some(e)));
+                    }
+                    Some(_) => {}
+                    // Installed but uncatalogued: hide when a catalog exists (bases unknown).
+                    None => {}
+                }
+            } else {
+                out.push((file.clone(), None));
+            }
+        }
+        out.sort_by(|a, b| {
+            let an = a.1.map(|e| e.display_name()).unwrap_or(a.0.as_str());
+            let bn = b.1.map(|e| e.display_name()).unwrap_or(b.0.as_str());
+            an.to_lowercase().cmp(&bn.to_lowercase())
+        });
+        out
+    }
+
+    fn add_lora(&mut self, file: &str) {
+        if self.params.loras.iter().any(|l| l.file == file) {
+            return;
+        }
+        let (sm, sc, triggers, negatives) = match self.lora_catalog.entry(file) {
+            Some(e) => {
+                let (sm, sc) = e.add_strengths();
+                (sm, sc, e.trigger_text(), e.negative_text())
+            }
+            None => (1.0, 1.0, String::new(), String::new()),
+        };
+        let injected = merge_triggers(
+            &mut self.params.lora_triggers,
+            &triggers,
+            &self.params.positive,
+        );
+        append_negatives(&mut self.params.negative, &negatives);
+        self.params.loras.push(ActiveLora {
+            file: file.to_string(),
+            strength_model: sm,
+            strength_clip: sc,
+            injected,
+        });
+        self.selected_preset.clear();
+    }
+
+    fn remove_lora_at(&mut self, index: usize) {
+        if index >= self.params.loras.len() {
+            return;
+        }
+        let removed = self.params.loras.remove(index);
+        strip_injected(&mut self.params.lora_triggers, &removed.injected);
+        self.selected_preset.clear();
+    }
+
+    /// Fill Create params from gallery/`workflow_clip` or system clipboard JSON.
+    fn paste_workflow_into_create(&mut self, host: &Host) {
+        let body = self.workflow_clip.clone().or_else(|| {
+            host.clipboard_text().filter(|t| {
+                let t = t.trim();
+                t.starts_with('{') || t.starts_with('[')
+            })
+        });
+        let Some(body) = body else {
+            self.status = "Nothing to paste".into();
+            return;
+        };
+        let meta = gallery::parse_workflow_meta(&body);
+        if meta.is_empty() {
+            self.status = "Could not read workflow".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        self.apply_image_meta(&meta);
+        self.status = "Create filled from workflow".into();
+        host.haptic(Haptic::Medium);
+    }
+
+    fn paste_sampler_pack(&mut self, host: &Host) {
+        let pack = self.sampler_clip.clone().or_else(|| {
+            host.clipboard_text()
+                .as_deref()
+                .and_then(SamplerPack::from_clipboard_json)
+        });
+        let Some(pack) = pack else {
+            self.status = "No sampler pack to paste".into();
+            return;
+        };
+        self.apply_sampler_pack(&pack);
+        self.status = "Sampler settings pasted".into();
+        host.haptic(Haptic::Medium);
+    }
+
+    fn paste_lora_pack(&mut self, host: &Host) {
+        let pack = self.lora_clip.clone().or_else(|| {
+            host.clipboard_text()
+                .as_deref()
+                .and_then(LoraPack::from_clipboard_json)
+        });
+        let Some(pack) = pack else {
+            self.status = "No LoRAs to paste".into();
+            return;
+        };
+        self.apply_lora_pack(&pack);
+        self.status = format!("{} LoRA(s) pasted", pack.loras.len());
+        host.haptic(Haptic::Medium);
+    }
+
+    fn apply_sampler_pack(&mut self, pack: &SamplerPack) {
+        if let Some(s) = pack.sampler.as_ref().and_then(|s| match_sampler_name(s, &self.samplers))
+        {
+            self.params.sampler = s;
+        }
+        if let Some(s) =
+            pack.scheduler.as_ref().and_then(|s| match_sampler_name(s, &self.schedulers))
+        {
+            self.params.scheduler = s;
+        }
+        if let Some(v) = pack.steps {
+            self.params.steps = v;
+        }
+        if let Some(v) = pack.cfg {
+            self.params.cfg = v;
+        }
+        self.selected_preset.clear();
+    }
+
+    fn apply_lora_pack(&mut self, pack: &LoraPack) {
+        self.params.loras = pack.loras.clone();
+        self.selected_preset.clear();
+    }
+
+    fn copy_sampler_pack_from_meta(&mut self, meta: &ImageMeta, host: &Host) {
+        let pack = SamplerPack {
+            sampler: meta.sampler.clone(),
+            scheduler: meta.scheduler.clone(),
+            steps: meta.steps.map(|n| n as u32),
+            cfg: meta.cfg.map(|n| n as f32),
+        };
+        if pack.is_empty() {
+            return;
+        }
+        host.copy_text(pack.to_clipboard_json());
+        self.sampler_clip = Some(pack);
+        self.gallery_status = "Sampler settings copied".into();
+        host.haptic(Haptic::Light);
+    }
+
+    fn copy_lora_pack_from_meta(&mut self, meta: &ImageMeta, host: &Host) {
+        if meta.loras.is_empty() {
+            return;
+        }
+        let pack = LoraPack {
+            loras: meta
+                .loras
+                .iter()
+                .map(|l| ActiveLora {
+                    file: l.name.clone(),
+                    strength_model: l.strength_model as f32,
+                    strength_clip: l.strength_clip.unwrap_or(l.strength_model) as f32,
+                    injected: String::new(),
+                })
+                .collect(),
+        };
+        host.copy_text(pack.to_clipboard_json());
+        self.lora_clip = Some(pack);
+        self.gallery_status = "LoRAs copied".into();
+        host.haptic(Haptic::Light);
+    }
+
+    fn apply_image_meta(&mut self, meta: &ImageMeta) {
+        if let Some(m) = meta.models.first() {
+            self.params.checkpoint = m.clone();
+        }
+        if let Some(p) = &meta.positive {
+            self.params.positive = p.clone();
+        }
+        if let Some(n) = &meta.negative {
+            self.params.negative = n.clone();
+        }
+        // Workflow positive already includes triggers — keep the dedicated field clear.
+        self.params.lora_triggers.clear();
+        self.apply_sampler_pack(&SamplerPack {
+            sampler: meta.sampler.clone(),
+            scheduler: meta.scheduler.clone(),
+            steps: meta.steps.map(|n| n as u32),
+            cfg: meta.cfg.map(|n| n as f32),
+        });
+        if let Some(v) = meta.seed.filter(|&s| s >= 0) {
+            self.params.seed = v as u64;
+            self.params.randomize_seed = false;
+        }
+        self.apply_lora_pack(&LoraPack {
+            loras: meta
+                .loras
+                .iter()
+                .map(|l| ActiveLora {
+                    file: l.name.clone(),
+                    strength_model: l.strength_model as f32,
+                    strength_clip: l.strength_clip.unwrap_or(l.strength_model) as f32,
+                    injected: String::new(),
+                })
+                .collect(),
+        });
+        self.create_pane = CreatePane::Main;
+    }
+
+    fn apply_preset(&mut self, name: &str) {
+        if let Some(p) = self.presets.iter().find(|p| p.name == name) {
+            self.params = p.params.clone();
+            self.selected_preset = name.to_string();
+        }
+    }
+
+    fn save_preset(&mut self, name: String) {
+        if name.is_empty() {
+            return;
+        }
+        if let Some(slot) = self.presets.iter_mut().find(|p| p.name == name) {
+            slot.params = self.params.clone();
+        } else {
+            self.presets.push(CreatePreset { name: name.clone(), params: self.params.clone() });
+            self.presets.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        }
+        self.selected_preset = name;
+    }
+
+    fn delete_selected_preset(&mut self) {
+        let name = self.selected_preset.clone();
+        if name.is_empty() {
+            return;
+        }
+        self.presets.retain(|p| p.name != name);
+        self.selected_preset.clear();
     }
 
     fn output(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -1019,7 +2239,9 @@ impl ComfyApp {
     }
 
     fn generate_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
-        egui::ScrollArea::vertical()
+        self.create_pane_bar(ui);
+        ui.separator();
+        crate::theme::scroll_vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let connected = matches!(self.conn, Conn::Connected)
@@ -1084,7 +2306,7 @@ impl ComfyApp {
 
         match self.graph_pane {
             GraphPane::Canvas => self.graph_canvas(ui, host),
-            GraphPane::Props => self.props_tab(ui),
+            GraphPane::Props => self.props_tab(ui, host),
         }
     }
 
@@ -1108,11 +2330,86 @@ impl ComfyApp {
         if let Some(tapped) = self.view.show(ui, g, self.executing, self.props_node) {
             self.props_node = Some(tapped);
         }
-        // Long-press on empty canvas opens the (persistent, categorized) Add node picker there.
-        if let Some(pos) = self.view.take_long_press() {
-            self.add_open = true;
-            self.add_pos = pos - egui::vec2(90.0, 50.0);
+        // Long-press on empty canvas → Add node / Paste workflow menu.
+        if let Some(graph_pos) = self.view.take_long_press() {
+            let screen = ui
+                .ctx()
+                .input(|i| i.pointer.interact_pos())
+                .unwrap_or(ui.clip_rect().center());
+            // Offset so the finger-up doesn't immediately hit a button.
+            self.canvas_menu = Some((graph_pos, screen + egui::vec2(12.0, -48.0), false));
             host.haptic(Haptic::Medium);
+        }
+        self.canvas_context_menu(ui, host);
+    }
+
+    /// Popup after a long-press on empty graph canvas.
+    fn canvas_context_menu(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let Some((graph_pos, screen, armed)) = self.canvas_menu else { return };
+        // Arm only after the opening press is fully idle (not on the release frame itself).
+        if !armed {
+            let idle = ui.ctx().input(|i| !i.pointer.any_down() && !i.pointer.any_click());
+            if idle {
+                if let Some(m) = self.canvas_menu.as_mut() {
+                    m.2 = true;
+                }
+            }
+        }
+        let sys_clip = host.clipboard_text().filter(|t| {
+            let t = t.trim();
+            t.starts_with('{') || t.starts_with('[')
+        });
+        let has_clip = self.workflow_clip.is_some() || sys_clip.is_some();
+        let mut close = false;
+        let mut add = false;
+        let mut paste = false;
+        let resp = egui::Area::new(egui::Id::new("graph-canvas-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen)
+            .constrain(true)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    if ui.button(format!("{} Add node…", icons::ADD)).clicked() {
+                        add = true;
+                    }
+                    if ui
+                        .add_enabled(has_clip, egui::Button::new(format!("{} Paste workflow", icons::PROPS)))
+                        .on_hover_text("Load a workflow previously copied from the gallery")
+                        .clicked()
+                    {
+                        paste = true;
+                    }
+                });
+            });
+        let armed = self.canvas_menu.map(|m| m.2).unwrap_or(false);
+        // Close on a tap that lands outside the menu (only after armed).
+        let outside_click = armed
+            && ui.ctx().input(|i| i.pointer.any_click())
+            && !resp.response.contains_pointer()
+            && !ui.ctx().input(|i| i.pointer.any_down());
+        if outside_click {
+            close = true;
+        }
+        if add {
+            self.add_open = true;
+            self.add_pos = graph_pos - egui::vec2(90.0, 50.0);
+            close = true;
+        }
+        if paste {
+            let body = self.workflow_clip.clone().or(sys_clip);
+            if let (Some(body), Some(schemas)) = (body, self.schemas.clone()) {
+                self.graph_status = "Pasting workflow…".into();
+                self.wf_loading = true;
+                self.engine.as_ref().unwrap().load_workflow_json(
+                    "pasted.json".into(),
+                    body,
+                    schemas,
+                );
+            }
+            close = true;
+        }
+        if close {
+            self.canvas_menu = None;
         }
     }
 
@@ -1208,6 +2505,18 @@ impl ComfyApp {
                 {
                     self.auto_follow = !self.auto_follow;
                 }
+                let arrange = if self.auto_arrange {
+                    format!("{} Auto-arrange: on", icons::CHECK)
+                } else {
+                    "     Auto-arrange: off".to_string()
+                };
+                if ui
+                    .selectable_label(self.auto_arrange, arrange)
+                    .on_hover_text("Relayout nodes automatically when a workflow loads")
+                    .clicked()
+                {
+                    self.auto_arrange = !self.auto_arrange;
+                }
             });
 
             ui.separator();
@@ -1223,11 +2532,6 @@ impl ComfyApp {
                     self.queue_graph(ui.ctx(), host);
                 }
             }
-            if let Some(node) = self.props_node
-                && let Some(data) = self.graph.as_ref().and_then(|g| g.snarl.get_node(node))
-            {
-                ui.weak(format!("{} {}", icons::DOT, elide(data.object.display_name(), 18)));
-            }
         });
     }
 
@@ -1235,6 +2539,7 @@ impl ComfyApp {
         if let Some(g) = &mut self.graph {
             g.clear();
         }
+        self.restore_workflow = None;
         self.graph_name.clear();
         self.graph_status.clear();
         self.graph_outputs.clear();
@@ -1318,7 +2623,7 @@ impl ComfyApp {
                 ui.separator();
                 let Some(g) = self.graph.as_ref() else { return };
                 let filter = self.search_filter.to_lowercase();
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
                     let mut shown = 0usize;
                     for (id, pos, data) in g.snarl.nodes_pos_ids() {
                         let title = data.object.display_name();
@@ -1351,7 +2656,7 @@ impl ComfyApp {
         self.search_open = open;
     }
 
-    fn props_tab(&mut self, ui: &mut egui::Ui) {
+    fn props_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         if self.graph.is_none() {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| ui.label("Connect to a server first."));
@@ -1379,23 +2684,32 @@ impl ComfyApp {
         });
         ui.separator();
         // Deliberate edits stay possible here even when the canvas is in view-only mode.
+        // Capture width *before* the ScrollArea: inside a vertical ScrollArea, available_width
+        // grows with content desired sizes, so TextEdit(INFINITY / available) clips on the right.
+        let content_width = ui.available_width();
         let mut exists = true;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            if let Some(g) = self.graph.as_mut() {
-                exists = graphview::node_properties(ui, g, node, false);
-            }
-            // For LoadImage-style nodes, a thumbnail picker over the server's input images.
-            self.loadimage_picker(ui, node);
-            ui.add_space(12.0);
-        });
+        crate::theme::scroll_vertical()
+            .auto_shrink([false, false])
+            .max_width(content_width)
+            .show(ui, |ui| {
+                ui.set_width(content_width);
+                ui.set_max_width(content_width);
+                if let Some(g) = self.graph.as_mut() {
+                    exists = graphview::node_properties(ui, g, node, false);
+                }
+                // For LoadImage-style nodes, a thumbnail picker over the server inputs or the phone.
+                self.loadimage_picker(ui, host, node);
+                ui.add_space(12.0);
+            });
         if !exists {
             self.props_node = None;
         }
     }
 
-    /// If `node` has an `image` selector (LoadImage), render its options as a thumbnail grid so
-    /// you can see what you're choosing — the server input images, previewed via `/view?type=input`.
-    fn loadimage_picker(&mut self, ui: &mut egui::Ui, node: NodeId) {
+    /// If `node` has an `image` selector (LoadImage), render a thumbnail picker so you can see what
+    /// you're choosing — either the server's input images (previewed via `/view?type=input`) or the
+    /// phone's own photo gallery (MediaStore), uploaded to the server on tap.
+    fn loadimage_picker(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId) {
         let (input_idx, options, selected) = {
             let Some(g) = self.graph.as_ref() else { return };
             let Some(data) = g.snarl.get_node(node) else { return };
@@ -1404,7 +2718,7 @@ impl ComfyApp {
                     return None;
                 }
                 match &inp.value {
-                    FlowValueType::Array { options, selected } if !options.is_empty() => {
+                    FlowValueType::Array { options, selected } => {
                         Some((i, options.clone(), selected.clone()))
                     }
                     _ => None,
@@ -1418,6 +2732,44 @@ impl ComfyApp {
 
         ui.separator();
         ui.strong(format!("{} Choose image", icons::IMAGE));
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.img_pick_source, ImgPickSource::Server, "Server");
+            ui.selectable_value(&mut self.img_pick_source, ImgPickSource::Device, "Device");
+        });
+        match self.img_pick_source {
+            ImgPickSource::Server => self.loadimage_server_grid(ui, node, input_idx, &options, &selected),
+            ImgPickSource::Device => self.loadimage_device_grid(ui, host, node),
+        }
+    }
+
+    /// Column count and square tile size for a picker grid inside the props scroll area, clamped to
+    /// the visible width so the row can't spill past the screen edge (see the grid-width note).
+    fn picker_grid_dims(ui: &egui::Ui) -> (usize, f32) {
+        let spacing = ui.spacing().item_spacing.x;
+        // `available_width()` over-reports inside this vertical scroll area (the scrollbar gutter
+        // isn't reserved), which once spilled the grid a whole column past the screen edge. Clamp
+        // to what's actually visible from the grid's left edge, leaving the scrollbar its width.
+        let bar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
+        let visible_right = ui.clip_rect().right() - bar - 4.0;
+        let avail = (visible_right - ui.max_rect().left()).min(ui.available_width()).max(120.0);
+        let cols = ((avail / 104.0).floor() as usize).clamp(2, 5);
+        let tile = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(64.0);
+        (cols, tile)
+    }
+
+    /// Grid over the server's uploaded input images.
+    fn loadimage_server_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: NodeId,
+        input_idx: usize,
+        options: &[String],
+        selected: &str,
+    ) {
+        if options.is_empty() {
+            ui.weak("No input images on the server yet — pick one from Device.");
+            return;
+        }
         ui.add(
             egui::TextEdit::singleline(&mut self.img_pick_filter)
                 .hint_text("filter input images")
@@ -1430,10 +2782,7 @@ impl ComfyApp {
             .take(120)
             .collect();
 
-        let spacing = ui.spacing().item_spacing.x;
-        let avail = ui.available_width();
-        let cols = ((avail / 104.0).floor() as usize).clamp(2, 5);
-        let tile = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(64.0);
+        let (cols, tile) = Self::picker_grid_dims(ui);
         let mut picked: Option<String> = None;
         for row in matches.chunks(cols) {
             ui.horizontal(|ui| {
@@ -1488,6 +2837,128 @@ impl ComfyApp {
         }
     }
 
+    /// Grid over the phone's photo gallery (MediaStore). Tapping an image uploads it to the server
+    /// as a LoadImage input; the node's selection updates when the upload finishes.
+    /// How many device thumbnails to load synchronously per frame. Each load is a blocking JNI
+    /// round trip on the render thread, so cap it to keep scrolling smooth; the rest fill in over
+    /// the next frames (repaint is requested while any tile is still pending).
+    const DEVICE_THUMBS_PER_FRAME: usize = 2;
+
+    fn loadimage_device_grid(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId) {
+        if !host.has_media_images_permission() {
+            ui.add_space(4.0);
+            ui.label("Allow access to your photos to pick an image from this device.");
+            if ui.button(format!("{} Open settings to allow", icons::IMAGE)).clicked() {
+                host.request_media_images_permission();
+                self.device_images_loaded = false;
+            }
+            ui.weak("Grant “Photos and videos”, then return here.");
+            // Poll (not every frame) so the grid appears when the user returns having granted it.
+            ui.ctx().request_repaint_after(Duration::from_millis(400));
+            return;
+        }
+        if !self.device_images_loaded {
+            self.device_images = host.list_device_images(300);
+            self.device_images_loaded = true;
+        }
+        ui.horizontal(|ui| {
+            if ui.button(format!("{} Refresh", icons::REFRESH)).clicked() {
+                self.thumbs.reset_pending();
+                self.device_images = host.list_device_images(300);
+            }
+            if !self.pending_uploads.is_empty() {
+                ui.spinner();
+                ui.weak("uploading…");
+            }
+        });
+        if self.device_images.is_empty() {
+            ui.weak("No photos found on this device.");
+            return;
+        }
+
+        let (cols, tile) = Self::picker_grid_dims(ui);
+        // Clone the listing so the per-tile thumbnail cache can be mutated without aliasing it.
+        let images = self.device_images.clone();
+        let mut pick: Option<(i64, String)> = None;
+        let mut loaded_this_frame = 0usize;
+        let mut more_pending = false;
+        for row in images.chunks(cols) {
+            ui.horizontal(|ui| {
+                for (id, name) in row {
+                    let key = format!("dev#{id}");
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    match self.thumbs.get(&key) {
+                        Some(tex) => {
+                            let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                .fit_to_exact_size(egui::vec2(tile, tile))
+                                .sense(egui::Sense::click());
+                            if ui.put(rect, img).clicked() {
+                                pick = Some((*id, name.clone()));
+                            }
+                        }
+                        None => {
+                            // Load a bounded number of thumbnails per frame; the rest wait a frame.
+                            // Only claim when actually loading (claim marks the tile done, so
+                            // claiming without loading would strand it). load_device_thumbnail
+                            // returns raw RGBA, so there's no re-decode.
+                            if loaded_this_frame < Self::DEVICE_THUMBS_PER_FRAME {
+                                if self.thumbs.claim(&key) {
+                                    loaded_this_frame += 1;
+                                    if let Some((w, h, rgba)) = host.load_device_thumbnail(*id, 256)
+                                    {
+                                        let image = egui::ColorImage::from_rgba_unmultiplied(
+                                            [w as usize, h as usize],
+                                            &rgba,
+                                        );
+                                        let cost = (w * h * 4) as usize;
+                                        let tex = ui.ctx().load_texture(
+                                            &key,
+                                            image,
+                                            egui::TextureOptions::LINEAR,
+                                        );
+                                        self.thumbs.insert(key.clone(), tex, cost);
+                                    }
+                                }
+                            } else {
+                                // Hit the per-frame budget; this tile still wants loading.
+                                more_pending = true;
+                            }
+                            let label = if name.is_empty() { "photo" } else { name.as_str() };
+                            if ui.put(rect, egui::Button::new(elide(label, 12)).wrap()).clicked() {
+                                pick = Some((*id, name.clone()));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        // Keep animating only while more thumbnails are waiting to load.
+        if more_pending {
+            ui.ctx().request_repaint();
+        }
+
+        if let Some((id, name)) = pick {
+            match host.load_device_image(id) {
+                Some(bytes) if !bytes.is_empty() => {
+                    let fname = if name.is_empty() { format!("device_{id}.jpg") } else { name };
+                    let token = self.next_upload_id;
+                    self.next_upload_id += 1;
+                    self.pending_uploads.insert(token, node);
+                    self.engine.as_ref().unwrap().upload_input_image(token, fname, bytes);
+                    host.haptic(Haptic::Light);
+                }
+                _ => {
+                    self.note = "Couldn't read that photo from the device".into();
+                    host.haptic(Haptic::Error);
+                }
+            }
+        }
+    }
+
     fn workflow_window(&mut self, ctx: &egui::Context) {
         if !self.wf_open {
             return;
@@ -1525,7 +2996,7 @@ impl ComfyApp {
                     let folder = name.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("Root");
                     folders.entry(folder).or_default().push(name);
                 }
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
                     if folders.is_empty() && !self.wf_loading {
                         ui.weak(if self.wf_names.is_empty() {
                             "no workflows on server"
@@ -1600,7 +3071,7 @@ impl ComfyApp {
                         };
                         cats.entry(cat).or_default().push(object);
                     }
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
                         if cats.is_empty() {
                             ui.weak("no matches");
                         }
@@ -1647,7 +3118,15 @@ impl ComfyApp {
         self.gallery_status.clear();
         // Forget in-flight thumb requests so earlier failures get retried.
         self.thumbs.reset_pending();
-        self.engine.as_ref().unwrap().gallery_list(0, GALLERY_PAGE, &self.gallery_q, &self.gallery_view);
+        // Supersede any in-flight pages of the previous query (auto-load chains overlap).
+        self.gallery_gen = self.gallery_gen.wrapping_add(1);
+        self.engine.as_ref().unwrap().gallery_list(
+            self.gallery_gen,
+            0,
+            self.gallery_page_size(),
+            &self.gallery_q,
+            &self.gallery_view,
+        );
     }
 
     /// The gallery's bottom control bar: search, model filter, sort, grouping and column count.
@@ -1658,6 +3137,8 @@ impl ComfyApp {
         self.gallery_view.group != GalleryGroup::None
             || !self.gallery_view.model.is_empty()
             || self.gallery_view.album.is_some()
+            // The media filter is client-side, so the full set must be present to filter over.
+            || self.gallery_view.media != GalleryMedia::All
     }
 
     fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool) -> bool {
@@ -1758,6 +3239,33 @@ impl ComfyApp {
                     changed |=
                         ui.selectable_value(&mut self.gallery_view.group, *g, g.label()).clicked();
                 }
+                if self.gallery_view.group != GalleryGroup::None {
+                    ui.separator();
+                    let open_label = if self.gallery_view.groups_open {
+                        format!("{} Headers open", icons::CHECK)
+                    } else {
+                        "     Headers closed".to_string()
+                    };
+                    if ui
+                        .selectable_label(self.gallery_view.groups_open, open_label)
+                        .on_hover_text("Default open/closed state for group headers")
+                        .clicked()
+                    {
+                        self.gallery_view.groups_open = !self.gallery_view.groups_open;
+                    }
+                }
+            });
+
+            let media_label = match self.gallery_view.media {
+                GalleryMedia::All => format!("{} All media", icons::GALLERY),
+                GalleryMedia::Images => format!("{} Images", icons::IMAGE),
+                GalleryMedia::Videos => format!("{} Videos", icons::RUN),
+            };
+            up_menu(ui, media_label, |ui| {
+                for m in GalleryMedia::ALL {
+                    changed |=
+                        ui.selectable_value(&mut self.gallery_view.media, *m, m.label()).clicked();
+                }
             });
         });
         changed
@@ -1791,7 +3299,7 @@ impl ComfyApp {
                 ui.separator();
                 let mut rename: Option<i64> = None;
                 let mut delete: Option<(i64, String)> = None;
-                egui::ScrollArea::vertical().max_height(300.0).auto_shrink([false, false]).show(
+                crate::theme::scroll_vertical().max_height(300.0).auto_shrink([false, false]).show(
                     ui,
                     |ui| {
                         if self.albums.is_empty() {
@@ -1850,7 +3358,18 @@ impl ComfyApp {
                 ui.spinner();
             }
             if self.gallery_total > 0 {
-                ui.weak(format!("{} of {}", self.gallery.len(), self.gallery_total));
+                if self.gallery_view.media == GalleryMedia::All {
+                    ui.weak(format!("{} of {}", self.gallery.len(), self.gallery_total));
+                } else {
+                    let media = self.gallery_view.media;
+                    let n = self.gallery.iter().filter(|it| media.matches(it.is_video)).count();
+                    ui.weak(format!(
+                        "{n} {} · {} of {} scanned",
+                        media.label().to_lowercase(),
+                        self.gallery.len(),
+                        self.gallery_total
+                    ));
+                }
             }
         });
         if !self.gallery_status.is_empty() {
@@ -1890,21 +3409,32 @@ impl ComfyApp {
         if self.gallery.is_empty() && self.gallery_total == 0 && !self.gallery_loading {
             self.gallery_loading = true;
             self.engine.as_ref().unwrap().gallery_list(
+                self.gallery_gen,
                 0,
-                GALLERY_PAGE,
+                self.gallery_page_size(),
                 &self.gallery_q,
                 &self.gallery_view,
             );
         }
 
-        let groups = crate::gallery::group_items(&self.gallery, self.gallery_view.group);
+        // Media filter is client-side: group over the matching subset only (indices stay original).
+        let media = self.gallery_view.media;
+        let visible: Vec<usize> = self
+            .gallery
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| media.matches(it.is_video))
+            .map(|(i, _)| i)
+            .collect();
+        let groups =
+            crate::gallery::group_selected(&self.gallery, &visible, self.gallery_view.group);
         let cols = self.gallery_view.columns.clamp(1, 3);
         let mut open: Option<usize> = None;
         let mut load_more = false;
         self.tile_hits.clear();
 
         // While a long-press paint-select is in progress, dragging must select tiles, not scroll.
-        let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        let mut scroll = crate::theme::scroll_vertical().auto_shrink([false, false]);
         if self.sel_painting {
             use egui::containers::scroll_area::{DragScroll, ScrollSource};
             scroll = scroll.scroll_source(ScrollSource { drag: DragScroll::Never, ..Default::default() });
@@ -1918,7 +3448,7 @@ impl ComfyApp {
                 let header = format!("{} ({})", elide(&group.label, 40), group.items.len());
                 egui::CollapsingHeader::new(header)
                     .id_salt(&group.key)
-                    .default_open(true)
+                    .default_open(self.gallery_view.groups_open)
                     .show(ui, |ui| {
                         open = self.gallery_grid(ui, &group.items, cols).or(open);
                     });
@@ -1933,7 +3463,7 @@ impl ComfyApp {
                         load_more = true;
                     }
                 });
-            } else if self.gallery.is_empty() && !self.gallery_loading {
+            } else if visible.is_empty() && !self.gallery_loading {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| ui.weak("Nothing matches these filters."));
             }
@@ -1943,15 +3473,16 @@ impl ComfyApp {
         if load_more {
             self.gallery_loading = true;
             self.engine.as_ref().unwrap().gallery_list(
+                self.gallery_gen,
                 self.gallery.len() as u64,
-                GALLERY_PAGE,
+                self.gallery_page_size(),
                 &self.gallery_q,
                 &self.gallery_view,
             );
         }
         // Tapping a tile opens it only in browse mode; in select mode the grid handled the toggle.
         if let Some(idx) = open {
-            self.open_viewer(idx);
+            self.open_viewer(idx, host);
         }
         self.handle_gallery_gesture(ui, host);
     }
@@ -1974,9 +3505,17 @@ impl ComfyApp {
         let mut clear = false;
         let mut done = false;
         let mut save_all = false;
+        let mut select_all = false;
+        let mut invert = false;
         ui.horizontal_wrapped(|ui| {
             ui.strong(format!("{n} selected"));
             ui.separator();
+            if ui.button("All").on_hover_text("Select every visible image").clicked() {
+                select_all = true;
+            }
+            if ui.button("Invert").on_hover_text("Flip the current selection").clicked() {
+                invert = true;
+            }
             ui.add_enabled_ui(n > 0, |ui| {
                 up_menu(ui, format!("{} Add to album", icons::ALBUM), |ui| {
                     if self.albums.is_empty() {
@@ -2003,7 +3542,25 @@ impl ComfyApp {
                 done = true;
             }
         });
-        if save_all {
+        if select_all {
+            let media = self.gallery_view.media;
+            for it in &self.gallery {
+                if media.matches(it.is_video) {
+                    self.selected.insert(it.key());
+                }
+            }
+        } else if invert {
+            let media = self.gallery_view.media;
+            for it in &self.gallery {
+                if !media.matches(it.is_video) {
+                    continue;
+                }
+                let key = it.key();
+                if !self.selected.remove(&key) {
+                    self.selected.insert(key);
+                }
+            }
+        } else if save_all {
             self.engine.as_ref().unwrap().download_for_save(items.clone());
             self.gallery_status = format!("Saving {n} to Photos…");
             host.haptic(Haptic::Light);
@@ -2152,20 +3709,36 @@ impl ComfyApp {
         open
     }
 
-    fn open_viewer(&mut self, idx: usize) {
+    fn open_viewer(&mut self, idx: usize, host: &Host) {
         let Some(item) = self.gallery.get(idx).cloned() else { return };
+        // Any previous item's playback ends here (drop stops the decode thread).
+        self.player = None;
         let engine = self.engine.as_ref().unwrap();
-        // Videos can't be decoded/played in-app; download the raw file so the poster shows and Save
-        // works. Images decode as usual.
+        let cache_dir = host.documents_dir();
+        // Videos download the raw file — the poster shows immediately, Save works, and playback
+        // starts once the bytes land (Msg::VideoReady). Images decode as usual (disk-cached).
         if item.is_video {
             engine.fetch_video(item.subfolder.clone(), item.filename.clone());
         } else {
-            engine.fetch_full(item.subfolder.clone(), item.filename.clone());
+            engine.fetch_full(item.subfolder.clone(), item.filename.clone(), cache_dir);
         }
         engine.fetch_item_albums(item.subfolder.clone(), item.filename.clone());
+        // Always try the workflow endpoint — list `has_workflow` is often missing/false even when
+        // the PNG embeds a graph (models still appear because the indexer scraped them separately).
+        engine.fetch_item_workflow(item.subfolder.clone(), item.filename.clone());
         self.gallery_status.clear();
-        self.viewer =
-            Some(Viewer { item, idx, tex: None, bytes: None, loading: true, albums: None });
+        self.viewer = Some(Viewer {
+            item,
+            idx,
+            tex: None,
+            bytes: None,
+            loading: true,
+            albums: None,
+            meta_open: false,
+            workflow_json: None,
+            meta: None,
+            meta_loading: true,
+        });
     }
 
     fn gallery_viewer(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -2174,11 +3747,18 @@ impl ComfyApp {
             Save,
             UseAsInput,
             OpenWorkflow,
+            CopyWorkflow,
+            ToggleMeta,
             AlbumAdd(i64),
             AlbumRemove(i64),
             Show(usize),
         }
         let mut act: Option<Act> = None;
+        // Move decoded frames into the texture before anything samples it this frame.
+        if let Some(p) = &mut self.player {
+            p.pump(ui.ctx());
+        }
+        let meta_anchor;
         {
             let v = self.viewer.as_ref().unwrap();
             ui.horizontal_wrapped(|ui| {
@@ -2196,7 +3776,7 @@ impl ComfyApp {
                 }
                 if ui
                     .add_enabled(
-                        v.item.has_workflow,
+                        v.item.has_workflow || v.workflow_json.is_some(),
                         egui::Button::new(format!("{} Open workflow", icons::GRAPH)),
                     )
                     .clicked()
@@ -2229,16 +3809,95 @@ impl ComfyApp {
                     }
                 });
             });
-            ui.weak(format!(
-                "{}  ({:.1} MB)",
-                elide(&v.item.filename, 56),
-                v.item.size as f64 / 1e6
-            ));
-            if !v.item.models.is_empty() {
-                ui.weak(format!("{} {}", icons::MODEL, elide(&v.item.models.join(", "), 76)));
-            }
+            // Collapsed filename row; expand overlays metadata on the image below.
+            let header = ui.horizontal(|ui| {
+                let chevron = if v.meta_open { "▼" } else { "▶" };
+                let title = format!(
+                    "{chevron} {}  ({:.1} MB)",
+                    elide(&v.item.filename, 48),
+                    v.item.size as f64 / 1e6
+                );
+                if ui
+                    .add(egui::Button::new(title).frame(false))
+                    .on_hover_text("Show generation metadata")
+                    .clicked()
+                {
+                    act = Some(Act::ToggleMeta);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            v.workflow_json.is_some(),
+                            egui::Button::new(format!("{} Copy", icons::PROPS)),
+                        )
+                        .on_hover_text("Copy embedded workflow JSON")
+                        .clicked()
+                    {
+                        act = Some(Act::CopyWorkflow);
+                    }
+                });
+            });
+            meta_anchor = header.response.rect;
             if v.item.is_video {
-                ui.weak(format!("{} Video — preview only (no in-app playback); Save to keep it", icons::RUN));
+                match self.player.as_mut().filter(|p| p.key == v.item.key()) {
+                    Some(p) if p.failed.is_some() => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 160, 120),
+                            format!(
+                                "{} {} — Save still works",
+                                icons::WARN,
+                                p.failed.as_deref().unwrap_or("playback failed")
+                            ),
+                        );
+                    }
+                    Some(p) if p.frame_count > 0 => {
+                        ui.horizontal(|ui| {
+                            let paused = p.ctrl.paused.load(Ordering::Relaxed);
+                            let label = if paused { icons::RUN } else { "⏸" };
+                            if ui.button(label).clicked() {
+                                // Play at the end of a non-looping video restarts it — otherwise
+                                // the loop would decode the last frame and immediately re-pause.
+                                if paused && p.cur >= p.frame_count - 1 {
+                                    p.cur = 0;
+                                    p.ctrl.seek.store(0, Ordering::Relaxed);
+                                }
+                                p.ctrl.paused.store(!paused, Ordering::Relaxed);
+                                p.auto_paused = false;
+                            }
+                            let mut looping = p.ctrl.looping.load(Ordering::Relaxed);
+                            if ui.toggle_value(&mut looping, "🔁").on_hover_text("Loop").changed()
+                            {
+                                p.ctrl.looping.store(looping, Ordering::Relaxed);
+                            }
+                            let secs = |f: i32| f as f32 / p.fps.max(1.0);
+                            ui.weak(format!(
+                                "{:>5.1}s / {:.1}s",
+                                secs(p.cur),
+                                p.duration_ms as f32 / 1000.0
+                            ));
+                            let mut pos = p.cur;
+                            let max = (p.frame_count - 1).max(0);
+                            let slider = ui.add(
+                                egui::Slider::new(&mut pos, 0..=max)
+                                    .show_value(false)
+                                    .trailing_fill(true),
+                            );
+                            if slider.changed() {
+                                p.cur = pos;
+                                p.ctrl.seek.store(pos, Ordering::Relaxed);
+                                // Flush frames queued before the seek so the image and slider
+                                // don't briefly snap back to pre-seek positions.
+                                while p.rx.try_recv().is_ok() {}
+                            }
+                        });
+                    }
+                    Some(_) => {
+                        ui.weak(format!("{} opening video…", icons::RUN));
+                    }
+                    None => {
+                        ui.weak(format!("{} downloading video…", icons::RUN));
+                    }
+                }
             }
             if !self.gallery_status.is_empty() {
                 ui.colored_label(
@@ -2254,24 +3913,48 @@ impl ComfyApp {
             // The filmstrip is a bottom panel so the image gets whatever height is left.
             act = self.filmstrip(ui).map(Act::Show).or(act);
             let v = self.viewer.as_ref().unwrap();
-            // Fall back to any cached thumbnail so something shows while the full read lands.
+            // Live video frame first, then the decoded image, then any cached thumbnail so
+            // something shows while the full read lands.
+            let video_tex = self
+                .player
+                .as_ref()
+                .filter(|p| p.key == v.item.key())
+                .and_then(|p| p.tex.as_ref());
             let cached = [1024u32, 512, 320]
                 .iter()
                 .find_map(|s| self.thumbs.get(&v.item.thumb_key(*s)));
-            if let Some(tex) = v.tex.as_ref().or(cached) {
-                egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+            if let Some(tex) = video_tex.or(v.tex.as_ref()).or(cached) {
+                crate::theme::scroll_both().auto_shrink([false, false]).show(ui, |ui| {
                     let avail = ui.available_width();
                     let sized = egui::load::SizedTexture::from_handle(tex);
                     ui.add(egui::Image::new(sized).max_width(avail));
                 });
             }
         }
+        // Expanded metadata floats over the image so the layout below does not shift.
+        if self.viewer.as_ref().is_some_and(|v| v.meta_open) {
+            self.viewer_meta_overlay(ui.ctx(), host, meta_anchor);
+        }
         match act {
             Some(Act::Close) => {
                 self.viewer = None;
+                self.player = None;
                 self.gallery_status.clear();
             }
-            Some(Act::Show(idx)) => self.open_viewer(idx),
+            Some(Act::Show(idx)) => self.open_viewer(idx, host),
+            Some(Act::ToggleMeta) => {
+                if let Some(v) = &mut self.viewer {
+                    v.meta_open = !v.meta_open;
+                }
+            }
+            Some(Act::CopyWorkflow) => {
+                if let Some(json) = self.viewer.as_ref().and_then(|v| v.workflow_json.clone()) {
+                    self.workflow_clip = Some(json.clone());
+                    host.copy_text(json);
+                    host.haptic(Haptic::Light);
+                    self.gallery_status = "Workflow copied".into();
+                }
+            }
             Some(Act::AlbumAdd(id)) => {
                 let v = self.viewer.as_ref().unwrap();
                 let items = vec![(v.item.subfolder.clone(), v.item.filename.clone())];
@@ -2304,15 +3987,181 @@ impl ComfyApp {
                 if let Some(schemas) = self.schemas.clone() {
                     self.graph_status = format!("Loading workflow of {}…", elide(&v.item.filename, 40));
                     self.wf_loading = true;
-                    self.engine.as_ref().unwrap().open_gallery_workflow(
-                        v.item.subfolder.clone(),
-                        v.item.filename.clone(),
-                        schemas,
-                    );
+                    // Prefer the already-fetched body so we don't wait on a second download.
+                    if let Some(body) = v.workflow_json.clone() {
+                        self.engine.as_ref().unwrap().load_workflow_json(
+                            v.item.filename.clone(),
+                            body,
+                            schemas,
+                        );
+                    } else {
+                        self.engine.as_ref().unwrap().open_gallery_workflow(
+                            v.item.subfolder.clone(),
+                            v.item.filename.clone(),
+                            schemas,
+                        );
+                    }
                     self.tab = Tab::Graph;
                 }
             }
             None => {}
+        }
+    }
+
+    /// Floating metadata panel anchored under the filename header, painted over the image.
+    fn viewer_meta_overlay(&mut self, ctx: &egui::Context, host: &Host, anchor: egui::Rect) {
+        let Some(v) = self.viewer.as_ref() else { return };
+        let width = anchor.width().max(240.0);
+        let meta_loading = v.meta_loading;
+        let has_workflow = v.item.has_workflow;
+        let item_models = v.item.models.clone();
+        let meta = v.meta.clone();
+        let mut copy_positive: Option<String> = None;
+        let mut copy_negative: Option<String> = None;
+        let mut copy_sampler = false;
+        let mut copy_loras = false;
+        egui::Area::new(egui::Id::new("viewer-meta-overlay"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(anchor.left(), anchor.bottom() + 2.0))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .inner_margin(10.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(width);
+                        ui.set_max_height(320.0);
+                        crate::theme::scroll_vertical().show(ui, |ui| {
+                            if meta_loading {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.weak("loading workflow…");
+                                });
+                                return;
+                            }
+                            let models = meta
+                                .as_ref()
+                                .map(|m| m.models.as_slice())
+                                .filter(|m| !m.is_empty())
+                                .unwrap_or(item_models.as_slice());
+                            if !models.is_empty() {
+                                ui.label(format!(
+                                    "{} {}",
+                                    icons::MODEL,
+                                    elide(&models.join(", "), 120)
+                                ));
+                            }
+                            if let Some(meta) = meta.as_ref() {
+                                if !meta.loras.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.strong("LoRAs");
+                                        if ui
+                                            .small_button(icons::PROPS)
+                                            .on_hover_text("Copy LoRAs + strengths for Create")
+                                            .clicked()
+                                        {
+                                            copy_loras = true;
+                                        }
+                                    });
+                                    for l in &meta.loras {
+                                        let clip = l
+                                            .strength_clip
+                                            .map(|c| format!(" / clip {c:.2}"))
+                                            .unwrap_or_default();
+                                        ui.label(format!(
+                                            "{} {}  (model {:.2}{clip})",
+                                            icons::DOT,
+                                            elide(&l.name, 64),
+                                            l.strength_model
+                                        ));
+                                    }
+                                }
+                                if let Some(p) = meta.positive.as_deref().filter(|s| !s.is_empty()) {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.strong("Positive");
+                                        if ui
+                                            .small_button(icons::PROPS)
+                                            .on_hover_text("Copy positive prompt")
+                                            .clicked()
+                                        {
+                                            copy_positive = Some(p.to_string());
+                                        }
+                                    });
+                                    ui.add(egui::Label::new(p).wrap());
+                                }
+                                if let Some(n) = meta.negative.as_deref().filter(|s| !s.is_empty()) {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.strong("Negative");
+                                        if ui
+                                            .small_button(icons::PROPS)
+                                            .on_hover_text("Copy negative prompt")
+                                            .clicked()
+                                        {
+                                            copy_negative = Some(n.to_string());
+                                        }
+                                    });
+                                    ui.add(egui::Label::new(n).wrap());
+                                }
+                                let mut bits = Vec::new();
+                                if let Some(s) = &meta.sampler {
+                                    bits.push(s.clone());
+                                }
+                                if let Some(s) = &meta.scheduler {
+                                    bits.push(s.clone());
+                                }
+                                if let Some(n) = meta.steps {
+                                    bits.push(format!("{n} steps"));
+                                }
+                                if let Some(c) = meta.cfg {
+                                    bits.push(format!("cfg {c:.1}"));
+                                }
+                                if let Some(seed) = meta.seed {
+                                    bits.push(format!("seed {seed}"));
+                                }
+                                if !bits.is_empty() {
+                                    ui.add_space(4.0);
+                                    ui.horizontal(|ui| {
+                                        ui.weak(bits.join(" · "));
+                                        if ui
+                                            .small_button(icons::PROPS)
+                                            .on_hover_text(
+                                                "Copy sampler / scheduler / steps / CFG for Create",
+                                            )
+                                            .clicked()
+                                        {
+                                            copy_sampler = true;
+                                        }
+                                    });
+                                }
+                                if meta.is_empty() && models.is_empty() {
+                                    ui.weak("No prompt metadata in this workflow.");
+                                }
+                            } else if !has_workflow {
+                                ui.weak("No embedded workflow on this file.");
+                            } else {
+                                ui.weak("Could not load workflow metadata.");
+                            }
+                        });
+                    });
+            });
+        if copy_sampler {
+            if let Some(meta) = self.viewer.as_ref().and_then(|v| v.meta.clone()) {
+                self.copy_sampler_pack_from_meta(&meta, host);
+            }
+        } else if copy_loras {
+            if let Some(meta) = self.viewer.as_ref().and_then(|v| v.meta.clone()) {
+                self.copy_lora_pack_from_meta(&meta, host);
+            }
+        } else if let Some(text) = copy_positive {
+            host.copy_text(text);
+            host.haptic(Haptic::Light);
+            self.gallery_status = "Positive prompt copied".into();
+        } else if let Some(text) = copy_negative {
+            host.copy_text(text);
+            host.haptic(Haptic::Light);
+            self.gallery_status = "Negative prompt copied".into();
         }
     }
 
@@ -2328,10 +4177,14 @@ impl ComfyApp {
         egui::Panel::bottom("filmstrip")
             .exact_size(FRAME + 12.0)
             .show(ui, |ui| {
-                egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
+                crate::theme::scroll_horizontal().auto_shrink([false, false]).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         for idx in 0..self.gallery.len() {
                             let Some(item) = self.gallery.get(idx) else { continue };
+                            // Keep the strip consistent with the grid's media filter.
+                            if !self.gallery_view.media.matches(item.is_video) {
+                                continue;
+                            }
                             let key = item.thumb_key(320);
                             let size = egui::vec2(FRAME, FRAME);
                             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
@@ -2377,25 +4230,28 @@ impl ComfyApp {
     }
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
-        ui.horizontal(|ui| {
-            if ui.button("Copy all").clicked() {
-                host.copy_text(self.logs_text());
-                host.haptic(Haptic::Light);
-                self.note = "Logs copied".into();
-            }
-            if ui.button("Share").clicked() {
-                host.share_text(self.logs_text());
-            }
-            if ui.button("Clear").clicked() {
-                self.log_lines.clear();
-                self.log.clear();
-            }
-            ui.weak(format!("{} lines", self.log_lines.len()));
+        egui::Panel::bottom("logs-actions").show(ui, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Copy all").clicked() {
+                    host.copy_text(self.logs_text());
+                    host.haptic(Haptic::Light);
+                    self.note = "Logs copied".into();
+                }
+                if ui.button("Share").clicked() {
+                    host.share_text(self.logs_text());
+                }
+                if ui.button("Clear").clicked() {
+                    self.log_lines.clear();
+                    self.log.clear();
+                }
+                ui.weak(format!("{} lines", self.log_lines.len()));
+            });
+            ui.add_space(2.0);
         });
-        ui.add_space(4.0);
 
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
-        egui::ScrollArea::both()
+        crate::theme::scroll_both()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show_rows(ui, row_h, self.log_lines.len(), |ui, range| {
@@ -2457,6 +4313,7 @@ impl EguiApp for ComfyApp {
             crate::theme::apply(ui.ctx());
             egui_extras::install_image_loaders(ui.ctx());
             self.load_settings(host);
+            crate::theme::apply_fonts(ui.ctx(), &self.fonts);
             if !self.server_url.trim().is_empty() {
                 self.log.info("auto-connecting to saved server");
                 self.connect(host);
@@ -2465,6 +4322,19 @@ impl EguiApp for ComfyApp {
 
         for m in self.engine.as_ref().unwrap().drain() {
             self.handle(ui.ctx(), host, m);
+        }
+        // Don't burn CPU decoding video nobody can see: pause while the viewer is off-screen and
+        // resume where it left off on return (unless the user paused it themselves).
+        if let Some(p) = &mut self.player {
+            let visible = self.tab == Tab::Gallery && self.viewer.is_some();
+            if !visible {
+                if !p.ctrl.paused.swap(true, Ordering::Relaxed) {
+                    p.auto_paused = true;
+                }
+            } else if p.auto_paused {
+                p.ctrl.paused.store(false, Ordering::Relaxed);
+                p.auto_paused = false;
+            }
         }
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
         if self.log_lines.len() > logger::MAX_LINES {
@@ -2570,7 +4440,7 @@ fn up_menu<R>(
                 .with_tag_value(MenuConfig::MENU_CONFIG_TAG, config),
         )
         .show(|ui| {
-            egui::ScrollArea::vertical()
+            crate::theme::scroll_vertical()
                 .max_height(320.0)
                 .show(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -2591,18 +4461,26 @@ fn centered(window: egui::Window<'_>) -> egui::Window<'_> {
 }
 
 /// Draw a play-button badge centered on a tile, marking it as a video.
+/// A centered, mostly transparent play button over a video tile: faint dark disc, thin ring, and
+/// a soft-white triangle — enough to read as "playable" without hiding the thumbnail.
 fn video_badge(ui: &egui::Ui, rect: egui::Rect) {
     let c = rect.center();
-    let r = (rect.width().min(rect.height()) * 0.16).clamp(9.0, 26.0);
+    let r = (rect.width().min(rect.height()) * 0.20).clamp(12.0, 40.0);
     let p = ui.painter();
-    p.circle_filled(c, r, egui::Color32::from_black_alpha(150));
-    let t = r * 0.55;
+    p.circle_filled(c, r, egui::Color32::from_black_alpha(70));
+    p.circle_stroke(c, r, egui::Stroke::new(1.5, egui::Color32::from_white_alpha(110)));
+    let t = r * 0.52;
+    // Nudge right so the triangle's centroid sits on the disc's center.
     let tri = vec![
-        c + egui::vec2(-t * 0.55, -t),
-        c + egui::vec2(-t * 0.55, t),
+        c + egui::vec2(-t * 0.5, -t),
+        c + egui::vec2(-t * 0.5, t),
         c + egui::vec2(t, 0.0),
     ];
-    p.add(egui::Shape::convex_polygon(tri, egui::Color32::WHITE, egui::Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(
+        tri,
+        egui::Color32::from_white_alpha(210),
+        egui::Stroke::NONE,
+    ));
 }
 
 /// Draw the multi-select overlay on a gallery tile: a tint plus a corner check badge.
@@ -2633,12 +4511,258 @@ fn selection_overlay(ui: &egui::Ui, rect: egui::Rect, selected: bool) {
     }
 }
 
+fn wrap_meta(ui: &mut egui::Ui, label: &str, value: &str) {
+    if value.trim().is_empty() {
+        return;
+    }
+    ui.add(egui::Label::new(egui::RichText::new(format!("{label}: {value}")).small()).wrap());
+}
+
+/// Wrapped checkpoint catalog fields for a collapsing details body.
+fn checkpoint_meta_body(
+    ui: &mut egui::Ui,
+    file: &str,
+    entry: Option<&crate::types::CheckpointEntry>,
+) {
+    wrap_meta(ui, "File", file);
+    let Some(e) = entry else {
+        ui.weak("No catalog metadata for this checkpoint.");
+        return;
+    };
+    if !e.directory.trim().is_empty() {
+        wrap_meta(ui, "Directory", &e.directory);
+    }
+    if !e.name.trim().is_empty() && e.name != e.file {
+        wrap_meta(ui, "Name", &e.name);
+    }
+    if let Some(v) = e.version.as_ref().filter(|s| !s.trim().is_empty()) {
+        wrap_meta(ui, "Version", v);
+    }
+    if !e.bases.is_empty() {
+        wrap_meta(ui, "Bases", &e.bases.join(", "));
+    }
+    if let Some(v) = e.base_model.as_ref().filter(|s| !s.trim().is_empty()) {
+        wrap_meta(ui, "Base model", v);
+    }
+    if let Some(v) = e.base_model_type.as_ref().filter(|s| !s.trim().is_empty()) {
+        wrap_meta(ui, "Base type", v);
+    }
+    if let Some(v) = e.creator.as_ref().filter(|s| !s.trim().is_empty()) {
+        wrap_meta(ui, "Creator", v);
+    }
+    if let Some(n) = e.size {
+        wrap_meta(ui, "Size", &format_bytes(n));
+    }
+    if let Some(n) = e.download_count {
+        wrap_meta(ui, "Downloads", &n.to_string());
+    }
+    if let Some(n) = e.thumbs_up {
+        wrap_meta(ui, "Thumbs up", &n.to_string());
+    }
+    wrap_meta(
+        ui,
+        "Flags",
+        &format!(
+            "favorite={} · civitai={}",
+            e.favorite, e.from_civitai
+        ),
+    );
+    if let Some(rec) = &e.recommended {
+        let mut parts = Vec::new();
+        if let Some(v) = rec.steps {
+            parts.push(format!("steps {v}"));
+        } else if let (Some(a), Some(b)) = (rec.steps_min, rec.steps_max) {
+            parts.push(format!("steps {a}–{b}"));
+        }
+        if let Some(v) = rec.cfg {
+            parts.push(format!("CFG {v}"));
+        } else if let (Some(a), Some(b)) = (rec.cfg_min, rec.cfg_max) {
+            parts.push(format!("CFG {a}–{b}"));
+        }
+        if let (Some(w), Some(h)) = (rec.width, rec.height) {
+            parts.push(format!("{w}×{h}"));
+        }
+        if let Some(s) = rec.sampler.as_ref().filter(|s| !s.is_empty()) {
+            parts.push(format!("sampler {s}"));
+        }
+        if let Some(s) = rec.scheduler.as_ref().filter(|s| !s.is_empty()) {
+            parts.push(format!("scheduler {s}"));
+        }
+        if let Some(v) = rec.clip_skip {
+            parts.push(format!("clip skip {v}"));
+        }
+        if !parts.is_empty() {
+            wrap_meta(ui, "Recommended", &parts.join(" · "));
+        }
+    }
+    wrap_meta(ui, "Notes", e.notes.trim());
+    if let Some(d) = e.description.as_ref().filter(|s| !s.trim().is_empty()) {
+        wrap_meta(ui, "Description", &strip_simple_html(d));
+    }
+    if !e.tags.is_empty() {
+        wrap_meta(ui, "Tags", &e.tags.join(", "));
+    }
+}
+
+fn format_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let n = n as f64;
+    if n >= GB {
+        format!("{:.2} GB", n / GB)
+    } else if n >= MB {
+        format!("{:.1} MB", n / MB)
+    } else if n >= KB {
+        format!("{:.0} KB", n / KB)
+    } else {
+        format!("{n:.0} B")
+    }
+}
+
+fn strip_simple_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn preset_meta_body(ui: &mut egui::Ui, preset: &CreatePreset) {
+    let p = &preset.params;
+    wrap_meta(ui, "Model", &p.checkpoint);
+    wrap_meta(
+        ui,
+        "Mode",
+        match p.mode {
+            Mode::Txt2Img => "Text to Image",
+            Mode::Img2Img => "Image to Image",
+        },
+    );
+    wrap_meta(ui, "Prompt", &p.positive);
+    if !p.lora_triggers.trim().is_empty() {
+        wrap_meta(ui, "LoRA triggers", &p.lora_triggers);
+    }
+    wrap_meta(ui, "Negative", &p.negative);
+    wrap_meta(
+        ui,
+        "Sampler",
+        &format!(
+            "{} steps, CFG {}, {}×{}, {}/{}",
+            p.steps, p.cfg, p.width, p.height, p.sampler, p.scheduler
+        ),
+    );
+    if !p.loras.is_empty() {
+        let names: Vec<&str> = p.loras.iter().map(|l| l.file.as_str()).collect();
+        wrap_meta(ui, "LoRAs", &names.join(", "));
+    }
+}
+
+/// Wrapped LoRA catalog fields for a collapsing details body.
+fn lora_meta_body(ui: &mut egui::Ui, file: &str, entry: Option<&crate::types::LoraEntry>) {
+    wrap_meta(ui, "File", file);
+    let Some(e) = entry else {
+        ui.weak("No catalog metadata for this LoRA.");
+        return;
+    };
+    if !e.name.trim().is_empty() && e.name != e.file {
+        wrap_meta(ui, "Name", &e.name);
+    }
+    if !e.bases.is_empty() {
+        wrap_meta(ui, "Bases", &e.bases.join(", "));
+    }
+    if !e.checkpoints.is_empty() {
+        wrap_meta(ui, "Checkpoints", &e.checkpoints.join(", "));
+    }
+    let mut strength = format!("model {:.2}, CLIP {:.2}", e.strength_model, e.strength_clip);
+    match (e.strength_model_min, e.strength_model_max) {
+        (Some(a), Some(b)) => strength.push_str(&format!(" (range {a:.2}–{b:.2})")),
+        (Some(a), None) => strength.push_str(&format!(" (min {a:.2})")),
+        (None, Some(b)) => strength.push_str(&format!(" (max {b:.2})")),
+        _ => {}
+    }
+    if !e.strength_source.is_empty() {
+        strength.push_str(&format!(" · via {}", e.strength_source));
+    }
+    wrap_meta(ui, "Strength", &strength);
+    wrap_meta(ui, "Triggers", &e.trigger_text());
+    wrap_meta(ui, "Negative", &e.negative_text());
+    wrap_meta(ui, "Notes", e.notes.trim());
+    if !e.tags.is_empty() {
+        wrap_meta(ui, "Tags", &e.tags.join(", "));
+    }
+}
+
+/// Match a catalog sampler/scheduler name to a server option (ComfyUI vs Civitai spellings).
+fn match_sampler_name(want: &str, options: &[String]) -> Option<String> {
+    let want = want.trim();
+    if want.is_empty() {
+        return None;
+    }
+    if let Some(o) = options.iter().find(|o| o.eq_ignore_ascii_case(want)) {
+        return Some(o.clone());
+    }
+    let norm = |s: &str| {
+        s.trim()
+            .to_lowercase()
+            .replace("++", "pp")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>()
+            .split('_')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("_")
+    };
+    let target = norm(want);
+    options.iter().find(|o| norm(o) == target).cloned()
+}
+
 fn combo(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(if current.is_empty() { "—".to_string() } else { elide(current, 40) })
         .show_ui(ui, |ui| {
             for opt in options.iter().take(300) {
                 ui.selectable_value(current, opt.clone(), elide(opt, 56));
+            }
+        });
+}
+
+const SIZE_PRESETS: &[(&str, u32, u32)] = &[
+    ("512 × 512", 512, 512),
+    ("768 × 768", 768, 768),
+    ("1024 × 1024", 1024, 1024),
+    ("832 × 1216", 832, 1216),
+    ("1216 × 832", 1216, 832),
+    ("896 × 1152", 896, 1152),
+    ("1152 × 896", 1152, 896),
+    ("768 × 1344", 768, 1344),
+    ("1344 × 768", 1344, 768),
+    ("1536 × 640", 1536, 640),
+    ("640 × 1536", 640, 1536),
+];
+
+fn size_preset_combo(ui: &mut egui::Ui, width: &mut u32, height: &mut u32) {
+    let label = SIZE_PRESETS
+        .iter()
+        .find(|(_, w, h)| *w == *width && *h == *height)
+        .map(|(name, _, _)| (*name).to_string())
+        .unwrap_or_else(|| "Custom".into());
+    egui::ComboBox::from_id_salt("size_preset")
+        .selected_text(label)
+        .width(120.0)
+        .show_ui(ui, |ui| {
+            for (name, w, h) in SIZE_PRESETS {
+                if ui.selectable_label(*width == *w && *height == *h, *name).clicked() {
+                    *width = *w;
+                    *height = *h;
+                }
             }
         });
 }

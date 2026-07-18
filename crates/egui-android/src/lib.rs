@@ -122,7 +122,7 @@ impl Adapter {
             return;
         }
         if self.frame >= self.next_clip_poll {
-            self.has_clip = crate::host::clipboard_text().is_some();
+            self.has_clip = crate::host::read_clipboard_text().is_some();
             self.next_clip_poll = self.frame + 30;
         }
         let insets = self.host.safe_area_insets();
@@ -148,7 +148,7 @@ impl Adapter {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(self.has_clip, egui::Button::new("Paste")).clicked()
-                            && let Some(text) = crate::host::clipboard_text()
+                            && let Some(text) = crate::host::read_clipboard_text()
                         {
                             self.pending_events.push(egui::Event::Paste(text));
                             acted = true;
@@ -235,6 +235,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
 }
 
 pub mod host;
+pub mod video;
 pub use host::HostExt;
 
 #[cfg(feature = "plugins")]

@@ -16,12 +16,27 @@ pub enum Img2ImgSource {
     Url,
 }
 
+/// One LoRA stacked on the Create-tab graph (chained `LoraLoader` after the checkpoint).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ActiveLora {
+    /// Exact `lora_name` as ComfyUI knows it (`models/loras` relative path).
+    pub file: String,
+    pub strength_model: f32,
+    pub strength_clip: f32,
+    /// Trigger tokens appended to [`Params::lora_triggers`] when this LoRA was added.
+    #[serde(default)]
+    pub injected: String,
+}
+
 /// Everything a KSampler txt2img/img2img workflow needs, plus the UI's mode selection.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Params {
     pub checkpoint: String,
     pub positive: String,
     pub negative: String,
+    /// LoRA trigger / quality tags kept separate from the subject prompt.
+    #[serde(default)]
+    pub lora_triggers: String,
     pub steps: u32,
     pub cfg: f32,
     pub width: u32,
@@ -35,6 +50,8 @@ pub struct Params {
     pub mode: Mode,
     pub img2img_source: Img2ImgSource,
     pub input_url: String,
+    #[serde(default)]
+    pub loras: Vec<ActiveLora>,
 }
 
 impl Default for Params {
@@ -43,6 +60,7 @@ impl Default for Params {
             checkpoint: String::new(),
             positive: String::new(),
             negative: "text, watermark, low quality".to_string(),
+            lora_triggers: String::new(),
             steps: 20,
             cfg: 7.0,
             width: 1024,
@@ -56,7 +74,432 @@ impl Default for Params {
             mode: Mode::Txt2Img,
             img2img_source: Img2ImgSource::CurrentOutput,
             input_url: String::new(),
+            loras: Vec::new(),
         }
+    }
+}
+
+impl Params {
+    /// Positive CLIP text: LoRA triggers (if any) then the subject prompt.
+    pub fn combined_positive(&self) -> String {
+        let triggers = self.lora_triggers.trim().trim_end_matches(',').trim();
+        let subject = self.positive.trim();
+        match (triggers.is_empty(), subject.is_empty()) {
+            (true, _) => subject.to_string(),
+            (_, true) => triggers.to_string(),
+            _ => format!("{triggers}, {subject}"),
+        }
+    }
+}
+
+/// Sampler / steps / CFG bundle copied from a gallery image for Create paste.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SamplerPack {
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub scheduler: Option<String>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub cfg: Option<f32>,
+}
+
+impl SamplerPack {
+    pub const CLIP_TYPE: &'static str = "comfyui_android_sampler_v1";
+
+    pub fn is_empty(&self) -> bool {
+        self.sampler.is_none()
+            && self.scheduler.is_none()
+            && self.steps.is_none()
+            && self.cfg.is_none()
+    }
+
+    pub fn to_clipboard_json(&self) -> String {
+        serde_json::json!({
+            "type": Self::CLIP_TYPE,
+            "sampler": self.sampler,
+            "scheduler": self.scheduler,
+            "steps": self.steps,
+            "cfg": self.cfg,
+        })
+        .to_string()
+    }
+
+    pub fn from_clipboard_json(raw: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) != Some(Self::CLIP_TYPE) {
+            return None;
+        }
+        let pack = Self {
+            sampler: v.get("sampler").and_then(|x| x.as_str()).map(str::to_string),
+            scheduler: v.get("scheduler").and_then(|x| x.as_str()).map(str::to_string),
+            steps: v.get("steps").and_then(|x| x.as_u64()).map(|n| n as u32),
+            cfg: v.get("cfg").and_then(|x| x.as_f64()).map(|n| n as f32),
+        };
+        (!pack.is_empty()).then_some(pack)
+    }
+}
+
+/// LoRA stack copied from a gallery image for Create paste.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LoraPack {
+    pub loras: Vec<ActiveLora>,
+}
+
+impl LoraPack {
+    pub const CLIP_TYPE: &'static str = "comfyui_android_loras_v1";
+
+    pub fn to_clipboard_json(&self) -> String {
+        serde_json::json!({
+            "type": Self::CLIP_TYPE,
+            "loras": self.loras,
+        })
+        .to_string()
+    }
+
+    pub fn from_clipboard_json(raw: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) != Some(Self::CLIP_TYPE) {
+            return None;
+        }
+        let loras: Vec<ActiveLora> = serde_json::from_value(v.get("loras")?.clone()).ok()?;
+        (!loras.is_empty()).then_some(Self { loras })
+    }
+}
+
+/// A named snapshot of Create-tab params, stored on-device.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CreatePreset {
+    pub name: String,
+    pub params: Params,
+}
+
+/// Server-published checkpoint catalog (`GET /checkpoint-catalog.json`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CheckpointCatalog {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub checkpoints: Vec<CheckpointEntry>,
+}
+
+/// One catalogued checkpoint (LoRA Manager / Civitai sidecar metadata).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckpointEntry {
+    /// Path relative to `models/<directory>/` (ComfyUI loader name).
+    pub file: String,
+    /// `checkpoints`, `diffusion_models`, or `unet`.
+    #[serde(default)]
+    pub directory: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub bases: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub favorite: bool,
+    #[serde(default)]
+    pub from_civitai: bool,
+    #[serde(default)]
+    pub base_model: Option<String>,
+    #[serde(default)]
+    pub base_model_type: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub size: Option<u64>,
+    #[serde(default)]
+    pub creator: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub preview: Option<String>,
+    #[serde(default)]
+    pub nsfw_level: Option<i32>,
+    #[serde(default)]
+    pub civitai_id: Option<i64>,
+    #[serde(default)]
+    pub civitai_model_id: Option<i64>,
+    #[serde(default)]
+    pub download_count: Option<i64>,
+    #[serde(default)]
+    pub thumbs_up: Option<i64>,
+    /// Parsed sampler defaults from description / example metas (omitted when empty).
+    #[serde(default)]
+    pub recommended: Option<CheckpointRecommended>,
+}
+
+/// Recommended sampler settings for a checkpoint (`CheckpointEntry.recommended`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CheckpointRecommended {
+    #[serde(default)]
+    pub cfg: Option<f32>,
+    #[serde(default)]
+    pub cfg_min: Option<f32>,
+    #[serde(default)]
+    pub cfg_max: Option<f32>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub steps_min: Option<u32>,
+    #[serde(default)]
+    pub steps_max: Option<u32>,
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub scheduler: Option<String>,
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+impl CheckpointEntry {
+    pub fn display_name(&self) -> &str {
+        if self.name.trim().is_empty() { &self.file } else { &self.name }
+    }
+
+    /// Label for a version row under a shared display name.
+    pub fn version_label(&self) -> String {
+        if let Some(v) = self.version.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return v.to_string();
+        }
+        file_basename(&self.file).to_string()
+    }
+}
+
+impl CheckpointCatalog {
+    pub fn entry(&self, file: &str) -> Option<&CheckpointEntry> {
+        let base = file_basename(file);
+        self.checkpoints
+            .iter()
+            .find(|e| e.file == file || file_basename(&e.file) == base)
+    }
+
+    pub fn bases_for(&self, checkpoint: &str) -> Vec<String> {
+        self.entry(checkpoint).map(|e| e.bases.clone()).unwrap_or_default()
+    }
+}
+
+/// Server-published LoRA catalog (`GET /comfyui-android/lora-catalog.json`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LoraCatalog {
+    #[serde(default)]
+    pub version: u32,
+    /// Checkpoint filename (or basename) → base-model tags, e.g. `["sdxl"]`.
+    #[serde(default)]
+    pub checkpoints: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub loras: Vec<LoraEntry>,
+}
+
+/// One catalogued LoRA with recommended strengths and trigger words.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LoraEntry {
+    /// Exact ComfyUI `lora_name` (path under `models/loras`).
+    pub file: String,
+    #[serde(default)]
+    pub name: String,
+    /// Base families this LoRA supports (`sdxl`, `flux`, `sd15`, `pony`, …).
+    #[serde(default)]
+    pub bases: Vec<String>,
+    /// Optional explicit checkpoint filenames/basenames this LoRA is allowed with.
+    #[serde(default)]
+    pub checkpoints: Vec<String>,
+    #[serde(default = "default_lora_strength")]
+    pub strength_model: f32,
+    #[serde(default = "default_lora_strength")]
+    pub strength_clip: f32,
+    #[serde(default)]
+    pub strength_model_min: Option<f32>,
+    #[serde(default)]
+    pub strength_model_max: Option<f32>,
+    /// Where `strength_*` was resolved (`usage_tips`, `description_range`, …).
+    #[serde(default = "default_strength_source")]
+    pub strength_source: String,
+    /// Joined with `, ` and prepended to the positive prompt when the LoRA is added.
+    #[serde(default)]
+    pub trigger_words: Vec<String>,
+    /// Optionally appended to the negative prompt when the LoRA is added.
+    #[serde(default)]
+    pub negative_words: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+fn default_lora_strength() -> f32 {
+    1.0
+}
+
+fn default_strength_source() -> String {
+    "default".into()
+}
+
+impl LoraEntry {
+    pub fn display_name(&self) -> &str {
+        if self.name.trim().is_empty() { &self.file } else { &self.name }
+    }
+
+    pub fn trigger_text(&self) -> String {
+        self.trigger_words
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn negative_text(&self) -> String {
+        self.negative_words
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Model/CLIP strengths for Add, clamped to an optional recommended range.
+    pub fn add_strengths(&self) -> (f32, f32) {
+        let mut sm = self.strength_model;
+        let mut sc = self.strength_clip;
+        if let Some(lo) = self.strength_model_min {
+            sm = sm.max(lo);
+            sc = sc.max(lo);
+        }
+        if let Some(hi) = self.strength_model_max {
+            sm = sm.min(hi);
+            sc = sc.min(hi);
+        }
+        (sm, sc)
+    }
+
+    /// Compatible when listed for this checkpoint, sharing a base tag, or unrestricted.
+    pub fn matches_checkpoint(&self, checkpoint: &str, model_bases: &[String]) -> bool {
+        let ckpt = file_basename(checkpoint);
+        if self.checkpoints.iter().any(|c| file_basename(c) == ckpt || c == checkpoint) {
+            return true;
+        }
+        if self.bases.is_empty() && self.checkpoints.is_empty() {
+            return true;
+        }
+        if model_bases.is_empty() {
+            return false;
+        }
+        self.bases.iter().any(|b| {
+            model_bases.iter().any(|m| m.eq_ignore_ascii_case(b.trim()))
+        })
+    }
+}
+
+impl LoraCatalog {
+    pub fn bases_for_checkpoint(&self, checkpoint: &str) -> Vec<String> {
+        let ckpt = file_basename(checkpoint);
+        if let Some(bases) = self.checkpoints.get(checkpoint) {
+            return bases.clone();
+        }
+        self.checkpoints
+            .iter()
+            .find(|(k, _)| file_basename(k) == ckpt)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn entry(&self, file: &str) -> Option<&LoraEntry> {
+        let base = file_basename(file);
+        self.loras
+            .iter()
+            .find(|e| e.file == file || file_basename(&e.file) == base)
+    }
+}
+
+pub fn file_basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// Split a comma-separated trigger list into trimmed tokens.
+pub fn split_triggers(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn trigger_present(haystacks: &[&str], trigger: &str) -> bool {
+    let needle = trigger.trim().to_lowercase();
+    if needle.is_empty() {
+        return true;
+    }
+    for hay in haystacks {
+        for part in split_triggers(hay) {
+            if part.eq_ignore_ascii_case(&needle) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Append only the trigger tokens not already present in `dest` / `also_check`.
+/// Returns the comma-joined tokens that were actually added (for later removal).
+pub fn merge_triggers(dest: &mut String, triggers: &str, also_check: &str) -> String {
+    let mut added = Vec::new();
+    for t in split_triggers(triggers) {
+        if trigger_present(&[dest.as_str(), also_check], &t) {
+            continue;
+        }
+        added.push(t);
+    }
+    if added.is_empty() {
+        return String::new();
+    }
+    let piece = added.join(", ");
+    if dest.trim().is_empty() {
+        *dest = piece.clone();
+    } else {
+        dest.push_str(", ");
+        dest.push_str(&piece);
+    }
+    piece
+}
+
+/// Remove previously injected trigger tokens from a comma-separated field.
+pub fn strip_injected(dest: &mut String, injected: &str) {
+    let remove: std::collections::HashSet<String> = split_triggers(injected)
+        .into_iter()
+        .map(|t| t.to_lowercase())
+        .collect();
+    if remove.is_empty() {
+        return;
+    }
+    let kept: Vec<String> = split_triggers(dest)
+        .into_iter()
+        .filter(|t| !remove.contains(&t.to_lowercase()))
+        .collect();
+    *dest = kept.join(", ");
+}
+
+/// Append negative words once (comma-separated) if not already present.
+pub fn append_negatives(negative: &mut String, words: &str) {
+    let words = words.trim();
+    if words.is_empty() || negative.to_lowercase().contains(&words.to_lowercase()) {
+        return;
+    }
+    if negative.trim().is_empty() {
+        *negative = words.to_string();
+    } else {
+        negative.push_str(", ");
+        negative.push_str(words);
     }
 }
 
@@ -125,6 +568,37 @@ impl GalleryGroup {
     pub const ALL: &'static [Self] = &[Self::Folder, Self::Model, Self::None];
 }
 
+/// Media-type filter for the gallery listing. Applied client-side (the listing API has no media
+/// param), so a non-All value triggers the same load-the-whole-set paging as grouping does.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GalleryMedia {
+    #[default]
+    All,
+    Images,
+    Videos,
+}
+
+impl GalleryMedia {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All media",
+            Self::Images => "Images",
+            Self::Videos => "Videos",
+        }
+    }
+
+    /// Whether `is_video` passes this filter.
+    pub fn matches(self, is_video: bool) -> bool {
+        match self {
+            Self::All => true,
+            Self::Images => !is_video,
+            Self::Videos => is_video,
+        }
+    }
+
+    pub const ALL: &'static [Self] = &[Self::All, Self::Images, Self::Videos];
+}
+
 /// The gallery's query + layout state, persisted so the view survives restarts.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GalleryView {
@@ -133,10 +607,24 @@ pub struct GalleryView {
     pub model: String,
     #[serde(default)]
     pub album: Option<i64>,
+    /// Images / videos / everything, filtered client-side.
+    #[serde(default)]
+    pub media: GalleryMedia,
     pub sort: GallerySort,
     pub group: GalleryGroup,
     /// Tiles per row, 1..=3. At 1 the tiles show near-full-resolution images.
     pub columns: usize,
+    /// Whether folder/model collapsing headers start expanded.
+    #[serde(default = "default_true")]
+    pub groups_open: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_gallery_page() -> u64 {
+    60
 }
 
 impl Default for GalleryView {
@@ -144,9 +632,11 @@ impl Default for GalleryView {
         Self {
             model: String::new(),
             album: None,
+            media: GalleryMedia::All,
             sort: GallerySort::Newest,
             group: GalleryGroup::Folder,
             columns: 3,
+            groups_open: true,
         }
     }
 }
@@ -161,6 +651,38 @@ impl GalleryView {
             2 => 512,
             _ => 320,
         }
+    }
+}
+
+/// Per-style font sizes (points), applied to egui's `TextStyle` map.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FontSizes {
+    pub heading: f32,
+    pub body: f32,
+    pub button: f32,
+    pub small: f32,
+    pub monospace: f32,
+}
+
+impl Default for FontSizes {
+    fn default() -> Self {
+        Self {
+            heading: 18.0,
+            body: 14.5,
+            button: 14.5,
+            small: 11.0,
+            monospace: 12.5,
+        }
+    }
+}
+
+impl FontSizes {
+    pub fn clamp(&mut self) {
+        self.heading = self.heading.clamp(12.0, 36.0);
+        self.body = self.body.clamp(10.0, 28.0);
+        self.button = self.button.clamp(10.0, 28.0);
+        self.small = self.small.clamp(8.0, 20.0);
+        self.monospace = self.monospace.clamp(9.0, 24.0);
     }
 }
 
@@ -179,9 +701,32 @@ pub struct Settings {
     pub params: Params,
     #[serde(default)]
     pub gallery: GalleryView,
+    /// Gallery search box text.
+    #[serde(default)]
+    pub gallery_q: String,
+    /// How many gallery rows to fetch per page / Load more (20..=500).
+    #[serde(default = "default_gallery_page")]
+    pub gallery_page: u64,
     /// Auto-follow: pan/zoom the graph to whichever node is currently executing.
     #[serde(default)]
     pub auto_follow: bool,
+    /// Auto-arrange the canvas when a workflow is loaded.
+    #[serde(default = "default_true")]
+    pub auto_arrange: bool,
+    #[serde(default)]
+    pub fonts: FontSizes,
+    /// Name of the last opened graph workflow.
+    #[serde(default)]
+    pub workflow_name: String,
+    /// UI-format JSON of the last opened graph, restored after reconnect.
+    #[serde(default)]
+    pub workflow_json: Option<String>,
+    /// On-device Create-tab presets (prompts, sampler, LoRAs, …).
+    #[serde(default)]
+    pub presets: Vec<CreatePreset>,
+    /// Name of the last-applied Create preset (empty = none / custom).
+    #[serde(default)]
+    pub selected_preset: String,
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),
@@ -281,6 +826,54 @@ mod tests {
         // A bare namespace is the account's output root — never show the raw account id.
         assert_eq!(item("shadowbroker_531d823e-4a3b-46c8-9550-2e8f").group_label(), "Output");
         assert_eq!(item("").group_label(), "Output");
+    }
+
+    #[test]
+    fn inject_and_strip_triggers() {
+        let mut triggers = String::new();
+        let inj = merge_triggers(&mut triggers, "foo style, bar", "a cat");
+        assert_eq!(inj, "foo style, bar");
+        assert_eq!(triggers, "foo style, bar");
+        // Already present — not re-added.
+        let again = merge_triggers(&mut triggers, "foo style, baz", "a cat");
+        assert_eq!(again, "baz");
+        assert_eq!(triggers, "foo style, bar, baz");
+        strip_injected(&mut triggers, "foo style, baz");
+        assert_eq!(triggers, "bar");
+        assert_eq!(
+            Params {
+                lora_triggers: "masterpiece, ".into(),
+                positive: "a cat".into(),
+                ..Default::default()
+            }
+            .combined_positive(),
+            "masterpiece, a cat"
+        );
+    }
+
+    #[test]
+    fn lora_matches_by_base_and_checkpoint() {
+        let entry = LoraEntry {
+            file: "style.safetensors".into(),
+            name: "Style".into(),
+            bases: vec!["sdxl".into()],
+            checkpoints: vec![],
+            strength_model: 0.8,
+            strength_clip: 0.8,
+            strength_model_min: None,
+            strength_model_max: None,
+            strength_source: "default".into(),
+            trigger_words: vec!["style".into()],
+            negative_words: vec![],
+            notes: String::new(),
+            tags: vec![],
+        };
+        assert!(entry.matches_checkpoint(
+            "models/juggernautXL.safetensors",
+            &["sdxl".into()],
+        ));
+        assert!(!entry.matches_checkpoint("flux1-dev.safetensors", &["flux".into()]));
+        assert!(!entry.matches_checkpoint("unknown.safetensors", &[]));
     }
 }
 

@@ -117,6 +117,15 @@ impl SchemaSet {
     pub fn schedulers(&self) -> Vec<String> {
         self.enum_options("KSampler", "scheduler")
     }
+
+    /// Installed LoRA filenames from `LoraLoader.lora_name` (falls back to `LoraLoaderModelOnly`).
+    pub fn loras(&self) -> Vec<String> {
+        let simple = self.enum_options("LoraLoader", "lora_name");
+        if !simple.is_empty() {
+            return simple;
+        }
+        self.enum_options("LoraLoaderModelOnly", "lora_name")
+    }
 }
 
 pub fn parse(root: &Value) -> SchemaSet {

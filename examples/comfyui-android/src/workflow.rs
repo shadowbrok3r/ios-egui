@@ -1,10 +1,10 @@
 //! Builds a standard KSampler workflow (txt2img or img2img) from [`Params`] using rucomfyui's
-//! typed nodes. Mirrors ComfyUI's default graph: checkpoint -> CLIP encode x2 -> (empty latent or
-//! VAE-encoded input) -> KSampler -> VAE decode -> SaveImage.
+//! typed nodes. Mirrors ComfyUI's default graph: checkpoint -> optional LoRA chain -> CLIP encode
+//! x2 -> (empty latent or VAE-encoded input) -> KSampler -> VAE decode -> SaveImage.
 
 use rucomfyui::nodes::all::{
-    CLIPTextEncode, CheckpointLoaderSimple, EmptyLatentImage, KSampler, LoadImage, SaveImage,
-    VAEDecode, VAEEncode,
+    CLIPTextEncode, CheckpointLoaderSimple, EmptyLatentImage, KSampler, LoadImage, LoraLoader,
+    SaveImage, VAEDecode, VAEEncode,
 };
 use rucomfyui::{Workflow, WorkflowGraph, WorkflowNodeId};
 
@@ -15,6 +15,26 @@ use crate::types::{Mode, Params};
 pub fn build(p: &Params, input_image: Option<String>) -> (Workflow, WorkflowNodeId) {
     let g = WorkflowGraph::new();
     let c = g.add(CheckpointLoaderSimple::new(p.checkpoint.clone()));
+
+    let (model, clip) = {
+        let mut model = c.model;
+        let mut clip = c.clip;
+        for lora in &p.loras {
+            if lora.file.trim().is_empty() {
+                continue;
+            }
+            let out = g.add(LoraLoader::new(
+                model,
+                clip,
+                lora.file.clone(),
+                lora.strength_model,
+                lora.strength_clip,
+            ));
+            model = out.model;
+            clip = out.clip;
+        }
+        (model, clip)
+    };
 
     let latent = match input_image {
         Some(name) if p.mode == Mode::Img2Img => {
@@ -31,14 +51,14 @@ pub fn build(p: &Params, input_image: Option<String>) -> (Workflow, WorkflowNode
     let denoise = if p.mode == Mode::Img2Img { p.denoise } else { 1.0 };
 
     let samples = g.add(KSampler {
-        model: c.model,
+        model,
         seed: p.seed,
         steps: p.steps,
         cfg: p.cfg,
         sampler_name: p.sampler.clone(),
         scheduler: p.scheduler.clone(),
-        positive: g.add(CLIPTextEncode::new(p.positive.clone(), c.clip)),
-        negative: g.add(CLIPTextEncode::new(p.negative.clone(), c.clip)),
+        positive: g.add(CLIPTextEncode::new(p.combined_positive(), clip.clone())),
+        negative: g.add(CLIPTextEncode::new(p.negative.clone(), clip)),
         latent_image: latent,
         denoise,
     });

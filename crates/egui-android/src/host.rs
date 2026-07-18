@@ -36,6 +36,7 @@ const K_REQ_INSTALL_PERM: i32 = 101;
 const K_REQ_OVERLAY_PERM: i32 = 102;
 const K_REQ_NOTIF_PERM: i32 = 103;
 const K_SAVE_GALLERY: i32 = 104;
+const K_REQ_MEDIA_PERM: i32 = 105;
 
 // Pending permission checks: (core permission index, android permission string, frames left).
 static PENDING_PERMS: Mutex<Vec<(usize, String, u32)>> = Mutex::new(Vec::new());
@@ -88,6 +89,13 @@ pub fn drain(host: &Host) {
                     save_to_gallery(&path, name, mime);
                 }
             }
+            // The runtime permission dialog needs the Activity, but `ndk_context` only exposes the
+            // Application here (android-activity 0.6 keeps the Activity private), so
+            // `requestPermissions` throws NoSuchMethodError. Send the user to the app's Settings
+            // page to grant Photos access instead — the same fallback used for install/overlay perms.
+            K_REQ_MEDIA_PERM => {
+                start_settings_for_package("android.settings.APPLICATION_DETAILS_SETTINGS")
+            }
             other => log::info!("egui-android: host request kind {other} not handled"),
         }
     }
@@ -105,7 +113,11 @@ fn with_activity<R>(
     match f(&mut env, &activity) {
         Ok(r) => Some(r),
         Err(e) => {
-            // Clear any pending Java exception so it can't poison the next JNI call this frame.
+            // Surface the Java exception's stack to logcat, then clear it so it can't poison the
+            // next JNI call this frame.
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_describe();
+            }
             let _ = env.exception_clear();
             log::error!("egui-android JNI error: {e:?}");
             None
@@ -217,7 +229,7 @@ fn set_clipboard(text: &str) {
 }
 
 /// Read the system clipboard as text (Android grants reads only while the app has focus).
-pub(crate) fn clipboard_text() -> Option<String> {
+pub fn read_clipboard_text() -> Option<String> {
     with_activity(|env, activity| {
         let svc = env.new_string("clipboard")?;
         let cm = env
@@ -408,6 +420,210 @@ fn save_to_gallery(path: &str, name: &str, mime: &str) {
     if done.is_none() {
         log::error!("save_to_gallery: JNI call failed for {name}");
     }
+}
+
+/// The runtime permission that gates reading the shared image gallery: scoped
+/// `READ_MEDIA_IMAGES` on Android 13+ (API 33), the broad `READ_EXTERNAL_STORAGE` below.
+fn media_images_permission() -> &'static str {
+    let sdk = with_activity(|env, _| {
+        env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()
+    })
+    .unwrap_or(0);
+    if sdk >= 33 {
+        "android.permission.READ_MEDIA_IMAGES"
+    } else {
+        "android.permission.READ_EXTERNAL_STORAGE"
+    }
+}
+
+fn jni_has_media_permission() -> Option<bool> {
+    check_permission(media_images_permission())
+}
+
+/// List the most recent device gallery images as `(MediaStore id, display name)`, newest first,
+/// capped at `limit`.
+fn jni_list_device_images(limit: i32) -> Option<Vec<(i64, String)>> {
+    with_activity(|env, activity| {
+        let resolver = env
+            .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
+            .l()?;
+        let collection = env
+            .get_static_field(
+                "android/provider/MediaStore$Images$Media",
+                "EXTERNAL_CONTENT_URI",
+                "Landroid/net/Uri;",
+            )?
+            .l()?;
+        // Projection [_id, _display_name]; MediaStore sorts by date_added descending (newest first).
+        let col_id = env.new_string("_id")?;
+        let projection = env.new_object_array(2, "java/lang/String", &col_id)?;
+        let col_name = env.new_string("_display_name")?;
+        env.set_object_array_element(&projection, 1, &col_name)?;
+        let sort = env.new_string("date_added DESC")?;
+        let null = JObject::null();
+        let cursor = env
+            .call_method(
+                &resolver,
+                "query",
+                "(Landroid/net/Uri;[Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;)Landroid/database/Cursor;",
+                &[
+                    (&collection).into(),
+                    (&projection).into(),
+                    (&null).into(),
+                    (&null).into(),
+                    (&sort).into(),
+                ],
+            )?
+            .l()?;
+        if cursor.is_null() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        while (out.len() as i32) < limit {
+            if !env.call_method(&cursor, "moveToNext", "()Z", &[])?.z()? {
+                break;
+            }
+            // Read the row inside a local frame so the per-row `getString` local reference is freed
+            // each iteration — otherwise hundreds of rows overflow ART's local reference table.
+            let row = env.with_local_frame::<_, (i64, String), jni::errors::Error>(8, |env| {
+                let id = env.call_method(&cursor, "getLong", "(I)J", &[JValue::Int(0)])?.j()?;
+                let name_obj = env
+                    .call_method(&cursor, "getString", "(I)Ljava/lang/String;", &[JValue::Int(1)])?
+                    .l()?;
+                let name = if name_obj.is_null() {
+                    String::new()
+                } else {
+                    let s: JString = name_obj.into();
+                    env.get_string(&s)?.into()
+                };
+                Ok((id, name))
+            })?;
+            out.push(row);
+        }
+        env.call_method(&cursor, "close", "()V", &[])?;
+        Ok(out)
+    })
+}
+
+/// `content://` URI for a MediaStore image id.
+fn image_uri<'a>(
+    env: &mut jni::JNIEnv<'a>,
+    id: i64,
+) -> jni::errors::Result<JObject<'a>> {
+    let base = env
+        .get_static_field(
+            "android/provider/MediaStore$Images$Media",
+            "EXTERNAL_CONTENT_URI",
+            "Landroid/net/Uri;",
+        )?
+        .l()?;
+    env.call_static_method(
+        "android/content/ContentUris",
+        "withAppendedId",
+        "(Landroid/net/Uri;J)Landroid/net/Uri;",
+        &[(&base).into(), JValue::Long(id)],
+    )?
+    .l()
+}
+
+/// A device image's thumbnail as raw RGBA pixels `(width, height, rgba)` (≈ `size`×`size`).
+/// `loadThumbnail` needs API 29+. Returns pixels directly (no PNG round-trip) so the caller can
+/// build a texture without a re-decode.
+fn jni_load_device_thumb(id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)> {
+    with_activity(|env, activity| {
+        let resolver = env
+            .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
+            .l()?;
+        let uri = image_uri(env, id)?;
+        let size_obj =
+            env.new_object("android/util/Size", "(II)V", &[JValue::Int(size), JValue::Int(size)])?;
+        let null = JObject::null();
+        let bitmap = env
+            .call_method(
+                &resolver,
+                "loadThumbnail",
+                "(Landroid/net/Uri;Landroid/util/Size;Landroid/os/CancellationSignal;)Landroid/graphics/Bitmap;",
+                &[(&uri).into(), (&size_obj).into(), (&null).into()],
+            )?
+            .l()?;
+        bitmap_to_rgba(env, &bitmap)
+    })
+}
+
+/// Read an ARGB_8888 `Bitmap` into an egui-ready RGBA byte buffer via `getPixels`.
+pub(crate) fn bitmap_to_rgba(env: &mut jni::JNIEnv, bitmap: &JObject) -> jni::errors::Result<(u32, u32, Vec<u8>)> {
+    let w = env.call_method(bitmap, "getWidth", "()I", &[])?.i()?;
+    let h = env.call_method(bitmap, "getHeight", "()I", &[])?.i()?;
+    let n = (w.max(0) as usize) * (h.max(0) as usize);
+    let pixels = env.new_int_array(n as i32)?;
+    env.call_method(
+        bitmap,
+        "getPixels",
+        "([IIIIIII)V",
+        &[
+            (&pixels).into(),
+            JValue::Int(0),      // offset
+            JValue::Int(w),      // stride
+            JValue::Int(0),      // x
+            JValue::Int(0),      // y
+            JValue::Int(w),
+            JValue::Int(h),
+        ],
+    )?;
+    let mut argb = vec![0i32; n];
+    env.get_int_array_region(&pixels, 0, &mut argb)?;
+    // getPixels yields 0xAARRGGBB per int (non-premultiplied); unpack to RGBA bytes.
+    let mut rgba = Vec::with_capacity(n * 4);
+    for px in &argb {
+        let p = *px as u32;
+        rgba.push(((p >> 16) & 0xff) as u8); // R
+        rgba.push(((p >> 8) & 0xff) as u8); // G
+        rgba.push((p & 0xff) as u8); // B
+        rgba.push(((p >> 24) & 0xff) as u8); // A
+    }
+    Ok((w as u32, h as u32, rgba))
+}
+
+/// A device image's full file bytes (for upload to ComfyUI).
+fn jni_load_device_bytes(id: i64) -> Option<Vec<u8>> {
+    with_activity(|env, activity| {
+        let resolver = env
+            .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
+            .l()?;
+        let uri = image_uri(env, id)?;
+        let stream = env
+            .call_method(
+                &resolver,
+                "openInputStream",
+                "(Landroid/net/Uri;)Ljava/io/InputStream;",
+                &[(&uri).into()],
+            )?
+            .l()?;
+        if stream.is_null() {
+            return Ok(Vec::new());
+        }
+        let out = read_stream_fully(env, &stream);
+        let _ = env.call_method(&stream, "close", "()V", &[]);
+        out
+    })
+}
+
+fn read_stream_fully(env: &mut jni::JNIEnv, stream: &JObject) -> jni::errors::Result<Vec<u8>> {
+    const CHUNK: i32 = 64 * 1024;
+    let buf = env.new_byte_array(CHUNK)?;
+    let mut out = Vec::new();
+    let mut tmp = vec![0i8; CHUNK as usize];
+    loop {
+        let n = env.call_method(stream, "read", "([B)I", &[(&buf).into()])?.i()?;
+        if n < 0 {
+            break;
+        }
+        if n > 0 {
+            env.get_byte_array_region(&buf, 0, &mut tmp[..n as usize])?;
+            out.extend(tmp[..n as usize].iter().map(|&b| b as u8));
+        }
+    }
+    Ok(out)
 }
 
 fn notify(title: &str, body: &str) {
@@ -936,6 +1152,24 @@ pub trait HostExt {
     /// MediaStore. Scoped-storage insert — needs no runtime permission on Android 10+. `mime` is
     /// e.g. `"image/png"` or `"video/mp4"`.
     fn save_to_gallery(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>);
+    /// Ask the user to grant photo-gallery access. Because `ndk_context` only exposes the
+    /// Application (not the Activity) under android-activity 0.6, the runtime permission dialog
+    /// can't be shown from here, so this opens the app's Settings page where the user toggles
+    /// Photos access. Poll [`has_media_images_permission`](HostExt::has_media_images_permission)
+    /// (checkable on the Application context) for the result on return.
+    fn request_media_images_permission(&self);
+    /// Whether this app may currently read the device photo gallery.
+    fn has_media_images_permission(&self) -> bool;
+    /// Recent device gallery images as `(MediaStore id, display name)`, newest first, capped at
+    /// `limit`. Empty when the permission is denied or there are none.
+    fn list_device_images(&self, limit: i32) -> Vec<(i64, String)>;
+    /// A device image's thumbnail as raw RGBA pixels `(width, height, rgba)` (≈ `size`×`size`),
+    /// or `None` on failure.
+    fn load_device_thumbnail(&self, id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)>;
+    /// A device image's full file bytes (for upload), or `None` on failure.
+    fn load_device_image(&self, id: i64) -> Option<Vec<u8>>;
+    /// Current system clipboard text, if any (requires app focus).
+    fn clipboard_text(&self) -> Option<String>;
 }
 
 impl HostExt for Host {
@@ -964,5 +1198,23 @@ impl HostExt for Host {
         // path in str_a, "name\tmime" in str_b (the request channel carries only two strings).
         let meta = format!("{}\t{}", display_name.into(), mime.into());
         self.drv_enqueue(K_SAVE_GALLERY, Some(path.into()), Some(meta), 0);
+    }
+    fn request_media_images_permission(&self) {
+        self.drv_enqueue(K_REQ_MEDIA_PERM, None, None, 0);
+    }
+    fn has_media_images_permission(&self) -> bool {
+        jni_has_media_permission().unwrap_or(false)
+    }
+    fn list_device_images(&self, limit: i32) -> Vec<(i64, String)> {
+        jni_list_device_images(limit).unwrap_or_default()
+    }
+    fn load_device_thumbnail(&self, id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)> {
+        jni_load_device_thumb(id, size)
+    }
+    fn load_device_image(&self, id: i64) -> Option<Vec<u8>> {
+        jni_load_device_bytes(id)
+    }
+    fn clipboard_text(&self) -> Option<String> {
+        read_clipboard_text()
     }
 }

@@ -37,7 +37,7 @@ egui_extras = { version = "0.35", default-features = false, features = ["image"]
 # would hand the compressed bytes to the JSON parser.
 # `form`: comfy-gate's /login is an HTML form post (application/x-www-form-urlencoded), not JSON.
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "multipart", "gzip", "brotli", "deflate"] }
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros"] }
 # Authenticated /ws listener for live progress + previews: rucomfyui's own websocket transport
 # can't attach auth headers to the handshake, so the engine runs its own socket alongside polling.
 tokio-tungstenite = "0.24"
@@ -90,3 +90,10 @@ name = "android.permission.INTERNET"
 name = "android.permission.VIBRATE"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.POST_NOTIFICATIONS"
+# Read the device photo gallery for the LoadImage "Device" picker. READ_MEDIA_IMAGES is the
+# Android 13+ (API 33) scoped permission; READ_EXTERNAL_STORAGE covers older devices only.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_IMAGES"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32
