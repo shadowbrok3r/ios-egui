@@ -9,7 +9,7 @@ xtool
 .DS_Store
 
 .claude
-
+.cursor
 # Per-machine Android build env (absolute SDK/NDK/JDK paths); see ANDROID_SETUP.md
 /.cargo/config.toml
 SESSION_HANDOFF.md

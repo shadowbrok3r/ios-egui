@@ -1,4 +1,5 @@
 use std::iter::FusedIterator;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use bitflags::bitflags;
 
@@ -1318,6 +1319,98 @@ impl InputType {
     }
 }
 
+// Side channel carrying the latest pointer state observed at motion-event dispatch. winit
+// forwards touch pressure but drops tool type and hover, so consumers read it here instead.
+// Written on the input-pump thread and read on the same render thread each frame.
+static POINTER_TOOL: AtomicU8 = AtomicU8::new(0);
+static POINTER_BUTTONS: AtomicU32 = AtomicU32::new(0);
+static POINTER_HOVERING: AtomicBool = AtomicBool::new(false);
+static POINTER_HOVER_X: AtomicU32 = AtomicU32::new(0);
+static POINTER_HOVER_Y: AtomicU32 = AtomicU32::new(0);
+
+/// Pointer tool from the most recent motion event (Android `getToolType`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PointerTool {
+    Unknown,
+    Finger,
+    Stylus,
+    Mouse,
+    Eraser,
+    Palm,
+}
+
+/// A snapshot of the most recent pointer observed by [`InputIterator::next`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PointerProbe {
+    pub tool: PointerTool,
+    /// Raw button-state bitfield (stylus-primary `0x20`, stylus-secondary `0x40`).
+    pub buttons: u32,
+    /// Hover position in window physical pixels when the pointer hovers without contact.
+    pub hover: Option<(f32, f32)>,
+}
+
+fn tool_to_u8(t: ToolType) -> u8 {
+    match t {
+        ToolType::Finger => 1,
+        ToolType::Stylus => 2,
+        ToolType::Mouse => 3,
+        ToolType::Eraser => 4,
+        ToolType::Palm => 5,
+        _ => 0,
+    }
+}
+
+/// Read the current pointer side-channel snapshot surfaced from motion events.
+pub fn pointer_probe() -> PointerProbe {
+    let tool = match POINTER_TOOL.load(Ordering::Relaxed) {
+        1 => PointerTool::Finger,
+        2 => PointerTool::Stylus,
+        3 => PointerTool::Mouse,
+        4 => PointerTool::Eraser,
+        5 => PointerTool::Palm,
+        _ => PointerTool::Unknown,
+    };
+    let hover = POINTER_HOVERING.load(Ordering::Relaxed).then(|| {
+        (
+            f32::from_bits(POINTER_HOVER_X.load(Ordering::Relaxed)),
+            f32::from_bits(POINTER_HOVER_Y.load(Ordering::Relaxed)),
+        )
+    });
+    PointerProbe { tool, buttons: POINTER_BUTTONS.load(Ordering::Relaxed), hover }
+}
+
+// Record tool type / hover / buttons from a motion event without consuming it.
+fn record_pointer_from_event(event: &crate::activity_impl::input::InputEvent) {
+    let crate::activity_impl::input::InputEvent::MotionEvent(m) = event else {
+        return;
+    };
+    let count = m.pointer_count();
+    if count == 0 {
+        return;
+    }
+    let action = m.action();
+    let idx = match action {
+        MotionAction::Down | MotionAction::Up | MotionAction::PointerDown | MotionAction::PointerUp => {
+            m.pointer_index().min(count - 1)
+        }
+        _ => 0,
+    };
+    let p = m.pointer_at_index(idx);
+    POINTER_TOOL.store(tool_to_u8(p.tool_type()), Ordering::Relaxed);
+    POINTER_BUTTONS.store(m.button_state().0, Ordering::Relaxed);
+    match action {
+        MotionAction::HoverEnter | MotionAction::HoverMove => {
+            POINTER_HOVER_X.store(p.x().to_bits(), Ordering::Relaxed);
+            POINTER_HOVER_Y.store(p.y().to_bits(), Ordering::Relaxed);
+            POINTER_HOVERING.store(true, Ordering::Relaxed);
+        }
+        MotionAction::HoverExit | MotionAction::Down | MotionAction::PointerDown => {
+            POINTER_HOVERING.store(false, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 /// An exclusive, lending iterator for input events
 pub struct InputIterator<'a> {
     pub(crate) inner: crate::activity_impl::InputIteratorInner<'a>,
@@ -1333,7 +1426,10 @@ impl InputIterator<'_> {
     where
         F: FnOnce(&crate::activity_impl::input::InputEvent) -> InputStatus,
     {
-        self.inner.next(callback)
+        self.inner.next(|event| {
+            record_pointer_from_event(event);
+            callback(event)
+        })
     }
 }
 

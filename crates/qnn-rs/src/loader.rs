@@ -77,7 +77,6 @@ impl QnnSystem {
 pub struct Backend {
     _lib: Library,
     // Function table for D1 device execution (contextCreateFromBinary/graphExecute).
-    #[allow(dead_code)]
     pub(crate) ftab: ffi::QnnInterface_ImplementationV2_37_t,
     provider_name: String,
     backend_id: u32,

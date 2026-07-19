@@ -491,7 +491,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
 pub mod host;
 pub mod ime_bridge;
 pub mod video;
-pub use host::HostExt;
+pub use host::{HostExt, ScreenOrientation, device_orientation_deg};
 
 #[cfg(feature = "plugins")]
 pub mod plugins;

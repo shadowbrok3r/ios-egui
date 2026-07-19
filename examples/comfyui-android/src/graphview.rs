@@ -418,13 +418,15 @@ impl GraphView {
         // Queue default is one slot above; lock is the bottom of the stack.
         egui::Area::new(egui::Id::new("comfy-lock"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(view.right() - 58.0, view.bottom() - 58.0))
+            .fixed_pos(egui::pos2(
+                view.right() - crate::theme::FAB_EDGE,
+                view.bottom() - crate::theme::FAB_EDGE,
+            ))
             .show(ui.ctx(), |aui| {
-                let btn = egui::Button::new(egui::RichText::new(icon).size(22.0))
-                    .min_size(egui::vec2(48.0, 48.0))
-                    .corner_radius(24.0)
-                    .fill(egui::Color32::from_rgb(45, 55, 85));
-                if aui.add(btn).on_hover_text(tip).clicked() {
+                if crate::theme::fab(aui, icon, crate::theme::fab_bg())
+                    .on_hover_text(tip)
+                    .clicked()
+                {
                     self.locked = !self.locked;
                 }
             });

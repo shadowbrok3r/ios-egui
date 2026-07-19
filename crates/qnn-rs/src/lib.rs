@@ -5,9 +5,10 @@
 //! datatypes, and per-tensor scale-offset quantization — on any host. No QNN
 //! libraries are linked; everything is resolved via `*_getProviders`.
 //!
-//! Milestone D1 (on device): execute UNet/VAE on the Snapdragon HTP NPU via the
-//! HTP backend. That surface is declared in [`Context`] but returns
-//! [`Error::Unimplemented`] on host.
+//! Milestone D1 (on device): [`Context::from_binary`]/[`Context::execute`] and
+//! [`set_htp_performance_mode`] drive UNet/VAE on the Snapdragon HTP NPU. The
+//! FFI compiles on host but fails at backend init there (no NPU); quant/dequant
+//! math ([`quant`]) is host-testable.
 //!
 //! ```no_run
 //! use qnn_rs::{QnnSystem, ContextBinaryInfo};
@@ -25,11 +26,14 @@ mod bindings;
 
 mod device;
 mod error;
+mod fastrpc;
+mod htp;
 mod loader;
 mod parse;
+pub mod quant;
 mod types;
 
-pub use device::{set_htp_performance_mode, Context};
+pub use device::{prepare_htp_env, set_htp_performance_mode, Context};
 pub use error::{Error, Result};
 pub use loader::{Backend, QnnSystem};
 pub use types::{ContextBinaryInfo, DataType, GraphInfo, ScaleOffset, TensorInfo};

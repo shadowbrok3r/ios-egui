@@ -38,6 +38,19 @@ pub struct RunArgs {
     pub tcp: Option<String>,
 }
 
+#[derive(Args, Clone)]
+pub struct LogcatArgs {
+    /// Connect over wireless adb first (`host` or `host:port`; default port 5555).
+    #[arg(long, value_name = "HOST[:PORT]")]
+    pub tcp: Option<String>,
+    /// Log tags to allowlist (repeatable); default streams the app + QNN self-test tags.
+    #[arg(long = "tag", value_name = "TAG")]
+    pub tags: Vec<String>,
+    /// Clear the device log buffer before streaming.
+    #[arg(long)]
+    pub clear: bool,
+}
+
 fn ident(name: &str) -> String {
     name.replace(['-', ' '], "_")
 }
@@ -107,6 +120,51 @@ pub fn cmd_adb_connect(host: &str) -> Result<()> {
     let serial = normalize_tcp_serial(host);
     adb_connect(&serial)?;
     println!("Connected to {serial}");
+    Ok(())
+}
+
+/// Default logcat tags: the comfyui in-app logger plus the QNN/local-sd self-test targets.
+const DEFAULT_LOGCAT_TAGS: &[&str] = &["comfyui", "local_sd", "qnn_rs", "egui-android"];
+
+/// Stream device logs (blocks until interrupted) with the resolved SDK env, allowlisting the
+/// app + self-test tags so a diagnostic printed via `log`/`android_logger` is easy to read back.
+pub fn cmd_logcat(args: &LogcatArgs) -> Result<()> {
+    let env = resolve_android_env()?;
+    let adb = adb_path(&env);
+    let serial = if let Some(tcp) = &args.tcp {
+        let serial = normalize_tcp_serial(tcp);
+        adb_connect(&serial)?;
+        Some(serial)
+    } else {
+        None
+    };
+    if args.clear {
+        let mut clear = Command::new(&adb);
+        if let Some(s) = &serial {
+            clear.arg("-s").arg(s);
+        }
+        clear.arg("logcat").arg("-c").env("PATH", &env.path);
+        let _ = clear.status();
+    }
+    let specs: Vec<String> = if args.tags.is_empty() {
+        DEFAULT_LOGCAT_TAGS.iter().map(|t| format!("{t}:V")).collect()
+    } else {
+        args.tags.iter().map(|t| format!("{t}:V")).collect()
+    };
+    let mut cmd = Command::new(&adb);
+    if let Some(s) = &serial {
+        cmd.arg("-s").arg(s);
+    }
+    cmd.arg("logcat").arg("-s");
+    for spec in &specs {
+        cmd.arg(spec);
+    }
+    cmd.env("PATH", &env.path);
+    println!("adb logcat -s {}", specs.join(" "));
+    let status = cmd.status().context("running adb logcat (is platform-tools installed?)")?;
+    if !status.success() {
+        bail!("adb logcat exited with failure");
+    }
     Ok(())
 }
 

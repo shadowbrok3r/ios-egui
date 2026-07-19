@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use egui_mobile::{CreateContext, EguiApp, Haptic, Host, HostExt, app, egui};
+use egui_mobile::{CreateContext, EguiApp, Haptic, Host, HostExt, ScreenOrientation, device_orientation_deg, app, egui};
 use egui_snarl::{InPinId, OutPinId};
 use rucomfyui::workflow::WorkflowNodeId;
 use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
@@ -75,6 +75,8 @@ enum CreatePane {
 enum SettingsPane {
     Server,
     Logs,
+    #[cfg(feature = "local-npu")]
+    Diagnostics,
 }
 
 /// Destination for the app picker's selection.
@@ -204,6 +206,20 @@ struct InpaintState {
     erase: bool,
     overlay_tex: Option<egui::TextureHandle>,
     overlay_dirty: bool,
+    /// Accept only stylus strokes (palm rejection); defaulted from device stylus presence once.
+    stylus_only: bool,
+    /// One-shot init of `stylus_only` from host stylus detection.
+    input_inited: bool,
+    /// Show live pointer telemetry (tool type, force, contact) over the canvas.
+    show_debug: bool,
+    /// Latest pointer force (0..1) from `egui::Event::Touch`, if any.
+    dbg_force: Option<f32>,
+    /// A touch was in contact this frame (Start/Move seen).
+    dbg_contact: bool,
+    /// A touch event arrived this frame (else the pointer is a mouse or absent).
+    dbg_saw_touch: bool,
+    /// Keep the center brush-size preview visible until this time (seconds).
+    brush_preview_until: f64,
 }
 
 /// One open workflow editor document (multi-tab Graph workspace).
@@ -377,6 +393,10 @@ struct ComfyApp {
     /// Debounce timer for Create → Graph pushes.
     create_sync_dirty_at: Option<f64>,
     graph_pane: GraphPane,
+    /// Graph-tab landscape fullscreen mode (OS orientation locked to landscape).
+    graph_fullscreen: bool,
+    /// Debounce timer: when the device has been near portrait for this long (seconds) exit fs.
+    graph_fs_portrait_since: Option<f64>,
     auto_follow: bool,
     /// Auto-arrange when a loaded workflow's canvas is first shown.
     auto_arrange: bool,
@@ -538,6 +558,32 @@ struct ComfyApp {
     /// Cached prompt lint issues plus the fingerprint they were computed from.
     lint_issues: Vec<lint::LintIssue>,
     lint_fp: u64,
+
+    /// D1 NPU self-test worker result, delivered off the render thread.
+    #[cfg(feature = "local-npu")]
+    d1_rx: Option<std::sync::mpsc::Receiver<local_sd::SelftestReport>>,
+    /// A self-test worker is in flight.
+    #[cfg(feature = "local-npu")]
+    d1_running: bool,
+    /// Last self-test diagnostic dump, shown in the Diagnostics pane.
+    #[cfg(feature = "local-npu")]
+    d1_last: Option<String>,
+    /// Last self-test pass/fail.
+    #[cfg(feature = "local-npu")]
+    d1_ok: Option<bool>,
+
+    /// D2 text2img smoke worker result.
+    #[cfg(feature = "local-npu")]
+    d2_rx: Option<std::sync::mpsc::Receiver<local_sd::Text2ImgReport>>,
+    #[cfg(feature = "local-npu")]
+    d2_running: bool,
+    #[cfg(feature = "local-npu")]
+    d2_last: Option<String>,
+    #[cfg(feature = "local-npu")]
+    d2_ok: Option<bool>,
+    /// Settings: route Create Queue to on-device HTP instead of the ComfyUI server.
+    #[cfg(feature = "local-npu")]
+    local_npu: bool,
 }
 
 impl ComfyApp {
@@ -614,6 +660,8 @@ impl ComfyApp {
             create_graph_export_fp: 0,
             create_sync_dirty_at: None,
             graph_pane: GraphPane::Canvas,
+            graph_fullscreen: false,
+            graph_fs_portrait_since: None,
             auto_follow: false,
             auto_arrange: true,
             fonts: FontSizes::default(),
@@ -708,6 +756,24 @@ impl ComfyApp {
             tag_dict_override: None,
             lint_issues: Vec::new(),
             lint_fp: 0,
+            #[cfg(feature = "local-npu")]
+            d1_rx: None,
+            #[cfg(feature = "local-npu")]
+            d1_running: false,
+            #[cfg(feature = "local-npu")]
+            d1_last: None,
+            #[cfg(feature = "local-npu")]
+            d1_ok: None,
+            #[cfg(feature = "local-npu")]
+            d2_rx: None,
+            #[cfg(feature = "local-npu")]
+            d2_running: false,
+            #[cfg(feature = "local-npu")]
+            d2_last: None,
+            #[cfg(feature = "local-npu")]
+            d2_ok: None,
+            #[cfg(feature = "local-npu")]
+            local_npu: false,
         }
     }
 
@@ -1422,6 +1488,13 @@ impl ComfyApp {
 
     /// Whether a Create-tab generation can be queued right now.
     fn can_queue_create(&self) -> Result<(), &'static str> {
+        #[cfg(feature = "local-npu")]
+        if self.local_npu {
+            if self.params.mode != Mode::Txt2Img {
+                return Err("Local NPU is txt2img only for now");
+            }
+            return Ok(());
+        }
         if let Some(missing) = self.params.missing_model_part() {
             return Err(missing);
         }
@@ -1473,6 +1546,13 @@ impl ComfyApp {
         if self.params.randomize_seed {
             self.params.seed = random_seed();
         }
+
+        #[cfg(feature = "local-npu")]
+        if self.local_npu {
+            self.start_local_npu_generation(host);
+            return;
+        }
+
         // Keep the linked graph current so highlights / auto-follow work during the run.
         self.push_create_to_linked_graph();
         // txt2img: queue the linked graph itself so node ids match execution events.
@@ -1527,6 +1607,43 @@ impl ComfyApp {
                 .map(|doc| doc.view.export_ui(&doc.graph, schemas, &doc.bypassed))
         });
         self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow);
+        host.haptic(Haptic::Medium);
+    }
+
+    #[cfg(feature = "local-npu")]
+    fn start_local_npu_generation(&mut self, host: &Host) {
+        let Some(lib_dir) = host.native_lib_dir() else {
+            self.status = "Local NPU: nativeLibraryDir unavailable".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let Some(model_dir) = self.qnn_model_dir(host) else {
+            self.status = "Local NPU: model dir unavailable".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let fresh = !self.running;
+        if fresh {
+            self.progress = (0, 0);
+            self.preview = None;
+            self.results.clear();
+            self.result_view = None;
+            self.run_total = 0;
+            self.run_seen.clear();
+        }
+        self.running = true;
+        self.jobs_left += 1;
+        self.status = if !fresh {
+            format!("Local NPU queued ({} in flight)", self.jobs_left)
+        } else {
+            "Local NPU queued".into()
+        };
+        self.enhance_note.clear();
+        let paths = crate::local_engine::LocalPaths {
+            lib_dir: std::path::PathBuf::from(lib_dir),
+            model_dir: std::path::PathBuf::from(model_dir),
+        };
+        self.engine.as_mut().unwrap().generate_local(paths, self.params.clone());
         host.haptic(Haptic::Medium);
     }
 
@@ -1858,6 +1975,13 @@ impl ComfyApp {
             erase: false,
             overlay_tex: None,
             overlay_dirty: true,
+            stylus_only: false,
+            input_inited: false,
+            show_debug: false,
+            dbg_force: None,
+            dbg_contact: false,
+            dbg_saw_touch: false,
+            brush_preview_until: 0.0,
         });
     }
 
@@ -1904,6 +2028,13 @@ impl ComfyApp {
             return;
         }
 
+        if let Some(st) = self.inpaint.as_mut()
+            && !st.input_inited
+        {
+            st.stylus_only = host.has_stylus();
+            st.input_inited = true;
+        }
+
         let mut close = false;
         let mut use_mask = false;
         let mut do_undo = false;
@@ -1921,7 +2052,7 @@ impl ComfyApp {
             const BTN_H: f32 = 36.0;
             const ICON_W: f32 = 40.0;
             ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
+            ui.horizontal(|ui| {
                 let st = self.inpaint.as_mut().unwrap();
                 if ui
                     .add(egui::Button::new(icons::CLOSE).min_size(egui::vec2(ICON_W, BTN_H)))
@@ -1930,22 +2061,22 @@ impl ComfyApp {
                 {
                     close = true;
                 }
-                ui.toggle_value(&mut st.erase, "Erase")
-                    .on_hover_text("Wipe mask instead of painting");
                 if ui
-                    .add(egui::Button::new(format!("{} Undo", icons::UNDO)).min_size(egui::vec2(0.0, BTN_H)))
-                    .clicked()
-                {
-                    do_undo = true;
-                }
-                if ui
-                    .add(egui::Button::new(format!("{} Clear", icons::TRASH)).min_size(egui::vec2(0.0, BTN_H)))
+                    .add(egui::Button::new(icons::TRASH).min_size(egui::vec2(ICON_W, BTN_H)))
+                    .on_hover_text("Clear mask")
                     .clicked()
                 {
                     do_clear = true;
                 }
                 ui.label("Brush");
-                ui.add(egui::Slider::new(&mut st.brush_uv, 0.01..=0.15).show_value(false));
+                let slider_w = (ui.available_width() - 120.0).max(80.0);
+                let brush_resp = ui.add_sized(
+                    [slider_w, BTN_H],
+                    egui::Slider::new(&mut st.brush_uv, 0.01..=0.15).show_value(false),
+                );
+                if brush_resp.changed() || brush_resp.dragged() {
+                    st.brush_preview_until = ui.input(|i| i.time) + 0.9;
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(
@@ -1974,16 +2105,90 @@ impl ComfyApp {
                 let (w, h) = if aw / ah > ar { (ah * ar, ah) } else { (aw, aw / ar) };
                 egui::Rect::from_center_size(area.center(), egui::vec2(w, h))
             };
+
+            // Icon-only tool stack on the right: undo, erase, stylus, debug.
+            let stack_pos =
+                egui::pos2(area.right() - crate::theme::FAB_EDGE, area.top() + 10.0);
+            egui::Area::new(egui::Id::new("inpaint-tool-stack"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(stack_pos)
+                .show(ui.ctx(), |aui| {
+                    aui.spacing_mut().item_spacing.y = 8.0;
+                    aui.vertical(|aui| {
+                        if crate::theme::fab(aui, icons::UNDO, crate::theme::fab_bg())
+                            .on_hover_text("Undo last stroke")
+                            .clicked()
+                        {
+                            do_undo = true;
+                        }
+                        for (on_flag, icon, tip) in [
+                            (&mut st.erase, icons::ERASE, "Wipe mask instead of painting"),
+                            (
+                                &mut st.stylus_only,
+                                icons::STYLUS,
+                                "Accept only stylus strokes so you can rest your palm",
+                            ),
+                            (&mut st.show_debug, icons::BUG, "Show live S-Pen telemetry over the canvas"),
+                        ] {
+                            let fill = if *on_flag {
+                                crate::theme::fab_bg_on()
+                            } else {
+                                crate::theme::fab_bg()
+                            };
+                            if crate::theme::fab(aui, icon, fill).on_hover_text(tip).clicked() {
+                                *on_flag = !*on_flag;
+                            }
+                        }
+                    });
+                });
             let (resp, painter) = ui.allocate_painter(area.size(), egui::Sense::drag());
             let uv_full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             painter.image(st.base_tex.id(), fitted, uv_full, egui::Color32::WHITE);
 
-            let radius = st.brush_uv;
             let soft = 0.5;
+            // Latest touch force + contact this frame; mouse/desktop reports no touch events.
+            let (force, contact, saw_touch) = ui.input(|i| {
+                let mut force = None;
+                let mut contact = false;
+                let mut saw = false;
+                for e in &i.events {
+                    if let egui::Event::Touch { phase, force: f, .. } = e {
+                        saw = true;
+                        if matches!(phase, egui::TouchPhase::Start | egui::TouchPhase::Move) {
+                            contact = true;
+                            force = *f;
+                        }
+                    }
+                }
+                (force, contact, saw)
+            });
+            if saw_touch {
+                st.dbg_force = force;
+            }
+            st.dbg_contact = contact;
+            st.dbg_saw_touch = saw_touch;
+            // Live S-Pen state from the android-activity input side channel (tool type, hover, and
+            // buttons that winit drops); hover px converts to egui points.
+            let (tool_u8, hover_px, buttons) = host.stylus_probe();
+            let kind = match tool_u8 {
+                1 => mask::PointerKind::Finger,
+                2 => mask::PointerKind::Stylus,
+                3 => mask::PointerKind::Mouse,
+                4 => mask::PointerKind::Eraser,
+                5 => mask::PointerKind::Palm,
+                _ => mask::PointerKind::Unknown,
+            };
+            let ppp = ui.ctx().pixels_per_point();
+            let hover_pt = hover_px.map(|(x, y)| egui::pos2(x / ppp, y / ppp));
+            // Stylus barrel button (primary 0x20 / secondary 0x40) or the flipped eraser tip erases.
+            let btn_erase = buttons & 0x60 != 0;
+            let erase = st.erase || btn_erase || matches!(kind, mask::PointerKind::Eraser);
+            let brush = mask::pressure_brush(st.brush_uv, force);
             if resp.drag_started() {
                 st.groups.push(st.strokes.len());
             }
             if resp.dragged()
+                && mask::accept_paint(kind, st.stylus_only)
                 && let Some(pos) = resp.interact_pointer_pos()
                 && fitted.width() > 0.0
                 && fitted.height() > 0.0
@@ -2000,13 +2205,14 @@ impl ComfyApp {
                     (cur.0 - d.x / fitted.width()).clamp(0.0, 1.0),
                     (cur.1 - d.y / fitted.height()).clamp(0.0, 1.0),
                 );
-                st.canvas.stroke(prev, cur, radius, soft, st.erase);
+                st.canvas.stroke(prev, cur, brush.radius_uv, soft, brush.intensity, erase);
                 st.strokes.push(mask::StrokeRec {
                     from: prev,
                     to: cur,
-                    radius_uv: radius,
+                    radius_uv: brush.radius_uv,
                     soft,
-                    erase: st.erase,
+                    intensity: brush.intensity,
+                    erase,
                 });
                 st.overlay_dirty = true;
             }
@@ -2032,17 +2238,62 @@ impl ComfyApp {
                 painter.image(tex.id(), fitted, uv_full, egui::Color32::WHITE);
             }
 
-            // Brush-size cursor ring at the pointer.
-            if let Some(pos) = resp.interact_pointer_pos().or(resp.hover_pos())
+            // Brush-size cursor ring at the pointer or stylus hover; reflects pressure and erase.
+            let brush_col = if erase {
+                egui::Color32::from_rgb(90, 170, 255)
+            } else {
+                egui::Color32::from_rgb(230, 70, 70)
+            };
+            if let Some(pos) = resp.interact_pointer_pos().or(resp.hover_pos()).or(hover_pt)
                 && fitted.contains(pos)
             {
+                let eff = if force.is_some() { brush.radius_uv } else { st.brush_uv };
+                let r = (eff * fitted.size().min_elem()).max(2.0);
+                painter.circle_stroke(pos, r, egui::Stroke::new(1.5, brush_col));
+            }
+
+            // Center preview while scrubbing the brush slider (and briefly after).
+            let now = ui.input(|i| i.time);
+            if now < st.brush_preview_until {
                 let r = (st.brush_uv * fitted.size().min_elem()).max(2.0);
-                let col = if st.erase {
-                    egui::Color32::from_rgb(90, 170, 255)
-                } else {
-                    egui::Color32::from_rgb(230, 70, 70)
+                let c = fitted.center();
+                painter.circle_filled(c, r, brush_col.gamma_multiply(0.25));
+                painter.circle_stroke(c, r, egui::Stroke::new(2.0, brush_col));
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+            }
+
+            if st.show_debug {
+                let tool = match kind {
+                    mask::PointerKind::Finger => "finger",
+                    mask::PointerKind::Stylus => "stylus",
+                    mask::PointerKind::Eraser => "eraser",
+                    mask::PointerKind::Palm => "palm",
+                    mask::PointerKind::Mouse => "mouse",
+                    mask::PointerKind::Unknown => "unknown",
                 };
-                painter.circle_stroke(pos, r, egui::Stroke::new(1.5, col));
+                let force_s = st.dbg_force.map(|f| format!("{f:.2}")).unwrap_or_else(|| "-".into());
+                let state = if st.dbg_contact {
+                    "contact"
+                } else if hover_pt.is_some() {
+                    "hover"
+                } else if st.dbg_saw_touch {
+                    "release"
+                } else {
+                    "idle"
+                };
+                let hover_s =
+                    hover_pt.map(|p| format!("{:.0},{:.0}", p.x, p.y)).unwrap_or_else(|| "-".into());
+                let text = format!(
+                    "S-Pen telemetry\ntool: {tool}\nforce: {force_s}\nstate: {state}\nhover: {hover_s}\nbuttons: 0x{buttons:02x}\nerase: {erase}\nbrush r/i: {:.3}/{:.2}\nstylus-only: {}",
+                    brush.radius_uv, brush.intensity, st.stylus_only,
+                );
+                let galley =
+                    painter.layout(text, egui::FontId::monospace(12.0), egui::Color32::WHITE, 240.0);
+                let pad = egui::vec2(6.0, 5.0);
+                let origin = area.left_top() + egui::vec2(8.0, 8.0);
+                let bg = egui::Rect::from_min_size(origin, galley.size() + pad * 2.0);
+                painter.rect_filled(bg, 4.0, egui::Color32::from_black_alpha(180));
+                painter.galley(origin + pad, galley, egui::Color32::WHITE);
             }
         }
 
@@ -2123,6 +2374,10 @@ impl ComfyApp {
             confirm_gallery_delete: self.confirm_gallery_delete,
             create_setup_open: self.create_setup_open,
             create_companions_open: self.create_companions_open,
+            #[cfg(feature = "local-npu")]
+            local_npu: self.local_npu,
+            #[cfg(not(feature = "local-npu"))]
+            local_npu: false,
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -2188,6 +2443,10 @@ impl ComfyApp {
             self.confirm_gallery_delete = saved.confirm_gallery_delete;
             self.create_setup_open = saved.create_setup_open;
             self.create_companions_open = saved.create_companions_open;
+            #[cfg(feature = "local-npu")]
+            {
+                self.local_npu = saved.local_npu;
+            }
             if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
                 self.restore_workflow = Some((saved.workflow_name, json));
             }
@@ -2257,11 +2516,15 @@ impl ComfyApp {
                 SettingsPane::Logs,
                 format!("{} Logs", icons::LOGS),
             );
+            #[cfg(feature = "local-npu")]
+            ui.selectable_value(&mut self.settings_pane, SettingsPane::Diagnostics, "Diagnostics");
         });
         ui.separator();
         match self.settings_pane {
             SettingsPane::Server => self.settings_server_pane(ui, host),
             SettingsPane::Logs => self.logs_tab(ui, host),
+            #[cfg(feature = "local-npu")]
+            SettingsPane::Diagnostics => self.diagnostics_pane(ui, host),
         }
     }
 
@@ -2371,6 +2634,24 @@ impl ComfyApp {
                     );
                 }
             });
+            #[cfg(feature = "local-npu")]
+            {
+                ui.add_space(12.0);
+                ui.heading("Local NPU");
+                ui.group(|ui| {
+                    ui.checkbox(&mut self.local_npu, "Local NPU (experimental)");
+                    ui.weak(
+                        "Queue on Create runs on-device HTP (512² SD1.5 txt2img). Needs pushed \
+                         unet.bin / vae_decoder.bin / tokenizer.json / clip.safetensors. \
+                         Assets stay cached after the first run.",
+                    );
+                    if ui.button("Unload NPU cache").clicked() {
+                        crate::local_engine::drop_cache();
+                        self.log.info("local-npu: asset cache dropped");
+                    }
+                });
+            }
+
             ui.add_space(12.0);
             ui.heading(format!("{} Gallery", icons::GALLERY));
             ui.group(|ui| {
@@ -2576,7 +2857,7 @@ impl ComfyApp {
         ui.horizontal(|ui| {
             ui.label("Prompt");
             if ui
-                .selectable_label(self.prompt_chips, "chips")
+                .add(egui::Button::new("chips").selected(self.prompt_chips))
                 .on_hover_text("Edit the prompt as tag chips")
                 .clicked()
             {
@@ -2766,10 +3047,21 @@ impl ComfyApp {
         };
         let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
         let enhance_label = if app_n > 0 { format!(" · +{app_n} enhance") } else { String::new() };
+        #[cfg(feature = "local-npu")]
+        let local_badge = if self.local_npu { " · Local" } else { "" };
+        #[cfg(not(feature = "local-npu"))]
+        let local_badge = "";
         ui.weak(sanitize_ui_text(
             ui,
-            &format!("{ckpt_label} · {preset_label}{enhance_label}"),
+            &format!("{ckpt_label} · {preset_label}{enhance_label}{local_badge}"),
         ));
+        #[cfg(feature = "local-npu")]
+        if self.local_npu {
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 230),
+                "Local NPU — Queue runs on-device (txt2img 512²)",
+            );
+        }
         if let Some(hint) = self
             .checkpoint_catalog
             .entry(&model_file)
@@ -3896,22 +4188,25 @@ impl ComfyApp {
         }
 
         let mut action = None;
+        let undo_w = crate::theme::FAB_SIZE * 2.0 + 8.0;
         egui::Area::new(egui::Id::new("comfy-undo"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(view.right() - 10.0 - 104.0, view.top() + 10.0))
+            .fixed_pos(egui::pos2(view.right() - 10.0 - undo_w, view.top() + 10.0))
             .show(ui.ctx(), |aui| {
+                aui.spacing_mut().item_spacing.x = 8.0;
                 aui.horizontal(|aui| {
                     for (icon, tip, enabled, act) in [
                         (icons::UNDO, "Undo", can_undo, true),
                         (icons::REDO, "Redo", can_redo, false),
                     ] {
-                        let btn = egui::Button::new(egui::RichText::new(icon).size(20.0))
-                            .min_size(egui::vec2(48.0, 48.0))
-                            .corner_radius(24.0)
-                            .fill(egui::Color32::from_rgb(45, 55, 85));
-                        if aui.add_enabled(enabled, btn).on_hover_text(tip).clicked() {
-                            action = Some(act);
-                        }
+                        aui.add_enabled_ui(enabled, |aui| {
+                            if crate::theme::fab(aui, icon, crate::theme::fab_bg())
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                action = Some(act);
+                            }
+                        });
                     }
                 });
             });
@@ -5374,10 +5669,12 @@ impl ComfyApp {
             return;
         }
         // One slot above the menu/lock FAB so the stack reads queue-on-top.
-        let default = egui::pos2(pane.right() - 58.0, pane.bottom() - 58.0 - 56.0);
+        let edge = crate::theme::FAB_EDGE;
+        let step = crate::theme::FAB_STEP;
+        let default = egui::pos2(pane.right() - edge, pane.bottom() - edge - step);
         let mut pos = self.queue_fab_pos.unwrap_or(default);
-        pos.x = pos.x.clamp(pane.left() + 8.0, pane.right() - 52.0);
-        pos.y = pos.y.clamp(pane.top() + 8.0, pane.bottom() - 52.0);
+        pos.x = pos.x.clamp(pane.left() + 8.0, pane.right() - crate::theme::FAB_SIZE - 4.0);
+        pos.y = pos.y.clamp(pane.top() + 8.0, pane.bottom() - crate::theme::FAB_SIZE - 4.0);
 
         let can_queue = match kind {
             QueueFabKind::Create => self.can_queue_create().is_ok(),
@@ -5408,20 +5705,19 @@ impl ComfyApp {
                     "Queue".into()
                 };
                 let label = if jobs > 0 {
-                    egui::RichText::new(format!("{}{jobs}", icons::RUN)).size(18.0)
+                    format!("{}{jobs}", icons::RUN)
                 } else {
-                    egui::RichText::new(icons::RUN).size(22.0)
+                    icons::RUN.to_owned()
                 };
                 let fill = if jobs > 0 {
-                    egui::Color32::from_rgb(55, 90, 55)
+                    crate::theme::fab_bg_ok()
                 } else {
-                    egui::Color32::from_rgb(45, 55, 85)
+                    crate::theme::fab_bg()
                 };
-                let btn = egui::Button::new(label)
-                    .min_size(egui::vec2(48.0, 48.0))
-                    .corner_radius(24.0)
-                    .fill(fill);
-                let resp = ui.add_enabled(can_queue, btn).on_hover_text(tip);
+                let resp = ui
+                    .add_enabled_ui(can_queue, |ui| crate::theme::fab(ui, &label, fill))
+                    .inner
+                    .on_hover_text(tip);
                 if resp.dragged() {
                     let delta = resp.drag_delta();
                     if delta != egui::Vec2::ZERO {
@@ -5435,22 +5731,17 @@ impl ComfyApp {
             });
 
         if self.running {
-            let cancel_pos = egui::pos2(pos.x, (pos.y - 56.0).max(pane.top() + 8.0));
+            let cancel_pos = egui::pos2(pos.x, (pos.y - step).max(pane.top() + 8.0));
             egui::Area::new(egui::Id::new("cancel-fab"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(cancel_pos)
                 .show(ctx, |ui| {
-                    let stop_label = if jobs > 1 {
-                        egui::RichText::new(format!("{}{jobs}", icons::STOP)).size(18.0)
+                    let stop = if jobs > 1 {
+                        format!("{}{jobs}", icons::STOP)
                     } else {
-                        egui::RichText::new(icons::STOP).size(22.0)
+                        icons::STOP.to_owned()
                     };
-                    let btn = egui::Button::new(stop_label)
-                        .min_size(egui::vec2(48.0, 48.0))
-                        .corner_radius(24.0)
-                        .fill(egui::Color32::from_rgb(120, 55, 55));
-                    if ui
-                        .add(btn)
+                    if crate::theme::fab(ui, &stop, crate::theme::fab_bg_danger())
                         .on_hover_text(if jobs > 1 {
                             format!("Cancel all ({jobs} in flight)")
                         } else {
@@ -5483,13 +5774,15 @@ impl ComfyApp {
         if !pane.is_finite() || pane.width() < 80.0 {
             return;
         }
+        let edge = crate::theme::FAB_EDGE;
+        let step = crate::theme::FAB_STEP;
         let queue = self
             .queue_fab_pos
-            .unwrap_or(egui::pos2(pane.right() - 58.0, pane.bottom() - 58.0 - 56.0));
-        let default = egui::pos2(queue.x, queue.y + 56.0);
+            .unwrap_or(egui::pos2(pane.right() - edge, pane.bottom() - edge - step));
+        let default = egui::pos2(queue.x, queue.y + step);
         let mut pos = self.create_fab_pos.unwrap_or(default);
-        pos.x = pos.x.clamp(pane.left() + 8.0, pane.right() - 52.0);
-        pos.y = pos.y.clamp(pane.top() + 8.0, pane.bottom() - 52.0);
+        pos.x = pos.x.clamp(pane.left() + 8.0, pane.right() - crate::theme::FAB_SIZE - 4.0);
+        pos.y = pos.y.clamp(pane.top() + 8.0, pane.bottom() - crate::theme::FAB_SIZE - 4.0);
 
         let can_open_graph =
             self.params.missing_model_part().is_none() && self.schemas.is_some();
@@ -5529,7 +5822,7 @@ impl ComfyApp {
             let menu = egui::Area::new(egui::Id::new("create-fab-menu"))
                 .order(egui::Order::Foreground)
                 .pivot(egui::Align2::RIGHT_BOTTOM)
-                .fixed_pos(egui::pos2(pos.x + 48.0, pos.y - 8.0))
+                .fixed_pos(egui::pos2(pos.x + crate::theme::FAB_SIZE, pos.y - 8.0))
                 .constrain_to(pane.expand(4.0))
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
@@ -5626,16 +5919,12 @@ impl ComfyApp {
             .current_pos(pos)
             .show(ctx, |ui| {
                 let fill = if open {
-                    egui::Color32::from_rgb(70, 90, 140)
+                    crate::theme::fab_bg_on()
                 } else {
-                    egui::Color32::from_rgb(45, 55, 85)
+                    crate::theme::fab_bg()
                 };
                 let label = if open { icons::CHECK } else { icons::MENU };
-                let btn = egui::Button::new(egui::RichText::new(label).size(22.0))
-                    .min_size(egui::vec2(48.0, 48.0))
-                    .corner_radius(24.0)
-                    .fill(fill);
-                let resp = ui.add(btn).on_hover_text("Actions — drag to move");
+                let resp = crate::theme::fab(ui, label, fill).on_hover_text("Actions — drag to move");
                 if resp.dragged() {
                     let delta = resp.drag_delta();
                     if delta != egui::Vec2::ZERO {
@@ -5713,11 +6002,53 @@ impl ComfyApp {
         host.haptic(Haptic::Success);
     }
 
+    fn enter_graph_fullscreen(&mut self, host: &Host) {
+        self.graph_fullscreen = true;
+        self.graph_pane = GraphPane::Canvas;
+        self.graph_fs_portrait_since = None;
+        host.set_screen_orientation(ScreenOrientation::Landscape);
+    }
+
+    fn exit_graph_fullscreen(&mut self, host: &Host) {
+        self.graph_fullscreen = false;
+        self.graph_fs_portrait_since = None;
+        host.set_screen_orientation(ScreenOrientation::Unspecified);
+    }
+
     fn graph_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
+        // Auto-exit fullscreen when the device is tilted back to portrait for >0.4s.
+        if self.graph_fullscreen {
+            let now = ui.input(|i| i.time);
+            let near_portrait = device_orientation_deg().is_some_and(|d| {
+                let d = d.rem_euclid(360.0);
+                d < 25.0 || d > 335.0 || (d > 155.0 && d < 205.0)
+            });
+            if near_portrait {
+                let since = *self.graph_fs_portrait_since.get_or_insert(now);
+                if now - since > 0.4 {
+                    self.exit_graph_fullscreen(host);
+                }
+            } else {
+                self.graph_fs_portrait_since = None;
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+        }
+
+        // Back / Esc exits fullscreen (doesn't navigate away).
+        if self.graph_fullscreen
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            self.exit_graph_fullscreen(host);
+            return;
+        }
+
         let has_graph = self.has_graph_editor();
 
-        // Top: open workflow tabs only.
-        if has_graph {
+        // Top: open workflow tabs only (hidden in fullscreen).
+        if has_graph && !self.graph_fullscreen {
             ui.horizontal(|ui| {
                 self.graph_tabs_menu(ui);
             });
@@ -5735,7 +6066,8 @@ impl ComfyApp {
             return;
         }
 
-        // Bottom: File/Edit/View | Canvas/Properties.
+        // Bottom: File/Edit/View | Canvas/Properties | fullscreen toggle.
+        let fs = self.graph_fullscreen;
         egui::Panel::bottom("graph-controls").show(ui, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
@@ -5747,6 +6079,25 @@ impl ComfyApp {
                     GraphPane::Props,
                     format!("{} Properties", icons::PROPS),
                 );
+                // Fullscreen toggle (rightmost).
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (icon, tip) = if fs {
+                        (icons::FULLSCREEN_EXIT, "Exit fullscreen")
+                    } else {
+                        (icons::FULLSCREEN, "Fullscreen — landscape editor")
+                    };
+                    if ui
+                        .add(egui::Button::new(icon).min_size(egui::vec2(32.0, 0.0)))
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        if fs {
+                            self.exit_graph_fullscreen(host);
+                        } else {
+                            self.enter_graph_fullscreen(host);
+                        }
+                    }
+                });
             });
             ui.add_space(2.0);
         });
@@ -7391,10 +7742,12 @@ impl ComfyApp {
         }
 
         // While a long-press paint-select is in progress, dragging must select tiles, not scroll.
+        // Same when a View/menu popup is open — otherwise scrolls and holds bleed into the grid.
         let mut scroll = crate::theme::scroll_vertical()
             .id_salt("gallery_list")
             .auto_shrink([false, false]);
-        if self.sel_painting {
+        let menu_open = ui.ctx().any_popup_open();
+        if self.sel_painting || menu_open {
             use egui::containers::scroll_area::{DragScroll, ScrollSource};
             scroll = scroll.scroll_source(ScrollSource { drag: DragScroll::Never, ..Default::default() });
         }
@@ -7455,7 +7808,7 @@ impl ComfyApp {
 
     /// Pull-down at the top of the gallery list → refresh. Returns true when a refresh should run.
     fn gallery_pull_to_refresh(&mut self, ui: &egui::Ui) -> bool {
-        if self.sel_painting {
+        if self.sel_painting || ui.ctx().any_popup_open() {
             self.gallery_pull = 0.0;
             self.gallery_pull_tracking = false;
             return false;
@@ -7800,6 +8153,14 @@ impl ComfyApp {
     /// lifting then selects every tile it passes over (scroll is suppressed for that gesture). A
     /// drag that moves before the hold completes is a normal scroll and never paints.
     fn handle_gallery_gesture(&mut self, ui: &egui::Ui, host: &Host) {
+        // Menus sit above the grid but this handler reads raw pointer pos — ignore while any
+        // popup is open so Model/Album lists and hold-on-item don't paint-select tiles behind.
+        if ui.ctx().any_popup_open() {
+            self.sel_press = None;
+            self.sel_long_fired = false;
+            self.sel_painting = false;
+            return;
+        }
         let (down, pos, time) =
             ui.input(|i| (i.pointer.any_down(), i.pointer.interact_pos(), i.time));
         if !down {
@@ -7907,7 +8268,8 @@ impl ComfyApp {
                     if select_mode {
                         selection_overlay(ui, rect, selected);
                     }
-                    if clicked && !suppress_click {
+                    // Skip tile taps while a menu is open (same frame as an outside-dismiss).
+                    if clicked && !suppress_click && !ui.ctx().any_popup_open() {
                         if select_mode {
                             if selected {
                                 self.selected.remove(&item_key);
@@ -8783,6 +9145,215 @@ impl ComfyApp {
         }
         out
     }
+
+    /// External QNN model dir: internal documents dir's <pkg> → /storage/emulated/0/Android/data/<pkg>/files/qnn.
+    #[cfg(feature = "local-npu")]
+    fn qnn_model_dir(&self, host: &Host) -> Option<String> {
+        let docs = host.documents_dir()?;
+        let pkg = std::path::Path::new(&docs).parent()?.file_name()?.to_str()?.to_string();
+        Some(format!("/storage/emulated/0/Android/data/{pkg}/files/qnn"))
+    }
+
+    /// Spawn the D1 self-test on a worker thread; the report returns via the channel.
+    #[cfg(feature = "local-npu")]
+    fn start_d1_selftest(&mut self, ctx: &egui::Context, lib_dir: String, model_bin: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.d1_rx = Some(rx);
+        self.d1_running = true;
+        self.d1_ok = None;
+        self.log.info(format!("D1-SELFTEST starting (libs={lib_dir}, model={model_bin})"));
+        let cfg = local_sd::SelftestConfig {
+            system_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnSystem.so")),
+            backend_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnHtp.so")),
+            model_bin: std::path::PathBuf::from(model_bin),
+            skel_dir: Some(std::path::PathBuf::from(lib_dir)),
+            set_performance_mode: true,
+            graph: None,
+        };
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let report = local_sd::device_selftest(cfg);
+            let _ = tx.send(report);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drain a finished self-test, mirror its diagnostic to logcat, and keep it for the pane.
+    #[cfg(feature = "local-npu")]
+    fn poll_d1_selftest(&mut self) {
+        let Some(rx) = self.d1_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(report) => {
+                self.d1_rx = None;
+                self.d1_running = false;
+                self.d1_ok = Some(report.ok);
+                let pretty = report.pretty();
+                for line in pretty.lines() {
+                    self.log.info(format!("D1-SELFTEST {line}"));
+                }
+                self.d1_last = Some(pretty);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.d1_rx = None;
+                self.d1_running = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Spawn D2 text2img (CLIP + UNet + VAE) on a worker thread.
+    #[cfg(feature = "local-npu")]
+    fn start_d2_text2img(&mut self, ctx: &egui::Context, lib_dir: String, model_dir: String) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.d2_rx = Some(rx);
+        self.d2_running = true;
+        self.d2_ok = None;
+        self.log.info(format!("D2-TEXT2IMG starting (libs={lib_dir}, models={model_dir})"));
+        let cfg = local_sd::Text2ImgConfig {
+            system_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnSystem.so")),
+            backend_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnHtp.so")),
+            skel_dir: Some(std::path::PathBuf::from(lib_dir)),
+            unet_bin: std::path::PathBuf::from(format!("{model_dir}/unet.bin")),
+            vae_decoder_bin: std::path::PathBuf::from(format!("{model_dir}/vae_decoder.bin")),
+            tokenizer: std::path::PathBuf::from(format!("{model_dir}/tokenizer.json")),
+            clip_weights: std::path::PathBuf::from(format!("{model_dir}/clip.safetensors")),
+            output_png: std::path::PathBuf::from(format!("{model_dir}/d2-smoke.png")),
+            ..local_sd::Text2ImgConfig::default()
+        };
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let report = local_sd::device_text2img(cfg);
+            let _ = tx.send(report);
+            ctx.request_repaint();
+        });
+    }
+
+    #[cfg(feature = "local-npu")]
+    fn poll_d2_text2img(&mut self) {
+        let Some(rx) = self.d2_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(report) => {
+                self.d2_rx = None;
+                self.d2_running = false;
+                self.d2_ok = Some(report.ok);
+                let pretty = report.pretty();
+                for line in pretty.lines() {
+                    self.log.info(format!("D2-TEXT2IMG {line}"));
+                }
+                self.d2_last = Some(pretty);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.d2_rx = None;
+                self.d2_running = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Settings → Diagnostics: D1 NPU smoke + D2 text2img smoke.
+    #[cfg(feature = "local-npu")]
+    fn diagnostics_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let lib_dir = host.native_lib_dir();
+        let model_dir = self.qnn_model_dir(host);
+        let model_bin = model_dir.as_ref().map(|d| format!("{d}/unet.bin"));
+        let warn = egui::Color32::from_rgb(230, 180, 120);
+        let busy = self.d1_running || self.d2_running;
+        crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.heading("D1 NPU self-test");
+            ui.weak("Loads the APK-bundled QNN HTP libs + pushed unet.bin, runs one execute on the NPU.");
+            ui.group(|ui| {
+                if let Some(d) = lib_dir.as_deref() {
+                    ui.weak(format!("libs: {d}"));
+                } else {
+                    ui.colored_label(warn, "libs: nativeLibraryDir unavailable (not on device?)");
+                }
+                if let Some(m) = model_bin.as_deref() {
+                    ui.weak(format!("model: {m}"));
+                } else {
+                    ui.colored_label(warn, "model: documents dir unavailable");
+                }
+                ui.add_space(8.0);
+                let ready = lib_dir.is_some() && model_bin.is_some() && !busy;
+                let btn = egui::Button::new("Run D1 NPU self-test").min_size(egui::vec2(220.0, 34.0));
+                if ui.add_enabled(ready, btn).clicked()
+                    && let (Some(lib), Some(model)) = (lib_dir.clone(), model_bin.clone())
+                {
+                    self.start_d1_selftest(ui.ctx(), lib, model);
+                }
+                if self.d1_running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("running… (adb logcat -s comfyui)");
+                    });
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                }
+            });
+            if let Some(ok) = self.d1_ok {
+                ui.add_space(8.0);
+                let (c, t) = if ok {
+                    (egui::Color32::from_rgb(120, 220, 140), "PASSED")
+                } else {
+                    (egui::Color32::from_rgb(230, 120, 120), "FAILED")
+                };
+                ui.colored_label(c, format!("last run: {t}"));
+            }
+            if let Some(last) = &self.d1_last {
+                ui.add_space(4.0);
+                ui.group(|ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(last).monospace())
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+            }
+
+            ui.add_space(16.0);
+            ui.heading("D2 text2img smoke");
+            ui.weak("CLIP (CPU) + UNet/VAE (HTP). Needs unet.bin, vae_decoder.bin, tokenizer.json, clip.safetensors.");
+            ui.group(|ui| {
+                if let Some(d) = model_dir.as_deref() {
+                    ui.weak(format!("models: {d}"));
+                    ui.weak(format!("output: {d}/d2-smoke.png"));
+                } else {
+                    ui.colored_label(warn, "models: documents dir unavailable");
+                }
+                ui.add_space(8.0);
+                let ready = lib_dir.is_some() && model_dir.is_some() && !busy;
+                let btn = egui::Button::new("Run D2 text2img (8 steps)").min_size(egui::vec2(240.0, 34.0));
+                if ui.add_enabled(ready, btn).clicked()
+                    && let (Some(lib), Some(models)) = (lib_dir.clone(), model_dir.clone())
+                {
+                    self.start_d2_text2img(ui.ctx(), lib, models);
+                }
+                if self.d2_running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("running… (~1–3 min; adb logcat -s comfyui local_sd)");
+                    });
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                }
+            });
+            if let Some(ok) = self.d2_ok {
+                ui.add_space(8.0);
+                let (c, t) = if ok {
+                    (egui::Color32::from_rgb(120, 220, 140), "PASSED")
+                } else {
+                    (egui::Color32::from_rgb(230, 120, 120), "FAILED")
+                };
+                ui.colored_label(c, format!("last run: {t}"));
+            }
+            if let Some(last) = &self.d2_last {
+                ui.add_space(4.0);
+                ui.group(|ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(last).monospace())
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+            }
+        });
+    }
 }
 
 impl EguiApp for ComfyApp {
@@ -8825,6 +9396,10 @@ impl EguiApp for ComfyApp {
                 p.auto_paused = false;
             }
         }
+        #[cfg(feature = "local-npu")]
+        self.poll_d1_selftest();
+        #[cfg(feature = "local-npu")]
+        self.poll_d2_text2img();
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
         if self.log_lines.len() > logger::MAX_LINES {
             let excess = self.log_lines.len() - logger::MAX_LINES;
@@ -8851,6 +9426,23 @@ impl EguiApp for ComfyApp {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.inpaint_overlay(ui, host));
             return;
+        }
+
+        // Graph fullscreen: hide nav bar + progress, give the whole screen to graph_tab.
+        if self.graph_fullscreen && self.tab == Tab::Graph {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.graph_tab(ui, host));
+            self.app_picker_window(ui.ctx(), host);
+            self.publish_window(ui.ctx(), host);
+            if self.running || self.queue_remaining > 0 {
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+            return;
+        }
+        // If fullscreen was active but the user navigated away, release the lock.
+        if self.graph_fullscreen {
+            self.exit_graph_fullscreen(host);
         }
 
         // Navigation sits at the bottom, within thumb reach. Panels are laid out before the

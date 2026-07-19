@@ -3,7 +3,10 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use cargo_egui_android::{BuildArgs, RunArgs, cmd_adb_connect, cmd_build, cmd_env, cmd_new, cmd_run};
+use cargo_egui_android::{
+    BuildArgs, LogcatArgs, RunArgs, cmd_adb_connect, cmd_build, cmd_env, cmd_logcat, cmd_new,
+    cmd_run,
+};
 
 #[derive(Parser)]
 #[command(bin_name = "cargo")]
@@ -39,6 +42,8 @@ enum Cmd {
         /// Phone address, e.g. `192.168.1.20` or `192.168.1.20:5555`.
         host: String,
     },
+    /// Stream filtered device logs (`adb logcat`) with the resolved SDK env.
+    Logcat(LogcatArgs),
     /// Print shell exports for SDK/NDK/JDK/Kotlin (for bare `cargo apk2`).
     Env,
 }
@@ -54,6 +59,7 @@ fn main() -> Result<()> {
         Cmd::Build(a) => cmd_build(&a),
         Cmd::Run(a) => cmd_run(&a),
         Cmd::AdbConnect { host } => cmd_adb_connect(&host),
+        Cmd::Logcat(a) => cmd_logcat(&a),
         Cmd::Env => cmd_env(),
     }
 }

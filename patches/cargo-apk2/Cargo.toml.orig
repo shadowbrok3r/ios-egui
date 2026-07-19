@@ -1,0 +1,28 @@
+[package]
+name = "cargo-apk2"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Cargo extension for building Android apps easily"
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+android-build.workspace = true
+anyhow.workspace = true
+cargo-subcommand.workspace = true
+dunce.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dependencies.ndk-build2]
+path = "../ndk-build2"
+version = "1.3"
+
+[dependencies.clap]
+workspace = true
+features = ["derive"]

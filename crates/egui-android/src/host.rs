@@ -38,6 +38,11 @@ const K_REQ_NOTIF_PERM: i32 = 103;
 const K_SAVE_GALLERY: i32 = 104;
 const K_REQ_MEDIA_PERM: i32 = 105;
 const K_SHARE_MEDIA: i32 = 106;
+const K_SET_ORIENTATION: i32 = 107;
+
+// ActivityInfo.SCREEN_ORIENTATION_* constants.
+const SCREEN_ORIENTATION_UNSPECIFIED: i32 = -1;
+const SCREEN_ORIENTATION_SENSOR_LANDSCAPE: i32 = 4;
 
 // Pending permission checks: (core permission index, android permission string, frames left).
 static PENDING_PERMS: Mutex<Vec<(usize, String, u32)>> = Mutex::new(Vec::new());
@@ -108,6 +113,7 @@ pub fn drain(host: &Host) {
             K_REQ_MEDIA_PERM => {
                 start_settings_for_package("android.settings.APPLICATION_DETAILS_SETTINGS")
             }
+            K_SET_ORIENTATION => jni_set_orientation(host.drv_int()),
             other => log::info!("egui-android: host request kind {other} not handled"),
         }
     }
@@ -1037,6 +1043,40 @@ fn ime_inset_px() -> Option<f32> {
     }
 }
 
+/// Call `Activity.setRequestedOrientation(value)`.
+fn jni_set_orientation(value: i32) {
+    with_native_activity(|env, activity| {
+        env.call_method(activity, "setRequestedOrientation", "(I)V", &[JValue::Int(value)])?;
+        Ok(())
+    });
+}
+
+/// Gravity-sensor roll in degrees, sampled once per call. Returns `None` on non-Android or when
+/// the sensor is unavailable. Roll ≈ 0/±180 → portrait; ≈ ±90 → landscape.
+pub fn device_orientation_deg() -> Option<f32> {
+    with_native_activity(|env, activity| {
+        // Context.getSystemService("window") → WindowManager.getDefaultDisplay() → Display.getRotation()
+        // Rotation: 0 = portrait, 1 = landscape, 2 = reverse-portrait, 3 = reverse-landscape.
+        let wm_str = env.new_string("window")?;
+        let wm = env
+            .call_method(activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[(&wm_str).into()])?
+            .l()?;
+        let display = env
+            .call_method(&wm, "getDefaultDisplay", "()Landroid/view/Display;", &[])?
+            .l()?;
+        let rotation = env.call_method(&display, "getRotation", "()I", &[])?.i()?;
+        // Map Android rotation constant to approximate degree so the app can detect portrait.
+        let deg = match rotation {
+            0 => 0.0_f32,
+            1 => 90.0,
+            2 => 180.0,
+            3 => 270.0,
+            _ => 0.0,
+        };
+        Ok(deg)
+    })
+}
+
 // Insets are read via `Resources` (Context method, thread-safe) rather than the View hierarchy —
 // `getRootWindowInsets`/`getDecorView` are View methods that MUST run on the UI thread and throw
 // `CalledFromWrongThreadException` from the render thread. `status_bar_height` covers the top
@@ -1273,6 +1313,44 @@ fn jni_can_draw_overlays() -> Option<bool> {
     })
 }
 
+/// Whether the device reports a built-in stylus: Samsung S-Pen (`com.sec.feature.spen_usp`) or the
+/// standard bundled-stylus feature (`android.hardware.stylus`, API 34+).
+fn jni_has_stylus() -> Option<bool> {
+    with_activity(|env, activity| {
+        let pm = env
+            .call_method(
+                activity,
+                "getPackageManager",
+                "()Landroid/content/pm/PackageManager;",
+                &[],
+            )?
+            .l()?;
+        for feat in ["com.sec.feature.spen_usp", "android.hardware.stylus"] {
+            let jfeat = env.new_string(feat)?;
+            let has = env
+                .call_method(&pm, "hasSystemFeature", "(Ljava/lang/String;)Z", &[(&jfeat).into()])?
+                .z()?;
+            if has {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+}
+
+/// `ApplicationInfo.nativeLibraryDir`: the APK's extracted lib dir, the only path a non-rooted
+/// device can `dlopen` bundled `.so` from.
+fn jni_native_lib_dir() -> Option<String> {
+    with_activity(|env, activity| {
+        let app_info = env
+            .call_method(activity, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", &[])?
+            .l()?;
+        let dir = env.get_field(&app_info, "nativeLibraryDir", "Ljava/lang/String;")?.l()?;
+        let s: JString = dir.into();
+        Ok(env.get_string(&s)?.into())
+    })
+}
+
 fn jni_version_code() -> Option<i64> {
     with_activity(|env, activity| {
         let pm = env
@@ -1297,10 +1375,21 @@ fn jni_version_code() -> Option<i64> {
     })
 }
 
+/// Screen-orientation request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ScreenOrientation {
+    /// Let the system decide (back to normal).
+    Unspecified,
+    /// Lock to landscape (sensor-allowed flip between natural and reverse).
+    Landscape,
+}
+
 /// Android-only host capabilities beyond the common cross-platform surface. Import with
 /// `use egui_android::HostExt;`. On iOS these methods do not exist (compile error), so keep
 /// Android-only calls behind `#[cfg(target_os = "android")]` in shared app code.
 pub trait HostExt {
+    /// Lock or release the screen orientation. See [`ScreenOrientation`].
+    fn set_screen_orientation(&self, o: ScreenOrientation);
     /// Install an APK on disk (self-update / sideload). Requires `REQUEST_INSTALL_PACKAGES` and
     /// the same signing key + `versionCode >=` current. Shows the system confirm dialog.
     fn self_update(&self, apk_path: impl Into<String>);
@@ -1345,9 +1434,37 @@ pub trait HostExt {
     fn clipboard_has_text(&self) -> bool {
         false
     }
+    /// Whether the device reports a built-in stylus (Samsung S-Pen or the standard bundled-stylus
+    /// feature). Device capability only: the winit input path forwards touch pressure but not
+    /// per-event tool type, so this is not live pointer data.
+    fn has_stylus(&self) -> bool {
+        false
+    }
+    /// This app's `ApplicationInfo.nativeLibraryDir` — the APK-bundled lib dir. `None` off-device.
+    /// The only directory bundled `.so` (e.g. QNN HTP libs) can be `dlopen`'d from on non-rooted
+    /// Android.
+    fn native_lib_dir(&self) -> Option<String> {
+        None
+    }
+    /// Live pointer probe from the android-activity input side channel, sampled at motion-event
+    /// dispatch (winit drops tool type + hover). Returns `(tool, hover_px, buttons)`: `tool` is
+    /// 0 unknown / 1 finger / 2 stylus / 3 mouse / 4 eraser / 5 palm; `hover_px` is the hover
+    /// position in window physical pixels (pen near, not touching); `buttons` is the raw
+    /// button-state bitfield (stylus-primary `0x20`, stylus-secondary `0x40`).
+    fn stylus_probe(&self) -> (u8, Option<(f32, f32)>, u32) {
+        (0, None, 0)
+    }
 }
 
 impl HostExt for Host {
+    fn set_screen_orientation(&self, o: ScreenOrientation) {
+        let v = match o {
+            ScreenOrientation::Unspecified => SCREEN_ORIENTATION_UNSPECIFIED,
+            ScreenOrientation::Landscape => SCREEN_ORIENTATION_SENSOR_LANDSCAPE,
+        };
+        self.drv_enqueue(K_SET_ORIENTATION, None, None, v);
+    }
+
     fn self_update(&self, apk_path: impl Into<String>) {
         self.drv_enqueue(K_SELF_UPDATE, Some(apk_path.into()), None, 0);
     }
@@ -1399,5 +1516,23 @@ impl HostExt for Host {
     }
     fn clipboard_has_text(&self) -> bool {
         clipboard_has_text()
+    }
+    fn has_stylus(&self) -> bool {
+        jni_has_stylus().unwrap_or(false)
+    }
+    fn native_lib_dir(&self) -> Option<String> {
+        jni_native_lib_dir()
+    }
+    fn stylus_probe(&self) -> (u8, Option<(f32, f32)>, u32) {
+        let p = android_activity::input::pointer_probe();
+        let tool = match p.tool {
+            android_activity::input::PointerTool::Finger => 1,
+            android_activity::input::PointerTool::Stylus => 2,
+            android_activity::input::PointerTool::Mouse => 3,
+            android_activity::input::PointerTool::Eraser => 4,
+            android_activity::input::PointerTool::Palm => 5,
+            android_activity::input::PointerTool::Unknown => 0,
+        };
+        (tool, p.hover, p.buttons)
     }
 }

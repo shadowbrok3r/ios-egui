@@ -28,5 +28,7 @@ mod workflow;
 
 #[cfg(target_os = "android")]
 mod app;
+#[cfg(feature = "local-npu")]
+mod local_engine;
 #[cfg(target_os = "android")]
 mod player;

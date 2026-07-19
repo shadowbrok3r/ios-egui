@@ -29,6 +29,14 @@ pub use egui_android::app;
 #[cfg(target_os = "android")]
 pub use egui_android::HostExt;
 
+/// Screen orientation lock (landscape / unspecified).
+#[cfg(target_os = "android")]
+pub use egui_android::ScreenOrientation;
+
+/// Current display rotation in degrees (0 = portrait, 90 = landscape, …).
+#[cfg(target_os = "android")]
+pub use egui_android::device_orientation_deg;
+
 /// Android-only frame-accurate video decoding (MediaMetadataRetriever) for in-app playback.
 #[cfg(target_os = "android")]
 pub use egui_android::video;

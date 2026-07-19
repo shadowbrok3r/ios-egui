@@ -15,11 +15,12 @@ members = [
     "crates/plugin-host",
     "crates/plugin-sdk",
     "crates/qnn-rs",
+    "crates/local-sd",
     "examples/hello/rust",
     "examples/desktop-host",
     "examples/plugins-ios/rust",
 ]
-exclude = ["template", "template-plugin", "plugins"]
+exclude = ["template", "template-plugin", "plugins", "patches/ndk-build2", "patches/cargo-apk2"]
 # egui-android only builds for android targets (android-activity/eframe-android), so it is a
 # member (buildable via `cargo ndk -p egui-android`) but excluded from the default host build.
 default-members = [
@@ -66,15 +67,6 @@ log = "0.4"
 toml = "1"
 egui-ios-plugin-abi = { path = "crates/plugin-abi" }
 egui-ios-plugin-host = { path = "crates/plugin-host" }
-egui-ios-plugin-sdk = { path = "crates/plugin-sdk" }
 egui-mobile-core = { path = "crates/egui-mobile-core" }
 egui-ios = { path = "crates/egui-ios" }
 egui-android = { path = "crates/egui-android" }
-
-# wasmtime compiles plugin modules at runtime; keep the compiler fast even in dev builds.
-[profile.dev.package.cranelift-codegen]
-opt-level = 2
-[profile.dev.package.regalloc2]
-opt-level = 2
-[profile.dev.package.pulley-interpreter]
-opt-level = 2

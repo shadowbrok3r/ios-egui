@@ -19,13 +19,15 @@ impl MaskCanvas {
     }
 
     /// Stamp feathered discs from `from` to `to` (uv 0..1) at ~radius/2 spacing.
-    /// Paint max-blends toward 255; erase min-blends toward 0. `soft` is the feather fraction.
+    /// Paint max-blends toward `intensity`*255; erase min-blends toward 0. `soft` is the feather
+    /// fraction; `intensity` (0..1) scales coverage for pressure-sensitive strokes.
     pub fn stroke(
         &mut self,
         from: (f32, f32),
         to: (f32, f32),
         radius_uv: f32,
         soft: f32,
+        intensity: f32,
         erase: bool,
     ) {
         let r = radius_uv.max(0.0);
@@ -38,13 +40,14 @@ impl MaskCanvas {
         let count = (len / step).ceil().max(1.0) as u32;
         for i in 0..=count {
             let t = i as f32 / count as f32;
-            self.stamp(from.0 + dx * t, from.1 + dy * t, r, soft, erase);
+            self.stamp(from.0 + dx * t, from.1 + dy * t, r, soft, intensity, erase);
         }
     }
 
-    /// One feathered disc centered at (cx, cy) in uv space.
-    fn stamp(&mut self, cx: f32, cy: f32, r: f32, soft: f32, erase: bool) {
+    /// One feathered disc centered at (cx, cy) in uv space, coverage scaled by `intensity`.
+    fn stamp(&mut self, cx: f32, cy: f32, r: f32, soft: f32, intensity: f32, erase: bool) {
         let (w, h) = (self.w as f32, self.h as f32);
+        let k = intensity.clamp(0.0, 1.0);
         let inner = r * (1.0 - soft.clamp(0.0, 1.0));
         let min_x = (((cx - r) * w).floor() as i64).clamp(0, self.w as i64 - 1) as u32;
         let max_x = (((cx + r) * w).ceil() as i64).clamp(0, self.w as i64 - 1) as u32;
@@ -58,11 +61,12 @@ impl MaskCanvas {
                 if d > r {
                     continue;
                 }
-                let a = if d <= inner || r <= inner {
+                let cov = if d <= inner || r <= inner {
                     1.0
                 } else {
                     1.0 - (d - inner) / (r - inner)
                 };
+                let a = cov * k;
                 let idx = py as usize * self.w as usize + px as usize;
                 if erase {
                     self.buf[idx] = self.buf[idx].min(((1.0 - a) * 255.0).round() as u8);
@@ -96,6 +100,7 @@ pub struct StrokeRec {
     pub to: (f32, f32),
     pub radius_uv: f32,
     pub soft: f32,
+    pub intensity: f32,
     pub erase: bool,
 }
 
@@ -103,9 +108,49 @@ pub struct StrokeRec {
 pub fn rasterize(w: u32, h: u32, strokes: &[StrokeRec]) -> MaskCanvas {
     let mut canvas = MaskCanvas::new(w, h);
     for s in strokes {
-        canvas.stroke(s.from, s.to, s.radius_uv, s.soft, s.erase);
+        canvas.stroke(s.from, s.to, s.radius_uv, s.soft, s.intensity, s.erase);
     }
     canvas
+}
+
+/// A brush shaped by pointer pressure: `radius_uv` and mask `intensity` (0..1).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Brush {
+    pub radius_uv: f32,
+    pub intensity: f32,
+}
+
+/// Shape `base_radius_uv` by pointer `force` (0..1, from `egui::Event::Touch`). No force keeps the
+/// full radius and intensity; light contact paints thinner and fainter down to a fixed floor.
+pub fn pressure_brush(base_radius_uv: f32, force: Option<f32>) -> Brush {
+    match force {
+        Some(f) => {
+            let p = f.clamp(0.0, 1.0);
+            Brush { radius_uv: base_radius_uv * (0.4 + 0.6 * p), intensity: 0.35 + 0.65 * p }
+        }
+        None => Brush { radius_uv: base_radius_uv, intensity: 1.0 },
+    }
+}
+
+/// Pointer tool as seen by the paint surface, surfaced from the android-activity motion-event
+/// side channel (`getToolType`). `Unknown` covers pre-first-event and non-touch pointers.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PointerKind {
+    Finger,
+    Stylus,
+    Eraser,
+    Palm,
+    Mouse,
+    Unknown,
+}
+
+/// Whether a paint stroke from `kind` is accepted under `stylus_only`. Rejects finger and palm
+/// contacts; stylus, eraser, mouse, and unknown are accepted.
+pub fn accept_paint(kind: PointerKind, stylus_only: bool) -> bool {
+    if !stylus_only {
+        return true;
+    }
+    !matches!(kind, PointerKind::Finger | PointerKind::Palm)
 }
 
 /// Decode `src_image` (PNG/JPEG), set each pixel's alpha to 255 minus the sampled mask, re-encode PNG.
@@ -144,21 +189,21 @@ mod tests {
     #[test]
     fn stroke_covers_center_and_erase_clears() {
         let mut c = MaskCanvas::new(16, 16);
-        c.stroke((0.1, 0.5), (0.9, 0.5), 0.15, 0.3, false);
+        c.stroke((0.1, 0.5), (0.9, 0.5), 0.15, 0.3, 1.0, false);
         assert!(!c.is_empty());
         // A pixel on the stroke line is painted; a corner far away is not.
         assert!(c.buf[8 * 16 + 8] > 0);
         assert_eq!(c.buf[0], 0);
         // Erasing the same path clears the painted pixels.
-        c.stroke((0.1, 0.5), (0.9, 0.5), 0.2, 0.0, true);
+        c.stroke((0.1, 0.5), (0.9, 0.5), 0.2, 0.0, 1.0, true);
         assert_eq!(c.buf[8 * 16 + 8], 0);
     }
 
     #[test]
     fn rasterize_is_deterministic() {
         let strokes = vec![
-            StrokeRec { from: (0.2, 0.2), to: (0.8, 0.8), radius_uv: 0.2, soft: 0.4, erase: false },
-            StrokeRec { from: (0.8, 0.2), to: (0.2, 0.8), radius_uv: 0.1, soft: 0.2, erase: false },
+            StrokeRec { from: (0.2, 0.2), to: (0.8, 0.8), radius_uv: 0.2, soft: 0.4, intensity: 1.0, erase: false },
+            StrokeRec { from: (0.8, 0.2), to: (0.2, 0.8), radius_uv: 0.1, soft: 0.2, intensity: 1.0, erase: false },
         ];
         let a = rasterize(24, 24, &strokes);
         let b = rasterize(24, 24, &strokes);
@@ -169,11 +214,55 @@ mod tests {
     }
 
     #[test]
+    fn intensity_scales_painted_value() {
+        let c = 8 * 16 + 8;
+        let mut full = MaskCanvas::new(16, 16);
+        full.stroke((0.5, 0.5), (0.5, 0.5), 0.3, 0.0, 1.0, false);
+        let mut half = MaskCanvas::new(16, 16);
+        half.stroke((0.5, 0.5), (0.5, 0.5), 0.3, 0.0, 0.5, false);
+        assert_eq!(full.buf[c], 255);
+        // Half intensity halves the covered center value (soft 0 → coverage 1 * 0.5).
+        assert_eq!(half.buf[c], 128);
+    }
+
+    #[test]
+    fn pressure_brush_scales_with_force() {
+        let base = 0.1;
+        let none = pressure_brush(base, None);
+        assert_eq!(none.radius_uv, base);
+        assert_eq!(none.intensity, 1.0);
+        let light = pressure_brush(base, Some(0.0));
+        let hard = pressure_brush(base, Some(1.0));
+        // Harder press → larger radius and higher intensity, bounded by base / full.
+        assert!(light.radius_uv < hard.radius_uv);
+        assert!(light.intensity < hard.intensity);
+        assert!(light.radius_uv > 0.0 && hard.radius_uv <= base + 1e-6);
+        assert!(hard.intensity <= 1.0 + 1e-6 && light.intensity >= 0.0);
+        // Out-of-range force clamps to the full-press brush.
+        assert_eq!(pressure_brush(base, Some(2.0)), hard);
+    }
+
+    #[test]
+    fn stylus_only_gates_finger_and_palm() {
+        use PointerKind::*;
+        // Off: everything paints.
+        assert!(accept_paint(Finger, false));
+        assert!(accept_paint(Palm, false));
+        // On: finger and palm rejected; stylus/eraser/mouse/unknown accepted.
+        assert!(!accept_paint(Finger, true));
+        assert!(!accept_paint(Palm, true));
+        assert!(accept_paint(Stylus, true));
+        assert!(accept_paint(Eraser, true));
+        assert!(accept_paint(Mouse, true));
+        assert!(accept_paint(Unknown, true));
+    }
+
+    #[test]
     fn bake_alpha_inverts_mask_over_png_and_jpeg() {
         // PNG in: left half masked -> left alpha 0, right alpha 255; RGB preserved.
         let png = encode([200, 40, 40], 8, 8, image::ImageFormat::Png);
         let mut mask = MaskCanvas::new(8, 8);
-        mask.stroke((0.0, 0.5), (0.25, 0.5), 0.5, 0.0, false);
+        mask.stroke((0.0, 0.5), (0.25, 0.5), 0.5, 0.0, 1.0, false);
         let baked = bake_alpha(&png, &mask).unwrap();
         assert_eq!(&baked[..4], &[0x89, 0x50, 0x4E, 0x47]);
         let out = image::load_from_memory(&baked).unwrap().to_rgba8();

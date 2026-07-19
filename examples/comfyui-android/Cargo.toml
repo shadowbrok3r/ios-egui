@@ -19,6 +19,9 @@ tls = [
     "dep:webpki-roots",
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
+# On-device Qualcomm HTP NPU (D1/D2 diagnostics + Create-tab Local NPU). Off by default;
+# pulls local-sd (candle CPU + qnn-rs). Build with `cargo ndk ... --features tls,local-npu`.
+local-npu = ["dep:local-sd"]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
@@ -54,6 +57,8 @@ log = "0.4"
 # platform trust store / JNI. ring cross-compiles cleanly with the NDK.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "0.26", optional = true }
+# On-device SD1.5 / D1 NPU self-test (feature `local-npu`). Heavy (candle); kept optional.
+local-sd = { path = "../../crates/local-sd", optional = true }
 
 [dev-dependencies]
 skrifa = "0.42"
@@ -63,6 +68,22 @@ skrifa = "0.42"
 package = "com.example.comfyui"
 # Hidden EditText InputConnection (Gboard spacebar trackpad) — shared with egui-android.
 java_sources = "../../crates/egui-android/java"
+# QNN HTP NPU libs (qnn-rs D1). Proprietary QAIRT .so are NOT in-repo; scripts/qnn-stage-libs.sh
+# populates qnn-runtime-libs/arm64-v8a/ before deploy. cargo-apk2 bundles `<folder>/arm64-v8a/*.so`
+# into the APK's lib/arm64-v8a/. From /path/to/qairt/<ver>/:
+#   lib/aarch64-android/libQnnHtp.so          — HTP backend (Backend::load target)
+#   lib/aarch64-android/libQnnSystem.so       — metadata parse (QnnSystem::load target)
+#   lib/aarch64-android/libQnnHtpV81Stub.so   — V81 CPU-side stub (S26 Ultra / SM8850 / HTP V81)
+#   lib/aarch64-android/libQnnHtpPrepare.so   — optional (only for on-device graph prepare)
+#   lib/hexagon-v81/unsigned/libQnnHtpV81Skel.so — the DSP skel (FastRPC loads it on the NSP)
+#   <NDK>/.../sysroot/usr/lib/aarch64-linux-android/libc++_shared.so — QNN links the C++ runtime
+# runtime_libs only applies at APK package time, so `cargo ndk check` passes even when the folder
+# is empty/missing; scripts/qnn-stage-libs.sh must populate it before `cargo egui-mobile run`.
+runtime_libs = "qnn-runtime-libs"
+# The skel must be a real file on disk for FastRPC to load it, so the APK sets
+# android:extractNativeLibs="true" (see [package.metadata.android.application]). Before loading
+# libQnnHtp.so, call qnn_rs::prepare_htp_env(native_lib_dir) to point
+# ADSP_LIBRARY_PATH/DSP_LIBRARY_PATH/LD_LIBRARY_PATH at it (skel_dir = nativeLibraryDir).
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -76,6 +97,13 @@ keystore_password = "android"
 [package.metadata.android.application]
 label = "ComfyUI"
 has_code = true
+# Unpack bundled .so to nativeLibraryDir so FastRPC can load libQnnHtpV81Skel.so from a real path.
+extract_native_libs = true
+# Vendor FastRPC (CDSP). Required on targetSdk 31+ so enable_unsigned_pd can dlopen it
+# before HTP loads the unsigned skel (without this: deviceCreate 0x36b1 / QnnDsp err 4000).
+[[package.metadata.android.application.uses_native_library]]
+name = "libcdsprpc.so"
+required = false
 
 # EguiNativeActivity hosts a hidden EditText for real IME InputConnection (spacebar cursor).
 [[package.metadata.android.application.activity]]

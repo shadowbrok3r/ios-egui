@@ -1131,6 +1131,9 @@ pub struct Settings {
     /// Create Main: companions & image source block is expanded (same block, persisted separately).
     #[serde(default = "default_true")]
     pub create_companions_open: bool,
+    /// Route Create Queue through on-device HTP (feature `local-npu`); ignores remote ComfyUI.
+    #[serde(default)]
+    pub local_npu: bool,
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),

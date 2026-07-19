@@ -2,7 +2,7 @@
 //! over an mpsc channel. [`Host`] is main-thread only, so the worker never touches it — it wakes
 //! the UI with a cloned [`egui::Context`] and the UI applies effects (haptics, notifications).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -149,6 +149,9 @@ pub struct Engine {
     inflight: Arc<AtomicUsize>,
     ws_task: Option<tokio::task::JoinHandle<()>>,
     current_prompt: CurrentPrompt,
+    /// Shared cancel flag for local-npu `spawn_blocking` jobs (tokio abort alone won't stop them).
+    #[cfg(feature = "local-npu")]
+    local_cancel: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -172,6 +175,8 @@ impl Engine {
             inflight: Arc::new(AtomicUsize::new(0)),
             ws_task: None,
             current_prompt: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "local-npu")]
+            local_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -351,6 +356,8 @@ impl Engine {
 
     /// Abort all local generate/graph jobs (the server may keep finishing queued prompts).
     pub fn cancel(&mut self) {
+        #[cfg(feature = "local-npu")]
+        self.local_cancel.store(true, Ordering::SeqCst);
         for h in self.jobs.drain(..) {
             h.abort();
         }
@@ -359,6 +366,22 @@ impl Engine {
         self.log.warn("generation cancelled locally");
         let _ = self.tx.send(Msg::Cancelled);
         self.ctx.request_repaint();
+    }
+
+    /// Queue an on-device HTP text2img (feature `local-npu`). Uses `spawn_blocking` so the NPU
+    /// work doesn't starve the async runtime; cancel is cooperative via [`Self::cancel`].
+    #[cfg(feature = "local-npu")]
+    pub fn generate_local(&mut self, paths: crate::local_engine::LocalPaths, params: Params) {
+        self.local_cancel.store(false, Ordering::SeqCst);
+        let cancel = self.local_cancel.clone();
+        let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
+        let inflight = self.inflight.clone();
+        inflight.fetch_add(1, Ordering::SeqCst);
+        self.reap_jobs();
+        self.jobs.push(self.rt.spawn_blocking(move || {
+            crate::local_engine::run(paths, params, tx, ctx, log, cancel);
+            inflight.fetch_sub(1, Ordering::SeqCst);
+        }));
     }
 
     fn reap_jobs(&mut self) {

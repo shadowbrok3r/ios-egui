@@ -52,6 +52,31 @@ impl DataType {
         }
     }
 
+    /// Raw QNN enum value for this type, inverse of `from_raw`.
+    pub fn to_raw(self) -> ffi::Qnn_DataType_t {
+        use ffi::Qnn_DataType_t as D;
+        match self {
+            DataType::Int8 => D::QNN_DATATYPE_INT_8,
+            DataType::Int16 => D::QNN_DATATYPE_INT_16,
+            DataType::Int32 => D::QNN_DATATYPE_INT_32,
+            DataType::Int64 => D::QNN_DATATYPE_INT_64,
+            DataType::UInt8 => D::QNN_DATATYPE_UINT_8,
+            DataType::UInt16 => D::QNN_DATATYPE_UINT_16,
+            DataType::UInt32 => D::QNN_DATATYPE_UINT_32,
+            DataType::UInt64 => D::QNN_DATATYPE_UINT_64,
+            DataType::Float16 => D::QNN_DATATYPE_FLOAT_16,
+            DataType::Float32 => D::QNN_DATATYPE_FLOAT_32,
+            DataType::SFixedPoint8 => D::QNN_DATATYPE_SFIXED_POINT_8,
+            DataType::SFixedPoint16 => D::QNN_DATATYPE_SFIXED_POINT_16,
+            DataType::SFixedPoint32 => D::QNN_DATATYPE_SFIXED_POINT_32,
+            DataType::UFixedPoint8 => D::QNN_DATATYPE_UFIXED_POINT_8,
+            DataType::UFixedPoint16 => D::QNN_DATATYPE_UFIXED_POINT_16,
+            DataType::UFixedPoint32 => D::QNN_DATATYPE_UFIXED_POINT_32,
+            DataType::Bool8 => D::QNN_DATATYPE_BOOL_8,
+            DataType::Other(v) => D(v),
+        }
+    }
+
     /// Byte width of one element, or None for sub-byte/opaque types.
     pub fn byte_width(self) -> Option<u32> {
         Some(match self {

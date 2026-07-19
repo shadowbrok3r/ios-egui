@@ -32,6 +32,18 @@ pub enum Error {
     #[error("malformed context binary metadata: {0}")]
     Malformed(&'static str),
 
+    #[error("graph '{0}' not found in context binary")]
+    GraphNotFound(String),
+
+    #[error("no input provided for tensor '{0}'")]
+    MissingInput(String),
+
+    #[error("tensor '{name}': expected {expected} elements, got {got}")]
+    ShapeMismatch { name: String, expected: u64, got: usize },
+
+    #[error("unsupported {kind} data type {dtype:?} for tensor '{name}'")]
+    UnsupportedDataType { kind: &'static str, name: String, dtype: crate::types::DataType },
+
     #[error("device execution is not implemented on host; this is on-device milestone D1")]
     Unimplemented,
 }

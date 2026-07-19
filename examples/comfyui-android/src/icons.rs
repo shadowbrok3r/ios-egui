@@ -39,6 +39,11 @@ pub const CHECK: &str = "✔";
 pub const CLOSE: &str = "✖";
 pub const MENU: &str = "☰";
 pub const STAR: &str = "⭐";
+pub const STYLUS: &str = "✏";
+pub const ERASE: &str = "🗙";
+pub const BUG: &str = "🐛";
+pub const FULLSCREEN: &str = "⛶";
+pub const FULLSCREEN_EXIT: &str = "⛶";
 
 /// Every icon constant, for the font-coverage test.
 #[cfg(test)]
@@ -75,6 +80,11 @@ const ALL: &[(&str, &str)] = &[
     ("CLOSE", CLOSE),
     ("MENU", MENU),
     ("STAR", STAR),
+    ("STYLUS", STYLUS),
+    ("ERASE", ERASE),
+    ("BUG", BUG),
+    ("FULLSCREEN", FULLSCREEN),
+    ("FULLSCREEN_EXIT", FULLSCREEN_EXIT),
 ];
 
 #[cfg(test)]

@@ -1,2 +1,2 @@
-# Proprietary QNN/QAIRT .so libs, staged by scripts/qnn-stage-libs.sh.
-*.so
+*
+!.gitignore

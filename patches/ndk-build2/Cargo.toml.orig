@@ -1,0 +1,25 @@
+[package]
+name = "ndk-build2"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Utilities for building Android binaries"
+license.workspace = true
+keywords.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+android-build.workspace = true
+dirs.workspace = true
+dunce.workspace = true
+thiserror.workspace = true
+which.workspace = true
+
+[dependencies.serde]
+workspace = true
+features = ["derive"]
+
+[dependencies.quick-xml]
+workspace = true
+features = ["serialize"]

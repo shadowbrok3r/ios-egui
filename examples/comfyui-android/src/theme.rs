@@ -6,7 +6,7 @@
 //! warnings and pink errors. Spacing stays touch-sized rather than the source's desktop density.
 
 use egui::containers::scroll_area::ScrollBarVisibility;
-use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle};
+use egui::{Color32, CornerRadius, FontFamily, FontId, Sense, Stroke, TextStyle};
 
 use crate::types::FontSizes;
 
@@ -16,6 +16,78 @@ fn rgb(r: u8, g: u8, b: u8) -> Color32 {
 
 fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
+}
+
+/// Circular floating-action diameter (queue, create menu, lock, undo, inpaint tools).
+pub const FAB_SIZE: f32 = 40.0;
+/// Vertical/horizontal step between stacked FABs.
+pub const FAB_STEP: f32 = FAB_SIZE + 8.0;
+/// Inset from a pane edge to the FAB's top-left (`FAB_SIZE` + 10).
+pub const FAB_EDGE: f32 = FAB_SIZE + 10.0;
+
+/// Hot-pink icon ink (`error_fg` from the mastertech dump).
+pub fn fab_icon() -> Color32 {
+    rgb(255, 73, 137)
+}
+
+/// Default translucent FAB disc.
+pub fn fab_bg() -> Color32 {
+    rgba(8, 8, 11, 190)
+}
+
+/// Selected / open FAB disc (active magenta panel).
+pub fn fab_bg_on() -> Color32 {
+    rgba(70, 34, 74, 220)
+}
+
+/// Queue-busy FAB disc.
+pub fn fab_bg_ok() -> Color32 {
+    rgba(18, 48, 28, 210)
+}
+
+/// Cancel FAB disc.
+pub fn fab_bg_danger() -> Color32 {
+    rgba(72, 20, 36, 210)
+}
+
+/// Circular icon FAB with CENTER_CENTER glyph paint (avoids button-padding left bias on emoji).
+pub fn fab(ui: &mut egui::Ui, icon: &str, fill: Color32) -> egui::Response {
+    fab_with_sense(ui, icon, fill, Sense::click_and_drag())
+}
+
+fn fab_with_sense(
+    ui: &mut egui::Ui,
+    icon: &str,
+    fill: Color32,
+    sense: Sense,
+) -> egui::Response {
+    let size = egui::vec2(FAB_SIZE, FAB_SIZE);
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let enabled = ui.is_enabled();
+    let mut fill = fill;
+    if enabled {
+        if resp.is_pointer_button_down_on() {
+            fill = fab_bg_on();
+        } else if resp.hovered() {
+            fill = rgba(46, 42, 66, 220);
+        }
+    } else {
+        fill = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), fill.a() / 2);
+    }
+    let center = rect.center();
+    let r = FAB_SIZE * 0.5;
+    ui.painter().circle_filled(center, r, fill);
+    ui.painter().circle_stroke(center, r, Stroke::new(1.0, rgba(104, 108, 148, 140)));
+    let ink = if enabled { fab_icon() } else { rgba(255, 73, 137, 110) };
+    let icon_pt = if icon.chars().count() > 1 { 15.0 } else { 17.0 };
+    ui.painter().text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        icon,
+        FontId::new(icon_pt, FontFamily::Proportional),
+        ink,
+    );
+    resp
 }
 
 /// Apply the theme to a context: dark, near-black, purple/magenta accented.
