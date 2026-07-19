@@ -1,0 +1,17 @@
+[package]
+name = "qnn-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust dlopen wrapper for Qualcomm QNN (AI Engine Direct): parse SD context-binary metadata on host, execute on HTP NPU on device."
+
+[dependencies]
+libloading = "0.9.0"
+thiserror = "2"
+
+[dev-dependencies]
+
+[[example]]
+name = "dump_context"
+path = "examples/dump_context.rs"

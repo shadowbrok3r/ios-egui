@@ -12,10 +12,12 @@ pub enum Mode {
 }
 
 /// Where the img2img input image comes from (Android's runtime has no file picker yet).
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Img2ImgSource {
     CurrentOutput,
     Url,
+    /// A photo picked from the device this session; the bytes live outside `Params`.
+    Picked,
 }
 
 /// Which loader topology a model needs: one all-in-one checkpoint, or a bare diffusion model
@@ -86,6 +88,9 @@ pub struct Params {
     pub denoise: f32,
     pub mode: Mode,
     pub img2img_source: Img2ImgSource,
+    /// Route img2img through a SetLatentNoiseMask branch keyed off the input's alpha.
+    #[serde(default)]
+    pub inpaint_mask: bool,
     pub input_url: String,
     #[serde(default)]
     pub loras: Vec<ActiveLora>,
@@ -182,6 +187,7 @@ impl Default for Params {
             denoise: 0.6,
             mode: Mode::Txt2Img,
             img2img_source: Img2ImgSource::CurrentOutput,
+            inpaint_mask: false,
             input_url: String::new(),
             loras: Vec::new(),
             apps: Vec::new(),
@@ -1314,8 +1320,25 @@ mod tests {
         assert_eq!(p.model_file(), "sdxl.safetensors");
         assert!(p.clip_names.is_empty() && p.vae_name.is_empty());
         assert!(!p.loras[0].model_only);
+        // Old JSON without the flag defaults inpaint off.
+        assert!(!p.inpaint_mask);
         // Unchanged behavior for existing presets: nothing blocks the queue.
         assert_eq!(p.missing_model_part(), None);
+    }
+
+    #[test]
+    fn params_round_trip_with_picked_img2img_source() {
+        let p = Params {
+            img2img_source: Img2ImgSource::Picked,
+            mode: Mode::Img2Img,
+            inpaint_mask: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&p).expect("serialize");
+        let back: Params = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.img2img_source, Img2ImgSource::Picked);
+        assert_eq!(back.mode, Mode::Img2Img);
+        assert!(back.inpaint_mask);
     }
 
     #[test]

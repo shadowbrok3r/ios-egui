@@ -14,6 +14,7 @@ members = [
     "crates/plugin-abi",
     "crates/plugin-host",
     "crates/plugin-sdk",
+    "crates/qnn-rs",
     "examples/hello/rust",
     "examples/desktop-host",
     "examples/plugins-ios/rust",

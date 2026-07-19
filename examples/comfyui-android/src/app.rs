@@ -18,6 +18,8 @@ use crate::engine::{Engine, GenCtx, Msg};
 use crate::gallery::{self, ImageMeta, ThumbCache};
 use crate::graphview::{self, GraphView, LongPress, LoraPick, elide, elide_width, sanitize_ui_text};
 use crate::icons;
+use crate::mask;
+use crate::{lint, tags};
 use crate::logger::{self, Logger};
 use crate::player::Player;
 use crate::schema::{self, SchemaSet};
@@ -179,6 +181,29 @@ struct Viewer {
     /// Parsed prompts / LoRAs / sampler summary from the workflow.
     meta: Option<ImageMeta>,
     meta_loading: bool,
+}
+
+/// A device photo chosen as img2img input this session; the bytes are never persisted.
+struct PickedInput {
+    name: String,
+    bytes: Vec<u8>,
+    tex: Option<egui::TextureHandle>,
+}
+
+/// Session-only finger-paint inpainting: strokes over a base image, baked into an alpha mask.
+struct InpaintState {
+    source_bytes: Vec<u8>,
+    source_name: String,
+    img_size: [u32; 2],
+    base_tex: egui::TextureHandle,
+    strokes: Vec<mask::StrokeRec>,
+    /// Start index in `strokes` of each drag gesture, for whole-gesture undo.
+    groups: Vec<usize>,
+    canvas: mask::MaskCanvas,
+    brush_uv: f32,
+    erase: bool,
+    overlay_tex: Option<egui::TextureHandle>,
+    overlay_dirty: bool,
 }
 
 /// One open workflow editor document (multi-tab Graph workspace).
@@ -460,6 +485,16 @@ struct ComfyApp {
     /// Debounce: last seen input_url and when it changed.
     img2img_url_pending: String,
     img2img_url_pending_at: f64,
+    /// Device photo chosen as img2img input (session-only bytes + decoded preview).
+    picked_input: Option<PickedInput>,
+    /// Grid to change the device img2img photo is expanded inline.
+    picked_input_grid_open: bool,
+    /// Full-screen finger-paint inpainting session (session-only, never persisted).
+    inpaint: Option<InpaintState>,
+    /// A Remix tap is waiting on the viewer's workflow meta to finish loading.
+    viewer_remix_pending: bool,
+    /// How many separate Create jobs one Queue tap enqueues (1..=8).
+    queue_variants: usize,
     /// Long-press menu on empty graph canvas: `(graph_pos, screen_pos, armed)`.
     /// `armed` stays false until the opening press is released so that release doesn't dismiss.
     canvas_menu: Option<(egui::Pos2, egui::Pos2, bool)>,
@@ -492,6 +527,17 @@ struct ComfyApp {
     create_setup_open: bool,
     /// Create Main: companions & image source block open state (persisted separately).
     create_companions_open: bool,
+    /// Positive prompt shown as editable chips (session-only: the Settings struct is off-limits).
+    prompt_chips: bool,
+    /// Bundled tag dictionary parsed and ready to query off-thread.
+    tag_dict_warm: bool,
+    /// Completion signal for the background tag-dictionary warmup.
+    tag_dict_warming: Option<std::sync::mpsc::Receiver<()>>,
+    /// Server tag-dictionary override; used ahead of the bundled dictionary when present.
+    tag_dict_override: Option<Arc<tags::TagDict>>,
+    /// Cached prompt lint issues plus the fingerprint they were computed from.
+    lint_issues: Vec<lint::LintIssue>,
+    lint_fp: u64,
 }
 
 impl ComfyApp {
@@ -635,6 +681,11 @@ impl ComfyApp {
             img2img_url_err: String::new(),
             img2img_url_pending: String::new(),
             img2img_url_pending_at: 0.0,
+            picked_input: None,
+            picked_input_grid_open: false,
+            inpaint: None,
+            viewer_remix_pending: false,
+            queue_variants: 1,
             canvas_menu: None,
             node_menu: None,
             gallery_scroll_y: 0.0,
@@ -651,6 +702,12 @@ impl ComfyApp {
             queue_fab_pos: None,
             create_setup_open: true,
             create_companions_open: true,
+            prompt_chips: false,
+            tag_dict_warm: false,
+            tag_dict_warming: None,
+            tag_dict_override: None,
+            lint_issues: Vec::new(),
+            lint_fp: 0,
         }
     }
 
@@ -961,6 +1018,11 @@ impl ComfyApp {
             Msg::CheckpointCatalogError(err) => {
                 self.log.warn(format!("checkpoint catalog: {err}"));
             }
+            Msg::TagDict(dict) => {
+                self.log.info(format!("tag dict override: {} entries", dict.len()));
+                self.tag_dict_override = Some(dict);
+                self.tag_dict_warm = true;
+            }
             Msg::Connected { schemas, models } => {
                 self.conn = Conn::Connected;
                 // Albums and model facets are per-account, so they follow the credential.
@@ -968,6 +1030,7 @@ impl ComfyApp {
                 self.engine.as_ref().unwrap().facets();
                 self.engine.as_ref().unwrap().fetch_lora_catalog();
                 self.engine.as_ref().unwrap().fetch_checkpoint_catalog();
+                self.engine.as_ref().unwrap().fetch_tag_dict();
                 self.installed_loras = schemas.loras();
                 // Swap the node catalog in place so a reconnect keeps open tabs.
                 let object_info = schema::to_object_info(&schemas);
@@ -1278,6 +1341,7 @@ impl ComfyApp {
                 }
             }
             Msg::ItemWorkflow { key, json } => {
+                let mut do_remix = false;
                 if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
@@ -1290,18 +1354,37 @@ impl ComfyApp {
                         meta.loras.len(),
                         meta.positive.as_ref().map(|p| p.len()).unwrap_or(0)
                     ));
+                    let empty = meta.is_empty();
                     v.meta = Some(meta);
                     v.workflow_json = Some(json);
                     v.item.has_workflow = true;
                     v.meta_loading = false;
+                    do_remix = self.viewer_remix_pending && !empty;
+                }
+                if do_remix {
+                    self.viewer_remix_pending = false;
+                    if let Some(meta) = self.viewer.as_ref().and_then(|v| v.meta.clone()) {
+                        self.remix_from_meta(&meta);
+                    }
+                    self.viewer = None;
+                    self.player = None;
+                    self.viewer_swipe_origin = None;
+                    self.gallery_status.clear();
+                    host.haptic(Haptic::Light);
                 }
             }
             Msg::ItemWorkflowError { key, error } => {
+                let mut for_current = false;
                 if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
                     v.meta_loading = false;
+                    for_current = true;
                     self.log.warn(format!("workflow meta {key}: {error}"));
+                }
+                if for_current && self.viewer_remix_pending {
+                    self.viewer_remix_pending = false;
+                    self.gallery_status = "No workflow metadata to remix".into();
                 }
             }
             Msg::VideoReady { key, bytes } => {
@@ -1341,6 +1424,18 @@ impl ComfyApp {
     fn can_queue_create(&self) -> Result<(), &'static str> {
         if let Some(missing) = self.params.missing_model_part() {
             return Err(missing);
+        }
+        if self.params.mode == Mode::Img2Img
+            && self.params.img2img_source == Img2ImgSource::Picked
+            && self.picked_input.is_none()
+        {
+            return Err("Pick a device photo for img2img first");
+        }
+        if self.params.mode == Mode::Img2Img
+            && self.params.inpaint_mask
+            && (self.params.img2img_source != Img2ImgSource::Picked || self.picked_input.is_none())
+        {
+            return Err("Re-apply the inpaint mask first");
         }
         if !matches!(self.conn, Conn::Connected)
             && !self.engine.as_ref().is_some_and(|e| e.is_connected())
@@ -1418,7 +1513,11 @@ impl ComfyApp {
             "Queued".into()
         };
         let params = self.params.clone();
-        let current = self.result_bytes.clone();
+        // Picked bytes live outside Params; other sources pass the last result (Url ignores it).
+        let current = match self.params.img2img_source {
+            Img2ImgSource::Picked => self.picked_input.as_ref().map(|p| p.bytes.clone()),
+            _ => self.result_bytes.clone(),
+        };
         let gcx = self.gen_ctx();
         self.enhance_note.clear();
         // Export the UI workflow from the linked graph so SaveImage can embed it in the PNG.
@@ -1429,6 +1528,30 @@ impl ComfyApp {
         });
         self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow);
         host.haptic(Haptic::Medium);
+    }
+
+    /// Queue `queue_variants` Create jobs. With seed randomization off, iterations after the first
+    /// re-roll the seed so the variants differ; iteration 0 keeps the user's seed. (With it on,
+    /// start_generation already re-rolls per call.)
+    fn queue_create_variants(&mut self, ctx: &egui::Context, host: &Host) {
+        if let Err(e) = self.can_queue_create() {
+            self.status = e.into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let n = self.queue_variants.clamp(1, 8);
+        let base_seed = self.params.seed;
+        let restore_seed = !self.params.randomize_seed;
+        for i in 0..n {
+            if i > 0 && !self.params.randomize_seed {
+                self.params.seed = random_seed();
+            }
+            self.start_generation(ctx, host);
+        }
+        // Restore the user's seed; each variant already captured its own.
+        if restore_seed {
+            self.params.seed = base_seed;
+        }
     }
 
     fn queue_graph(&mut self, ctx: &egui::Context, host: &Host) {
@@ -1672,6 +1795,284 @@ impl ComfyApp {
         }
     }
 
+    fn share_bytes(&mut self, host: &Host, bytes: &[u8], name: &str) -> String {
+        let Some(dir) = host.documents_dir() else {
+            return "No storage directory".into();
+        };
+        let folder = format!("{dir}/comfyui/share");
+        let _ = std::fs::create_dir_all(&folder);
+        let path = format!("{folder}/{name}");
+        match std::fs::write(&path, bytes) {
+            Ok(()) => {
+                let mime = if name.to_lowercase().ends_with(".mp4") {
+                    "video/mp4"
+                } else if name.to_lowercase().ends_with(".webp") {
+                    "image/webp"
+                } else {
+                    "image/png"
+                };
+                host.share_media(&path, name, mime);
+                host.haptic(Haptic::Light);
+                "Opening share sheet…".to_string()
+            }
+            Err(e) => {
+                self.log.error(format!("share failed: {e}"));
+                format!("Share failed: {e}")
+            }
+        }
+    }
+
+    /// Decode picked photo bytes into a preview texture and stash them as the img2img input.
+    fn set_picked_input(&mut self, ctx: &egui::Context, name: String, bytes: Vec<u8>) {
+        let tex = crate::engine::decode(&bytes)
+            .map(|ci| ctx.load_texture("picked_input", ci, egui::TextureOptions::LINEAR));
+        self.picked_input = Some(PickedInput { name, bytes, tex });
+        self.picked_input_grid_open = false;
+        // A plain pick carries no mask; inpaint re-sets the flag after this call.
+        self.params.inpaint_mask = false;
+    }
+
+    /// Decode `bytes`, build the base texture and a half-res mask canvas, and open the overlay.
+    fn open_inpaint(&mut self, ctx: &egui::Context, bytes: Vec<u8>, name: String) {
+        let Some(ci) = crate::engine::decode(&bytes) else {
+            self.note = "Couldn't open that image for inpainting".into();
+            return;
+        };
+        let [iw, ih] = [ci.size[0] as u32, ci.size[1] as u32];
+        let base_tex = ctx.load_texture("inpaint_base", ci, egui::TextureOptions::LINEAR);
+        // Canvas at ~half image resolution, long side capped at 1024.
+        let long = iw.max(ih).max(1);
+        let target = (long / 2).clamp(1, 1024);
+        let scale = target as f32 / long as f32;
+        let cw = ((iw as f32 * scale).round() as u32).max(1);
+        let ch = ((ih as f32 * scale).round() as u32).max(1);
+        self.inpaint = Some(InpaintState {
+            source_bytes: bytes,
+            source_name: name,
+            img_size: [iw.max(1), ih.max(1)],
+            base_tex,
+            strokes: Vec::new(),
+            groups: Vec::new(),
+            canvas: mask::MaskCanvas::new(cw, ch),
+            brush_uv: 0.06,
+            erase: false,
+            overlay_tex: None,
+            overlay_dirty: true,
+        });
+    }
+
+    /// Bake the current mask into the source alpha and route it to Create as a masked img2img input.
+    fn apply_inpaint_mask(&mut self, ctx: &egui::Context, host: &Host) {
+        let baked = {
+            let Some(st) = self.inpaint.as_ref() else { return };
+            if st.canvas.is_empty() {
+                return;
+            }
+            let base = file_basename(&st.source_name);
+            let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+            let name = format!("inpaint_{stem}.png");
+            mask::bake_alpha(&st.source_bytes, &st.canvas).map(|png| (png, name))
+        };
+        match baked {
+            Ok((png, name)) => {
+                self.set_picked_input(ctx, name, png);
+                self.params.mode = Mode::Img2Img;
+                self.params.img2img_source = Img2ImgSource::Picked;
+                self.params.inpaint_mask = true;
+                if self.params.denoise >= 0.999 {
+                    self.params.denoise = 0.85;
+                }
+                self.inpaint = None;
+                self.tab = Tab::Generate;
+                self.note = "Masked image set for inpainting".into();
+                host.haptic(Haptic::Success);
+            }
+            Err(e) => {
+                self.note = format!("Inpaint bake failed: {e}");
+                host.haptic(Haptic::Error);
+            }
+        }
+    }
+
+    /// Full-screen brush overlay: paint the mask over the fitted base image, then bake it.
+    fn inpaint_overlay(&mut self, ui: &mut egui::Ui, host: &Host) {
+        if ui.ctx().input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+        }) {
+            self.inpaint = None;
+            return;
+        }
+
+        let mut close = false;
+        let mut use_mask = false;
+        let mut do_undo = false;
+        let mut do_clear = false;
+
+        ui.horizontal(|ui| {
+            let st = self.inpaint.as_ref().unwrap();
+            ui.label(format!("{} Fix area", icons::MODEL));
+            ui.weak(elide(&st.source_name, 32));
+        });
+        ui.separator();
+
+        let empty = self.inpaint.as_ref().unwrap().canvas.is_empty();
+        egui::Panel::bottom("inpaint-actions").show(ui, |ui| {
+            const BTN_H: f32 = 36.0;
+            const ICON_W: f32 = 40.0;
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                let st = self.inpaint.as_mut().unwrap();
+                if ui
+                    .add(egui::Button::new(icons::CLOSE).min_size(egui::vec2(ICON_W, BTN_H)))
+                    .on_hover_text("Cancel and discard")
+                    .clicked()
+                {
+                    close = true;
+                }
+                ui.toggle_value(&mut st.erase, "Erase")
+                    .on_hover_text("Wipe mask instead of painting");
+                if ui
+                    .add(egui::Button::new(format!("{} Undo", icons::UNDO)).min_size(egui::vec2(0.0, BTN_H)))
+                    .clicked()
+                {
+                    do_undo = true;
+                }
+                if ui
+                    .add(egui::Button::new(format!("{} Clear", icons::TRASH)).min_size(egui::vec2(0.0, BTN_H)))
+                    .clicked()
+                {
+                    do_clear = true;
+                }
+                ui.label("Brush");
+                ui.add(egui::Slider::new(&mut st.brush_uv, 0.01..=0.15).show_value(false));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !empty,
+                            egui::Button::new(format!("{} Use mask", icons::CHECK))
+                                .min_size(egui::vec2(0.0, BTN_H)),
+                        )
+                        .on_hover_text("Bake the mask and send to Create")
+                        .clicked()
+                    {
+                        use_mask = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+        });
+
+        {
+            let st = self.inpaint.as_mut().unwrap();
+            let [iw, ih] = st.img_size;
+            let ar = iw as f32 / ih as f32;
+            let area = ui.available_rect_before_wrap();
+            // Aspect-fit the image inside the area left below the header and toolbar.
+            let fitted = {
+                let (aw, ah) = (area.width().max(1.0), area.height().max(1.0));
+                let (w, h) = if aw / ah > ar { (ah * ar, ah) } else { (aw, aw / ar) };
+                egui::Rect::from_center_size(area.center(), egui::vec2(w, h))
+            };
+            let (resp, painter) = ui.allocate_painter(area.size(), egui::Sense::drag());
+            let uv_full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            painter.image(st.base_tex.id(), fitted, uv_full, egui::Color32::WHITE);
+
+            let radius = st.brush_uv;
+            let soft = 0.5;
+            if resp.drag_started() {
+                st.groups.push(st.strokes.len());
+            }
+            if resp.dragged()
+                && let Some(pos) = resp.interact_pointer_pos()
+                && fitted.width() > 0.0
+                && fitted.height() > 0.0
+            {
+                let to_uv = |p: egui::Pos2| {
+                    (
+                        ((p.x - fitted.left()) / fitted.width()).clamp(0.0, 1.0),
+                        ((p.y - fitted.top()) / fitted.height()).clamp(0.0, 1.0),
+                    )
+                };
+                let cur = to_uv(pos);
+                let d = resp.drag_delta();
+                let prev = (
+                    (cur.0 - d.x / fitted.width()).clamp(0.0, 1.0),
+                    (cur.1 - d.y / fitted.height()).clamp(0.0, 1.0),
+                );
+                st.canvas.stroke(prev, cur, radius, soft, st.erase);
+                st.strokes.push(mask::StrokeRec {
+                    from: prev,
+                    to: cur,
+                    radius_uv: radius,
+                    soft,
+                    erase: st.erase,
+                });
+                st.overlay_dirty = true;
+            }
+
+            if st.overlay_dirty {
+                let (mw, mh) = (st.canvas.w as usize, st.canvas.h as usize);
+                let mut px = vec![0u8; mw * mh * 4];
+                for (i, &m) in st.canvas.buf.iter().enumerate() {
+                    if m > 0 {
+                        let o = i * 4;
+                        px[o] = 220;
+                        px[o + 1] = 40;
+                        px[o + 2] = 40;
+                        px[o + 3] = m / 2;
+                    }
+                }
+                let ci = egui::ColorImage::from_rgba_unmultiplied([mw, mh], &px);
+                st.overlay_tex =
+                    Some(ui.ctx().load_texture("inpaint_overlay", ci, egui::TextureOptions::LINEAR));
+                st.overlay_dirty = false;
+            }
+            if let Some(tex) = &st.overlay_tex {
+                painter.image(tex.id(), fitted, uv_full, egui::Color32::WHITE);
+            }
+
+            // Brush-size cursor ring at the pointer.
+            if let Some(pos) = resp.interact_pointer_pos().or(resp.hover_pos())
+                && fitted.contains(pos)
+            {
+                let r = (st.brush_uv * fitted.size().min_elem()).max(2.0);
+                let col = if st.erase {
+                    egui::Color32::from_rgb(90, 170, 255)
+                } else {
+                    egui::Color32::from_rgb(230, 70, 70)
+                };
+                painter.circle_stroke(pos, r, egui::Stroke::new(1.5, col));
+            }
+        }
+
+        if close {
+            self.inpaint = None;
+            return;
+        }
+        if do_undo {
+            if let Some(st) = &mut self.inpaint
+                && let Some(start) = st.groups.pop()
+            {
+                st.strokes.truncate(start);
+                st.canvas = mask::rasterize(st.canvas.w, st.canvas.h, &st.strokes);
+                st.overlay_dirty = true;
+                host.haptic(Haptic::Light);
+            }
+        }
+        if do_clear {
+            if let Some(st) = &mut self.inpaint {
+                st.strokes.clear();
+                st.groups.clear();
+                st.canvas = mask::MaskCanvas::new(st.canvas.w, st.canvas.h);
+                st.overlay_dirty = true;
+            }
+        }
+        if use_mask {
+            self.apply_inpaint_mask(ui.ctx(), host);
+        }
+    }
+
     fn save_result_at(&mut self, host: &Host, idx: usize) {
         let bytes = match self.results.get(idx) {
             Some((_, b)) => b.clone(),
@@ -1765,6 +2166,12 @@ impl ComfyApp {
             self.username = saved.username;
             self.session = saved.session;
             self.params = saved.params;
+            // Picked device-photo bytes are session-only; fall back to the current result on restore.
+            if self.params.img2img_source == Img2ImgSource::Picked {
+                self.params.img2img_source = Img2ImgSource::CurrentOutput;
+            }
+            // The masked photo went with the Picked bytes, so drop the flag on restore too.
+            self.params.inpaint_mask = false;
             self.gallery_view = saved.gallery;
             self.gallery_q = saved.gallery_q;
             self.gallery_page = saved.gallery_page.clamp(20, GALLERY_PAGE_MAX);
@@ -2130,7 +2537,219 @@ impl ComfyApp {
         }
     }
 
-    fn create_main_pane(&mut self, ui: &mut egui::Ui, _host: &Host) {
+    /// Warm the bundled tag dictionary on a background thread; mark ready once its parse finishes.
+    fn ensure_tag_dict_warm(&mut self, ctx: &egui::Context) {
+        if self.tag_dict_warm || self.tag_dict_override.is_some() {
+            return;
+        }
+        if let Some(rx) = &self.tag_dict_warming {
+            match rx.try_recv() {
+                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.tag_dict_warm = true;
+                    self.tag_dict_warming = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            }
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tags::TagDict::bundled();
+                let _ = tx.send(());
+            });
+            self.tag_dict_warming = Some(rx);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Prefix suggestions as owned `(insert_text, count)` pairs; override first, else bundled if warm.
+    fn tag_suggestions(&self, prefix: &str, limit: usize) -> Vec<(String, u32)> {
+        let entries = match &self.tag_dict_override {
+            Some(d) => d.suggest(prefix, limit),
+            None if self.tag_dict_warm => tags::TagDict::bundled().suggest(prefix, limit),
+            None => return Vec::new(),
+        };
+        entries.iter().map(|e| (e.insert_text(), e.count)).collect()
+    }
+
+    /// Positive prompt: a label + chip-view toggle, then either the chip editor or the text field.
+    fn positive_prompt_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Prompt");
+            if ui
+                .selectable_label(self.prompt_chips, "chips")
+                .on_hover_text("Edit the prompt as tag chips")
+                .clicked()
+            {
+                self.prompt_chips = !self.prompt_chips;
+            }
+        });
+        if self.prompt_chips {
+            self.positive_chip_view(ui);
+        } else {
+            self.positive_text_view(ui);
+        }
+    }
+
+    /// Positive text field plus a tag-autocomplete row under it while the field has focus.
+    fn positive_text_view(&mut self, ui: &mut egui::Ui) {
+        let id = egui::Id::new("create_positive_edit");
+        let out = egui::TextEdit::multiline(&mut self.params.positive)
+            .id(id)
+            .desired_rows(3)
+            .desired_width(f32::INFINITY)
+            .hint_text("what you want to see")
+            .show(ui);
+        if !out.response.has_focus() {
+            return;
+        }
+        let Some(cursor_char) = out.cursor_range.map(|r| r.primary.index.0) else {
+            return;
+        };
+        let text = self.params.positive.clone();
+        let cursor_byte =
+            text.char_indices().nth(cursor_char).map(|(b, _)| b).unwrap_or(text.len());
+        let (range, tok) = tags::token_at(&text, cursor_byte);
+        if tok.chars().count() < 2 {
+            return;
+        }
+        let sugg = self.tag_suggestions(tok, 8);
+        if sugg.is_empty() {
+            return;
+        }
+        let mut accepted: Option<(String, usize)> = None;
+        crate::theme::scroll_horizontal().id_salt("tag_suggest_row").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (name, count) in &sugg {
+                    let label = format!("{name}  {}", fmt_count(*count));
+                    if ui.small_button(sanitize_ui_text(ui, &label)).clicked() {
+                        accepted = Some(tags::accept_suggestion(&text, range.clone(), name));
+                    }
+                }
+            });
+        });
+        if let Some((new_text, cursor_byte)) = accepted {
+            let char_idx = new_text[..cursor_byte].chars().count();
+            self.params.positive = new_text;
+            if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id) {
+                let cur = egui::text::CCursor::new(char_idx);
+                st.cursor.set_char_range(Some(egui::text::CCursorRange::one(cur)));
+                egui::TextEdit::store_state(ui.ctx(), id, st);
+            }
+            ui.memory_mut(|m| m.request_focus(id));
+        }
+    }
+
+    /// Positive prompt rendered as tap-to-edit chips; the text string stays the source of truth.
+    fn positive_chip_view(&mut self, ui: &mut egui::Ui) {
+        let chips = tags::parse_chips(&self.params.positive);
+        let mut new_text: Option<String> = None;
+        let mut to_text = false;
+        ui.horizontal_wrapped(|ui| {
+            for (i, chip) in chips.iter().enumerate() {
+                let label = if (chip.weight - 1.0).abs() < 0.005 {
+                    chip.tag.clone()
+                } else {
+                    format!("{} x{}", chip.tag, fmt_weight(chip.weight))
+                };
+                ui.menu_button(sanitize_ui_text(ui, &label), |ui| {
+                    if ui.button("Weight +").clicked() {
+                        new_text = Some(tags::bump_weight(&self.params.positive, i, 0.05));
+                    }
+                    if ui.button("Weight -").clicked() {
+                        new_text = Some(tags::bump_weight(&self.params.positive, i, -0.05));
+                    }
+                    if ui.button("Move left").clicked() {
+                        new_text = Some(tags::move_chip(&self.params.positive, i, -1));
+                    }
+                    if ui.button("Move right").clicked() {
+                        new_text = Some(tags::move_chip(&self.params.positive, i, 1));
+                    }
+                    if ui.button(format!("{} Delete", icons::TRASH)).clicked() {
+                        new_text = Some(tags::remove_chip(&self.params.positive, i));
+                    }
+                });
+            }
+            if ui.button(format!("{} Add", icons::ADD)).clicked() {
+                to_text = true;
+            }
+        });
+        if let Some(t) = new_text {
+            self.params.positive = t;
+        }
+        if to_text {
+            self.prompt_chips = false;
+            ui.memory_mut(|m| m.request_focus(egui::Id::new("create_positive_edit")));
+        }
+    }
+
+    /// Recompute the cached lint issues when the prompt/model/LoRA fingerprint changes.
+    fn refresh_lint(&mut self) {
+        let model = self.params.model_file().to_string();
+        let mut key = String::new();
+        key.push_str(&self.params.positive);
+        key.push('\u{1}');
+        key.push_str(&self.params.negative);
+        key.push('\u{1}');
+        key.push_str(&self.params.lora_triggers);
+        key.push('\u{1}');
+        key.push_str(&model);
+        for al in &self.params.loras {
+            key.push('\u{1}');
+            key.push_str(&al.file);
+            key.push_str(&format!(":{}:{}", al.strength_model, al.strength_clip));
+        }
+        let fp = str_fingerprint(&key);
+        if fp == self.lint_fp {
+            return;
+        }
+        self.lint_fp = fp;
+        let ckpt = self.checkpoint_catalog.entry(&model);
+        let loras: Vec<_> =
+            self.params.loras.iter().map(|al| (al, self.lora_catalog.entry(&al.file))).collect();
+        self.lint_issues = lint::lint(&self.params, ckpt, &loras);
+    }
+
+    /// One wrapped row of lint chips; a fixable issue applies its fix on tap.
+    fn lint_chips_ui(&mut self, ui: &mut egui::Ui) {
+        self.refresh_lint();
+        if self.lint_issues.is_empty() {
+            return;
+        }
+        ui.add_space(4.0);
+        let mut applied: Option<lint::Fix> = None;
+        ui.horizontal_wrapped(|ui| {
+            for issue in &self.lint_issues {
+                let color = match issue.severity {
+                    lint::Severity::Warn => ui.visuals().warn_fg_color,
+                    lint::Severity::Info => ui.visuals().weak_text_color(),
+                };
+                let text = egui::RichText::new(sanitize_ui_text(ui, &issue.msg)).small().color(color);
+                if let Some(fix) = &issue.fix {
+                    if ui.button(text).on_hover_text("Tap to apply fix").clicked() {
+                        applied = Some(fix.clone());
+                    }
+                } else {
+                    ui.add(egui::Label::new(text));
+                }
+            }
+        });
+        if let Some(fix) = applied {
+            self.apply_fix(fix);
+            self.lint_fp = 0;
+        }
+    }
+
+    /// Apply a lint fix: one whole-field assignment.
+    fn apply_fix(&mut self, fix: lint::Fix) {
+        match fix {
+            lint::Fix::SetPositive(s) => self.params.positive = s,
+            lint::Fix::SetNegative(s) => self.params.negative = s,
+            lint::Fix::SetLoraTriggers(s) => self.params.lora_triggers = s,
+        }
+    }
+
+    fn create_main_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        self.ensure_tag_dict_warm(ui.ctx());
         let model_file = self.params.model_file().to_string();
         let ckpt_label = if model_file.is_empty() {
             "no model".to_string()
@@ -2191,6 +2810,7 @@ impl ComfyApp {
                 (false, true, false) => match self.params.img2img_source {
                     Img2ImgSource::CurrentOutput => "Image source · Current result".into(),
                     Img2ImgSource::Url => "Image source · From URL".into(),
+                    Img2ImgSource::Picked => "Image source · Device photo".into(),
                 },
                 (false, false, _) => String::new(),
             };
@@ -2260,7 +2880,8 @@ impl ComfyApp {
                         if show_companions {
                             ui.add_space(4.0);
                         }
-                        ui.horizontal(|ui| {
+                        let prev_src = self.params.img2img_source;
+                        ui.horizontal_wrapped(|ui| {
                             ui.selectable_value(
                                 &mut self.params.img2img_source,
                                 Img2ImgSource::CurrentOutput,
@@ -2271,8 +2892,65 @@ impl ComfyApp {
                                 Img2ImgSource::Url,
                                 "From URL",
                             );
+                            ui.selectable_value(
+                                &mut self.params.img2img_source,
+                                Img2ImgSource::Picked,
+                                "Device photo",
+                            );
                         });
+                        // Leaving Picked drops the masked photo it applied to.
+                        if prev_src == Img2ImgSource::Picked
+                            && self.params.img2img_source != Img2ImgSource::Picked
+                        {
+                            self.params.inpaint_mask = false;
+                        }
                         match self.params.img2img_source {
+                            Img2ImgSource::Picked => {
+                                let mut change = false;
+                                if let Some(picked) = &self.picked_input {
+                                    ui.horizontal(|ui| {
+                                        if let Some(tex) = &picked.tex {
+                                            let sized = egui::load::SizedTexture::from_handle(tex);
+                                            ui.add(
+                                                egui::Image::new(sized)
+                                                    .max_size(egui::vec2(96.0, 96.0)),
+                                            );
+                                        }
+                                        ui.vertical(|ui| {
+                                            ui.weak(elide(&picked.name, 28));
+                                            if ui.button("Change").clicked() {
+                                                change = true;
+                                            }
+                                        });
+                                    });
+                                } else {
+                                    ui.weak("Pick a photo from this device.");
+                                    self.picked_input_grid_open = true;
+                                }
+                                if change {
+                                    self.picked_input_grid_open = !self.picked_input_grid_open;
+                                }
+                                if self.picked_input_grid_open
+                                    && let Some((id, name)) = self.device_photo_grid(ui, host)
+                                {
+                                    match host.load_device_image(id) {
+                                        Some(bytes) if !bytes.is_empty() => {
+                                            let fname = if name.is_empty() {
+                                                format!("device_{id}.jpg")
+                                            } else {
+                                                name
+                                            };
+                                            self.set_picked_input(ui.ctx(), fname, bytes);
+                                            host.haptic(Haptic::Light);
+                                        }
+                                        _ => {
+                                            self.note =
+                                                "Couldn't read that photo from the device".into();
+                                            host.haptic(Haptic::Error);
+                                        }
+                                    }
+                                }
+                            }
                             Img2ImgSource::Url => {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.params.input_url)
@@ -2319,13 +2997,7 @@ impl ComfyApp {
             }
         }
 
-        ui.label("Prompt");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.positive)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .hint_text("what you want to see"),
-        );
+        self.positive_prompt_ui(ui);
         ui.label("LoRA triggers");
         ui.add(
             egui::TextEdit::multiline(&mut self.params.lora_triggers)
@@ -2341,6 +3013,8 @@ impl ComfyApp {
                 .hint_text("what to avoid"),
         );
 
+        self.lint_chips_ui(ui);
+
         ui.add_space(4.0);
         ui.columns(2, |cols| {
             cols[0].vertical_centered(|ui| {
@@ -2351,8 +3025,15 @@ impl ComfyApp {
             });
         });
         ui.add_space(4.0);
-        ui.vertical_centered(|ui| {
-            stepper_u32(ui, "Batch", &mut self.params.batch_size, 1..=8, 1);
+        ui.columns(2, |cols| {
+            cols[0].vertical_centered(|ui| {
+                stepper_u32(ui, "Batch", &mut self.params.batch_size, 1..=8, 1);
+            });
+            cols[1].vertical_centered(|ui| {
+                let mut variants = self.queue_variants.clamp(1, 8) as u32;
+                stepper_u32(ui, "Variants", &mut variants, 1..=8, 1);
+                self.queue_variants = variants as usize;
+            });
         });
 
         ui.add_space(4.0);
@@ -4377,6 +5058,20 @@ impl ComfyApp {
         self.create_pane = CreatePane::Main;
     }
 
+    /// Load a gallery image's scraped meta into Create for an exact re-generation.
+    fn remix_from_meta(&mut self, meta: &ImageMeta) {
+        self.apply_image_meta(meta);
+        // Repair a diffusion model's companions against this server's installed files.
+        if self.params.model_kind == ModelKind::Diffusion {
+            self.resolve_companions(Companions::Repair);
+        }
+        // Disable seed randomization so the seed reproduces.
+        self.params.randomize_seed = false;
+        self.selected_preset.clear();
+        self.tab = Tab::Generate;
+        self.note = "Remixed into Create".into();
+    }
+
     /// Move catalog trigger words for the active LoRA stack out of `positive` into `lora_triggers`.
     fn pull_lora_triggers_from_positive(&mut self) {
         let known: Vec<(usize, String)> = self
@@ -4414,6 +5109,12 @@ impl ComfyApp {
         if let Some(p) = self.presets.iter().find(|p| p.name == name) {
             self.params = p.params.clone();
             self.params.loras = dedupe_loras(std::mem::take(&mut self.params.loras));
+            // Picked device-photo bytes are session-only; a preset can't carry them.
+            if self.params.img2img_source == Img2ImgSource::Picked {
+                self.params.img2img_source = Img2ImgSource::CurrentOutput;
+            }
+            // No Picked bytes means no masked photo, so the inpaint flag can't apply.
+            self.params.inpaint_mask = false;
             self.selected_preset = name.to_string();
             // A preset saved against another server may name companions this one lacks.
             if self.params.model_kind == ModelKind::Diffusion {
@@ -4536,6 +5237,8 @@ impl ComfyApp {
         let n = self.results.len();
         let mut close = false;
         let mut save = false;
+        let mut share = false;
+        let mut inpaint = false;
         let mut go: Option<isize> = None;
         ui.horizontal(|ui| {
             if ui
@@ -4549,6 +5252,16 @@ impl ComfyApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Save").clicked() {
                     save = true;
+                }
+                if ui.button("Share").on_hover_text("Share via other apps").clicked() {
+                    share = true;
+                }
+                if ui
+                    .button(format!("{} Fix area", icons::MODEL))
+                    .on_hover_text("Paint a mask to inpaint")
+                    .clicked()
+                {
+                    inpaint = true;
                 }
                 if n > 1 {
                     if ui
@@ -4587,6 +5300,15 @@ impl ComfyApp {
             self.result_view = None;
         } else if save {
             self.save_result_at(host, idx);
+        } else if share {
+            let bytes = self.results[idx].1.clone();
+            let name = format!("output-{}.png", idx + 1);
+            self.note = self.share_bytes(host, &bytes, &name);
+        } else if inpaint {
+            let bytes = self.results[idx].1.clone();
+            let name = format!("output-{}.png", idx + 1);
+            self.result_view = None;
+            self.open_inpaint(ui.ctx(), bytes, name);
         } else if let Some(d) = go {
             let next = idx as isize + d;
             if next >= 0 && (next as usize) < n {
@@ -4750,7 +5472,7 @@ impl ComfyApp {
         }
         if queue_clicked {
             match kind {
-                QueueFabKind::Create => self.start_generation(ctx, host),
+                QueueFabKind::Create => self.queue_create_variants(ctx, host),
                 QueueFabKind::Graph => self.queue_graph(ctx, host),
             }
         }
@@ -5982,7 +6704,9 @@ impl ComfyApp {
     /// the next frames (repaint is requested while any tile is still pending).
     const DEVICE_THUMBS_PER_FRAME: usize = 2;
 
-    fn loadimage_device_grid(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId) {
+    /// Shared device-photo grid (permission gate + MediaStore thumbnails, 2 loads/frame). Returns
+    /// the tapped `(MediaStore id, display name)`; callers decide what to do with the pick.
+    fn device_photo_grid(&mut self, ui: &mut egui::Ui, host: &Host) -> Option<(i64, String)> {
         if !host.has_media_images_permission() {
             ui.add_space(4.0);
             ui.label("Allow access to your photos to pick an image from this device.");
@@ -5993,7 +6717,7 @@ impl ComfyApp {
             ui.weak("Grant “Photos and videos”, then return here.");
             // Poll (not every frame) so the grid appears when the user returns having granted it.
             ui.ctx().request_repaint_after(Duration::from_millis(400));
-            return;
+            return None;
         }
         if !self.device_images_loaded {
             self.device_images = host.list_device_images(300);
@@ -6011,7 +6735,7 @@ impl ComfyApp {
         });
         if self.device_images.is_empty() {
             ui.weak("No photos found on this device.");
-            return;
+            return None;
         }
 
         let (cols, tile) = Self::picker_grid_dims(ui);
@@ -6078,8 +6802,12 @@ impl ComfyApp {
         if more_pending {
             ui.ctx().request_repaint();
         }
+        pick
+    }
 
-        if let Some((id, name)) = pick {
+    /// Graph LoadImage device picker: a pick eagerly uploads to the server for `node`.
+    fn loadimage_device_grid(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId) {
+        if let Some((id, name)) = self.device_photo_grid(ui, host) {
             match host.load_device_image(id) {
                 Some(bytes) if !bytes.is_empty() => {
                     let fname = if name.is_empty() { format!("device_{id}.jpg") } else { name };
@@ -7216,6 +7944,7 @@ impl ComfyApp {
         self.gallery_status.clear();
         self.filmstrip_center = true;
         self.viewer_swipe_origin = None;
+        self.viewer_remix_pending = false;
         self.viewer = Some(Viewer {
             item,
             idx,
@@ -7281,7 +8010,10 @@ impl ComfyApp {
         enum Act {
             Close,
             Save,
+            Share,
+            Remix,
             UseAsInput,
+            Inpaint,
             OpenWorkflow,
             CopyWorkflow,
             ToggleMeta,
@@ -7408,6 +8140,8 @@ impl ComfyApp {
             let can_save = v.bytes.is_some();
             let can_open_wf = v.item.has_workflow || v.workflow_json.is_some();
             let albums_known = v.albums.is_some();
+            // Remix once the scraped meta is non-empty, or while it is still loading (deferred).
+            let can_remix = v.meta.as_ref().is_some_and(|m| !m.is_empty()) || v.meta_loading;
             egui::Panel::bottom("viewer-actions").show(ui, |ui| {
                 const BTN_H: f32 = 36.0;
                 const ICON_W: f32 = 40.0;
@@ -7431,6 +8165,27 @@ impl ComfyApp {
                         act = Some(Act::Save);
                     }
                     if ui
+                        .add_enabled(
+                            can_save,
+                            egui::Button::new("Share").min_size(egui::vec2(0.0, BTN_H)),
+                        )
+                        .on_hover_text("Share via other apps")
+                        .clicked()
+                    {
+                        act = Some(Act::Share);
+                    }
+                    if ui
+                        .add_enabled(
+                            can_remix,
+                            egui::Button::new(format!("{} Remix", icons::GENERATE))
+                                .min_size(egui::vec2(0.0, BTN_H)),
+                        )
+                        .on_hover_text("Load this image's prompt + settings into Create")
+                        .clicked()
+                    {
+                        act = Some(Act::Remix);
+                    }
+                    if ui
                         .add(
                             egui::Button::new(format!("{} Use", icons::IMAGE))
                                 .min_size(egui::vec2(0.0, BTN_H)),
@@ -7439,6 +8194,17 @@ impl ComfyApp {
                         .clicked()
                     {
                         act = Some(Act::UseAsInput);
+                    }
+                    if ui
+                        .add_enabled(
+                            can_save,
+                            egui::Button::new(format!("{} Fix area", icons::MODEL))
+                                .min_size(egui::vec2(0.0, BTN_H)),
+                        )
+                        .on_hover_text("Paint a mask to inpaint")
+                        .clicked()
+                    {
+                        act = Some(Act::Inpaint);
                     }
                     if ui
                         .add_enabled(
@@ -7552,6 +8318,7 @@ impl ComfyApp {
                 self.viewer = None;
                 self.player = None;
                 self.viewer_swipe_origin = None;
+                self.viewer_remix_pending = false;
                 self.gallery_status.clear();
             }
             Some(Act::Show(idx)) => self.open_viewer(idx, host),
@@ -7596,9 +8363,43 @@ impl ComfyApp {
                 let (bytes, name) = (v.bytes.clone().unwrap(), v.item.filename.clone());
                 self.gallery_status = self.save_bytes(host, &bytes, &name);
             }
+            Some(Act::Share) => {
+                if let Some((bytes, name)) = self
+                    .viewer
+                    .as_ref()
+                    .and_then(|v| v.bytes.clone().map(|b| (b, v.item.filename.clone())))
+                {
+                    self.gallery_status = self.share_bytes(host, &bytes, &name);
+                }
+            }
+            Some(Act::Remix) => {
+                if let Some(meta) =
+                    self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
+                {
+                    self.remix_from_meta(&meta);
+                    self.viewer = None;
+                    self.player = None;
+                    self.viewer_swipe_origin = None;
+                    self.viewer_remix_pending = false;
+                    self.gallery_status.clear();
+                    host.haptic(Haptic::Light);
+                } else {
+                    // Workflow still fetching — finish the remix when Msg::ItemWorkflow lands.
+                    self.viewer_remix_pending = true;
+                    self.gallery_status = "Loading workflow to remix…".into();
+                }
+            }
             Some(Act::UseAsInput) => {
                 let v = self.viewer.as_ref().unwrap();
-                if let Some(url) =
+                // Use the loaded bytes when present, else the server view URL.
+                if let Some(bytes) = v.bytes.clone() {
+                    let name = v.item.filename.clone();
+                    self.set_picked_input(ui.ctx(), name, bytes);
+                    self.params.mode = Mode::Img2Img;
+                    self.params.img2img_source = Img2ImgSource::Picked;
+                    self.tab = Tab::Generate;
+                    self.note = "Gallery image set as img2img input".into();
+                } else if let Some(url) =
                     self.engine.as_ref().unwrap().view_url(&v.item.subfolder, &v.item.filename)
                 {
                     self.params.mode = Mode::Img2Img;
@@ -7606,6 +8407,20 @@ impl ComfyApp {
                     self.params.input_url = url;
                     self.tab = Tab::Generate;
                     self.note = "Gallery image set as img2img input".into();
+                }
+            }
+            Some(Act::Inpaint) => {
+                if let Some((bytes, name)) = self
+                    .viewer
+                    .as_ref()
+                    .and_then(|v| v.bytes.clone().map(|b| (b, v.item.filename.clone())))
+                {
+                    self.viewer = None;
+                    self.player = None;
+                    self.viewer_swipe_origin = None;
+                    self.viewer_remix_pending = false;
+                    self.gallery_status.clear();
+                    self.open_inpaint(ui.ctx(), bytes, name);
                 }
             }
             Some(Act::OpenWorkflow) => {
@@ -8028,6 +8843,14 @@ impl EguiApp for ComfyApp {
             } else {
                 ui.ctx().request_repaint_after(Duration::from_secs_f64((at - now).max(0.05)));
             }
+        }
+
+        // Inpaint takes over the whole screen, above the tabs, until closed.
+        if self.inpaint.is_some() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.inpaint_overlay(ui, host));
+            return;
         }
 
         // Navigation sits at the bottom, within thumb reach. Panels are laid out before the
@@ -9007,6 +9830,23 @@ fn str_fingerprint(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// Compact tag-count label: `1.2M`, `87k`, or the bare number.
+fn fmt_count(n: u32) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Weight at 2 decimals with trailing zeros / dot trimmed.
+fn fmt_weight(w: f32) -> String {
+    let s = format!("{w:.2}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Find a MODEL/CLIP wire to splice into — prefer edges into a sampler, else the last chain edge.

@@ -7,8 +7,8 @@
 
 use rucomfyui::nodes::all::{
     CLIPLoader, CLIPTextEncode, CheckpointLoaderSimple, DualCLIPLoader, EmptyLatentImage, KSampler,
-    LoadImage, LoraLoader, LoraLoaderModelOnly, SaveImage, UNETLoader, VAEDecode, VAEEncode,
-    VAELoader,
+    LoadImage, LoraLoader, LoraLoaderModelOnly, SaveImage, SetLatentNoiseMask, UNETLoader,
+    VAEDecode, VAEEncode, VAELoader,
 };
 use rucomfyui::nodes::types::{ClipOut, ModelOut, VaeOut};
 use rucomfyui::{Workflow, WorkflowGraph, WorkflowNodeId};
@@ -90,7 +90,13 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
 
     let latent = match input_image {
         Some(name) if p.mode == Mode::Img2Img => {
-            g.add(VAEEncode::new(g.add(LoadImage::new(name)).image, vae))
+            let img = g.add(LoadImage::new(name));
+            let enc = g.add(VAEEncode::new(img.image, vae));
+            if p.inpaint_mask {
+                g.add(SetLatentNoiseMask::new(enc, img.mask))
+            } else {
+                enc
+            }
         }
         _ => g.add(EmptyLatentImage {
             width: p.width,
@@ -227,6 +233,61 @@ mod tests {
         let (ks2, _) = wf2.0[&dec2].inputs["samples"].as_slot().unwrap();
         let (lat2, _) = wf2.0[&ks2].inputs["latent_image"].as_slot().unwrap();
         assert_eq!(wf2.0[&lat2].class_type, "EmptyLatentImage");
+    }
+
+    /// Inpainting threads the VAE-encoded latent and the LoadImage mask through SetLatentNoiseMask.
+    #[test]
+    fn masked_img2img_inserts_a_set_latent_noise_mask() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = params();
+        p.mode = Mode::Img2Img;
+        p.inpaint_mask = true;
+        p.denoise = 0.45;
+
+        let (wf, out, _) = build(&p, Some(crate::engine::INPUT_IMAGE_NAME.into()), &apps, &schemas);
+        let ks = upstream(&wf, &upstream(&wf, &out, "images"), "samples");
+        let mask_node = upstream(&wf, &ks, "latent_image");
+        assert_eq!(class_of(&wf, &mask_node), "SetLatentNoiseMask");
+        // samples <- VAEEncode, mask <- LoadImage's second output.
+        let enc = upstream(&wf, &mask_node, "samples");
+        assert_eq!(class_of(&wf, &enc), "VAEEncode");
+        let (load, slot) = wf.0[&mask_node].inputs["mask"].as_slot().unwrap();
+        assert_eq!(wf.0[&load].class_type, "LoadImage");
+        assert_eq!(slot, 1, "mask reads LoadImage's mask output slot");
+        // One LoadImage feeds both the encode's pixels and the mask.
+        assert_eq!(upstream(&wf, &enc, "pixels"), load);
+        assert_eq!(wf.0[&ks].inputs["denoise"].as_f64().unwrap() as f32, 0.45);
+    }
+
+    /// Unmasked img2img keeps the plain VAEEncode -> KSampler shape with no mask node.
+    #[test]
+    fn unmasked_img2img_has_no_set_latent_noise_mask() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = params();
+        p.mode = Mode::Img2Img;
+        p.inpaint_mask = false;
+        p.denoise = 0.6;
+
+        let (wf, out, _) = build(&p, Some(crate::engine::INPUT_IMAGE_NAME.into()), &apps, &schemas);
+        assert!(!wf.0.values().any(|n| n.class_type == "SetLatentNoiseMask"));
+        let ks = upstream(&wf, &upstream(&wf, &out, "images"), "samples");
+        let enc = upstream(&wf, &ks, "latent_image");
+        assert_eq!(class_of(&wf, &enc), "VAEEncode");
+        assert_eq!(class_of(&wf, &upstream(&wf, &enc, "pixels")), "LoadImage");
+    }
+
+    /// The inpaint flag is inert for txt2img: no input image, so the latent stays empty.
+    #[test]
+    fn txt2img_ignores_the_inpaint_flag() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = params();
+        p.mode = Mode::Txt2Img;
+        p.inpaint_mask = true;
+
+        let (wf, out, _) = build(&p, Some(crate::engine::INPUT_IMAGE_NAME.into()), &apps, &schemas);
+        assert!(!wf.0.values().any(|n| n.class_type == "SetLatentNoiseMask"));
+        let ks = upstream(&wf, &upstream(&wf, &out, "images"), "samples");
+        assert_eq!(class_of(&wf, &upstream(&wf, &ks, "latent_image")), "EmptyLatentImage");
     }
 
     #[test]

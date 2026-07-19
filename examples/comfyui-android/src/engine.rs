@@ -18,7 +18,7 @@ use crate::types::{
     Album, AlbumList, CheckpointCatalog, Facets, GalleryPage, GalleryView, Img2ImgSource,
     LoraCatalog, Mode, Params,
 };
-use crate::{uiwf, workflow};
+use crate::{tags, uiwf, workflow};
 
 /// The prompt id currently executing, shared with the websocket listener so it can filter
 /// broadcast events down to our run.
@@ -124,6 +124,8 @@ pub enum Msg {
     /// Server checkpoint catalog (`GET /checkpoint-catalog.json`).
     CheckpointCatalog(CheckpointCatalog),
     CheckpointCatalogError(String),
+    /// Server tag dictionary override (`GET /comfyui-android/tags.csv.gz`).
+    TagDict(Arc<tags::TagDict>),
     /// Decoded preview for Create img2img "From URL" (or an error string).
     Img2ImgUrlPreview {
         url: String,
@@ -489,6 +491,35 @@ impl Engine {
             log.warn("checkpoint catalog: not found");
             let _ = tx.send(Msg::CheckpointCatalogError("catalog not found".into()));
             ctx.request_repaint();
+        });
+    }
+
+    /// Fetch the server tag-dictionary sidecar (gzip). Tries `/comfyui-android/tags.csv.gz`, then
+    /// `/tags.csv.gz`. Soft-fails (logs only) so autocomplete falls back to the bundled dictionary.
+    pub fn fetch_tag_dict(&self) {
+        let Some(http) = self.http.clone() else { return };
+        let base = self.base.clone();
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let paths = ["/comfyui-android/tags.csv.gz", "/tags.csv.gz"];
+            for path in paths {
+                let Ok(url) = reqwest::Url::parse(&format!("{base}{path}")) else {
+                    continue;
+                };
+                match get_ok_bytes(&http, url).await {
+                    Ok(bytes) => match tags::TagDict::parse_csv_gz(&bytes) {
+                        Ok(dict) => {
+                            log.info(format!("tag dict: {} entries (from {path})", dict.len()));
+                            let _ = tx.send(Msg::TagDict(Arc::new(dict)));
+                            ctx.request_repaint();
+                            return;
+                        }
+                        Err(e) => log.warn(format!("tag dict {path}: parse error: {e}")),
+                    },
+                    Err(_) => continue,
+                }
+            }
+            log.warn("tag dict: not found");
         });
     }
 
@@ -1284,7 +1315,7 @@ async fn run_generate(
     // Resolve and upload the img2img input, if any.
     let input_image = if params.mode == Mode::Img2Img {
         let bytes = match params.img2img_source {
-            Img2ImgSource::CurrentOutput => current,
+            Img2ImgSource::CurrentOutput | Img2ImgSource::Picked => current,
             Img2ImgSource::Url => match fetch_bytes(&params.input_url, &authed, &log).await {
                 Ok(b) => Some(b),
                 Err(e) => {
@@ -1300,6 +1331,7 @@ async fn run_generate(
             ctx.request_repaint();
             return;
         };
+        // N queued variants upload identical bytes to the fixed INPUT_IMAGE_NAME; the overwrite is benign.
         let name = INPUT_IMAGE_NAME;
         log.info(format!("uploading img2img input ({} bytes)", bytes.len()));
         let resp = match client
