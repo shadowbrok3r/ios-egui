@@ -404,7 +404,7 @@ impl GraphView {
         if self.drag_from_node && delta.is_finite() { delta } else { egui::Vec2::ZERO }
     }
 
-    /// Floating lock toggle in the canvas's bottom-right (left of the queue FAB).
+    /// Floating lock toggle under the queue FAB (bottom-right stack).
     fn lock_button(&mut self, ui: &mut egui::Ui) {
         let view = self.view_rect;
         if !view.is_finite() || view.width() < 80.0 {
@@ -415,10 +415,10 @@ impl GraphView {
         } else {
             (crate::icons::UNLOCKED, "Editing — tap to lock")
         };
-        // Primary queue FAB sits at (right-58, bottom-58); lock is one slot left.
+        // Queue default is one slot above; lock is the bottom of the stack.
         egui::Area::new(egui::Id::new("comfy-lock"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(view.right() - 58.0 - 56.0, view.bottom() - 58.0))
+            .fixed_pos(egui::pos2(view.right() - 58.0, view.bottom() - 58.0))
             .show(ui.ctx(), |aui| {
                 let btn = egui::Button::new(egui::RichText::new(icon).size(22.0))
                     .min_size(egui::vec2(48.0, 48.0))

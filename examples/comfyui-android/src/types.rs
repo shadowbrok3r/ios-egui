@@ -446,6 +446,32 @@ pub struct CheckpointRecommended {
     pub weight_dtype: Option<String>,
 }
 
+impl CheckpointRecommended {
+    /// Short inline hint: steps, CFG, size (and sampler only if nothing else).
+    pub fn short_hint(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(v) = self.steps {
+            parts.push(format!("steps {v}"));
+        } else if let (Some(a), Some(b)) = (self.steps_min, self.steps_max) {
+            parts.push(format!("steps {a}–{b}"));
+        }
+        if let Some(v) = self.cfg {
+            parts.push(format!("CFG {v}"));
+        } else if let (Some(a), Some(b)) = (self.cfg_min, self.cfg_max) {
+            parts.push(format!("CFG {a}–{b}"));
+        }
+        if let (Some(w), Some(h)) = (self.width, self.height) {
+            parts.push(format!("{w}×{h}"));
+        }
+        if parts.is_empty() {
+            if let Some(s) = self.sampler.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                parts.push(s.to_string());
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
 impl CheckpointEntry {
     pub fn display_name(&self) -> &str {
         if self.name.trim().is_empty() { &self.file } else { &self.name }
@@ -655,6 +681,26 @@ impl LoraEntry {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// Short inline hint for active LoRA cards.
+    pub fn strength_hint(&self) -> String {
+        let mut parts = Vec::new();
+        if (self.strength_clip - self.strength_model).abs() < 0.005 {
+            parts.push(format!("strength {:.2}", self.strength_model));
+        } else {
+            parts.push(format!(
+                "model {:.2} · CLIP {:.2}",
+                self.strength_model, self.strength_clip
+            ));
+        }
+        match (self.strength_model_min, self.strength_model_max) {
+            (Some(a), Some(b)) => parts.push(format!("{a:.2}–{b:.2}")),
+            (Some(a), None) => parts.push(format!("min {a:.2}")),
+            (None, Some(b)) => parts.push(format!("max {b:.2}")),
+            _ => {}
+        }
+        parts.join(" · ")
     }
 
     /// Model/CLIP strengths for Add, clamped to an optional recommended range.
@@ -1073,6 +1119,9 @@ pub struct Settings {
     /// Ask before deleting gallery images (viewer or multi-select).
     #[serde(default = "default_true")]
     pub confirm_gallery_delete: bool,
+    /// Create Main: mode / sampler / size block is expanded.
+    #[serde(default = "default_true")]
+    pub create_setup_open: bool,
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),

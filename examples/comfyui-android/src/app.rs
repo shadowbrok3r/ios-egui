@@ -430,8 +430,10 @@ struct ComfyApp {
     confirm_gallery_delete: bool,
     /// Pending delete confirmation: items + "never show again" checkbox.
     delete_confirm: Option<(Vec<(String, String)>, bool)>,
-    /// Close the viewer after a confirmed single-image delete.
-    delete_closes_viewer: bool,
+    /// After a viewer delete, reopen this `(subfolder, filename)` once the list refreshes.
+    viewer_after_delete: Option<(String, String)>,
+    /// Scroll the Create tab to the result strip after a new image lands.
+    create_scroll_bottom: bool,
     /// Long-press-to-paint gesture: (press start time, screen origin, cancelled-as-a-scroll).
     sel_press: Option<(f64, egui::Pos2, bool)>,
     sel_long_fired: bool,
@@ -479,13 +481,15 @@ struct ComfyApp {
     viewer_swipe_origin: Option<egui::Pos2>,
     /// Re-fetch the gallery listing at this time (server indexing lag after generate).
     gallery_refresh_at: Option<f64>,
-    /// Create-tab menu FAB position; `None` = default left of the queue FAB.
+    /// Create-tab menu FAB position; `None` = default under the queue FAB.
     create_fab_pos: Option<egui::Pos2>,
     create_fab_open: bool,
     /// System clipboard snapshotted while the Create menu FAB is open (not polled every frame).
     create_fab_clip: Option<FabClipSnap>,
-    /// Shared Create/Graph queue (play) FAB position; `None` = default bottom-right.
+    /// Shared Create/Graph queue (play) FAB position; `None` = default above the menu/lock FAB.
     queue_fab_pos: Option<egui::Pos2>,
+    /// Create Main collapsing block for mode + sampler/size (persisted).
+    create_setup_open: bool,
 }
 
 impl ComfyApp {
@@ -612,7 +616,8 @@ impl ComfyApp {
             selected: HashSet::new(),
             confirm_gallery_delete: true,
             delete_confirm: None,
-            delete_closes_viewer: false,
+            viewer_after_delete: None,
+            create_scroll_bottom: false,
             sel_press: None,
             sel_long_fired: false,
             sel_painting: false,
@@ -642,6 +647,7 @@ impl ComfyApp {
             create_fab_open: false,
             create_fab_clip: None,
             queue_fab_pos: None,
+            create_setup_open: true,
         }
     }
 
@@ -853,12 +859,6 @@ impl ComfyApp {
                 self.gallery_status = note;
                 self.selected.clear();
                 self.select_mode = false;
-                if self.delete_closes_viewer {
-                    self.delete_closes_viewer = false;
-                    self.viewer = None;
-                    self.player = None;
-                    self.viewer_swipe_origin = None;
-                }
                 self.refresh_gallery();
                 host.haptic(Haptic::Success);
             }
@@ -1084,6 +1084,7 @@ impl ComfyApp {
                 self.results.push((tex, bytes));
                 self.preview = None;
                 self.note.clear();
+                self.create_scroll_bottom = true;
             }
             Msg::NodeExecuting(node) => {
                 if let Some(n) = node {
@@ -1227,10 +1228,10 @@ impl ComfyApp {
                 // for the groups/results to be complete — keep paging (in big chunks) instead of
                 // making the user tap "Load more". Capped so a huge namespace can't runaway.
                 let loaded = self.gallery.len() as u64;
-                if self.gallery_wants_all()
+                let more = self.gallery_wants_all()
                     && loaded < self.gallery_total
-                    && loaded < GALLERY_LOAD_ALL_CAP
-                {
+                    && loaded < GALLERY_LOAD_ALL_CAP;
+                if more {
                     self.gallery_loading = true;
                     self.engine.as_ref().unwrap().gallery_list(
                         self.gallery_gen,
@@ -1239,6 +1240,8 @@ impl ComfyApp {
                         &self.gallery_q,
                         &self.gallery_view,
                     );
+                } else if self.viewer_after_delete.is_some() || page.offset == 0 {
+                    self.resume_viewer_after_delete(host);
                 }
             }
             Msg::GalleryError(e) => {
@@ -1708,6 +1711,7 @@ impl ComfyApp {
             checkpoint_favorites: self.checkpoint_favorites.clone(),
             checkpoint_recent: self.checkpoint_recent.clone(),
             confirm_gallery_delete: self.confirm_gallery_delete,
+            create_setup_open: self.create_setup_open,
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -1765,6 +1769,7 @@ impl ComfyApp {
             self.checkpoint_favorites = saved.checkpoint_favorites;
             self.checkpoint_recent = saved.checkpoint_recent;
             self.confirm_gallery_delete = saved.confirm_gallery_delete;
+            self.create_setup_open = saved.create_setup_open;
             if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
                 self.restore_workflow = Some((saved.workflow_name, json));
             }
@@ -2135,113 +2140,13 @@ impl ComfyApp {
             ui,
             &format!("{ckpt_label} · {preset_label}{enhance_label}"),
         ));
-
-        // Diffusion models (Anima, Flux, Qwen-Image) ship without a text encoder or VAE, so those
-        // are picked here. select_model seeds them; this is the override.
-        if self.params.model_kind == ModelKind::Diffusion {
-            ui.group(|ui| {
-                ui.label("Diffusion model companions");
-
-                let clip_n = self.params.clip_names.len().max(1);
-                for i in 0..clip_n {
-                    if self.params.clip_names.len() <= i {
-                        self.params.clip_names.push(String::new());
-                    }
-                    ui.horizontal(|ui| {
-                        ui.label(if i == 0 { "Text encoder" } else { "  + encoder" });
-                        if i > 0 && ui.small_button(icons::TRASH).clicked() {
-                            self.params.clip_names.remove(i);
-                        }
-                    });
-                    if i < self.params.clip_names.len() {
-                        let mut val = self.params.clip_names[i].clone();
-                        combo_full(ui, &format!("clip_name_{i}"), &mut val, &self.clip_files);
-                        self.params.clip_names[i] = val;
-                    }
-                }
-                // Two encoders is the cap: DualCLIPLoader is the widest typed loader available.
-                if self.params.clip_names.len() < 2 && ui.button("+ second encoder").clicked() {
-                    self.params.clip_names.push(String::new());
-                }
-
-                ui.label("VAE");
-                combo_full(ui, "vae_name", &mut self.params.vae_name, &self.vaes);
-
-                egui::CollapsingHeader::new("Advanced").id_salt("diffusion_adv").show(ui, |ui| {
-                    ui.label("Encoder type");
-                    let mut ty = self.params.effective_clip_type();
-                    combo_full(ui, "clip_type", &mut ty, &self.clip_types);
-                    self.params.clip_type = ty;
-                    ui.label("Weight dtype");
-                    combo_full(ui, "weight_dtype", &mut self.params.weight_dtype, &self.weight_dtypes);
-                    if !self.clip_devices.is_empty() {
-                        ui.label("Encoder device");
-                        combo_full(ui, "clip_device", &mut self.params.clip_device, &self.clip_devices);
-                    }
-                });
-
-                if let Some(missing) = self.params.missing_model_part() {
-                    ui.colored_label(ui.visuals().warn_fg_color, missing);
-                }
-            });
-        }
-
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
-            ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
-        });
-
-        if self.params.mode == Mode::Img2Img {
-            ui.group(|ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(
-                        &mut self.params.img2img_source,
-                        Img2ImgSource::CurrentOutput,
-                        "Current result",
-                    );
-                    ui.selectable_value(
-                        &mut self.params.img2img_source,
-                        Img2ImgSource::Url,
-                        "From URL",
-                    );
-                });
-                match self.params.img2img_source {
-                    Img2ImgSource::Url => {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.params.input_url)
-                                .hint_text("https://…/image.png — or pick from Gallery")
-                                .desired_width(f32::INFINITY),
-                        );
-                        self.tick_img2img_url_preview(ui.ctx());
-                        ui.horizontal(|ui| {
-                            if let Some(tex) = &self.img2img_url_tex {
-                                let sized = egui::load::SizedTexture::from_handle(tex);
-                                ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
-                            } else if self.img2img_url_loading {
-                                ui.spinner();
-                                ui.weak("loading preview…");
-                            } else if !self.img2img_url_err.is_empty() {
-                                ui.weak(elide(&self.img2img_url_err, 64));
-                            }
-                        });
-                    }
-                    Img2ImgSource::CurrentOutput if self.result_bytes.is_none() => {
-                        ui.weak("Generate an image first to use it as input.");
-                    }
-                    Img2ImgSource::CurrentOutput => {
-                        if let Some(tex) = &self.result {
-                            let sized = egui::load::SizedTexture::from_handle(tex);
-                            ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
-                        }
-                    }
-                }
-                full_width_slider(ui, "Denoise", |ui, w| {
-                    ui.add_sized(
-                        [w, 24.0],
-                        egui::Slider::new(&mut self.params.denoise, 0.0..=1.0),
-                    );
-                });
-            });
+        if let Some(hint) = self
+            .checkpoint_catalog
+            .entry(&model_file)
+            .and_then(|e| e.recommended.as_ref())
+            .and_then(|r| r.short_hint())
+        {
+            ui.weak(sanitize_ui_text(ui, &format!("rec: {hint}")));
         }
 
         ui.label("Prompt");
@@ -2266,56 +2171,191 @@ impl ComfyApp {
                 .hint_text("what to avoid"),
         );
 
-        full_width_slider(ui, "Steps", |ui, w| {
-            ui.add_sized(
-                [w, 24.0],
-                egui::Slider::new(&mut self.params.steps, 5..=150)
-                    .step_by(5.0)
-                    .clamping(egui::SliderClamping::Always),
-            );
-        });
-        full_width_slider(ui, "CFG", |ui, w| {
-            ui.add_sized(
-                [w, 24.0],
-                egui::Slider::new(&mut self.params.cfg, 1.0..=20.0)
-                    .clamping(egui::SliderClamping::Always),
-            );
-        });
-        full_width_slider(ui, "Batch", |ui, w| {
-            ui.add_sized(
-                [w, 24.0],
-                egui::Slider::new(&mut self.params.batch_size, 1..=8).text("images"),
-            );
-        });
-
         ui.add_space(4.0);
-        ui.label("Size");
-        ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut self.params.width).range(64..=2048).speed(8.0));
-            ui.label("×");
-            ui.add(egui::DragValue::new(&mut self.params.height).range(64..=2048).speed(8.0));
-            size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
-        });
-        // An enabled step may render at a different size than the one above (hi-res fix works by
-        // generating small and scaling up). Show what it will actually do — the stored value is
-        // never touched, so this line simply disappears when the step is removed.
-        self.param_override_note(ui);
+        let mode_label = match self.params.mode {
+            Mode::Txt2Img => "Text to Image",
+            Mode::Img2Img => "Image to Image",
+        };
+        let setup_open = self.create_setup_open;
+        let setup_title = if setup_open {
+            "Setup".to_string()
+        } else {
+            format!(
+                "Setup · {mode_label} · {} steps · CFG {} · {}×{}",
+                self.params.steps, self.params.cfg, self.params.width, self.params.height
+            )
+        };
+        let setup = egui::CollapsingHeader::new(setup_title)
+            .id_salt("create_t2i_i2i_setup")
+            .open(Some(setup_open))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
+                    ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
+                });
 
-        ui.add_space(4.0);
-        ui.label("Sampler");
-        combo_full(ui, "sampler", &mut self.params.sampler, &self.samplers);
-        ui.label("Scheduler");
-        combo_full(ui, "scheduler", &mut self.params.scheduler, &self.schedulers);
+                // Diffusion models (Anima, Flux, Qwen-Image) ship without a text encoder or VAE, so those
+                // are picked here. select_model seeds them; this is the override.
+                if self.params.model_kind == ModelKind::Diffusion {
+                    ui.group(|ui| {
+                        ui.label("Diffusion model companions");
 
-        ui.add_space(4.0);
-        ui.label("Seed");
-        ui.horizontal(|ui| {
-            ui.add_enabled(
-                !self.params.randomize_seed,
-                egui::DragValue::new(&mut self.params.seed).speed(1.0),
-            );
-            ui.checkbox(&mut self.params.randomize_seed, "random");
-        });
+                        let clip_n = self.params.clip_names.len().max(1);
+                        for i in 0..clip_n {
+                            if self.params.clip_names.len() <= i {
+                                self.params.clip_names.push(String::new());
+                            }
+                            ui.horizontal(|ui| {
+                                ui.label(if i == 0 { "Text encoder" } else { "  + encoder" });
+                                if i > 0 && ui.small_button(icons::TRASH).clicked() {
+                                    self.params.clip_names.remove(i);
+                                }
+                            });
+                            if i < self.params.clip_names.len() {
+                                let mut val = self.params.clip_names[i].clone();
+                                combo_full(ui, &format!("clip_name_{i}"), &mut val, &self.clip_files);
+                                self.params.clip_names[i] = val;
+                            }
+                        }
+                        // Two encoders is the cap: DualCLIPLoader is the widest typed loader available.
+                        if self.params.clip_names.len() < 2 && ui.button("+ second encoder").clicked() {
+                            self.params.clip_names.push(String::new());
+                        }
+
+                        ui.label("VAE");
+                        combo_full(ui, "vae_name", &mut self.params.vae_name, &self.vaes);
+
+                        egui::CollapsingHeader::new("Advanced").id_salt("diffusion_adv").show(ui, |ui| {
+                            ui.label("Encoder type");
+                            let mut ty = self.params.effective_clip_type();
+                            combo_full(ui, "clip_type", &mut ty, &self.clip_types);
+                            self.params.clip_type = ty;
+                            ui.label("Weight dtype");
+                            combo_full(ui, "weight_dtype", &mut self.params.weight_dtype, &self.weight_dtypes);
+                            if !self.clip_devices.is_empty() {
+                                ui.label("Encoder device");
+                                combo_full(ui, "clip_device", &mut self.params.clip_device, &self.clip_devices);
+                            }
+                        });
+
+                        if let Some(missing) = self.params.missing_model_part() {
+                            ui.colored_label(ui.visuals().warn_fg_color, missing);
+                        }
+                    });
+                }
+
+                if self.params.mode == Mode::Img2Img {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.params.img2img_source,
+                                Img2ImgSource::CurrentOutput,
+                                "Current result",
+                            );
+                            ui.selectable_value(
+                                &mut self.params.img2img_source,
+                                Img2ImgSource::Url,
+                                "From URL",
+                            );
+                        });
+                        match self.params.img2img_source {
+                            Img2ImgSource::Url => {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.params.input_url)
+                                        .hint_text("https://…/image.png — or pick from Gallery")
+                                        .desired_width(f32::INFINITY),
+                                );
+                                self.tick_img2img_url_preview(ui.ctx());
+                                ui.horizontal(|ui| {
+                                    if let Some(tex) = &self.img2img_url_tex {
+                                        let sized = egui::load::SizedTexture::from_handle(tex);
+                                        ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                                    } else if self.img2img_url_loading {
+                                        ui.spinner();
+                                        ui.weak("loading preview…");
+                                    } else if !self.img2img_url_err.is_empty() {
+                                        ui.weak(elide(&self.img2img_url_err, 64));
+                                    }
+                                });
+                            }
+                            Img2ImgSource::CurrentOutput if self.result_bytes.is_none() => {
+                                ui.weak("Generate an image first to use it as input.");
+                            }
+                            Img2ImgSource::CurrentOutput => {
+                                if let Some(tex) = &self.result {
+                                    let sized = egui::load::SizedTexture::from_handle(tex);
+                                    ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                                }
+                            }
+                        }
+                        full_width_slider(ui, "Denoise", |ui, w| {
+                            ui.add_sized(
+                                [w, 24.0],
+                                egui::Slider::new(&mut self.params.denoise, 0.0..=1.0),
+                            );
+                        });
+                    });
+                }
+
+                ui.add_space(4.0);
+                ui.columns(2, |cols| {
+                    cols[0].vertical_centered(|ui| {
+                        stepper_u32(ui, "Steps", &mut self.params.steps, 5..=150, 1);
+                    });
+                    cols[1].vertical_centered(|ui| {
+                        stepper_f32(ui, "CFG", &mut self.params.cfg, 1.0..=20.0, 0.5);
+                    });
+                });
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| {
+                    stepper_u32(ui, "Batch", &mut self.params.batch_size, 1..=8, 1);
+                });
+
+                ui.add_space(4.0);
+                ui.vertical_centered(|ui| {
+                    section_title(ui, "Size");
+                });
+                centered_row(ui, |ui| {
+                    uint_text_edit(ui, "size_w", &mut self.params.width, 64..=2048);
+                    ui.label("×");
+                    uint_text_edit(ui, "size_h", &mut self.params.height, 64..=2048);
+                    size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
+                });
+                // An enabled step may render at a different size than the one above (hi-res fix works by
+                // generating small and scaling up). Show what it will actually do — the stored value is
+                // never touched, so this line simply disappears when the step is removed.
+                self.param_override_note(ui);
+
+                ui.add_space(4.0);
+                let mut sampler = self.params.sampler.clone();
+                let mut scheduler = self.params.scheduler.clone();
+                let samplers = self.samplers.clone();
+                let schedulers = self.schedulers.clone();
+                ui.columns(2, |cols| {
+                    cols[0].vertical_centered(|ui| {
+                        section_title(ui, "Sampler");
+                        combo_full(ui, "sampler", &mut sampler, &samplers);
+                    });
+                    cols[1].vertical_centered(|ui| {
+                        section_title(ui, "Scheduler");
+                        combo_full(ui, "scheduler", &mut scheduler, &schedulers);
+                    });
+                });
+                self.params.sampler = sampler;
+                self.params.scheduler = scheduler;
+
+                ui.add_space(4.0);
+                ui.label("Seed");
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!self.params.randomize_seed, |ui| {
+                        uint_text_edit_u64(ui, "seed", &mut self.params.seed, 0..=u64::MAX);
+                    });
+                    ui.checkbox(&mut self.params.randomize_seed, "random");
+                });
+            });
+        if setup.header_response.clicked() {
+            self.create_setup_open = !setup_open;
+        }
 
         if !self.params.loras.is_empty() {
             ui.add_space(4.0);
@@ -2347,8 +2387,8 @@ impl ComfyApp {
             }
         }
 
-        // Room for the floating action bubble.
-        ui.add_space(72.0);
+        // Room for the stacked queue + menu FABs.
+        ui.add_space(130.0);
     }
 
     fn create_models_pane(&mut self, ui: &mut egui::Ui) {
@@ -3017,6 +3057,9 @@ impl ComfyApp {
                             remove = Some(i);
                         }
                     });
+                    if let Some(meta) = meta.as_ref() {
+                        ui.weak(sanitize_ui_text(ui, &format!("rec: {}", meta.strength_hint())));
+                    }
                     if let Some(slot) = self.params.loras.get_mut(i) {
                         let (lo, hi) = meta
                             .as_ref()
@@ -3118,7 +3161,7 @@ impl ComfyApp {
         }
     }
 
-    /// Undo/redo, floating at the TOP right — far from the queue FAB and the lock at the bottom,
+    /// Undo/redo, floating at the TOP right — far from the queue/lock stack at the bottom,
     /// which are the taps you least want to hit by accident while reaching for undo.
     fn undo_redo_buttons(&mut self, ui: &mut egui::Ui, host: &Host) {
         let Some(doc) = self.active_doc() else { return };
@@ -3247,7 +3290,7 @@ impl ComfyApp {
                 "Nothing added. Steps run after the image is generated — upscale it, fix faces, \
                  sharpen. Tap Add.",
             );
-            ui.add_space(72.0);
+            ui.add_space(130.0);
             return;
         }
         if self.schemas.is_none() {
@@ -3321,7 +3364,7 @@ impl ComfyApp {
 
         ui.add_space(4.0);
         ui.weak("Steps run top to bottom on the finished image.");
-        ui.add_space(72.0);
+        ui.add_space(130.0);
     }
 
     /// One card's status note and knob widgets.
@@ -4532,10 +4575,16 @@ impl ComfyApp {
             return;
         }
 
-        self.create_pane_bar(ui);
-        ui.separator();
+        // Above the app nav bar (Create / Graph / Gallery / Settings).
+        egui::Panel::bottom("create-panes").show(ui, |ui| {
+            ui.add_space(2.0);
+            self.create_pane_bar(ui);
+            ui.add_space(2.0);
+        });
+
         let pane = ui.available_rect_before_wrap();
         crate::theme::scroll_vertical()
+            .id_salt("create-main-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let connected = matches!(self.conn, Conn::Connected)
@@ -4553,18 +4602,23 @@ impl ComfyApp {
                 ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
 
                 self.output(ui, host);
+                if self.create_scroll_bottom {
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                    self.create_scroll_bottom = false;
+                }
                 ui.add_space(12.0);
             });
         self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
         self.create_fab(ui.ctx(), host, pane);
     }
 
-    /// Queue FAB (+ Cancel while running) shared by Create and Graph (bottom-right).
+    /// Queue FAB (+ Cancel while running) shared by Create and Graph (bottom-right stack).
     fn queue_fab(&mut self, ctx: &egui::Context, host: &Host, pane: egui::Rect, kind: QueueFabKind) {
         if !pane.is_finite() || pane.width() < 80.0 {
             return;
         }
-        let default = egui::pos2(pane.right() - 58.0, pane.bottom() - 58.0);
+        // One slot above the menu/lock FAB so the stack reads queue-on-top.
+        let default = egui::pos2(pane.right() - 58.0, pane.bottom() - 58.0 - 56.0);
         let mut pos = self.queue_fab_pos.unwrap_or(default);
         pos.x = pos.x.clamp(pane.left() + 8.0, pane.right() - 52.0);
         pos.y = pos.y.clamp(pane.top() + 8.0, pane.bottom() - 52.0);
@@ -4668,15 +4722,15 @@ impl ComfyApp {
         }
     }
 
-    /// Draggable Create-tab menu bubble (paste / open graph).
+    /// Draggable Create-tab menu bubble (paste / open graph), under the queue FAB.
     fn create_fab(&mut self, ctx: &egui::Context, host: &Host, pane: egui::Rect) {
         if !pane.is_finite() || pane.width() < 80.0 {
             return;
         }
         let queue = self
             .queue_fab_pos
-            .unwrap_or(egui::pos2(pane.right() - 58.0, pane.bottom() - 58.0));
-        let default = egui::pos2(queue.x - 56.0, queue.y);
+            .unwrap_or(egui::pos2(pane.right() - 58.0, pane.bottom() - 58.0 - 56.0));
+        let default = egui::pos2(queue.x, queue.y + 56.0);
         let mut pos = self.create_fab_pos.unwrap_or(default);
         pos.x = pos.x.clamp(pane.left() + 8.0, pane.right() - 52.0);
         pos.y = pos.y.clamp(pane.top() + 8.0, pane.bottom() - 52.0);
@@ -6805,7 +6859,7 @@ impl ComfyApp {
             self.select_mode = false;
             host.haptic(Haptic::Light);
         } else if delete {
-            self.request_delete_images(items, false);
+            self.request_delete_images(items);
             host.haptic(Haptic::Warning);
         } else if clear {
             self.selected.clear();
@@ -6821,15 +6875,63 @@ impl ComfyApp {
     }
 
     /// Queue a gallery delete, optionally after a confirmation dialog.
-    fn request_delete_images(&mut self, items: Vec<(String, String)>, close_viewer: bool) {
+    fn request_delete_images(&mut self, items: Vec<(String, String)>) {
         if items.is_empty() {
             return;
         }
-        self.delete_closes_viewer = close_viewer;
         if self.confirm_gallery_delete {
             self.delete_confirm = Some((items, false));
         } else {
             self.engine.as_ref().unwrap().delete_images(items);
+        }
+    }
+
+    /// Prefer the next filmstrip neighbor after a viewer delete; fall back to previous.
+    fn remember_viewer_neighbor_after_delete(&mut self) {
+        let Some(v) = self.viewer.as_ref() else {
+            self.viewer_after_delete = None;
+            return;
+        };
+        let idx = v.idx;
+        let key = self
+            .gallery_neighbor(idx, 1)
+            .or_else(|| self.gallery_neighbor(idx, -1))
+            .and_then(|i| {
+                self.gallery
+                    .get(i)
+                    .map(|it| (it.subfolder.clone(), it.filename.clone()))
+            });
+        self.viewer_after_delete = key;
+    }
+
+    /// Reopen the neighbor captured before delete, or close if the listing is empty.
+    fn resume_viewer_after_delete(&mut self, host: &Host) {
+        let Some((sub, file)) = self.viewer_after_delete.take() else {
+            // Keep an open viewer in sync when the list reloads under it.
+            if let Some(v) = &self.viewer {
+                let key = v.item.key();
+                if let Some(idx) = self.gallery.iter().position(|it| it.key() == key) {
+                    if let Some(v) = self.viewer.as_mut() {
+                        v.idx = idx;
+                    }
+                } else if self.viewer.is_some() {
+                    self.viewer = None;
+                    self.player = None;
+                    self.viewer_swipe_origin = None;
+                }
+            }
+            return;
+        };
+        if let Some(idx) = self
+            .gallery
+            .iter()
+            .position(|it| it.subfolder == sub && it.filename == file)
+        {
+            self.open_viewer(idx, host);
+        } else {
+            self.viewer = None;
+            self.player = None;
+            self.viewer_swipe_origin = None;
         }
     }
 
@@ -6917,7 +7019,7 @@ impl ComfyApp {
         }
         if !open || cancel {
             self.delete_confirm = None;
-            self.delete_closes_viewer = false;
+            self.viewer_after_delete = None;
             return;
         }
         if confirm {
@@ -7449,9 +7551,10 @@ impl ComfyApp {
                     Some(vec![(v.item.subfolder.clone(), v.item.filename.clone())]);
             }
             Some(Act::Delete) => {
+                self.remember_viewer_neighbor_after_delete();
                 let v = self.viewer.as_ref().unwrap();
                 let items = vec![(v.item.subfolder.clone(), v.item.filename.clone())];
-                self.request_delete_images(items, true);
+                self.request_delete_images(items);
                 host.haptic(Haptic::Warning);
             }
             Some(Act::Save) => {
@@ -8492,6 +8595,124 @@ fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[Stri
                 ui.selectable_value(current, opt.clone(), elide(&sanitize_ui_text(ui, opt), 56));
             }
         });
+}
+
+/// Underlined section heading.
+fn section_title(ui: &mut egui::Ui, title: &str) {
+    ui.label(egui::RichText::new(title).strong().underline());
+}
+
+/// Lay out controls centered on the main axis (plain `horizontal` left-aligns in a wide parent).
+fn centered_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let w = ui.available_width();
+    ui.allocate_ui_with_layout(
+        egui::vec2(w, ui.spacing().interact_size.y + 4.0),
+        egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center),
+        add,
+    );
+}
+
+/// Underlined title with − / value / + (text field, not a drag slider).
+fn stepper_u32(
+    ui: &mut egui::Ui,
+    title: &str,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+    step: u32,
+) {
+    section_title(ui, title);
+    centered_row(ui, |ui| {
+        if ui.small_button("-").clicked() {
+            *value = (*value).saturating_sub(step).max(*range.start());
+        }
+        let mut s = value.to_string();
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut s)
+                    .desired_width(52.0)
+                    .horizontal_align(egui::Align::Center),
+            )
+            .changed()
+            && let Ok(v) = s.parse::<u32>()
+        {
+            *value = v.clamp(*range.start(), *range.end());
+        }
+        if ui.small_button("+").clicked() {
+            *value = (*value).saturating_add(step).min(*range.end());
+        }
+    });
+}
+
+fn stepper_f32(
+    ui: &mut egui::Ui,
+    title: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    step: f32,
+) {
+    section_title(ui, title);
+    centered_row(ui, |ui| {
+        if ui.small_button("-").clicked() {
+            *value = (*value - step).max(*range.start());
+        }
+        let mut s = format!("{value:.2}");
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut s)
+                    .desired_width(52.0)
+                    .horizontal_align(egui::Align::Center),
+            )
+            .changed()
+            && let Ok(v) = s.parse::<f32>()
+        {
+            *value = v.clamp(*range.start(), *range.end());
+        }
+        if ui.small_button("+").clicked() {
+            *value = (*value + step).min(*range.end());
+        }
+    });
+}
+
+fn uint_text_edit(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut u32,
+    range: std::ops::RangeInclusive<u32>,
+) {
+    let mut s = value.to_string();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut s)
+                .id_salt(id)
+                .desired_width(64.0)
+                .horizontal_align(egui::Align::Center),
+        )
+        .changed()
+        && let Ok(v) = s.parse::<u32>()
+    {
+        *value = v.clamp(*range.start(), *range.end());
+    }
+}
+
+fn uint_text_edit_u64(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut u64,
+    range: std::ops::RangeInclusive<u64>,
+) {
+    let mut s = value.to_string();
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut s)
+                .id_salt(id)
+                .desired_width(120.0)
+                .horizontal_align(egui::Align::Center),
+        )
+        .changed()
+        && let Ok(v) = s.parse::<u64>()
+    {
+        *value = v.clamp(*range.start(), *range.end());
+    }
 }
 
 fn full_width_slider(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, f32)) {
