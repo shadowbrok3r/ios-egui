@@ -2,6 +2,9 @@ package com.github.egui_mobile;
 
 import android.app.NativeActivity;
 import android.content.Context;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
+import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.InputType;
 import android.view.ActionMode;
@@ -20,9 +23,28 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 public class EguiNativeActivity extends NativeActivity {
     private EditText imeEdit;
     private volatile boolean updatingFromNative;
+    /** True while commitText/delete/etc. so caret moves do not enqueue racing S events. */
+    volatile boolean suppressSelectionEnqueue;
     private volatile boolean softImeRequested;
     private long lastShowUptimeMs;
     private final ConcurrentLinkedQueue<String> pending = new ConcurrentLinkedQueue<>();
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        // NativeActivity dlopens the native lib directly, so ART never registers it and
+        // nativeImeWake fails to resolve ("No implementation found"). loadLibrary registers
+        // it with ART first; NativeActivity's own load then reuses the same handle.
+        try {
+            ActivityInfo ai =
+                    getPackageManager()
+                            .getActivityInfo(getComponentName(), PackageManager.GET_META_DATA);
+            String libname = ai.metaData != null ? ai.metaData.getString("android.app.lib_name") : null;
+            System.loadLibrary(libname != null ? libname : "main");
+        } catch (Throwable t) {
+            // nativeImeWake stays unresolved; Rust falls back to polling while the IME is up.
+        }
+        super.onCreate(savedInstanceState);
+    }
 
     /** Suppress Android's selection/insertion ActionMode — it dismisses the soft keyboard. */
     private static final ActionMode.Callback NO_ACTION_MODE =
@@ -67,8 +89,8 @@ public class EguiNativeActivity extends NativeActivity {
             @Override
             protected void onSelectionChanged(int selStart, int selEnd) {
                 super.onSelectionChanged(selStart, selEnd);
-                // Backup path: some IMEs move the caret without InputConnection.setSelection.
-                if (!updatingFromNative) {
+                // Trackpad / explicit setSelection only — not caret churn from commitText.
+                if (!updatingFromNative && !suppressSelectionEnqueue) {
                     enqueue("S\t" + selStart + "\t" + selEnd);
                 }
             }
@@ -198,6 +220,20 @@ public class EguiNativeActivity extends NativeActivity {
     void enqueue(String event) {
         if (!updatingFromNative) {
             pending.offer(event);
+            if (!nativeWakeBroken) {
+                try {
+                    nativeImeWake();
+                } catch (Throwable t) {
+                    // Older native lib without the export — Rust falls back to polling.
+                    nativeWakeBroken = true;
+                }
+            }
         }
     }
+
+    /** Wakes the sleeping render loop so a queued IME event is applied this frame, not on the
+     * next unrelated touch/key. Implemented in Rust (egui-android ime_bridge). */
+    private static native void nativeImeWake();
+
+    private static volatile boolean nativeWakeBroken;
 }

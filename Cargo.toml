@@ -42,6 +42,12 @@ version = "0.1.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shadowbrok3r/egui-ios"
 
+# winit/egui-winit call hide_soft_input(HIDE_IMPLICIT_ONLY) on every IME interrupt; with the
+# egui-android EditText bridge that hide sticks (DecorView show is ignored). Skip implicit-only
+# hides so the bridge owns keyboard dismiss.
+[patch.crates-io]
+android-activity = { path = "patches/android-activity" }
+
 [workspace.dependencies]
 egui = "0.35"
 egui-wgpu = "0.35"

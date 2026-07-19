@@ -31,11 +31,35 @@ struct Adapter {
     ime_bridge_hot: bool,
     /// Consecutive frames where IME was not wanted (hide only after this exceeds a threshold).
     ime_hide_arm: u8,
-    /// Frames with `want_ime` but no keyboard inset — recover from winit's DecorView hide.
-    ime_recover_arm: u8,
+    /// Consecutive frames with `want_ime` but no keyboard inset, once the keyboard has actually
+    /// been seen open this "hot" session — used to detect a genuine external hide (as opposed to
+    /// the normal open animation's low-inset frames right after we request a show).
+    ime_recover_arm: u16,
+    /// The keyboard inset has reached [`Self::IME_OPEN_PT`] since [`Self::ime_bridge_hot`] went
+    /// true. Recovery is gated on this so it never fights the keyboard's own opening animation
+    /// (whose inset legitimately stays near zero for several frames while it ramps up).
+    ime_seen_open: bool,
+    /// Frames left before another forced re-show is allowed, after one just fired.
+    ime_recover_cooldown: u16,
     /// Last egui IME rect; re-emitted when a frame drops `PlatformOutput::ime` so winit does not
     /// call `set_ime_allowed(false)` (hide) while the EditText bridge still owns the keyboard.
     last_ime: Option<egui::output::IMEOutput>,
+    /// Focus id we last pushed into the hidden EditText (one-shot sync on focus/show/bar).
+    ime_synced_focus: Option<egui::Id>,
+    /// Force one egui→EditText sync after a text-actions bar edit (paste/cut/select-all).
+    ime_force_sync: bool,
+}
+
+impl Adapter {
+    /// Keyboard inset (pt) above which we consider the soft keyboard genuinely open.
+    const IME_OPEN_PT: f32 = 60.0;
+    /// Keyboard inset (pt) below which we consider it hidden.
+    const IME_HIDDEN_PT: f32 = 16.0;
+    /// Consecutive frames hidden (after having been open) before a forced re-show.
+    /// Long on purpose — winit's implicit hide is patched out; this is only a safety net.
+    const IME_RECOVER_FRAMES: u16 = 120;
+    /// Frames to wait after a forced re-show before trying again.
+    const IME_RECOVER_COOLDOWN_FRAMES: u16 = 300;
 }
 
 impl eframe::App for Adapter {
@@ -63,6 +87,10 @@ impl eframe::App for Adapter {
         });
         self.bar_touch |= pressed_in_bar;
         let hold = self.bar_touch || self.ime_hold_frames > 0;
+        // Primary press outside the bar = user is changing focus (another field or dismiss).
+        // Do not fight that with re-pin; still re-pin when focus drops with no press (reflow).
+        let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
+        let allow_blur = primary_pressed && !pressed_in_bar && !hold;
         ui.ctx().options_mut(|o| {
             o.input_options.surrender_focus_on = if hold {
                 egui::SurrenderFocusOn::Never
@@ -70,7 +98,9 @@ impl eframe::App for Adapter {
                 egui::SurrenderFocusOn::Clicks
             };
         });
-        if hold {
+        // Keep egui TextEdit focused while the keyboard is hot so the caret blinks and IME
+        // Text events are consumed (otherwise: first letter, then silence until retap).
+        if (hold || self.ime_bridge_hot) && !allow_blur {
             self.pin_text_focus(ui.ctx());
         }
         // Drain InputConnection → egui before the app frame. Do NOT show/hide the IME here:
@@ -78,11 +108,14 @@ impl eframe::App for Adapter {
         // flickers with keyboard-inset layout and caused a show/hide loop).
         if self.ime_bridge_hot || hold {
             let _ = crate::ime_bridge::bind_ime();
-            crate::ime_bridge::apply_pending(
+            let _ = crate::ime_bridge::apply_pending(
                 ui.ctx(),
                 self.last_focus,
                 &mut self.pending_events,
             );
+            // Backstop for nativeImeWake (missing JNI symbol / event landing mid-frame): while
+            // the keyboard is up, never sleep longer than this between queue drains.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
         if !self.pending_events.is_empty() {
             let events = std::mem::take(&mut self.pending_events);
@@ -111,10 +144,19 @@ impl eframe::App for Adapter {
             self.app.update(ui, &self.host);
         });
         let focused = ui.ctx().memory(|m| m.focused());
+        let prev_focus = self.last_focus;
         if let Some(id) = focused {
             self.last_focus = Some(id);
-        } else if !hold {
+        } else if allow_blur || !(hold || self.ime_bridge_hot) {
             self.last_focus = None;
+            self.ime_synced_focus = None;
+        }
+        let switched_field = matches!(
+            (prev_focus, self.last_focus),
+            (Some(a), Some(b)) if a != b
+        );
+        if switched_field {
+            crate::ime_bridge::clear_preedit_tracking();
         }
         // Keep `PlatformOutput::ime` stable while editing. A one-frame `ime: None` makes
         // egui-winit call `set_ime_allowed(false)` → hideSoftInput on the DecorView token,
@@ -127,7 +169,11 @@ impl eframe::App for Adapter {
                 cursor_rect: ime.cursor_rect,
                 should_interrupt_composition: false,
             });
-        } else if hold || focused.is_some() || guest_kb {
+        } else if hold
+            || focused.is_some()
+            || guest_kb
+            || (self.ime_bridge_hot && self.last_focus.is_some() && !allow_blur)
+        {
             if let Some(ime) = self.last_ime {
                 ui.ctx().output_mut(|o| {
                     o.ime = Some(ime);
@@ -135,6 +181,7 @@ impl eframe::App for Adapter {
             }
         }
         let ime_wanted = ui.ctx().output(|o| o.ime.is_some());
+        // Do not key want_ime off ime_bridge_hot alone — that can never go false and traps the keyboard.
         let want_ime = hold || ime_wanted || focused.is_some() || guest_kb;
         if want_ime {
             self.ime_hide_arm = 0;
@@ -142,33 +189,56 @@ impl eframe::App for Adapter {
             if !self.ime_bridge_hot {
                 let _ = crate::ime_bridge::set_soft_keyboard(true);
                 self.ime_bridge_hot = true;
+                self.ime_seen_open = false;
                 self.ime_recover_arm = 0;
-            } else if kb < 16.0 {
-                // winit hid us (DecorView show ignored); re-assert on the EditText.
-                self.ime_recover_arm = self.ime_recover_arm.saturating_add(1);
-                if self.ime_recover_arm >= 8 {
-                    let _ = crate::ime_bridge::show_ime_force();
-                    self.ime_recover_arm = 0;
-                } else {
-                    let _ = crate::ime_bridge::bind_ime();
-                }
+                self.ime_recover_cooldown = 0;
+                // Seed EditText once when the keyboard opens; never every frame while typing.
+                self.ime_force_sync = true;
             } else {
-                self.ime_recover_arm = 0;
                 let _ = crate::ime_bridge::bind_ime();
+                if kb >= Self::IME_OPEN_PT {
+                    self.ime_seen_open = true;
+                    self.ime_recover_arm = 0;
+                } else if self.ime_seen_open && kb < Self::IME_HIDDEN_PT {
+                    // The keyboard was genuinely open and is now gone — winit's DecorView hide
+                    // beat us and its follow-up show was ignored. Recover, but slowly: forcing
+                    // showSoftInput restarts the IME session (see logcat "Session id mismatch"),
+                    // which can corrupt in-flight typing/backspace if fired too eagerly.
+                    self.ime_recover_arm = self.ime_recover_arm.saturating_add(1);
+                    if self.ime_recover_cooldown > 0 {
+                        self.ime_recover_cooldown -= 1;
+                    } else if self.ime_recover_arm >= Self::IME_RECOVER_FRAMES {
+                        let _ = crate::ime_bridge::show_ime_force();
+                        self.ime_recover_arm = 0;
+                        self.ime_recover_cooldown = Self::IME_RECOVER_COOLDOWN_FRAMES;
+                    }
+                } else {
+                    self.ime_recover_arm = 0;
+                }
             }
         } else {
             self.ime_recover_arm = 0;
+            self.ime_recover_cooldown = 0;
             self.ime_hide_arm = self.ime_hide_arm.saturating_add(1);
             // ~0.5s at 60fps — absorbs one-frame ime_wanted flickers from keyboard reflow.
             if self.ime_hide_arm >= 30 && self.ime_bridge_hot {
                 let _ = crate::ime_bridge::set_soft_keyboard(false);
+                crate::ime_bridge::clear_preedit_tracking();
                 self.ime_bridge_hot = false;
+                self.ime_seen_open = false;
                 self.last_ime = None;
+                self.ime_synced_focus = None;
+                self.ime_force_sync = false;
             }
         }
-        // egui → hidden EditText (caret only when a range is selected — see sync_focused_text_edit).
-        if self.ime_bridge_hot || hold {
+        // egui → EditText only when opening the keyboard, switching fields, or bar paste/cut —
+        // never while typing (setText resets the caret and triggers invalidateInput).
+        let need_sync = self.ime_force_sync || switched_field;
+        if need_sync {
+            crate::ime_bridge::invalidate_last_sync();
             crate::ime_bridge::sync_focused_text_edit(ui.ctx(), self.last_focus);
+            self.ime_synced_focus = self.last_focus;
+            self.ime_force_sync = false;
         }
         // Mirror this frame's egui copies (host widgets and plugin viewports alike) into the
         // system clipboard; winit has no Android clipboard backend.
@@ -187,8 +257,11 @@ impl eframe::App for Adapter {
             self.bar_touch = false;
         }
         if self.ime_hold_frames > 0 {
-            self.pin_text_focus(ui.ctx());
             self.ime_hold_frames -= 1;
+        }
+        // Re-pin after the app frame so reflow cannot leave us unfocused for the next IME char.
+        if (hold || self.ime_bridge_hot) && !allow_blur {
+            self.pin_text_focus(ui.ctx());
         }
         crate::host::drain(&self.host);
     }
@@ -290,6 +363,7 @@ impl Adapter {
         if acted {
             self.ime_hold_frames = self.ime_hold_frames.max(24);
             self.ime_hide_arm = 0;
+            self.ime_force_sync = true;
             self.pin_text_focus(&ctx);
             if !self.ime_bridge_hot {
                 let _ = crate::ime_bridge::set_soft_keyboard(true);
@@ -319,6 +393,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
         "egui-android",
         options,
         Box::new(move |cc| {
+            crate::ime_bridge::set_wake_context(&cc.egui_ctx);
             // Install the plugin paint callback into eframe's wgpu renderer (feature `plugins`).
             #[cfg(feature = "plugins")]
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
@@ -346,7 +421,11 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
                 ime_bridge_hot: false,
                 ime_hide_arm: 0,
                 ime_recover_arm: 0,
+                ime_seen_open: false,
+                ime_recover_cooldown: 0,
                 last_ime: None,
+                ime_synced_focus: None,
+                ime_force_sync: false,
             }))
         }),
     );
