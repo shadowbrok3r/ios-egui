@@ -284,8 +284,15 @@ impl Engine {
 
     /// Queue a generation from the simple Generate tab. `current` is the last result's encoded
     /// bytes, used as the img2img source when the mode is "current result".
+    /// `ui_workflow` is the UI-format JSON to embed in the PNG via `extra_pnginfo`.
     /// Does not cancel other in-flight jobs — use [`Self::cancel`] for that.
-    pub fn generate(&mut self, params: Params, current: Option<Vec<u8>>, gcx: GenCtx) {
+    pub fn generate(
+        &mut self,
+        params: Params,
+        current: Option<Vec<u8>>,
+        gcx: GenCtx,
+        ui_workflow: Option<Value>,
+    ) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
             return;
@@ -316,13 +323,14 @@ impl Engine {
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
-            run_generate(client, params, current, gcx, current_prompt, authed, tx, ctx, log).await;
+            run_generate(client, params, current, gcx, ui_workflow, current_prompt, authed, tx, ctx, log).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
 
     /// Queue an arbitrary API-format workflow (from the graph editor).
-    pub fn run_workflow(&mut self, wf: Workflow) {
+    /// `ui_workflow` is the UI-format JSON to embed in the PNG via `extra_pnginfo`.
+    pub fn run_workflow(&mut self, wf: Workflow, ui_workflow: Option<Value>) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
             return;
@@ -334,7 +342,7 @@ impl Engine {
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
-            stream_execution(client, wf, tx, ctx, log, current).await;
+            stream_execution(client, wf, ui_workflow, tx, ctx, log, current).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
@@ -1266,6 +1274,7 @@ async fn run_generate(
     params: Params,
     current: Option<Vec<u8>>,
     gcx: GenCtx,
+    ui_workflow: Option<Value>,
     current_prompt: CurrentPrompt,
     authed: Option<(String, reqwest::Client)>,
     tx: Sender<Msg>,
@@ -1325,7 +1334,36 @@ async fn run_generate(
         log.info(format!("enhance: {note}"));
         let _ = tx.send(Msg::EnhanceNote(note));
     }
-    stream_execution(client, wf, tx, ctx, log, current_prompt).await;
+    stream_execution(client, wf, ui_workflow, tx, ctx, log, current_prompt).await;
+}
+
+/// POST `/prompt` with `extra_pnginfo.workflow` so `SaveImage` embeds the UI JSON in the PNG.
+async fn queue_prompt_with_workflow_meta(
+    client: &Client,
+    wf: &Workflow,
+    ui_workflow: Option<&Value>,
+    log: &Logger,
+) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct QueueResult {
+        prompt_id: String,
+    }
+
+    let body = serde_json::json!({
+        "prompt": wf,
+        "client_id": client.client_id(),
+        "extra_data": {
+            "extra_pnginfo": {
+                "workflow": ui_workflow
+            }
+        }
+    });
+    let result: QueueResult = client
+        .post_json("prompt", &body)
+        .await
+        .map_err(|e| format!("queue failed: {e}"))?;
+    log.info(format!("queued with workflow meta: {}", result.prompt_id));
+    Ok(result.prompt_id)
 }
 
 /// Queue a workflow and forward its event stream to the UI. Shared by the Generate tab and the
@@ -1334,6 +1372,7 @@ async fn run_generate(
 async fn stream_execution(
     client: Client,
     wf: Workflow,
+    ui_workflow: Option<Value>,
     tx: Sender<Msg>,
     ctx: egui::Context,
     log: Logger,
@@ -1345,6 +1384,29 @@ async fn stream_execution(
             let _ = tx.send($m);
             ctx.request_repaint();
         }};
+    }
+
+    // When we have UI workflow metadata to embed, queue via a custom POST that includes
+    // extra_pnginfo, then rely on the persistent ws_listener for progress and
+    // reconcile_from_history for final images. Otherwise use the standard execute() path.
+    if let Some(ui) = ui_workflow.as_ref() {
+        let prompt_id = match queue_prompt_with_workflow_meta(&client, &wf, Some(ui), &log).await {
+            Ok(id) => id,
+            Err(e) => {
+                log.error(format!("queueing workflow with metadata failed: {e}"));
+                send!(Msg::GenError(e.to_string()));
+                return;
+            }
+        };
+        *current_prompt.lock().unwrap() = Some(prompt_id.clone());
+        send!(Msg::Queued);
+        let outcome = reconcile_from_history(&client, &prompt_id, &tx, &ctx, &log).await;
+        *current_prompt.lock().unwrap() = None;
+        match outcome {
+            Ok(()) => send!(Msg::Done),
+            Err(m) => send!(Msg::GenError(m)),
+        }
+        return;
     }
 
     let mut execution = match client.execute(&wf).await {

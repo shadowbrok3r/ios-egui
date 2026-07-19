@@ -488,8 +488,10 @@ struct ComfyApp {
     create_fab_clip: Option<FabClipSnap>,
     /// Shared Create/Graph queue (play) FAB position; `None` = default above the menu/lock FAB.
     queue_fab_pos: Option<egui::Pos2>,
-    /// Create Main collapsing block for mode + sampler/size (persisted).
+    /// Create Main: companions / img2img source block is expanded (persisted).
     create_setup_open: bool,
+    /// Create Main: companions & image source block open state (persisted separately).
+    create_companions_open: bool,
 }
 
 impl ComfyApp {
@@ -648,6 +650,7 @@ impl ComfyApp {
             create_fab_clip: None,
             queue_fab_pos: None,
             create_setup_open: true,
+            create_companions_open: true,
         }
     }
 
@@ -1418,7 +1421,13 @@ impl ComfyApp {
         let current = self.result_bytes.clone();
         let gcx = self.gen_ctx();
         self.enhance_note.clear();
-        self.engine.as_mut().unwrap().generate(params, current, gcx);
+        // Export the UI workflow from the linked graph so SaveImage can embed it in the PNG.
+        let ui_workflow = self.schemas.as_ref().and_then(|schemas| {
+            self.create_graph_id
+                .and_then(|id| self.graph_tabs.iter().find(|d| d.id == id))
+                .map(|doc| doc.view.export_ui(&doc.graph, schemas, &doc.bypassed))
+        });
+        self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow);
         host.haptic(Haptic::Medium);
     }
 
@@ -1473,7 +1482,7 @@ impl ComfyApp {
             "Queued".into()
         };
         self.graph_status.clear();
-        self.engine.as_mut().unwrap().run_workflow(wf);
+        self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json));
         host.haptic(Haptic::Medium);
     }
 
@@ -1712,6 +1721,7 @@ impl ComfyApp {
             checkpoint_recent: self.checkpoint_recent.clone(),
             confirm_gallery_delete: self.confirm_gallery_delete,
             create_setup_open: self.create_setup_open,
+            create_companions_open: self.create_companions_open,
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -1770,6 +1780,7 @@ impl ComfyApp {
             self.checkpoint_recent = saved.checkpoint_recent;
             self.confirm_gallery_delete = saved.confirm_gallery_delete;
             self.create_setup_open = saved.create_setup_open;
+            self.create_companions_open = saved.create_companions_open;
             if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
                 self.restore_workflow = Some((saved.workflow_name, json));
             }
@@ -2149,57 +2160,46 @@ impl ComfyApp {
             ui.weak(sanitize_ui_text(ui, &format!("rec: {hint}")));
         }
 
-        ui.label("Prompt");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.positive)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .hint_text("what you want to see"),
-        );
-        ui.label("LoRA triggers");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.lora_triggers)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .hint_text("trigger words from LoRAs (auto-filled on Add)"),
-        );
-        ui.label("Negative");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.negative)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .hint_text("what to avoid"),
-        );
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
+            ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
+        });
 
-        ui.add_space(4.0);
-        let mode_label = match self.params.mode {
-            Mode::Txt2Img => "Text to Image",
-            Mode::Img2Img => "Image to Image",
-        };
-        let setup_open = self.create_setup_open;
-        let setup_title = if setup_open {
-            "Setup".to_string()
-        } else {
-            format!(
-                "Setup · {mode_label} · {} steps · CFG {} · {}×{}",
-                self.params.steps, self.params.cfg, self.params.width, self.params.height
-            )
-        };
-        let setup = egui::CollapsingHeader::new(setup_title)
-            .id_salt("create_t2i_i2i_setup")
-            .open(Some(setup_open))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
-                    ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
-                });
-
-                // Diffusion models (Anima, Flux, Qwen-Image) ship without a text encoder or VAE, so those
-                // are picked here. select_model seeds them; this is the override.
-                if self.params.model_kind == ModelKind::Diffusion {
-                    ui.group(|ui| {
-                        ui.label("Diffusion model companions");
-
+        let show_companions = self.params.model_kind == ModelKind::Diffusion;
+        let show_img_source = self.params.mode == Mode::Img2Img;
+        if show_companions || show_img_source {
+            let setup_open = self.create_companions_open;
+            let setup_title = match (show_companions, show_img_source, setup_open) {
+                (true, true, true) => "Companions & image source".into(),
+                (true, false, true) => "Text encoder / VAE".into(),
+                (false, true, true) => "Image source".into(),
+                (true, true, false) => "Companions & image source".into(),
+                (true, false, false) => {
+                    let clip = self
+                        .params
+                        .clip_names
+                        .first()
+                        .map(|s| elide(s, 18))
+                        .unwrap_or_else(|| "no encoder".into());
+                    let vae = if self.params.vae_name.is_empty() {
+                        "no VAE".into()
+                    } else {
+                        elide(&self.params.vae_name, 18)
+                    };
+                    format!("Text encoder / VAE · {clip} · {vae}")
+                }
+                (false, true, false) => match self.params.img2img_source {
+                    Img2ImgSource::CurrentOutput => "Image source · Current result".into(),
+                    Img2ImgSource::Url => "Image source · From URL".into(),
+                },
+                (false, false, _) => String::new(),
+            };
+            let setup = egui::CollapsingHeader::new(setup_title)
+                .id_salt("create_t2i_i2i_setup")
+                .open(Some(setup_open))
+                .show(ui, |ui| {
+                    // Diffusion models ship without a text encoder or VAE; select_model seeds these.
+                    if show_companions {
                         let clip_n = self.params.clip_names.len().max(1);
                         for i in 0..clip_n {
                             if self.params.clip_names.len() <= i {
@@ -2217,35 +2217,49 @@ impl ComfyApp {
                                 self.params.clip_names[i] = val;
                             }
                         }
-                        // Two encoders is the cap: DualCLIPLoader is the widest typed loader available.
-                        if self.params.clip_names.len() < 2 && ui.button("+ second encoder").clicked() {
+                        if self.params.clip_names.len() < 2 && ui.button("+ second encoder").clicked()
+                        {
                             self.params.clip_names.push(String::new());
                         }
 
                         ui.label("VAE");
                         combo_full(ui, "vae_name", &mut self.params.vae_name, &self.vaes);
 
-                        egui::CollapsingHeader::new("Advanced").id_salt("diffusion_adv").show(ui, |ui| {
-                            ui.label("Encoder type");
-                            let mut ty = self.params.effective_clip_type();
-                            combo_full(ui, "clip_type", &mut ty, &self.clip_types);
-                            self.params.clip_type = ty;
-                            ui.label("Weight dtype");
-                            combo_full(ui, "weight_dtype", &mut self.params.weight_dtype, &self.weight_dtypes);
-                            if !self.clip_devices.is_empty() {
-                                ui.label("Encoder device");
-                                combo_full(ui, "clip_device", &mut self.params.clip_device, &self.clip_devices);
-                            }
-                        });
+                        egui::CollapsingHeader::new("Advanced").id_salt("diffusion_adv").show(
+                            ui,
+                            |ui| {
+                                ui.label("Encoder type");
+                                let mut ty = self.params.effective_clip_type();
+                                combo_full(ui, "clip_type", &mut ty, &self.clip_types);
+                                self.params.clip_type = ty;
+                                ui.label("Weight dtype");
+                                combo_full(
+                                    ui,
+                                    "weight_dtype",
+                                    &mut self.params.weight_dtype,
+                                    &self.weight_dtypes,
+                                );
+                                if !self.clip_devices.is_empty() {
+                                    ui.label("Encoder device");
+                                    combo_full(
+                                        ui,
+                                        "clip_device",
+                                        &mut self.params.clip_device,
+                                        &self.clip_devices,
+                                    );
+                                }
+                            },
+                        );
 
                         if let Some(missing) = self.params.missing_model_part() {
                             ui.colored_label(ui.visuals().warn_fg_color, missing);
                         }
-                    });
-                }
+                    }
 
-                if self.params.mode == Mode::Img2Img {
-                    ui.group(|ui| {
+                    if show_img_source {
+                        if show_companions {
+                            ui.add_space(4.0);
+                        }
                         ui.horizontal(|ui| {
                             ui.selectable_value(
                                 &mut self.params.img2img_source,
@@ -2269,7 +2283,9 @@ impl ComfyApp {
                                 ui.horizontal(|ui| {
                                     if let Some(tex) = &self.img2img_url_tex {
                                         let sized = egui::load::SizedTexture::from_handle(tex);
-                                        ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                                        ui.add(
+                                            egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)),
+                                        );
                                     } else if self.img2img_url_loading {
                                         ui.spinner();
                                         ui.weak("loading preview…");
@@ -2288,74 +2304,98 @@ impl ComfyApp {
                                 }
                             }
                         }
+                        // Denoise at the bottom of the section, only relevant for img2img.
+                        ui.add_space(4.0);
                         full_width_slider(ui, "Denoise", |ui, w| {
                             ui.add_sized(
                                 [w, 24.0],
                                 egui::Slider::new(&mut self.params.denoise, 0.0..=1.0),
                             );
                         });
-                    });
-                }
-
-                ui.add_space(4.0);
-                ui.columns(2, |cols| {
-                    cols[0].vertical_centered(|ui| {
-                        stepper_u32(ui, "Steps", &mut self.params.steps, 5..=150, 1);
-                    });
-                    cols[1].vertical_centered(|ui| {
-                        stepper_f32(ui, "CFG", &mut self.params.cfg, 1.0..=20.0, 0.5);
-                    });
+                    }
                 });
-                ui.add_space(4.0);
-                ui.vertical_centered(|ui| {
-                    stepper_u32(ui, "Batch", &mut self.params.batch_size, 1..=8, 1);
-                });
-
-                ui.add_space(4.0);
-                ui.vertical_centered(|ui| {
-                    section_title(ui, "Size");
-                });
-                centered_row(ui, |ui| {
-                    uint_text_edit(ui, "size_w", &mut self.params.width, 64..=2048);
-                    ui.label("×");
-                    uint_text_edit(ui, "size_h", &mut self.params.height, 64..=2048);
-                    size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
-                });
-                // An enabled step may render at a different size than the one above (hi-res fix works by
-                // generating small and scaling up). Show what it will actually do — the stored value is
-                // never touched, so this line simply disappears when the step is removed.
-                self.param_override_note(ui);
-
-                ui.add_space(4.0);
-                let mut sampler = self.params.sampler.clone();
-                let mut scheduler = self.params.scheduler.clone();
-                let samplers = self.samplers.clone();
-                let schedulers = self.schedulers.clone();
-                ui.columns(2, |cols| {
-                    cols[0].vertical_centered(|ui| {
-                        section_title(ui, "Sampler");
-                        combo_full(ui, "sampler", &mut sampler, &samplers);
-                    });
-                    cols[1].vertical_centered(|ui| {
-                        section_title(ui, "Scheduler");
-                        combo_full(ui, "scheduler", &mut scheduler, &schedulers);
-                    });
-                });
-                self.params.sampler = sampler;
-                self.params.scheduler = scheduler;
-
-                ui.add_space(4.0);
-                ui.label("Seed");
-                ui.horizontal(|ui| {
-                    ui.add_enabled_ui(!self.params.randomize_seed, |ui| {
-                        uint_text_edit_u64(ui, "seed", &mut self.params.seed, 0..=u64::MAX);
-                    });
-                    ui.checkbox(&mut self.params.randomize_seed, "random");
-                });
-            });
-        if setup.header_response.clicked() {
-            self.create_setup_open = !setup_open;
+            if setup.header_response.clicked() {
+                self.create_companions_open = !setup_open;
+            }
         }
+
+        ui.label("Prompt");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.params.positive)
+                .desired_rows(3)
+                .desired_width(f32::INFINITY)
+                .hint_text("what you want to see"),
+        );
+        ui.label("LoRA triggers");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.params.lora_triggers)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("trigger words from LoRAs (auto-filled on Add)"),
+        );
+        ui.label("Negative");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.params.negative)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("what to avoid"),
+        );
+
+        ui.add_space(4.0);
+        ui.columns(2, |cols| {
+            cols[0].vertical_centered(|ui| {
+                stepper_u32(ui, "Steps", &mut self.params.steps, 5..=150, 1);
+            });
+            cols[1].vertical_centered(|ui| {
+                stepper_f32(ui, "CFG", &mut self.params.cfg, 1.0..=20.0, 0.5);
+            });
+        });
+        ui.add_space(4.0);
+        ui.vertical_centered(|ui| {
+            stepper_u32(ui, "Batch", &mut self.params.batch_size, 1..=8, 1);
+        });
+
+        ui.add_space(4.0);
+        ui.vertical_centered(|ui| {
+            section_title(ui, "Size");
+        });
+        centered_row(ui, |ui| {
+            uint_text_edit(ui, "size_w", &mut self.params.width, 64..=2048);
+            ui.label("×");
+            uint_text_edit(ui, "size_h", &mut self.params.height, 64..=2048);
+            size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
+        });
+        // An enabled step may render at a different size than the one above (hi-res fix works by
+        // generating small and scaling up). Show what it will actually do — the stored value is
+        // never touched, so this line simply disappears when the step is removed.
+        self.param_override_note(ui);
+
+        ui.add_space(4.0);
+        let mut sampler = self.params.sampler.clone();
+        let mut scheduler = self.params.scheduler.clone();
+        let samplers = self.samplers.clone();
+        let schedulers = self.schedulers.clone();
+        ui.columns(2, |cols| {
+            cols[0].vertical_centered(|ui| {
+                section_title(ui, "Sampler");
+                combo_full(ui, "sampler", &mut sampler, &samplers);
+            });
+            cols[1].vertical_centered(|ui| {
+                section_title(ui, "Scheduler");
+                combo_full(ui, "scheduler", &mut scheduler, &schedulers);
+            });
+        });
+        self.params.sampler = sampler;
+        self.params.scheduler = scheduler;
+
+        ui.add_space(4.0);
+        ui.label("Seed");
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.params.randomize_seed, |ui| {
+                uint_text_edit_u64(ui, "seed", &mut self.params.seed, 0..=u64::MAX);
+            });
+            ui.checkbox(&mut self.params.randomize_seed, "random");
+        });
 
         if !self.params.loras.is_empty() {
             ui.add_space(4.0);
@@ -4405,19 +4445,10 @@ impl ComfyApp {
     }
 
     fn output(&mut self, ui: &mut egui::Ui, host: &Host) {
-        if self.running || self.queue_remaining > 0 || !self.status.is_empty() {
+        // Sampling progress is on the bottom nav; keep idle notes (errors / Done) here only.
+        if !self.running && self.queue_remaining == 0 && !self.status.is_empty() {
             ui.add_space(6.0);
-            let (v, m) = self.progress;
-            if m > 0 && (self.running || self.queue_remaining > 0) {
-                ui.add(egui::ProgressBar::new(v as f32 / m as f32).text(elide(&self.status, 300)));
-            } else if self.running || self.queue_remaining > 0 {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(elide(&self.status, 300));
-                });
-            } else {
-                ui.label(elide(&self.status, 300));
-            }
+            ui.label(elide(&self.status, 300));
         }
 
         // Pinned rather than transient: a skipped upscale must outlive the status line.
@@ -4439,8 +4470,6 @@ impl ComfyApp {
         }
 
         if !self.results.is_empty() {
-            ui.add_space(6.0);
-            ui.separator();
             let n = self.results.len();
             ui.horizontal(|ui| {
                 ui.label(if n == 1 {
@@ -4599,13 +4628,18 @@ impl ComfyApp {
                     });
                     ui.separator();
                 }
-                ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
-
+                // Results first so a new image is immediately visible without scrolling.
+                let results_top = ui.cursor().min;
                 self.output(ui, host);
                 if self.create_scroll_bottom {
-                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                    ui.scroll_to_rect(
+                        egui::Rect::from_min_size(results_top, egui::vec2(1.0, 1.0)),
+                        Some(egui::Align::TOP),
+                    );
                     self.create_scroll_bottom = false;
                 }
+
+                ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
                 ui.add_space(12.0);
             });
         self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);

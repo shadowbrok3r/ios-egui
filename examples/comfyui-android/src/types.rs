@@ -1119,9 +1119,12 @@ pub struct Settings {
     /// Ask before deleting gallery images (viewer or multi-select).
     #[serde(default = "default_true")]
     pub confirm_gallery_delete: bool,
-    /// Create Main: mode / sampler / size block is expanded.
+    /// Create Main: text-encoder/VAE and img2img source block is expanded.
     #[serde(default = "default_true")]
     pub create_setup_open: bool,
+    /// Create Main: companions & image source block is expanded (same block, persisted separately).
+    #[serde(default = "default_true")]
+    pub create_companions_open: bool,
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),
