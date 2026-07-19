@@ -6,14 +6,16 @@
 //! app's nodes onto the same graph, so upscalers and face fixes are data, not code.
 
 use rucomfyui::nodes::all::{
-    CLIPTextEncode, CheckpointLoaderSimple, EmptyLatentImage, KSampler, LoadImage, LoraLoader,
-    SaveImage, VAEDecode, VAEEncode,
+    CLIPLoader, CLIPTextEncode, CheckpointLoaderSimple, DualCLIPLoader, EmptyLatentImage, KSampler,
+    LoadImage, LoraLoader, LoraLoaderModelOnly, SaveImage, UNETLoader, VAEDecode, VAEEncode,
+    VAELoader,
 };
+use rucomfyui::nodes::types::{ClipOut, ModelOut, VaeOut};
 use rucomfyui::{Workflow, WorkflowGraph, WorkflowNodeId};
 
 use crate::apps::{AppSet, Ctx, Report};
 use crate::schema::SchemaSet;
-use crate::types::{Mode, Params};
+use crate::types::{Mode, ModelKind, Params};
 
 /// Construct the workflow and return the SaveImage node id (the node whose `Executed` output
 /// carries the finished image bytes). `input_image` is the uploaded filename for img2img.
@@ -38,13 +40,39 @@ pub fn build(
 /// The typed base graph, ending at the VAE decode. Publishes every handle an app can reference.
 fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
     let g = WorkflowGraph::new();
-    let c = g.add(CheckpointLoaderSimple::new(p.checkpoint.clone()));
+
+    // Checkpoints carry MODEL+CLIP+VAE in one file; diffusion models (Anima, Flux, Qwen-Image)
+    // are bare UNETs that need the text encoder and VAE loaded alongside them.
+    let (base_model, base_clip, vae): (ModelOut, ClipOut, VaeOut) = match p.model_kind {
+        ModelKind::Checkpoint => {
+            let c = g.add(CheckpointLoaderSimple::new(p.checkpoint.clone()));
+            (c.model, c.clip, c.vae)
+        }
+        ModelKind::Diffusion => {
+            let model = g.add(UNETLoader::new(p.unet_name.clone(), p.effective_weight_dtype()));
+            let device: Option<String> =
+                (!p.clip_device.trim().is_empty()).then(|| p.clip_device.clone());
+            let ty = p.effective_clip_type();
+            let names = p.active_clips();
+            let clip = if names.len() >= 2 {
+                g.add(DualCLIPLoader::new(names[0].clone(), names[1].clone(), ty, device))
+            } else {
+                g.add(CLIPLoader::new(names.first().cloned().unwrap_or_default(), ty, device))
+            };
+            (model, clip, g.add(VAELoader::new(p.vae_name.clone())))
+        }
+    };
 
     let (model, clip) = {
-        let mut model = c.model;
-        let mut clip = c.clip;
+        let mut model = base_model;
+        let mut clip = base_clip;
         for lora in &p.loras {
             if lora.file.trim().is_empty() {
+                continue;
+            }
+            if lora.model_only {
+                model =
+                    g.add(LoraLoaderModelOnly::new(model, lora.file.clone(), lora.strength_model));
                 continue;
             }
             let out = g.add(LoraLoader::new(
@@ -62,7 +90,7 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
 
     let latent = match input_image {
         Some(name) if p.mode == Mode::Img2Img => {
-            g.add(VAEEncode::new(g.add(LoadImage::new(name)).image, c.vae))
+            g.add(VAEEncode::new(g.add(LoadImage::new(name)).image, vae))
         }
         _ => g.add(EmptyLatentImage {
             width: p.width,
@@ -89,8 +117,8 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
         denoise,
     });
 
-    let image = g.add(VAEDecode { samples, vae: c.vae });
-    let ctx = Ctx { image, latent: samples, model, clip, vae: c.vae, positive, negative };
+    let image = g.add(VAEDecode { samples, vae });
+    let ctx = Ctx { image, latent: samples, model, clip, vae, positive, negative };
     (g, ctx)
 }
 
@@ -100,6 +128,28 @@ mod tests {
 
     fn params() -> Params {
         Params { checkpoint: "sd.safetensors".into(), positive: "a cat".into(), ..Default::default() }
+    }
+
+    /// The user's proven-working Anima setup: a bare UNET plus a Qwen3 encoder and Qwen-Image VAE.
+    fn diffusion_params() -> Params {
+        Params {
+            model_kind: ModelKind::Diffusion,
+            unet_name: "Anima/novaAnimeAM_v30.safetensors".into(),
+            clip_names: vec!["qwen_3_06b_base.safetensors".into()],
+            clip_type: "stable_diffusion".into(),
+            vae_name: "qwen_image_vae.safetensors".into(),
+            positive: "1girl, solo".into(),
+            ..Default::default()
+        }
+    }
+
+    fn class_of<'a>(wf: &'a Workflow, id: &WorkflowNodeId) -> &'a str {
+        &wf.0[id].class_type
+    }
+
+    /// Follow `input` back to the node feeding it.
+    fn upstream(wf: &Workflow, id: &WorkflowNodeId, input: &str) -> WorkflowNodeId {
+        wf.0[id].inputs[input].as_slot().unwrap().0
     }
 
     fn schemas_with(json: &str) -> SchemaSet {
@@ -203,5 +253,113 @@ mod tests {
         // Both decodes hang off the one checkpoint loader's VAE.
         let (vae_a, _) = wf.0[&dec2].inputs["vae"].as_slot().unwrap();
         assert_eq!(wf.0[&vae_a].class_type, "CheckpointLoaderSimple");
+    }
+
+    /// Anima models are bare UNETs: the model, the text encoder and the VAE each load separately.
+    #[test]
+    fn a_diffusion_model_uses_three_separate_loaders() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let (wf, out, _) = build(&diffusion_params(), None, &apps, &schemas);
+
+        assert!(
+            !wf.0.values().any(|n| n.class_type == "CheckpointLoaderSimple"),
+            "diffusion path must not emit a checkpoint loader"
+        );
+
+        let dec = upstream(&wf, &out, "images");
+        let ks = upstream(&wf, &dec, "samples");
+
+        let unet = upstream(&wf, &ks, "model");
+        assert_eq!(class_of(&wf, &unet), "UNETLoader");
+        assert_eq!(wf.0[&unet].inputs["unet_name"].as_str().unwrap(), "Anima/novaAnimeAM_v30.safetensors");
+        assert_eq!(wf.0[&unet].inputs["weight_dtype"].as_str().unwrap(), "default");
+
+        let vae = upstream(&wf, &dec, "vae");
+        assert_eq!(class_of(&wf, &vae), "VAELoader");
+        assert_eq!(wf.0[&vae].inputs["vae_name"].as_str().unwrap(), "qwen_image_vae.safetensors");
+
+        for socket in ["positive", "negative"] {
+            let enc = upstream(&wf, &ks, socket);
+            assert_eq!(class_of(&wf, &enc), "CLIPTextEncode");
+            let clip = upstream(&wf, &enc, "clip");
+            assert_eq!(class_of(&wf, &clip), "CLIPLoader");
+            assert_eq!(wf.0[&clip].inputs["clip_name"].as_str().unwrap(), "qwen_3_06b_base.safetensors");
+            // rucomfyui's `type_` field serializes to ComfyUI's `type` key.
+            assert_eq!(wf.0[&clip].inputs["type"].as_str().unwrap(), "stable_diffusion");
+        }
+    }
+
+    /// The encode and the decode must land on one VAE node, not two competing loaders.
+    #[test]
+    fn diffusion_img2img_shares_one_vae_with_the_decode() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = diffusion_params();
+        p.mode = Mode::Img2Img;
+        p.denoise = 0.6;
+
+        let (wf, out, _) = build(&p, Some(crate::engine::INPUT_IMAGE_NAME.into()), &apps, &schemas);
+        let dec = upstream(&wf, &out, "images");
+        let ks = upstream(&wf, &dec, "samples");
+        let enc = upstream(&wf, &ks, "latent_image");
+        assert_eq!(class_of(&wf, &enc), "VAEEncode");
+        assert_eq!(upstream(&wf, &enc, "vae"), upstream(&wf, &dec, "vae"), "two separate VAE loaders");
+    }
+
+    /// Two encoders fold into a DualCLIPLoader, whose ComfyUI keys drop the underscore.
+    #[test]
+    fn two_text_encoders_emit_a_dual_clip_loader() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = diffusion_params();
+        p.clip_names = vec!["clip_l.safetensors".into(), "t5xxl.safetensors".into()];
+
+        let (wf, _, _) = build(&p, None, &apps, &schemas);
+        let dual = wf.0.values().find(|n| n.class_type == "DualCLIPLoader").expect("no DualCLIPLoader");
+        assert_eq!(dual.inputs["clip_name1"].as_str().unwrap(), "clip_l.safetensors");
+        assert_eq!(dual.inputs["clip_name2"].as_str().unwrap(), "t5xxl.safetensors");
+    }
+
+    /// A model-only LoRA advances MODEL while the text encode keeps reading the raw CLIP.
+    #[test]
+    fn a_model_only_lora_leaves_the_clip_alone() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = diffusion_params();
+        p.loras = vec![crate::types::ActiveLora {
+            file: "Anima/MatureFemaleSliderAnima.safetensors".into(),
+            strength_model: 0.7,
+            strength_clip: 0.7,
+            injected: String::new(),
+            model_only: true,
+        }];
+
+        let (wf, out, _) = build(&p, None, &apps, &schemas);
+        let ks = upstream(&wf, &upstream(&wf, &out, "images"), "samples");
+        let lora = upstream(&wf, &ks, "model");
+        assert_eq!(class_of(&wf, &lora), "LoraLoaderModelOnly");
+        assert_eq!(class_of(&wf, &upstream(&wf, &lora, "model")), "UNETLoader");
+        // The encode still hangs off the loader directly — no CLIP passed through the LoRA.
+        let enc = upstream(&wf, &ks, "positive");
+        assert_eq!(class_of(&wf, &upstream(&wf, &enc, "clip")), "CLIPLoader");
+    }
+
+    /// A model+clip LoRA still threads both handles on the diffusion path.
+    #[test]
+    fn a_standard_lora_threads_clip_on_the_diffusion_path() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = diffusion_params();
+        p.loras = vec![crate::types::ActiveLora {
+            file: "GothicNeonAnima.safetensors".into(),
+            strength_model: 0.7,
+            strength_clip: 0.7,
+            injected: String::new(),
+            model_only: false,
+        }];
+
+        let (wf, out, _) = build(&p, None, &apps, &schemas);
+        let ks = upstream(&wf, &upstream(&wf, &out, "images"), "samples");
+        assert_eq!(class_of(&wf, &upstream(&wf, &ks, "model")), "LoraLoader");
+        let enc = upstream(&wf, &ks, "positive");
+        let lora = upstream(&wf, &enc, "clip");
+        assert_eq!(class_of(&wf, &lora), "LoraLoader");
+        assert_eq!(class_of(&wf, &upstream(&wf, &lora, "clip")), "CLIPLoader");
     }
 }

@@ -6,11 +6,14 @@ import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.SystemClock;
+import android.text.Editable;
 import android.text.InputType;
+import android.util.Log;
 import android.view.ActionMode;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
+import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
 import android.view.inputmethod.InputMethodManager;
@@ -19,8 +22,9 @@ import android.widget.FrameLayout;
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
-/** NativeActivity with a hidden EditText so Gboard gets a real InputConnection. */
+/** NativeActivity with a hidden EditText so the IME gets a real InputConnection. */
 public class EguiNativeActivity extends NativeActivity {
+    static final boolean TRACE = EguiImeBridge.TRACE;
     private EditText imeEdit;
     private volatile boolean updatingFromNative;
     /** True while commitText/delete/etc. so caret moves do not enqueue racing S events. */
@@ -28,6 +32,9 @@ public class EguiNativeActivity extends NativeActivity {
     private volatile boolean softImeRequested;
     private long lastShowUptimeMs;
     private final ConcurrentLinkedQueue<String> pending = new ConcurrentLinkedQueue<>();
+    /** InputConnection batch depth; selection enqueues are deferred until the batch closes. */
+    private int batchDepth;
+    private boolean batchSawSelChange;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -83,6 +90,7 @@ public class EguiNativeActivity extends NativeActivity {
                 outAttrs.imeOptions = outAttrs.imeOptions | EditorInfo.IME_FLAG_NO_FULLSCREEN;
                 outAttrs.inputType =
                         InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+                if (TRACE) Log.i("EguiIme", "onCreateInputConnection");
                 return new EguiImeBridge(base, self);
             }
 
@@ -91,7 +99,11 @@ public class EguiNativeActivity extends NativeActivity {
                 super.onSelectionChanged(selStart, selEnd);
                 // Trackpad / explicit setSelection only — not caret churn from commitText.
                 if (!updatingFromNative && !suppressSelectionEnqueue) {
-                    enqueue("S\t" + selStart + "\t" + selEnd);
+                    if (batchDepth > 0) {
+                        batchSawSelChange = true;
+                    } else {
+                        enqueueSelection();
+                    }
                 }
             }
         };
@@ -110,6 +122,117 @@ public class EguiNativeActivity extends NativeActivity {
         imeEdit = edit;
     }
 
+    /** Current selection as an S event with code-point offsets. */
+    private void enqueueSelection() {
+        EditText edit = imeEdit;
+        Editable ed = edit != null ? edit.getText() : null;
+        if (ed == null) {
+            return;
+        }
+        int s = Math.max(0, edit.getSelectionStart());
+        int e = Math.max(0, edit.getSelectionEnd());
+        enqueue("S\t" + Character.codePointCount(ed, 0, Math.min(s, ed.length()))
+                + "\t" + Character.codePointCount(ed, 0, Math.min(e, ed.length())));
+    }
+
+    void imeBatchBegin() {
+        batchDepth++;
+    }
+
+    void imeBatchEnd() {
+        if (batchDepth > 0) {
+            batchDepth--;
+        }
+        // Selection settled by the batch (e.g. trackpad moves inside begin/endBatchEdit);
+        // mutating ops inside the batch make Rust drop it anyway.
+        if (batchDepth == 0 && batchSawSelChange) {
+            batchSawSelChange = false;
+            if (!updatingFromNative && !suppressSelectionEnqueue) {
+                enqueueSelection();
+            }
+        }
+    }
+
+    Editable imeEditable() {
+        EditText edit = imeEdit;
+        return edit != null ? edit.getText() : null;
+    }
+
+    /** Apply DEL/FORWARD_DEL to the hidden Editable: composing span, else selection, else one
+     * code point — the same range egui deletes for the key from the native queue. */
+    void mirrorDeleteKey(boolean backspace) {
+        EditText edit = imeEdit;
+        Editable ed = edit != null ? edit.getText() : null;
+        if (ed == null) {
+            return;
+        }
+        suppressSelectionEnqueue = true;
+        try {
+            int a = Math.max(0, edit.getSelectionStart());
+            int b = Math.max(0, edit.getSelectionEnd());
+            if (a > b) {
+                int t = a;
+                a = b;
+                b = t;
+            }
+            int ca = BaseInputConnection.getComposingSpanStart(ed);
+            int cb = BaseInputConnection.getComposingSpanEnd(ed);
+            if (ca >= 0 && cb >= ca) {
+                a = ca;
+                b = cb;
+            }
+            if (a != b) {
+                ed.delete(a, b);
+            } else if (backspace && a > 0) {
+                ed.delete(Character.offsetByCodePoints(ed, a, -1), a);
+            } else if (!backspace && b < ed.length()) {
+                ed.delete(b, Character.offsetByCodePoints(ed, b, 1));
+            }
+        } finally {
+            suppressSelectionEnqueue = false;
+        }
+    }
+
+    int imeSelStart() {
+        EditText edit = imeEdit;
+        return edit != null ? Math.max(0, edit.getSelectionStart()) : 0;
+    }
+
+    int imeSelEnd() {
+        EditText edit = imeEdit;
+        return edit != null ? Math.max(0, edit.getSelectionEnd()) : 0;
+    }
+
+    /** Compact EditText state for trace logs: text, selection, composing span (UTF-16 offsets). */
+    String imeStateDump() {
+        EditText edit = imeEdit;
+        Editable ed = edit != null ? edit.getText() : null;
+        if (edit == null || ed == null) {
+            return "<no edit>";
+        }
+        String t = ed.toString();
+        if (t.length() > 80) {
+            t = t.substring(0, 40) + "…" + t.substring(t.length() - 35);
+        }
+        return "\"" + t + "\" sel=" + edit.getSelectionStart() + ".." + edit.getSelectionEnd()
+                + " comp=" + BaseInputConnection.getComposingSpanStart(ed)
+                + ".." + BaseInputConnection.getComposingSpanEnd(ed);
+    }
+
+    /** Clamped UTF-16 offset for a code-point offset into `ed`. */
+    private static int cpToUtf16(Editable ed, int cp) {
+        int len = ed.length();
+        int cpLen = Character.codePointCount(ed, 0, len);
+        if (cp <= 0) {
+            return 0;
+        }
+        if (cp >= cpLen) {
+            return len;
+        }
+        return Character.offsetByCodePoints(ed, 0, cp);
+    }
+
+    /** Replace EditText contents/selection from egui; start/end are code-point offsets. */
     public void setImeState(String text, int start, int end) {
         runOnUiThread(
                 () -> {
@@ -125,15 +248,44 @@ public class EguiNativeActivity extends NativeActivity {
                         if (!cur.equals(text)) {
                             edit.setText(text);
                         }
-                        CharSequence after = edit.getText();
-                        int len = after != null ? after.length() : 0;
-                        int s = Math.max(0, Math.min(start, len));
-                        int e = Math.max(0, Math.min(end, len));
+                        Editable after = edit.getText();
+                        if (after == null) {
+                            return;
+                        }
+                        int s = cpToUtf16(after, start);
+                        int e = cpToUtf16(after, end);
                         if (edit.getSelectionStart() != s || edit.getSelectionEnd() != e) {
                             edit.setSelection(s, e);
                         }
+                        if (TRACE) Log.i("EguiIme", "setImeState => " + imeStateDump());
                         // Do not restartInput / showSoftInput here — that fights the IME and
                         // causes show/hide flicker when Select All expands the selection.
+                    } finally {
+                        updatingFromNative = false;
+                    }
+                });
+    }
+
+    /** Move only the EditText caret (code-point offsets); optionally end composition first. */
+    public void setImeSelection(int start, int end, boolean clearComposing) {
+        runOnUiThread(
+                () -> {
+                    EditText edit = imeEdit;
+                    Editable ed = edit != null ? edit.getText() : null;
+                    if (edit == null || ed == null) {
+                        return;
+                    }
+                    updatingFromNative = true;
+                    try {
+                        if (clearComposing) {
+                            edit.clearComposingText();
+                        }
+                        int s = cpToUtf16(ed, start);
+                        int e = cpToUtf16(ed, end);
+                        if (edit.getSelectionStart() != s || edit.getSelectionEnd() != e) {
+                            edit.setSelection(s, e);
+                        }
+                        if (TRACE) Log.i("EguiIme", "setImeSelection => " + imeStateDump());
                     } finally {
                         updatingFromNative = false;
                     }
@@ -226,6 +378,7 @@ public class EguiNativeActivity extends NativeActivity {
                 } catch (Throwable t) {
                     // Older native lib without the export — Rust falls back to polling.
                     nativeWakeBroken = true;
+                    if (TRACE) Log.i("EguiIme", "nativeImeWake unavailable: " + t);
                 }
             }
         }

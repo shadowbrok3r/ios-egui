@@ -36,13 +36,26 @@ pub struct GenCtx {
     pub schemas: Arc<SchemaSet>,
 }
 
+/// Every option list the Create tab's pickers offer, read off `/object_info` on connect.
+#[derive(Clone, Default)]
+pub struct ModelLists {
+    pub checkpoints: Vec<String>,
+    /// `models/diffusion_models` + `models/unet` — the Anima/Flux/Qwen-Image family.
+    pub unets: Vec<String>,
+    pub clips: Vec<String>,
+    pub vaes: Vec<String>,
+    pub clip_types: Vec<String>,
+    pub clip_devices: Vec<String>,
+    pub weight_dtypes: Vec<String>,
+    pub samplers: Vec<String>,
+    pub schedulers: Vec<String>,
+}
+
 /// A message from the async worker to the UI thread.
 pub enum Msg {
     Connected {
         schemas: Arc<SchemaSet>,
-        checkpoints: Vec<String>,
-        samplers: Vec<String>,
-        schedulers: Vec<String>,
+        models: Box<ModelLists>,
     },
     ConnectError(String),
     /// Enhance-chain steps that were skipped or inputs dropped while building the prompt.
@@ -234,19 +247,30 @@ impl Engine {
         self.rt.spawn(async move {
             let msg = match fetch_object_info(&http, &base, &log).await {
                 Ok(schemas) => {
-                    let checkpoints = schemas.checkpoints();
-                    let samplers = schemas.samplers();
-                    let schedulers = schemas.schedulers();
+                    let models = ModelLists {
+                        checkpoints: schemas.checkpoints(),
+                        unets: schemas.unets(),
+                        clips: schemas.clips(),
+                        vaes: schemas.vaes(),
+                        clip_types: schemas.clip_types(),
+                        clip_devices: schemas.clip_devices(),
+                        weight_dtypes: schemas.weight_dtypes(),
+                        samplers: schemas.samplers(),
+                        schedulers: schemas.schedulers(),
+                    };
                     log.info(format!(
-                        "options: {} checkpoints, {} samplers, {} schedulers",
-                        checkpoints.len(),
-                        samplers.len(),
-                        schedulers.len()
+                        "options: {} checkpoints, {} diffusion models, {} clips, {} vaes, {} samplers, {} schedulers",
+                        models.checkpoints.len(),
+                        models.unets.len(),
+                        models.clips.len(),
+                        models.vaes.len(),
+                        models.samplers.len(),
+                        models.schedulers.len()
                     ));
-                    if checkpoints.is_empty() {
-                        log.warn("no checkpoints found in any *CheckpointLoader* node");
+                    if models.checkpoints.is_empty() && models.unets.is_empty() {
+                        log.warn("no models found in any *CheckpointLoader* or UNETLoader node");
                     }
-                    Msg::Connected { schemas: Arc::new(schemas), checkpoints, samplers, schedulers }
+                    Msg::Connected { schemas: Arc::new(schemas), models: Box::new(models) }
                 }
                 Err(e) => {
                     log.error(format!("connect failed: {e}"));
@@ -267,9 +291,12 @@ impl Engine {
             return;
         };
         self.log.info(format!(
-            "generate: {:?} ckpt={} {}x{} batch={} steps={} cfg={} {}/{} seed={} denoise={} loras={} apps={}",
+            "generate: {:?} {:?}={} clips={} vae={} {}x{} batch={} steps={} cfg={} {}/{} seed={} denoise={} loras={} apps={}",
             params.mode,
-            params.checkpoint,
+            params.model_kind,
+            params.model_file(),
+            params.active_clips().join("+"),
+            params.vae_name,
             params.width,
             params.height,
             params.batch_size,
@@ -796,19 +823,55 @@ impl Engine {
     pub fn delete_images(&self, items: Vec<(String, String)>) {
         let Some((http, url)) = self.authed_url("/gallery/api/delete", &[]) else { return };
         let n = items.len();
+        let sample = items
+            .first()
+            .map(|(sf, f)| format!("{sf}/{f}"))
+            .unwrap_or_default();
         let body = items_body(items);
         let (tx, ctx, log) = self.emitters();
         self.rt.spawn(async move {
-            log.info(format!("POST {url} (delete {n})"));
+            log.info(format!("POST {url} (delete {n}; e.g. {sample})"));
             let msg = match http.post(url).json(&body).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let text = resp.text().await.unwrap_or_default();
-                    let trashed = serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|v| v.get("trashed").and_then(Value::as_u64))
-                        .unwrap_or(n as u64);
-                    log.info(format!("-> trashed {trashed}"));
-                    Msg::GalleryMutated(format!("Moved {trashed} to trash"))
+                    log.info(format!("-> {}", head(&text, 300)));
+                    match serde_json::from_str::<Value>(&text) {
+                        Ok(v) => {
+                            let trashed = v.get("trashed").and_then(Value::as_u64).unwrap_or(0);
+                            let cleared = v.get("cleared").and_then(Value::as_u64).unwrap_or(0);
+                            let errors: Vec<String> = v
+                                .get("errors")
+                                .and_then(Value::as_array)
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|e| e.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let gone = trashed + cleared;
+                            if gone == 0 {
+                                let why = if errors.is_empty() {
+                                    "server rejected every item".into()
+                                } else {
+                                    errors.into_iter().take(3).collect::<Vec<_>>().join("; ")
+                                };
+                                log.error(format!("delete: trashed 0 — {why}"));
+                                Msg::AlbumError(format!("Delete failed: {why}"))
+                            } else if !errors.is_empty() {
+                                Msg::GalleryMutated(format!(
+                                    "Moved {trashed} to trash ({cleared} already gone); {}",
+                                    errors.into_iter().take(2).collect::<Vec<_>>().join("; ")
+                                ))
+                            } else if cleared > 0 && trashed == 0 {
+                                Msg::GalleryMutated(format!(
+                                    "Removed {cleared} missing item(s) from the gallery"
+                                ))
+                            } else {
+                                Msg::GalleryMutated(format!("Moved {trashed} to trash"))
+                            }
+                        }
+                        Err(_) => Msg::GalleryMutated(format!("Moved {n} to trash")),
+                    }
                 }
                 Ok(resp) => {
                     let status = resp.status();

@@ -14,12 +14,23 @@ pub struct LoraMeta {
     pub name: String,
     pub strength_model: f64,
     pub strength_clip: Option<f64>,
+    /// Came from `LoraLoaderModelOnly` — the CLIP was left untouched.
+    pub model_only: bool,
 }
 
 /// Prompt / model summary scraped from an embedded workflow for the viewer header.
 #[derive(Clone, Debug, Default)]
 pub struct ImageMeta {
     pub models: Vec<String>,
+    /// `UNETLoader.unet_name` — set when the graph used the diffusion-model topology.
+    pub unet: Option<String>,
+    /// Standalone text encoders from `CLIPLoader` / `DualCLIPLoader`.
+    pub clips: Vec<String>,
+    /// The encoder architecture (`stable_diffusion`, `flux`, `qwen_image`, …) — restoring the
+    /// encoder files without this rebuilds the graph under the wrong architecture.
+    pub clip_type: Option<String>,
+    pub vae: Option<String>,
+    pub weight_dtype: Option<String>,
     pub loras: Vec<LoraMeta>,
     pub positive: Option<String>,
     pub negative: Option<String>,
@@ -205,7 +216,26 @@ fn fill_api_meta(
             }
             "UNETLoader" => {
                 if let Some(n) = str_in(&inputs, "unet_name") {
+                    meta.unet.get_or_insert_with(|| n.clone());
                     push_unique(&mut meta.models, n);
+                }
+                if let Some(d) = str_in(&inputs, "weight_dtype") {
+                    meta.weight_dtype.get_or_insert(d);
+                }
+            }
+            "CLIPLoader" | "DualCLIPLoader" => {
+                for key in ["clip_name", "clip_name1", "clip_name2"] {
+                    if let Some(n) = str_in(&inputs, key) {
+                        push_unique(&mut meta.clips, n);
+                    }
+                }
+                if let Some(t) = str_in(&inputs, "type") {
+                    meta.clip_type.get_or_insert(t);
+                }
+            }
+            "VAELoader" => {
+                if let Some(n) = str_in(&inputs, "vae_name") {
+                    meta.vae.get_or_insert(n);
                 }
             }
             "LoraLoader" | "LoraLoaderModelOnly" => {
@@ -214,6 +244,7 @@ fn fill_api_meta(
                         name,
                         strength_model: num_in(&inputs, "strength_model").unwrap_or(1.0),
                         strength_clip: num_in(&inputs, "strength_clip"),
+                        model_only: class == "LoraLoaderModelOnly",
                     });
                 }
             }
@@ -256,6 +287,7 @@ fn fill_api_meta(
                                 .or_else(|| num_in(&inputs, "strength"))
                                 .unwrap_or(1.0),
                             strength_clip: num_in(&inputs, "strength_clip"),
+                            model_only: false,
                         });
                     }
                 }
@@ -315,17 +347,43 @@ fn fill_ui_meta(
                     push_unique(&mut meta.models, n);
                 }
             }
+            // UNETLoader widgets: [unet_name, weight_dtype].
             "UNETLoader" => {
                 if let Some(n) = widget_str(&widgets, 0) {
+                    meta.unet.get_or_insert_with(|| n.clone());
                     push_unique(&mut meta.models, n);
+                }
+                if let Some(d) = widget_str(&widgets, 1) {
+                    meta.weight_dtype.get_or_insert(d);
+                }
+            }
+            // CLIPLoader widgets: [clip_name, type, device].
+            // DualCLIPLoader widgets: [clip_name1, clip_name2, type, device].
+            "CLIPLoader" | "DualCLIPLoader" => {
+                let names = if class == "DualCLIPLoader" { 2 } else { 1 };
+                for slot in 0..names {
+                    if let Some(n) = widget_str(&widgets, slot) {
+                        push_unique(&mut meta.clips, n);
+                    }
+                }
+                if let Some(t) = widget_str(&widgets, names) {
+                    meta.clip_type.get_or_insert(t);
+                }
+            }
+            "VAELoader" => {
+                if let Some(n) = widget_str(&widgets, 0) {
+                    meta.vae.get_or_insert(n);
                 }
             }
             "LoraLoader" | "LoraLoaderModelOnly" => {
+                let model_only = class == "LoraLoaderModelOnly";
                 if let Some(name) = widget_str(&widgets, 0) {
                     meta.loras.push(LoraMeta {
                         name,
                         strength_model: widget_num(&widgets, 1).unwrap_or(1.0),
-                        strength_clip: widget_num(&widgets, 2),
+                        // Model-only has no clip widget; slot 2 would be another node's value.
+                        strength_clip: (!model_only).then(|| widget_num(&widgets, 2)).flatten(),
+                        model_only,
                     });
                 }
             }
@@ -361,6 +419,7 @@ fn fill_ui_meta(
                         name,
                         strength_model: widget_num(&widgets, 1).unwrap_or(1.0),
                         strength_clip: widget_num(&widgets, 2),
+                        model_only: false,
                     });
                 }
             }
@@ -721,6 +780,43 @@ impl ThumbCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A three-loader Anima graph must round-trip every part the Create tab needs to rebuild it —
+    /// dropping `type` would resurrect the encoders under the wrong architecture.
+    #[test]
+    fn api_format_captures_the_whole_diffusion_loader_set() {
+        let meta = parse_workflow_meta(
+            r#"{
+            "4": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_06b_base.safetensors", "type": "stable_diffusion", "device": "default"}},
+            "5": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+            "6": {"class_type": "UNETLoader", "inputs": {"unet_name": "Anima/novaAnimeAM_v30.safetensors", "weight_dtype": "default"}},
+            "7": {"class_type": "LoraLoaderModelOnly", "inputs": {"lora_name": "Anima/MatureFemaleSliderAnima.safetensors", "strength_model": 0.7, "model": ["6", 0]}}
+        }"#,
+        );
+        assert_eq!(meta.unet.as_deref(), Some("Anima/novaAnimeAM_v30.safetensors"));
+        assert_eq!(meta.clips, vec!["qwen_3_06b_base.safetensors"]);
+        assert_eq!(meta.clip_type.as_deref(), Some("stable_diffusion"));
+        assert_eq!(meta.vae.as_deref(), Some("qwen_image_vae.safetensors"));
+        assert_eq!(meta.weight_dtype.as_deref(), Some("default"));
+        assert!(meta.loras[0].model_only, "LoraLoaderModelOnly must not restore as a CLIP LoRA");
+    }
+
+    /// DualCLIPLoader's `type` sits at widget slot 2, after both names.
+    #[test]
+    fn ui_format_reads_dual_clip_widgets_positionally() {
+        let meta = parse_workflow_meta(
+            r#"{"nodes": [
+            {"id": 1, "type": "UNETLoader", "widgets_values": ["flux1-dev.safetensors", "fp8_e4m3fn"]},
+            {"id": 2, "type": "DualCLIPLoader", "widgets_values": ["clip_l.safetensors", "t5xxl.safetensors", "flux", "default"]},
+            {"id": 3, "type": "VAELoader", "widgets_values": ["ae.safetensors"]}
+        ], "links": []}"#,
+        );
+        assert_eq!(meta.unet.as_deref(), Some("flux1-dev.safetensors"));
+        assert_eq!(meta.weight_dtype.as_deref(), Some("fp8_e4m3fn"));
+        assert_eq!(meta.clips, vec!["clip_l.safetensors", "t5xxl.safetensors"]);
+        assert_eq!(meta.clip_type.as_deref(), Some("flux"));
+        assert_eq!(meta.vae.as_deref(), Some("ae.safetensors"));
+    }
 
     fn item(sub: &str, file: &str, models: &[&str]) -> GalleryItem {
         GalleryItem {

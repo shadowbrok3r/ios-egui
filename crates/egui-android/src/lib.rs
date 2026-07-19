@@ -87,10 +87,17 @@ impl eframe::App for Adapter {
         });
         self.bar_touch |= pressed_in_bar;
         let hold = self.bar_touch || self.ime_hold_frames > 0;
-        // Primary press outside the bar = user is changing focus (another field or dismiss).
-        // Do not fight that with re-pin; still re-pin when focus drops with no press (reflow).
-        let primary_pressed = ui.ctx().input(|i| i.pointer.primary_pressed());
-        let allow_blur = primary_pressed && !pressed_in_bar && !hold;
+        // egui surrenders focus on the frame a full CLICK lands (SurrenderFocusOn::Clicks checks
+        // any_click during the widget's interact). allow_blur must be true on that same frame or
+        // last_focus survives and pin_text_focus re-focuses the field. Keyed to any_click, not
+        // primary_pressed: with the IME wake running the loop, press and release land in
+        // different frames, and a press-keyed flag is false again by the surrender frame.
+        let clicked = ui.ctx().input(|i| i.pointer.any_click());
+        let click_in_bar = clicked
+            && self.bar_rect.is_some_and(|r| {
+                ui.ctx().input(|i| i.pointer.interact_pos().is_some_and(|p| r.contains(p)))
+            });
+        let allow_blur = clicked && !click_in_bar && !hold;
         ui.ctx().options_mut(|o| {
             o.input_options.surrender_focus_on = if hold {
                 egui::SurrenderFocusOn::Never
@@ -233,12 +240,34 @@ impl eframe::App for Adapter {
         }
         // egui → EditText only when opening the keyboard, switching fields, or bar paste/cut —
         // never while typing (setText resets the caret and triggers invalidateInput).
+        // Retries until the undoer has a stable snapshot: seeding before that pushed "" into the
+        // EditText, and every later IME op then edited against an empty mirror.
         let need_sync = self.ime_force_sync || switched_field;
         if need_sync {
             crate::ime_bridge::invalidate_last_sync();
-            crate::ime_bridge::sync_focused_text_edit(ui.ctx(), self.last_focus);
-            self.ime_synced_focus = self.last_focus;
-            self.ime_force_sync = false;
+            let seeded = crate::ime_bridge::sync_focused_text_edit(ui.ctx(), self.last_focus);
+            if seeded {
+                self.ime_synced_focus = self.last_focus;
+                self.ime_force_sync = false;
+            } else if self.ime_bridge_hot && self.last_focus.is_some() {
+                self.ime_force_sync = true;
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            } else {
+                self.ime_force_sync = false;
+            }
+        }
+        // User caret moves (tap in the field) must reach the EditText, or the IME keeps editing
+        // at the stale position; also ends composition on both sides like a platform EditText.
+        if self.ime_bridge_hot
+            && !self.bar_touch
+            && ui.ctx().input(|i| i.pointer.primary_released())
+            && let Some(id) = self.last_focus
+            && ui.ctx().memory(|m| m.focused() == Some(id))
+            && let Some(state) = egui::text_edit::TextEditState::load(ui.ctx(), id)
+            && state.cursor.char_range().is_some()
+        {
+            let (s, e) = crate::ime_bridge::selection_chars(&state);
+            crate::ime_bridge::notify_user_caret(s, e);
         }
         // Mirror this frame's egui copies (host widgets and plugin viewports alike) into the
         // system clipboard; winit has no Android clipboard backend.
@@ -384,6 +413,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
     }));
 
     host::set_android_app(app.clone());
+    ime_bridge::register_natives();
 
     let mut options = eframe::NativeOptions::default();
     options.android_app = Some(app);

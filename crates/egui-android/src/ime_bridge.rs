@@ -6,12 +6,17 @@
 //! JNI calls must use [`crate::host::with_native_activity`]: `ndk_context` only holds the
 //! `Application`, so Activity methods never reach the hidden EditText. Class checks must use
 //! `getObjectClass` (not `FindClass`) — the render thread's ClassLoader cannot see app classes.
+//!
+//! All offsets crossing this boundary are code-point (char) indices; Java converts from UTF-16.
 
 use std::sync::{Mutex, OnceLock};
 
 use jni::objects::{JObjectArray, JString, JValue};
 
 const ACTIVITY_CLASS_NAME: &str = "com.github.egui_mobile.EguiNativeActivity";
+
+/// Logs every drained event and sync at info level (mirrors `EguiImeBridge.TRACE`).
+const TRACE: bool = true;
 
 /// Events drained from the Java `InputConnectionWrapper` queue.
 #[derive(Debug, Clone)]
@@ -22,12 +27,19 @@ pub enum ImeEvent {
     /// `finishComposingText`: end composition KEEPING the composing text as committed.
     Finish,
     Delete { before: usize, after: usize },
+    /// `setComposingRegion`: existing text `[start, end)` (content `text`) becomes the composition.
+    Region { start: usize, end: usize, text: String },
+    /// `replaceText`: replace `[start, end)` with `text`, committed.
+    Replace { start: usize, end: usize, text: String },
     Key(i32),
 }
 
 static LAST_SYNC: Mutex<Option<(String, i32, i32)>> = Mutex::new(None);
 static IS_EGUI_ACTIVITY: OnceLock<bool> = OnceLock::new();
 static WAKE_CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
+/// Events deferred to the next frame: Region/Replace reposition the egui cursor, which only
+/// lands if no earlier event in the same injected batch already mutated text.
+static CARRY: Mutex<Vec<ImeEvent>> = Mutex::new(Vec::new());
 
 /// Register the egui context to wake when Java enqueues an InputConnection event.
 pub fn set_wake_context(ctx: &egui::Context) {
@@ -49,6 +61,27 @@ pub extern "system" fn Java_com_github_egui_1mobile_EguiNativeActivity_nativeIme
             ctx.request_repaint();
         }
     }
+}
+
+/// Register `nativeImeWake` on the activity class. NativeActivity dlopens the native lib, so
+/// ART's dynamic symbol resolution never finds it even though the symbol is exported; explicit
+/// RegisterNatives works regardless of how the lib was loaded.
+pub fn register_natives() {
+    let ok = crate::host::with_native_activity(|env, activity| {
+        if !is_egui_activity(env, activity)? {
+            return Ok(false);
+        }
+        let cls = env.get_object_class(activity)?;
+        let method = jni::NativeMethod {
+            name: jni::strings::JNIString::from("nativeImeWake"),
+            sig: jni::strings::JNIString::from("()V"),
+            fn_ptr: Java_com_github_egui_1mobile_EguiNativeActivity_nativeImeWake as *mut std::ffi::c_void,
+        };
+        env.register_native_methods(&cls, &[method])?;
+        Ok(true)
+    })
+    .unwrap_or(false);
+    log::info!("egui-android ime: register_natives(nativeImeWake) ok={ok}");
 }
 
 /// Whether `activity` is `EguiNativeActivity`.
@@ -132,7 +165,7 @@ pub fn invalidate_last_sync() {
     }
 }
 
-/// Preedit text egui currently displays (mirrors the last applied `C` event); consumed when
+/// Preedit text egui currently displays (mirrors the last applied `C`/`R` event); consumed when
 /// `finishComposingText` solidifies it. Cleared on commit, field switch, and keyboard hide so a
 /// late Finish cannot re-commit a stale word into the newly focused field.
 static LAST_PREEDIT: Mutex<String> = Mutex::new(String::new());
@@ -168,14 +201,71 @@ pub fn sync_to_ime(text: &str, sel_start: usize, sel_end: usize) {
     })
     .unwrap_or(false);
     if synced {
-        log::debug!(
-            "egui-android ime: sync_to_ime len={} sel={start}..{end}",
-            text.chars().count()
-        );
+        if TRACE {
+            log::info!(
+                "egui-android ime: sync_to_ime len={} sel={start}..{end}",
+                text.chars().count()
+            );
+        }
         if let Ok(mut g) = LAST_SYNC.lock() {
             *g = Some((text.to_owned(), start, end));
         }
     }
+}
+
+/// Move only the EditText caret; `clear_composing` also ends the EditText composition.
+pub fn sync_selection_to_ime(start: usize, end: usize, clear_composing: bool) {
+    let ok = crate::host::with_native_activity(|env, activity| {
+        if !is_egui_activity(env, activity)? {
+            return Ok(false);
+        }
+        env.call_method(
+            activity,
+            "setImeSelection",
+            "(IIZ)V",
+            &[
+                JValue::Int(start as i32),
+                JValue::Int(end as i32),
+                JValue::Bool(clear_composing as u8),
+            ],
+        )?;
+        Ok(true)
+    })
+    .unwrap_or(false);
+    if ok {
+        if TRACE {
+            log::info!("egui-android ime: sync_selection_to_ime {start}..{end} clear={clear_composing}");
+        }
+        if let Ok(mut g) = LAST_SYNC.lock() {
+            if let Some((_, s, e)) = g.as_mut() {
+                *s = start as i32;
+                *e = end as i32;
+            }
+        }
+    }
+}
+
+/// Report a user-driven caret move (tap in the field) to the EditText so the IME edits at the
+/// right position. Ends any composition on both sides — the preedit egui shows becomes plain
+/// committed text, matching what the tap did visually.
+pub fn notify_user_caret(start: usize, end: usize) {
+    if LAST_SYNC.lock().map(|g| g.is_none()).unwrap_or(true) {
+        return;
+    }
+    let caret = if start == end { start } else { end };
+    let had_preedit = LAST_PREEDIT.lock().map(|g| !g.is_empty()).unwrap_or(false);
+    let same = LAST_SYNC
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|(_, s, e)| *s == caret as i32 && *e == caret as i32))
+        .unwrap_or(false);
+    if same && !had_preedit {
+        return;
+    }
+    if had_preedit {
+        clear_preedit_tracking();
+    }
+    sync_selection_to_ime(caret, caret, had_preedit);
 }
 
 /// Drain pending InputConnection events from Kotlin.
@@ -231,6 +321,18 @@ fn parse_event(s: &str) -> Option<ImeEvent> {
                 after: b.parse().ok()?,
             })
         }
+        "R" | "X" => {
+            let (a, rest) = rest.split_once('\t')?;
+            let (b, text) = rest.split_once('\t')?;
+            let start = a.parse().ok()?;
+            let end = b.parse().ok()?;
+            let text = text.to_owned();
+            Some(if kind == "R" {
+                ImeEvent::Region { start, end, text }
+            } else {
+                ImeEvent::Replace { start, end, text }
+            })
+        }
         "K" => Some(ImeEvent::Key(rest.parse().ok()?)),
         _ => None,
     }
@@ -276,6 +378,20 @@ const KEYCODE_DPAD_RIGHT: i32 = 22;
 const KEYCODE_DEL: i32 = 67;
 const KEYCODE_FORWARD_DEL: i32 = 112;
 
+/// Set the focused TextEdit's cursor range directly (used to anchor Region/Replace replays).
+fn set_state_selection(ctx: &egui::Context, focus: Option<egui::Id>, start: usize, end: usize) {
+    let Some(id) = focus else { return };
+    let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) else {
+        return;
+    };
+    let range = egui::text::CCursorRange::two(
+        egui::text::CCursor::new(start),
+        egui::text::CCursor::new(end),
+    );
+    state.cursor.set_char_range(Some(range));
+    state.store(ctx, id);
+}
+
 /// Apply drained IME events: text/keys → `pending_events`; selection → `TextEditState`.
 /// Returns `true` if any events were applied.
 pub fn apply_pending(
@@ -283,19 +399,28 @@ pub fn apply_pending(
     focus: Option<egui::Id>,
     pending_events: &mut Vec<egui::Event>,
 ) -> bool {
-    let events = take_pending();
+    let mut events = CARRY.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
+    events.extend(take_pending());
     if events.is_empty() {
         return false;
     }
-    log::debug!(
-        "egui-android ime: apply_pending n={} focus={focus:?}",
-        events.len()
-    );
+    if TRACE {
+        log::info!(
+            "egui-android ime: apply_pending n={} focus={focus:?} events={events:?}",
+            events.len()
+        );
+    }
     // Text/delete first. Selection in the same batch is usually a caret move from commitText and
     // would be applied before egui inserts the character — snapping the cursor to the start.
     let mut last_sel: Option<(usize, usize)> = None;
     let mut had_mutate = false;
+    let mut deferred: Vec<ImeEvent> = Vec::new();
     for ev in events {
+        // Once one event defers, everything after it stays in order behind it.
+        if !deferred.is_empty() {
+            deferred.push(ev);
+            continue;
+        }
         match ev {
             ImeEvent::Selection { start, end } => {
                 last_sel = Some((start, end));
@@ -321,8 +446,8 @@ pub fn apply_pending(
             }
             ImeEvent::Finish => {
                 // Commit the preedit egui is showing, unchanged. Only when one is tracked:
-                // Gboard also finishes composition it started via setComposingRegion over
-                // already-committed text, where committing again would duplicate the word.
+                // IMEs also finish compositions started over already-committed text, where
+                // committing again would duplicate the word.
                 let preedit = LAST_PREEDIT
                     .lock()
                     .map(|mut g| std::mem::take(&mut *g))
@@ -334,12 +459,59 @@ pub fn apply_pending(
             }
             ImeEvent::Delete { before, after } => {
                 had_mutate = true;
+                let preedit = LAST_PREEDIT
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                // With an active preedit, egui keeps it selected and a bare Backspace would
+                // delete the whole word: lift the preedit, delete around it, re-apply.
+                if !preedit.is_empty() {
+                    pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: String::new(),
+                        active_range_chars: None,
+                    }));
+                }
                 for _ in 0..before {
                     pending_events.push(key(egui::Key::Backspace));
                 }
                 for _ in 0..after {
                     pending_events.push(key(egui::Key::Delete));
                 }
+                if !preedit.is_empty() {
+                    pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: preedit,
+                        active_range_chars: None,
+                    }));
+                }
+            }
+            ImeEvent::Region { start, end, text } => {
+                // Repositions the egui cursor; only sound while nothing earlier in this batch
+                // has already changed the text those offsets refer to.
+                if had_mutate {
+                    deferred.push(ImeEvent::Region { start, end, text });
+                    continue;
+                }
+                had_mutate = true;
+                if let Ok(mut g) = LAST_PREEDIT.lock() {
+                    g.clone_from(&text);
+                }
+                set_state_selection(ctx, focus, start, end);
+                pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text,
+                    active_range_chars: None,
+                }));
+            }
+            ImeEvent::Replace { start, end, text } => {
+                if had_mutate {
+                    deferred.push(ImeEvent::Replace { start, end, text });
+                    continue;
+                }
+                had_mutate = true;
+                if let Ok(mut g) = LAST_PREEDIT.lock() {
+                    g.clear();
+                }
+                set_state_selection(ctx, focus, start, end);
+                pending_events.push(egui::Event::Ime(egui::ImeEvent::Commit(text)));
             }
             ImeEvent::Key(code) => {
                 let egui_key = match code {
@@ -351,10 +523,7 @@ pub fn apply_pending(
                     KEYCODE_FORWARD_DEL => Some(egui::Key::Delete),
                     _ => None,
                 };
-                if matches!(
-                    code,
-                    KEYCODE_DEL | KEYCODE_FORWARD_DEL
-                ) {
+                if matches!(code, KEYCODE_DEL | KEYCODE_FORWARD_DEL) {
                     had_mutate = true;
                 }
                 if let Some(k) = egui_key {
@@ -363,21 +532,25 @@ pub fn apply_pending(
             }
         }
     }
+    if !deferred.is_empty() {
+        if TRACE {
+            log::info!("egui-android ime: deferring {} event(s) to next frame", deferred.len());
+        }
+        if let Ok(mut g) = CARRY.lock() {
+            *g = deferred;
+        }
+        ctx.request_repaint();
+    }
     // Trackpad / explicit caret move only — not selection attached to a text mutation.
     if !had_mutate {
         if let Some((start, end)) = last_sel {
             let Some(id) = focus else {
                 return true;
             };
-            let Some(mut state) = egui::text_edit::TextEditState::load(ctx, id) else {
+            if egui::text_edit::TextEditState::load(ctx, id).is_none() {
                 return true;
-            };
-            let range = egui::text::CCursorRange::two(
-                egui::text::CCursor::new(start),
-                egui::text::CCursor::new(end),
-            );
-            state.cursor.set_char_range(Some(range));
-            state.store(ctx, id);
+            }
+            set_state_selection(ctx, focus, start, end);
             if let Ok(mut g) = LAST_SYNC.lock() {
                 if let Some((_, s, e)) = g.as_mut() {
                     *s = start as i32;
@@ -399,7 +572,9 @@ fn key(k: egui::Key) -> egui::Event {
     }
 }
 
-/// Sync focused `TextEdit` undoer text + cursor into the hidden EditText.
+/// Sync focused `TextEdit` undoer text + cursor into the hidden EditText. Returns `true` once
+/// a snapshot was actually pushed; callers retry while it is `false` (undoer still in flux or
+/// not yet fed) instead of seeding the EditText with empty/stale text.
 ///
 /// Skips while the undoer is in flux: the EditText already has live IME text from
 /// `commitText` / `deleteSurroundingText`, and pushing a lagged undoer snapshot via
@@ -408,16 +583,19 @@ fn key(k: egui::Key) -> egui::Event {
 /// Non-collapsed egui selections are mirrored as a caret at the selection end. Pushing a full
 /// range into the selectable EditText puts Android into selection mode, which dismisses the
 /// keyboard (Select All). Gboard trackpad still updates egui via `onSelectionChanged`.
-pub fn sync_focused_text_edit(ctx: &egui::Context, focus: Option<egui::Id>) {
-    let Some(id) = focus else { return };
+pub fn sync_focused_text_edit(ctx: &egui::Context, focus: Option<egui::Id>) -> bool {
+    let Some(id) = focus else { return false };
     let Some(state) = egui::text_edit::TextEditState::load(ctx, id) else {
-        return;
+        return false;
     };
     if undoer_in_flux(&state) {
-        return;
+        return false;
     }
-    let text = probe_undoer_text(&state).unwrap_or_default();
+    let Some(text) = probe_undoer_text(&state) else {
+        return false;
+    };
     let (start, end) = selection_chars(&state);
     let caret = if start == end { start } else { end };
     sync_to_ime(&text, caret, caret);
+    true
 }

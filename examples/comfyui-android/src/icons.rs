@@ -36,7 +36,9 @@ pub const UNDO: &str = "↩";
 pub const REDO: &str = "↪";
 pub const DOT: &str = "•";
 pub const CHECK: &str = "✔";
+pub const CLOSE: &str = "✖";
 pub const MENU: &str = "☰";
+pub const STAR: &str = "⭐";
 
 /// Every icon constant, for the font-coverage test.
 #[cfg(test)]
@@ -70,7 +72,9 @@ const ALL: &[(&str, &str)] = &[
     ("REDO", REDO),
     ("DOT", DOT),
     ("CHECK", CHECK),
+    ("CLOSE", CLOSE),
     ("MENU", MENU),
+    ("STAR", STAR),
 ];
 
 #[cfg(test)]

@@ -134,6 +134,77 @@ impl SchemaSet {
         }
         self.enum_options("LoraLoaderModelOnly", "lora_name")
     }
+
+    /// Union of `input`'s enum options across every node whose class name contains `needle`.
+    fn union_options(&self, needle: &str, input: &str) -> Vec<String> {
+        let mut all = Vec::new();
+        for (name, node) in &self.nodes {
+            if !name.contains(needle) {
+                continue;
+            }
+            for i in &node.inputs {
+                if i.name == input
+                    && let InputKind::Enum { options, .. } = &i.kind
+                {
+                    for o in options {
+                        if !all.contains(o) {
+                            all.push(o.clone());
+                        }
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    /// Diffusion-model filenames (`models/diffusion_models`, `models/unet`) from
+    /// `UNETLoader.unet_name`, else the union across forks like the GGUF loader.
+    pub fn unets(&self) -> Vec<String> {
+        let simple = self.enum_options("UNETLoader", "unet_name");
+        if !simple.is_empty() {
+            return simple;
+        }
+        let mut all = self.union_options("UNETLoader", "unet_name");
+        for o in self.union_options("UnetLoader", "unet_name") {
+            if !all.contains(&o) {
+                all.push(o);
+            }
+        }
+        all
+    }
+
+    /// Standalone text-encoder filenames from `CLIPLoader.clip_name`.
+    pub fn clips(&self) -> Vec<String> {
+        let simple = self.enum_options("CLIPLoader", "clip_name");
+        if !simple.is_empty() {
+            return simple;
+        }
+        self.enum_options("DualCLIPLoader", "clip_name1")
+    }
+
+    pub fn vaes(&self) -> Vec<String> {
+        self.enum_options("VAELoader", "vae_name")
+    }
+
+    pub fn clip_types(&self) -> Vec<String> {
+        self.enum_options("CLIPLoader", "type")
+    }
+
+    pub fn clip_devices(&self) -> Vec<String> {
+        self.enum_options("CLIPLoader", "device")
+    }
+
+    pub fn weight_dtypes(&self) -> Vec<String> {
+        self.enum_options("UNETLoader", "weight_dtype")
+    }
+
+    /// The server-declared default for an enum input.
+    pub fn enum_default(&self, class: &str, input: &str) -> Option<String> {
+        match &self.input(class, input)?.kind {
+            InputKind::Enum { default, .. } => default.clone(),
+            _ => None,
+        }
+    }
 }
 
 pub fn parse(root: &Value) -> SchemaSet {
@@ -209,14 +280,31 @@ fn ordered_keys(
 }
 
 /// Parse one input spec. Observed shapes: `["TYPE"]`, `["TYPE", meta]`, `[[opts...], meta?]`,
-/// bare `"TYPE"`, `[null]`, and specs with trailing extras. Never fails.
+/// bare `"TYPE"`, `[null]`, `["COMBO", {options}]`, `["COMBO", ["a","b"]]`, and trailing extras.
+/// Never fails.
 fn parse_input(name: &str, required: bool, spec: &Value) -> InputSchema {
     let (first, meta) = match spec {
         Value::String(_) => (spec.clone(), None),
-        Value::Array(items) => (
-            items.first().cloned().unwrap_or(Value::Null),
-            items.get(1).and_then(Value::as_object).cloned(),
-        ),
+        Value::Array(items) => {
+            let first = items.first().cloned().unwrap_or(Value::Null);
+            // `["COMBO", ["a","b"]]` or `["COMBO", ["a","b"], {meta}]` — options in slot 1.
+            if first.as_str() == Some("COMBO")
+                && let Some(opts) = items.get(1).and_then(Value::as_array)
+            {
+                let meta = items
+                    .get(2)
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                return InputSchema {
+                    name: name.to_string(),
+                    required,
+                    kind: enum_kind(opts, &meta),
+                    tooltip: meta.get("tooltip").and_then(Value::as_str).map(str::to_string),
+                };
+            }
+            (first, items.get(1).and_then(Value::as_object).cloned())
+        }
         _ => (Value::Null, None),
     };
     let meta = meta.unwrap_or_default();
@@ -541,6 +629,30 @@ mod tests {
             r#"{"CheckpointLoader|pysssss": {"input": {"required": {"ckpt_name": [["a.ckpt", "b.ckpt"]]}}, "output": []}}"#,
         );
         assert_eq!(set.checkpoints(), vec!["a.ckpt", "b.ckpt"]);
+    }
+
+    #[test]
+    fn combo_accepts_options_array_in_slot_one() {
+        let set = parse_str(
+            r#"{"LoraLoader": {"input": {"required": {
+                "lora_name": ["COMBO", ["a.safetensors", "b.safetensors"]]
+            }}, "output": []}}"#,
+        );
+        let InputKind::Enum { options, .. } = kind(&set, "LoraLoader", "lora_name") else {
+            panic!("not an enum");
+        };
+        assert_eq!(options, &["a.safetensors", "b.safetensors"]);
+    }
+
+    #[test]
+    fn loras_fall_back_across_loader_classes() {
+        let set = parse_str(
+            r#"{
+                "LoraLoader": {"input": {"required": {"lora_name": ["COMBO", {"options": []}]}}, "output": []},
+                "LoraLoaderModelOnly": {"input": {"required": {"lora_name": [["x.safetensors"]]}}, "output": []}
+            }"#,
+        );
+        assert_eq!(set.loras(), vec!["x.safetensors"]);
     }
 
     #[test]

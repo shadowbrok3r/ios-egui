@@ -16,6 +16,17 @@ pub enum Img2ImgSource {
     Url,
 }
 
+/// Which loader topology a model needs: one all-in-one checkpoint, or a bare diffusion model
+/// paired with separately-loaded text encoder(s) and VAE.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum ModelKind {
+    /// `CheckpointLoaderSimple` -> MODEL + CLIP + VAE.
+    #[default]
+    Checkpoint,
+    /// `UNETLoader` + `CLIPLoader`/`DualCLIPLoader` + `VAELoader`.
+    Diffusion,
+}
+
 /// One LoRA stacked on the Create-tab graph (chained `LoraLoader` after the checkpoint).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ActiveLora {
@@ -26,12 +37,36 @@ pub struct ActiveLora {
     /// Trigger tokens appended to [`Params::lora_triggers`] when this LoRA was added.
     #[serde(default)]
     pub injected: String,
+    /// Chain through `LoraLoaderModelOnly`, leaving the CLIP untouched.
+    #[serde(default)]
+    pub model_only: bool,
 }
 
 /// Everything a KSampler txt2img/img2img workflow needs, plus the UI's mode selection.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Params {
     pub checkpoint: String,
+    /// Which loader topology [`Self::checkpoint`] / [`Self::unet_name`] needs.
+    #[serde(default)]
+    pub model_kind: ModelKind,
+    /// `UNETLoader.unet_name` when `model_kind` is [`ModelKind::Diffusion`].
+    #[serde(default)]
+    pub unet_name: String,
+    /// `UNETLoader.weight_dtype`; empty means `"default"`.
+    #[serde(default)]
+    pub weight_dtype: String,
+    /// Text encoders: one emits `CLIPLoader`, two emit `DualCLIPLoader`.
+    #[serde(default)]
+    pub clip_names: Vec<String>,
+    /// `CLIPLoader.type`; empty means `"stable_diffusion"`.
+    #[serde(default)]
+    pub clip_type: String,
+    /// `CLIPLoader.device`; empty omits the input.
+    #[serde(default)]
+    pub clip_device: String,
+    /// `VAELoader.vae_name`.
+    #[serde(default)]
+    pub vae_name: String,
     pub positive: String,
     pub negative: String,
     /// LoRA trigger / quality tags kept separate from the subject prompt.
@@ -123,6 +158,13 @@ impl Default for Params {
     fn default() -> Self {
         Self {
             checkpoint: String::new(),
+            model_kind: ModelKind::Checkpoint,
+            unet_name: String::new(),
+            weight_dtype: String::new(),
+            clip_names: Vec::new(),
+            clip_type: String::new(),
+            clip_device: String::new(),
+            vae_name: String::new(),
             positive: String::new(),
             negative: "text, watermark, low quality".to_string(),
             lora_triggers: String::new(),
@@ -154,6 +196,61 @@ impl Params {
             (true, _) => subject.to_string(),
             (_, true) => triggers.to_string(),
             _ => format!("{triggers}, {subject}"),
+        }
+    }
+
+    /// The selected model's filename, whichever loader it goes through.
+    pub fn model_file(&self) -> &str {
+        match self.model_kind {
+            ModelKind::Checkpoint => &self.checkpoint,
+            ModelKind::Diffusion => &self.unet_name,
+        }
+    }
+
+    /// Text encoders with blanks dropped, capped at the two a `DualCLIPLoader` accepts.
+    pub fn active_clips(&self) -> Vec<String> {
+        self.clip_names
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .take(2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// `UNETLoader.weight_dtype`, defaulted.
+    pub fn effective_weight_dtype(&self) -> String {
+        match self.weight_dtype.trim() {
+            "" => "default".to_string(),
+            s => s.to_string(),
+        }
+    }
+
+    /// `CLIPLoader.type`, defaulted to what the Anima/Qwen recipe uses.
+    pub fn effective_clip_type(&self) -> String {
+        match self.clip_type.trim() {
+            "" => "stable_diffusion".to_string(),
+            s => s.to_string(),
+        }
+    }
+
+    /// Why the diffusion path can't be queued yet, if anything is missing.
+    pub fn missing_model_part(&self) -> Option<&'static str> {
+        match self.model_kind {
+            ModelKind::Checkpoint => {
+                self.checkpoint.trim().is_empty().then_some("Pick a checkpoint first")
+            }
+            ModelKind::Diffusion => {
+                if self.unet_name.trim().is_empty() {
+                    Some("Pick a diffusion model first")
+                } else if self.active_clips().is_empty() {
+                    Some("Pick a text encoder for this model")
+                } else if self.vae_name.trim().is_empty() {
+                    Some("Pick a VAE for this model")
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -326,11 +423,29 @@ pub struct CheckpointRecommended {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+    /// Companion models for diffusion-model entries, when the catalog knows them.
+    #[serde(default)]
+    pub clip_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub clip_type: Option<String>,
+    #[serde(default)]
+    pub vae: Option<String>,
+    #[serde(default)]
+    pub weight_dtype: Option<String>,
 }
 
 impl CheckpointEntry {
     pub fn display_name(&self) -> &str {
         if self.name.trim().is_empty() { &self.file } else { &self.name }
+    }
+
+    /// Loader topology implied by `directory`, or `None` when the catalog didn't say.
+    pub fn model_kind(&self) -> Option<ModelKind> {
+        match self.directory.trim().to_ascii_lowercase().as_str() {
+            "diffusion_models" | "diffusion_model" | "unet" | "unets" => Some(ModelKind::Diffusion),
+            "checkpoints" | "checkpoint" => Some(ModelKind::Checkpoint),
+            _ => None,
+        }
     }
 
     /// Label for a version row under a shared display name.
@@ -340,6 +455,102 @@ impl CheckpointEntry {
         }
         file_basename(&self.file).to_string()
     }
+
+    /// Model-family bucket for the Create list.
+    /// Prefers Civitai `base_model` (Pony, Illustrious, Anima, …) over coarse `bases` tags (sdxl).
+    pub fn family_label(&self) -> String {
+        if let Some(b) = self.base_model.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return pretty_model_family(b);
+        }
+        if let Some(b) = self.base_model_type.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return pretty_model_family(b);
+        }
+        if let Some(b) = self.bases.iter().map(|s| s.trim()).find(|s| !s.is_empty()) {
+            return pretty_model_family(b);
+        }
+        "Other".into()
+    }
+}
+
+/// How checkpoint rows are ordered within Favorites / each family group.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum CheckpointSort {
+    #[default]
+    Name,
+    Recent,
+}
+
+impl CheckpointSort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Recent => "Recent",
+        }
+    }
+}
+
+/// Cap on persisted MRU checkpoint filenames.
+pub const CHECKPOINT_RECENT_MAX: usize = 40;
+
+/// Human label for a base-model tag (`sdxl` → `SDXL`, `sd15` → `SD 1.5`).
+pub fn pretty_model_family(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return "Other".into();
+    }
+    let key = t.to_ascii_lowercase().replace([' ', '_', '-', '.'], "");
+    match key.as_str() {
+        "sd15" | "stablediffusion15" => "SD 1.5".into(),
+        "sd20" | "sd2" => "SD 2.0".into(),
+        "sd21" => "SD 2.1".into(),
+        "sdxl" | "sdxl10" | "stablediffusionxl" => "SDXL".into(),
+        "sdxlturbo" => "SDXL Turbo".into(),
+        "sd3" | "sd30" | "stablediffusion3" => "SD 3".into(),
+        "sd35" | "sd35large" | "sd35medium" => "SD 3.5".into(),
+        "pony" | "ponydiffusion" | "ponyxl" => "Pony".into(),
+        "illustrious" | "illustriousxl" => "Illustrious".into(),
+        "noobai" | "noobaixl" => "NoobAI".into(),
+        "flux" | "flux1" | "fluxdev" | "flux1dev" | "flux1d" => "Flux".into(),
+        "fluxschnell" | "flux1schnell" | "flux1s" => "Flux Schnell".into(),
+        "auraflow" => "AuraFlow".into(),
+        "hunyuan" | "hunyuandit" | "hunyuanvideo" => "Hunyuan".into(),
+        "cascade" | "stablecascade" => "Cascade".into(),
+        "pixart" | "pixarta" | "pixartsigma" | "pixarte" => "PixArt".into(),
+        "qwen" | "qwenimage" => "Qwen".into(),
+        "anima" => "Anima".into(),
+        "svd" | "stablevideodiffusion" => "SVD".into(),
+        "wan" | "wanvideo" | "wan21" => "Wan".into(),
+        "lumina" | "lumina2" => "Lumina".into(),
+        "chroma" => "Chroma".into(),
+        "hidream" => "HiDream".into(),
+        other => {
+            // Title-case unknown tags; keep short acronyms uppercase.
+            if other.len() <= 5 && other.chars().all(|c| c.is_ascii_alphanumeric()) {
+                other.to_ascii_uppercase()
+            } else {
+                let mut out = String::new();
+                for (i, part) in t.split(|c: char| c == ' ' || c == '_' || c == '-').enumerate() {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    let mut chars = part.chars();
+                    if let Some(first) = chars.next() {
+                        out.extend(first.to_uppercase());
+                        out.push_str(&chars.as_str().to_ascii_lowercase());
+                    }
+                }
+                if out.is_empty() { "Other".into() } else { out }
+            }
+        }
+    }
+}
+
+/// Family bucket for an installed checkpoint (catalog metadata, else `"Other"`).
+pub fn checkpoint_family(entry: Option<&CheckpointEntry>) -> String {
+    entry.map(|e| e.family_label()).unwrap_or_else(|| "Other".into())
 }
 
 impl CheckpointCatalog {
@@ -779,7 +990,7 @@ pub struct Settings {
     /// Auto-follow: pan/zoom the graph to whichever node is currently executing.
     #[serde(default)]
     pub auto_follow: bool,
-    /// Auto-arrange the canvas when a workflow is loaded.
+    /// Auto-arrange the canvas when a loaded workflow is first shown.
     #[serde(default = "default_true")]
     pub auto_arrange: bool,
     #[serde(default)]
@@ -796,6 +1007,18 @@ pub struct Settings {
     /// Name of the last-applied Create preset (empty = none / custom).
     #[serde(default)]
     pub selected_preset: String,
+    /// Create Checkpoints list sort (name vs most recently used).
+    #[serde(default)]
+    pub checkpoint_sort: CheckpointSort,
+    /// Locally pinned favorite checkpoint filenames (in addition to catalog `favorite`).
+    #[serde(default)]
+    pub checkpoint_favorites: Vec<String>,
+    /// Most-recently-used checkpoint filenames (newest first).
+    #[serde(default)]
+    pub checkpoint_recent: Vec<String>,
+    /// Ask before deleting gallery images (viewer or multi-select).
+    #[serde(default = "default_true")]
+    pub confirm_gallery_delete: bool,
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),
@@ -934,6 +1157,79 @@ fn unix_ymd(secs: i64) -> String {
 mod tests {
     use super::*;
 
+    /// Presets and settings written before the diffusion-model fields existed must still load —
+    /// a failed `Settings` parse silently discards the server URL, key and every saved preset.
+    #[test]
+    fn params_without_the_diffusion_fields_still_load() {
+        let old = r#"{
+            "checkpoint": "sdxl.safetensors",
+            "positive": "a cat",
+            "negative": "blurry",
+            "steps": 20, "cfg": 7.0, "width": 1024, "height": 1024, "batch_size": 1,
+            "sampler": "euler", "scheduler": "normal", "seed": 0, "randomize_seed": true,
+            "denoise": 0.6, "mode": "Txt2Img", "img2img_source": "CurrentOutput",
+            "input_url": "",
+            "loras": [{"file": "x.safetensors", "strength_model": 1.0, "strength_clip": 1.0}]
+        }"#;
+        let p: Params = serde_json::from_str(old).expect("old params must still deserialize");
+        assert_eq!(p.model_kind, ModelKind::Checkpoint);
+        assert_eq!(p.model_file(), "sdxl.safetensors");
+        assert!(p.clip_names.is_empty() && p.vae_name.is_empty());
+        assert!(!p.loras[0].model_only);
+        // Unchanged behavior for existing presets: nothing blocks the queue.
+        assert_eq!(p.missing_model_part(), None);
+    }
+
+    #[test]
+    fn a_diffusion_model_needs_its_encoder_and_vae_before_queueing() {
+        let mut p = Params {
+            model_kind: ModelKind::Diffusion,
+            unet_name: "Anima/novaAnimeAM_v30.safetensors".into(),
+            ..Default::default()
+        };
+        assert_eq!(p.missing_model_part(), Some("Pick a text encoder for this model"));
+        p.clip_names = vec!["qwen_3_06b_base.safetensors".into()];
+        assert_eq!(p.missing_model_part(), Some("Pick a VAE for this model"));
+        p.vae_name = "qwen_image_vae.safetensors".into();
+        assert_eq!(p.missing_model_part(), None);
+        // Blank entries never count as a chosen encoder.
+        p.clip_names = vec!["  ".into()];
+        assert_eq!(p.missing_model_part(), Some("Pick a text encoder for this model"));
+    }
+
+    #[test]
+    fn catalog_directory_picks_the_loader() {
+        let entry = |dir: &str| CheckpointEntry {
+            file: "m.safetensors".into(),
+            directory: dir.into(),
+            name: String::new(),
+            bases: Vec::new(),
+            tags: Vec::new(),
+            notes: String::new(),
+            favorite: false,
+            from_civitai: false,
+            base_model: None,
+            base_model_type: None,
+            sha256: None,
+            size: None,
+            creator: None,
+            version: None,
+            description: None,
+            preview: None,
+            nsfw_level: None,
+            civitai_id: None,
+            civitai_model_id: None,
+            download_count: None,
+            thumbs_up: None,
+            recommended: None,
+        };
+        assert_eq!(entry("diffusion_models").model_kind(), Some(ModelKind::Diffusion));
+        assert_eq!(entry("unet").model_kind(), Some(ModelKind::Diffusion));
+        assert_eq!(entry("checkpoints").model_kind(), Some(ModelKind::Checkpoint));
+        // Unknown / absent directory defers to the caller's list-membership fallback.
+        assert_eq!(entry("").model_kind(), None);
+    }
+
     #[test]
     fn group_label_strips_user_root() {
         let item = |sub: &str| GalleryItem {
@@ -1011,6 +1307,47 @@ mod tests {
         ));
         assert!(!entry.matches_checkpoint("flux1-dev.safetensors", &["flux".into()]));
         assert!(!entry.matches_checkpoint("unknown.safetensors", &[]));
+    }
+
+    #[test]
+    fn pretty_model_family_normalizes_common_tags() {
+        assert_eq!(pretty_model_family("sdxl"), "SDXL");
+        assert_eq!(pretty_model_family("SD 1.5"), "SD 1.5");
+        assert_eq!(pretty_model_family("flux-dev"), "Flux");
+        assert_eq!(pretty_model_family("Pony"), "Pony");
+        assert_eq!(pretty_model_family("Illustrious"), "Illustrious");
+        assert_eq!(pretty_model_family("Anima"), "Anima");
+        assert_eq!(pretty_model_family(""), "Other");
+    }
+
+    #[test]
+    fn checkpoint_family_prefers_base_model_over_bases() {
+        let e = CheckpointEntry {
+            file: "a.safetensors".into(),
+            directory: "checkpoints".into(),
+            name: "A".into(),
+            bases: vec!["sdxl".into()],
+            tags: vec![],
+            notes: String::new(),
+            favorite: false,
+            from_civitai: false,
+            base_model: Some("Pony".into()),
+            base_model_type: None,
+            sha256: None,
+            size: None,
+            creator: None,
+            version: None,
+            description: None,
+            preview: None,
+            nsfw_level: None,
+            civitai_id: None,
+            civitai_model_id: None,
+            download_count: None,
+            thumbs_up: None,
+            recommended: None,
+        };
+        assert_eq!(e.family_label(), "Pony");
+        assert_eq!(checkpoint_family(None), "Other");
     }
 }
 

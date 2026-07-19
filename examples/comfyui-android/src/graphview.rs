@@ -25,6 +25,20 @@ pub enum ViewCmd {
     Focus(egui::Pos2),
 }
 
+/// Result of a long-press on the graph canvas.
+pub enum LongPress {
+    /// Empty canvas — open Add node / paste menu at this graph-space point.
+    Canvas(egui::Pos2),
+    /// Held on a node — open the node action menu (bypass / auto-wire).
+    Node(NodeId),
+}
+
+/// A `lora_name` combo selection that changed this frame (canvas or properties).
+pub struct LoraPick {
+    pub node: NodeId,
+    pub file: String,
+}
+
 /// View state and overlays for the graph canvas.
 pub struct GraphView {
     pub locked: bool,
@@ -37,18 +51,22 @@ pub struct GraphView {
     /// Frames to keep reporting a layout as in-flight after it runs, so undo does not record
     /// the settling positions as a user edit.
     arrange_settling: u8,
+    /// Auto-arrange requested by a load, waiting for the canvas to paint before running.
+    needs_auto_arrange: bool,
     sizes: HashMap<NodeId, egui::Vec2>,
     to_global: TSTransform,
     pub view_rect: egui::Rect,
     /// Whether the in-progress drag started on top of a node. In locked mode that drag pans the
     /// canvas instead of doing nothing, so panning never depends on finding empty space.
     drag_from_node: bool,
-    /// A press held still on empty canvas: (start time, screen origin). Drives long-press add.
-    press: Option<(f64, egui::Pos2)>,
+    /// A press held still: (start time, screen origin, node under press if any).
+    press: Option<(f64, egui::Pos2, Option<NodeId>)>,
     /// One long-press has already fired for the current press.
     long_fired: bool,
-    /// Graph-space position of a long-press this frame, for the caller to open Add node at.
-    long_press: Option<egui::Pos2>,
+    /// Long-press this frame (canvas add-menu or node menu).
+    long_press: Option<LongPress>,
+    /// `lora_name` picks this frame (recommended strengths applied by the app).
+    lora_picks: Vec<LoraPick>,
 }
 
 impl Default for GraphView {
@@ -66,6 +84,7 @@ impl GraphView {
             arrange_queued: false,
             arrange_wait: 0,
             arrange_settling: 0,
+            needs_auto_arrange: false,
             sizes: HashMap::new(),
             to_global: TSTransform::IDENTITY,
             view_rect: egui::Rect::ZERO,
@@ -73,6 +92,7 @@ impl GraphView {
             press: None,
             long_fired: false,
             long_press: None,
+            lora_picks: Vec::new(),
         }
     }
 
@@ -82,7 +102,13 @@ impl GraphView {
         self.cmd = None;
         self.arrange_queued = false;
         self.arrange_wait = 0;
+        self.arrange_settling = 0;
+        self.needs_auto_arrange = false;
         self.sizes.clear();
+        self.press = None;
+        self.long_fired = false;
+        self.long_press = None;
+        self.lora_picks.clear();
     }
 
     pub fn request_fit(&mut self) {
@@ -95,10 +121,19 @@ impl GraphView {
     /// matter because `arrange_now` clears the queue flag *before* it moves anything, so without
     /// them the move itself looks like a user edit.
     pub fn arrange_pending(&self) -> bool {
-        self.arrange_queued || self.arrange_settling > 0
+        self.needs_auto_arrange || self.arrange_queued || self.arrange_settling > 0
+    }
+
+    /// Defer auto-arrange until the canvas paints (Create sync / background loads never call `show`).
+    pub fn mark_needs_auto_arrange(&mut self) {
+        self.needs_auto_arrange = true;
+        self.arrange_queued = false;
+        self.arrange_wait = 0;
+        self.cmd = Some(ViewCmd::FitAll);
     }
 
     pub fn request_arrange(&mut self) {
+        self.needs_auto_arrange = false;
         self.arrange_queued = true;
         self.arrange_wait = 0;
         self.cmd = Some(ViewCmd::FitAll);
@@ -107,6 +142,7 @@ impl GraphView {
     /// Arrange immediately. Uses measured sizes when present, else [`NOMINAL_NODE`].
     /// Does not invent size cache entries — placeholders would fake "measured" and skip refine.
     pub fn arrange_now(&mut self, snarl: &mut Snarl<FlowNodeData>) {
+        self.needs_auto_arrange = false;
         self.arrange_queued = false;
         self.arrange_wait = 0;
         self.arrange_settling = 3;
@@ -120,6 +156,7 @@ impl GraphView {
     /// Load-time layout: nominal arrange + fit so every node paints, then queue a refine pass
     /// once `final_node_rect` has filled real sizes.
     pub fn arrange_on_load(&mut self, snarl: &mut Snarl<FlowNodeData>) {
+        self.needs_auto_arrange = false;
         self.arrange_now(snarl);
         self.arrange_queued = true;
         self.arrange_wait = 0;
@@ -141,9 +178,16 @@ impl GraphView {
             .then(|| self.to_global.inverse() * self.view_rect.center())
     }
 
+    /// `lora_name` selections made while rendering the canvas this frame.
+    pub fn take_lora_picks(&mut self) -> Vec<LoraPick> {
+        std::mem::take(&mut self.lora_picks)
+    }
+
     /// Render the canvas (with lock gating and pending view commands), then the minimap overlay.
     /// Returns the node tapped this frame, if any — snarl itself only selects on shift-click,
     /// which doesn't exist on touch.
+    ///
+    /// `lora_files` fills empty `lora_name` combos (Create-tab union across loader classes).
     #[must_use]
     pub fn show(
         &mut self,
@@ -151,9 +195,21 @@ impl GraphView {
         g: &mut ComfyUiNodeGraph,
         executing: Option<NodeId>,
         focus: Option<NodeId>,
+        bypassed: &HashSet<NodeId>,
+        lora_files: &[String],
     ) -> Option<NodeId> {
         self.sizes.retain(|id, _| g.snarl.get_node(*id).is_some());
         self.arrange_settling = self.arrange_settling.saturating_sub(1);
+        self.lora_picks.clear();
+        // Keep file combos populated even when a single loader class shipped an empty list.
+        for data in g.snarl.nodes_mut() {
+            ensure_file_combos(data, &g.object_info, lora_files);
+        }
+
+        // Background loads only mark the flag — arrange once the canvas is actually painting.
+        if self.needs_auto_arrange {
+            self.arrange_on_load(&mut g.snarl);
+        }
 
         if self.arrange_queued {
             let ids: Vec<NodeId> = g.snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();
@@ -190,6 +246,8 @@ impl GraphView {
             inner: FlowViewer { user_state: &mut g.user_state, object_info: &g.object_info },
             locked: self.locked,
             focus,
+            bypassed,
+            lora_picks: &mut self.lora_picks,
             cmd,
             pan,
             bounds: bounds(&g.snarl, &self.sizes),
@@ -217,19 +275,18 @@ impl GraphView {
         tapped
     }
 
-    /// A long-press on empty canvas this frame (graph space), for opening the Add node picker.
-    /// Taken so it fires once.
-    pub fn take_long_press(&mut self) -> Option<egui::Pos2> {
+    /// A long-press this frame. Taken so it fires once.
+    pub fn take_long_press(&mut self) -> Option<LongPress> {
         self.long_press.take()
     }
 
-    /// Detect a finger held still on empty canvas for ~0.5s (touch has no right-click, so this is
-    /// the add-node gesture). Only in edit mode; locked mode uses the same drag to pan.
+    /// Detect a finger held still for ~0.5s: on a node → bypass toggle; on empty canvas → add menu.
+    /// Locked mode uses the same drag to pan, so long-press is disabled while locked.
     fn detect_long_press(
         &mut self,
         ctx: &egui::Context,
         snarl: &Snarl<FlowNodeData>,
-    ) -> Option<egui::Pos2> {
+    ) -> Option<LongPress> {
         if self.locked {
             self.press = None;
             self.long_fired = false;
@@ -249,29 +306,36 @@ impl GraphView {
             return None;
         }
         let Some(pos) = pos else { return None };
-        let on_background = self.view_rect.contains(pos)
-            && !ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
-            && self.node_at(ctx, pos, snarl).is_none();
-        if !on_background {
+        if !self.view_rect.contains(pos)
+            || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
+        {
             self.press = None;
             return None;
         }
+        let under = self.node_at(ctx, pos, snarl);
         match self.press {
             None => {
-                self.press = Some((time, pos));
+                self.press = Some((time, pos, under));
                 None
             }
-            Some((start, origin)) => {
+            Some((start, origin, node)) => {
                 if dragging || (origin - pos).length() > 12.0 {
+                    self.press = None;
+                    return None;
+                }
+                // Finger slid onto a different target — cancel.
+                if under != node {
                     self.press = None;
                     return None;
                 }
                 if !self.long_fired && time - start > 0.5 {
                     self.long_fired = true;
                     ctx.request_repaint();
-                    return Some(self.to_global.inverse() * pos);
+                    return Some(match node {
+                        Some(id) => LongPress::Node(id),
+                        None => LongPress::Canvas(self.to_global.inverse() * pos),
+                    });
                 }
-                // Keep repainting so the timer completes even without pointer motion.
                 ctx.request_repaint();
                 None
             }
@@ -634,6 +698,8 @@ struct Wrapper<'a> {
     inner: FlowViewer<'a>,
     locked: bool,
     focus: Option<NodeId>,
+    bypassed: &'a HashSet<NodeId>,
+    lora_picks: &'a mut Vec<LoraPick>,
     cmd: Option<ViewCmd>,
     /// Screen-space pan to add this frame (locked-mode drag started on a node).
     pan: egui::Vec2,
@@ -663,13 +729,18 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<FlowNodeData>,
     ) -> PinInfo {
-        if self.locked {
+        let before = lora_name_selected(snarl, pin.id.node);
+        let info = if self.locked {
             let mut info = None;
             ui.add_enabled_ui(false, |ui| info = Some(self.inner.show_input(pin, ui, snarl)));
             info.unwrap_or_else(PinInfo::circle)
         } else {
             self.inner.show_input(pin, ui, snarl)
+        };
+        if let Some(file) = lora_name_changed(snarl, pin.id.node, before.as_deref()) {
+            self.lora_picks.push(LoraPick { node: pin.id.node, file });
         }
+        info
     }
 
     #[allow(refining_impl_trait)]
@@ -690,13 +761,17 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         outputs: &[OutPin],
         snarl: &Snarl<FlowNodeData>,
     ) -> egui::Frame {
-        let frame = self.inner.node_frame(default, node, inputs, outputs, snarl).fill(NODE_FILL);
-        // The executing highlight (green stroke from the inner viewer) wins over focus.
-        if self.focus == Some(node) && frame.stroke.width < 2.0 {
-            frame.stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 140, 226)))
-        } else {
-            frame
+        let mut frame = self.inner.node_frame(default, node, inputs, outputs, snarl).fill(NODE_FILL);
+        if self.bypassed.contains(&node) {
+            // Dimmed fill + dashed-feel orange stroke marks a bypassed (mode-4) node.
+            frame = frame
+                .fill(egui::Color32::from_rgb(55, 48, 40))
+                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(210, 140, 70)));
+        } else if self.focus == Some(node) && frame.stroke.width < 2.0 {
+            // The executing highlight (green stroke from the inner viewer) wins over focus.
+            frame = frame.stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 140, 226)));
         }
+        frame
     }
 
     fn has_body(&mut self, node: &FlowNodeData) -> bool {
@@ -820,6 +895,7 @@ impl GraphView {
         &self,
         g: &ComfyUiNodeGraph,
         schemas: &crate::schema::SchemaSet,
+        bypassed: &HashSet<NodeId>,
     ) -> serde_json::Value {
         use serde_json::json;
 
@@ -916,7 +992,7 @@ impl GraphView {
                 "size": [size.x, size.y],
                 "flags": {},
                 "order": order,
-                "mode": 0,
+                "mode": if bypassed.contains(&id) { 4 } else { 0 },
                 "inputs": inputs,
                 "outputs": outputs,
                 "properties": { "Node name for S&R": data.object.name },
@@ -945,15 +1021,110 @@ pub fn type_str(typ: &rucomfyui::object_info::ObjectType) -> String {
         .unwrap_or_else(|| "*".to_string())
 }
 
+// ── Combo / LoRA helpers ──────────────────────────────────────────────────────
+
+/// Fill empty (or under-populated) file combos from `object_info` and the Create-tab LoRA list.
+pub fn ensure_file_combos(
+    data: &mut FlowNodeData,
+    object_info: &rucomfyui::object_info::ObjectInfo,
+    lora_files: &[String],
+) {
+    let class = data.object.name.clone();
+    let template = object_info.get(&class);
+    for input in &mut data.inputs {
+        let from_template = template.and_then(|obj| {
+            obj.all_inputs().find(|(n, _, _)| *n == input.name).and_then(|(_, inp, _)| {
+                match inp.as_input_type() {
+                    rucomfyui::object_info::ObjectInputType::Array(vec) => {
+                        let opts: Vec<String> =
+                            vec.iter().map(|v| v.as_str().to_string()).collect();
+                        (!opts.is_empty()).then_some(opts)
+                    }
+                    _ => None,
+                }
+            })
+        });
+        let is_lora = input.name == "lora_name"
+            || class == "LoraLoader"
+            || class == "LoraLoaderModelOnly";
+        let mut opts = from_template.unwrap_or_default();
+        if is_lora {
+            for l in lora_files {
+                if !opts.iter().any(|o| o == l) {
+                    opts.push(l.clone());
+                }
+            }
+        }
+        if opts.is_empty() {
+            continue;
+        }
+        match &mut input.value {
+            FlowValueType::Array { options, selected } => {
+                if options.is_empty() || (is_lora && options.len() < opts.len()) {
+                    *options = opts;
+                }
+                if selected.is_empty() || !options.iter().any(|o| o == selected) {
+                    *selected = options.first().cloned().unwrap_or_default();
+                }
+            }
+            // Empty COMBO parsed as a connection pin — promote to a real dropdown.
+            other if is_lora && other.is_connection_only() => {
+                let selected = opts.first().cloned().unwrap_or_default();
+                input.value = FlowValueType::Array { options: opts, selected };
+                input.typ = rucomfyui::object_info::ObjectType::String;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lora_name_selected(snarl: &Snarl<FlowNodeData>, node: NodeId) -> Option<String> {
+    let data = snarl.get_node(node)?;
+    data.inputs.iter().find(|i| i.name == "lora_name").and_then(|i| match &i.value {
+        FlowValueType::Array { selected, .. } => Some(selected.clone()),
+        _ => None,
+    })
+}
+
+fn lora_name_changed(
+    snarl: &Snarl<FlowNodeData>,
+    node: NodeId,
+    before: Option<&str>,
+) -> Option<String> {
+    let after = lora_name_selected(snarl, node)?;
+    if before == Some(after.as_str()) {
+        return None;
+    }
+    (!after.is_empty()).then_some(after)
+}
+
+/// Write catalog strengths onto a LoRA node's strength widgets.
+pub fn apply_lora_strengths(data: &mut FlowNodeData, strength_model: f32, strength_clip: f32) {
+    for input in &mut data.inputs {
+        match (input.name.as_str(), &mut input.value) {
+            ("strength_model", FlowValueType::Float { value, min, max, .. }) => {
+                *value = (strength_model as f64).clamp(*min, *max);
+            }
+            ("strength_clip", FlowValueType::Float { value, min, max, .. }) => {
+                *value = (strength_clip as f64).clamp(*min, *max);
+            }
+            _ => {}
+        }
+    }
+}
+
 // ── Node properties editor ────────────────────────────────────────────────────
 
 /// Inspector for one node: type/category header, every input (connection source or editable
 /// value), and outputs. Returns `false` when the node no longer exists.
+/// `lora_picks` collects `lora_name` changes for recommended-strength application.
 pub fn node_properties(
     ui: &mut egui::Ui,
     g: &mut ComfyUiNodeGraph,
     node: NodeId,
     locked: bool,
+    lora_files: &[String],
+    lora_picks: &mut Vec<LoraPick>,
 ) -> bool {
     let Some(data) = g.snarl.get_node(node) else { return false };
 
@@ -972,6 +1143,7 @@ pub fn node_properties(
         .collect();
 
     let Some(data) = g.snarl.get_node_mut(node) else { return false };
+    ensure_file_combos(data, &g.object_info, lora_files);
     ui.strong(data.object.display_name());
     ui.weak(format!("{}  •  {}", data.object.name, data.object.category));
     if !data.object.description.is_empty() {
@@ -991,7 +1163,22 @@ pub fn node_properties(
                     ui.weak(format!("<- {}", elide(src, 40)));
                 });
             }
-            None => value_editor(ui, egui::Id::new((node, i)), input, locked),
+            None => {
+                let before = match &input.value {
+                    FlowValueType::Array { selected, .. } if input.name == "lora_name" => {
+                        Some(selected.clone())
+                    }
+                    _ => None,
+                };
+                value_editor(ui, egui::Id::new((node, i)), input, locked);
+                if input.name == "lora_name"
+                    && let FlowValueType::Array { selected, .. } = &input.value
+                    && before.as_deref() != Some(selected.as_str())
+                    && !selected.is_empty()
+                {
+                    lora_picks.push(LoraPick { node, file: selected.clone() });
+                }
+            }
         }
     }
 
@@ -1208,7 +1395,7 @@ mod tests {
                 let mut tapped = None;
                 let _ = ctx.run_ui(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        tapped = view.show(ui, graph, None, None);
+                        tapped = view.show(ui, graph, None, None, &HashSet::new(), &[]);
                     });
                 });
                 for (id, pos, data) in graph.snarl.nodes_pos_ids() {
@@ -1485,7 +1672,8 @@ mod tests {
             let editor_wf = graph.save_api_workflow();
 
             let view = GraphView::default();
-            let exported = view.export_ui(&graph, &schemas);
+            let bypassed = HashSet::new();
+            let exported = view.export_ui(&graph, &schemas, &bypassed);
             let reimported = crate::uiwf::convert(&exported, &schemas)
                 .unwrap_or_else(|e| panic!("{wf_path}: exported UI json failed to convert: {e}"));
             assert_eq!(
@@ -1552,6 +1740,15 @@ mod tests {
         let pos = |id| snarl.get_node_info(id).unwrap().pos;
         assert!(pos(c).x > pos(a).x);
         assert!(pos(c).x > pos(b).x);
+    }
+
+    #[test]
+    fn mark_needs_auto_arrange_defers_until_applied() {
+        let mut view = GraphView::new(3);
+        view.mark_needs_auto_arrange();
+        assert!(view.needs_auto_arrange);
+        assert!(view.arrange_pending());
+        assert!(!view.arrange_queued);
     }
 
     /// Load path must queue a refine pass; seeding nominal sizes used to make that pass a no-op.
