@@ -260,6 +260,26 @@ fn set_clipboard(text: &str) {
     });
 }
 
+/// True when the primary clip exists (no string materialization — safe to poll).
+pub fn clipboard_has_text() -> bool {
+    with_activity(|env, activity| {
+        let svc = env.new_string("clipboard")?;
+        let cm = env
+            .call_method(
+                activity,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[(&svc).into()],
+            )?
+            .l()?;
+        if cm.is_null() {
+            return Ok(false);
+        }
+        Ok(env.call_method(&cm, "hasPrimaryClip", "()Z", &[])?.z()?)
+    })
+    .unwrap_or(false)
+}
+
 /// Read the system clipboard as text (Android grants reads only while the app has focus).
 pub fn read_clipboard_text() -> Option<String> {
     with_activity(|env, activity| {
@@ -1213,6 +1233,10 @@ pub trait HostExt {
     fn load_device_image(&self, id: i64) -> Option<Vec<u8>>;
     /// Current system clipboard text, if any (requires app focus).
     fn clipboard_text(&self) -> Option<String>;
+    /// Whether the primary clip exists (no string copy — safe to poll every frame).
+    fn clipboard_has_text(&self) -> bool {
+        false
+    }
 }
 
 impl HostExt for Host {
@@ -1259,5 +1283,8 @@ impl HostExt for Host {
     }
     fn clipboard_text(&self) -> Option<String> {
         read_clipboard_text()
+    }
+    fn clipboard_has_text(&self) -> bool {
+        clipboard_has_text()
     }
 }

@@ -329,7 +329,8 @@ impl Adapter {
             return;
         }
         if self.frame >= self.next_clip_poll {
-            self.has_clip = crate::host::read_clipboard_text().is_some();
+            // Presence only — never materialize clipboard text just to enable Paste.
+            self.has_clip = crate::host::clipboard_has_text();
             self.next_clip_poll = self.frame + 30;
         }
         let insets = self.host.safe_area_insets();

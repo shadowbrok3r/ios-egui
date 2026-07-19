@@ -1,5 +1,7 @@
 //! Generation parameters and persisted settings shared between the UI and the async engine.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// Generation mode: a fresh image from noise, or refine an existing image.
@@ -310,6 +312,15 @@ pub struct LoraPack {
     pub loras: Vec<ActiveLora>,
 }
 
+/// Keep the first entry for each `file`; Create is a linear stack, not a side-by-side graph.
+pub fn dedupe_loras(loras: Vec<ActiveLora>) -> Vec<ActiveLora> {
+    let mut seen = HashSet::new();
+    loras
+        .into_iter()
+        .filter(|l| !l.file.is_empty() && seen.insert(l.file.clone()))
+        .collect()
+}
+
 impl LoraPack {
     pub const CLIP_TYPE: &'static str = "comfyui_android_loras_v1";
 
@@ -327,6 +338,7 @@ impl LoraPack {
             return None;
         }
         let loras: Vec<ActiveLora> = serde_json::from_value(v.get("loras")?.clone()).ok()?;
+        let loras = dedupe_loras(loras);
         (!loras.is_empty()).then_some(Self { loras })
     }
 }
@@ -1156,6 +1168,38 @@ fn unix_ymd(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedupe_loras_keeps_first_of_each_file() {
+        let pack = vec![
+            ActiveLora {
+                file: "a.safetensors".into(),
+                strength_model: 0.5,
+                strength_clip: 0.5,
+                injected: String::new(),
+                model_only: false,
+            },
+            ActiveLora {
+                file: "b.safetensors".into(),
+                strength_model: 1.0,
+                strength_clip: 1.0,
+                injected: String::new(),
+                model_only: true,
+            },
+            ActiveLora {
+                file: "a.safetensors".into(),
+                strength_model: 0.9,
+                strength_clip: 0.9,
+                injected: String::new(),
+                model_only: false,
+            },
+        ];
+        let out = dedupe_loras(pack);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].file, "a.safetensors");
+        assert!((out[0].strength_model - 0.5).abs() < 1e-6);
+        assert_eq!(out[1].file, "b.safetensors");
+    }
 
     /// Presets and settings written before the diffusion-model fields existed must still load —
     /// a failed `Settings` parse silently discards the server URL, key and every saved preset.

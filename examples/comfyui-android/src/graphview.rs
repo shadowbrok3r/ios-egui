@@ -1144,12 +1144,19 @@ pub fn node_properties(
 
     let Some(data) = g.snarl.get_node_mut(node) else { return false };
     ensure_file_combos(data, &g.object_info, lora_files);
-    ui.strong(data.object.display_name());
-    ui.weak(format!("{}  •  {}", data.object.name, data.object.category));
+    ui.strong(sanitize_ui_text(ui, data.object.display_name()));
+    ui.weak(sanitize_ui_text(
+        ui,
+        &format!("{}  •  {}", data.object.name, data.object.category),
+    ));
     if !data.object.description.is_empty() {
         ui.add(
-            egui::Label::new(egui::RichText::new(elide(&data.object.description, 300)).weak().small())
-                .wrap(),
+            egui::Label::new(
+                egui::RichText::new(elide(&sanitize_ui_text(ui, &data.object.description), 300))
+                    .weak()
+                    .small(),
+            )
+            .wrap(),
         );
     }
     ui.separator();
@@ -1160,7 +1167,7 @@ pub fn node_properties(
             Some(src) => {
                 ui.horizontal(|ui| {
                     ui.label(&input.name);
-                    ui.weak(format!("<- {}", elide(src, 40)));
+                    ui.weak(format!("<- {}", elide(&sanitize_ui_text(ui, src), 40)));
                 });
             }
             None => {
@@ -1258,7 +1265,7 @@ fn value_editor(ui: &mut egui::Ui, salt: egui::Id, input: &mut FlowInput, locked
 /// Dropdown over a possibly-huge option list: filters by substring and caps rendered rows.
 fn option_combo(ui: &mut egui::Ui, salt: egui::Id, selected: &mut String, options: &[String]) {
     egui::ComboBox::from_id_salt(salt)
-        .selected_text(elide(selected, 32))
+        .selected_text(elide(&sanitize_ui_text(ui, selected), 32))
         .show_ui(ui, |ui| {
             let filter_id = salt.with("filter");
             let mut filter: String =
@@ -1278,7 +1285,7 @@ fn option_combo(ui: &mut egui::Ui, salt: egui::Id, selected: &mut String, option
                     break;
                 }
                 shown += 1;
-                ui.selectable_value(selected, opt.clone(), elide(opt, 48));
+                ui.selectable_value(selected, opt.clone(), elide(&sanitize_ui_text(ui, opt), 48));
             }
             if shown == 0 {
                 ui.weak("no matches");
@@ -1296,26 +1303,31 @@ pub fn elide(s: &str, max: usize) -> String {
     }
 }
 
-/// Drop control chars and replace glyphs the active font cannot draw.
+/// Drop control chars and glyphs the active font cannot draw (space instead of tofu/`?`).
 pub fn sanitize_ui_text(ui: &egui::Ui, s: &str) -> String {
     let font = egui::TextStyle::Body.resolve(ui.style());
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
     ui.ctx().fonts_mut(|fonts| {
-        s.chars()
-            .map(|c| {
-                if c.is_control() {
-                    ' '
-                } else if fonts.has_glyph(&font, c) {
-                    c
-                } else {
-                    '?'
+        for c in s.chars() {
+            let ok = !c.is_control() && !c.is_whitespace() && fonts.has_glyph(&font, c);
+            if ok {
+                if pending_space && !out.is_empty() {
+                    out.push(' ');
                 }
-            })
-            .collect()
-    })
+                out.push(c);
+                pending_space = false;
+            } else {
+                pending_space = true;
+            }
+        }
+    });
+    out
 }
 
 /// Truncate `s` so its laid-out width fits within `max_width` (appends `…` when cut).
 pub fn elide_width(ui: &egui::Ui, s: &str, max_width: f32) -> String {
+    let s = sanitize_ui_text(ui, s);
     if s.is_empty() {
         return String::new();
     }
@@ -1327,8 +1339,8 @@ pub fn elide_width(ui: &egui::Ui, s: &str, max_width: f32) -> String {
         ui.ctx()
             .fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::WHITE).size().x)
     };
-    if measure(s) <= max_width {
-        return s.to_string();
+    if measure(&s) <= max_width {
+        return s;
     }
     let chars: Vec<char> = s.chars().collect();
     let mut lo = 0usize;

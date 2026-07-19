@@ -24,6 +24,7 @@ use crate::schema::{self, SchemaSet};
 use crate::uiwf;
 use crate::types::{
     ActiveLora, Album, AppPack, AppStep, CHECKPOINT_RECENT_MAX, CheckpointCatalog, CheckpointSort,
+    dedupe_loras,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, Img2ImgSource, LoraCatalog, LoraPack, Mode,
     ModelKind, Params, SamplerPack, Settings, append_negatives, checkpoint_family, fallback_vec,
@@ -117,6 +118,26 @@ impl Tab {
         (Tab::Gallery, icons::GALLERY, ""),
         (Tab::Settings, icons::SETTINGS, ""),
     ];
+}
+
+/// Clipboard kinds for the Create menu FAB (classified once when the menu opens).
+struct FabClipSnap {
+    has_wf: bool,
+    has_sampler: bool,
+    has_loras: bool,
+    has_apps: bool,
+}
+
+impl FabClipSnap {
+    fn from_text(text: &str) -> Self {
+        let t = text.trim();
+        Self {
+            has_wf: t.starts_with('{') || t.starts_with('['),
+            has_sampler: SamplerPack::from_clipboard_json(t).is_some(),
+            has_loras: LoraPack::from_clipboard_json(t).is_some(),
+            has_apps: AppPack::from_clipboard_json(t).is_some(),
+        }
+    }
 }
 
 /// Which tab's queue action the shared play FAB should run.
@@ -461,6 +482,8 @@ struct ComfyApp {
     /// Create-tab menu FAB position; `None` = default left of the queue FAB.
     create_fab_pos: Option<egui::Pos2>,
     create_fab_open: bool,
+    /// System clipboard snapshotted while the Create menu FAB is open (not polled every frame).
+    create_fab_clip: Option<FabClipSnap>,
     /// Shared Create/Graph queue (play) FAB position; `None` = default bottom-right.
     queue_fab_pos: Option<egui::Pos2>,
 }
@@ -617,6 +640,7 @@ impl ComfyApp {
             gallery_refresh_at: None,
             create_fab_pos: None,
             create_fab_open: false,
+            create_fab_clip: None,
             queue_fab_pos: None,
         }
     }
@@ -1424,16 +1448,23 @@ impl ComfyApp {
         doc.outputs.clear();
         doc.graph.populate_output_images("none", std::iter::empty());
         let n = wf.0.len();
+        let fresh = !self.running;
         self.run_seq += 1;
-        self.run_total = n;
-        self.run_seen.clear();
-        ctx.forget_all_images();
+        if fresh {
+            self.run_total = n;
+            self.run_seen.clear();
+            ctx.forget_all_images();
+            self.progress = (0, 0);
+            self.preview = None;
+            self.executing = None;
+        }
         self.running = true;
         self.jobs_left += 1;
-        self.status = "Queued".into();
-        self.progress = (0, 0);
-        self.preview = None;
-        self.executing = None;
+        self.status = if self.jobs_left > 1 {
+            format!("Queued ({} in flight)", self.jobs_left)
+        } else {
+            "Queued".into()
+        };
         self.graph_status.clear();
         self.engine.as_mut().unwrap().run_workflow(wf);
         host.haptic(Haptic::Medium);
@@ -2096,7 +2127,10 @@ impl ComfyApp {
         };
         let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
         let enhance_label = if app_n > 0 { format!(" · +{app_n} enhance") } else { String::new() };
-        ui.weak(format!("{ckpt_label} · {preset_label}{enhance_label}"));
+        ui.weak(sanitize_ui_text(
+            ui,
+            &format!("{ckpt_label} · {preset_label}{enhance_label}"),
+        ));
 
         // Diffusion models (Anima, Flux, Qwen-Image) ship without a text encoder or VAE, so those
         // are picked here. select_model seeds them; this is the override.
@@ -2934,6 +2968,7 @@ impl ComfyApp {
         // ScrollArea can report infinite width; pin to the clip so trailing buttons stay visible.
         let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
         ui.set_max_width(list_w);
+        self.params.loras = dedupe_loras(std::mem::take(&mut self.params.loras));
 
         let catalog_n = self.lora_catalog.loras.len();
         let model_bases = self.model_bases_for(self.params.model_file());
@@ -4131,7 +4166,7 @@ impl ComfyApp {
             return;
         };
         self.apply_lora_pack(&pack);
-        self.status = format!("{} LoRA(s) pasted", pack.loras.len());
+        self.status = format!("{} LoRA(s) pasted", self.params.loras.len());
         host.haptic(Haptic::Medium);
     }
 
@@ -4155,7 +4190,7 @@ impl ComfyApp {
     }
 
     fn apply_lora_pack(&mut self, pack: &LoraPack) {
-        self.params.loras = pack.loras.clone();
+        self.params.loras = dedupe_loras(pack.loras.clone());
         self.selected_preset.clear();
     }
 
@@ -4180,17 +4215,19 @@ impl ComfyApp {
             return;
         }
         let pack = LoraPack {
-            loras: meta
-                .loras
-                .iter()
-                .map(|l| ActiveLora {
-                    file: l.name.clone(),
-                    strength_model: l.strength_model as f32,
-                    strength_clip: l.strength_clip.unwrap_or(l.strength_model) as f32,
-                    injected: String::new(),
-                    model_only: l.model_only,
-                })
-                .collect(),
+            loras: dedupe_loras(
+                meta
+                    .loras
+                    .iter()
+                    .map(|l| ActiveLora {
+                        file: l.name.clone(),
+                        strength_model: l.strength_model as f32,
+                        strength_clip: l.strength_clip.unwrap_or(l.strength_model) as f32,
+                        injected: String::new(),
+                        model_only: l.model_only,
+                    })
+                    .collect(),
+            ),
         };
         host.copy_text(pack.to_clipboard_json());
         self.lora_clip = Some(pack);
@@ -4255,6 +4292,7 @@ impl ComfyApp {
     fn apply_preset(&mut self, name: &str) {
         if let Some(p) = self.presets.iter().find(|p| p.name == name) {
             self.params = p.params.clone();
+            self.params.loras = dedupe_loras(std::mem::take(&mut self.params.loras));
             self.selected_preset = name.to_string();
             // A preset saved against another server may name companions this one lacks.
             if self.params.model_kind == ModelKind::Diffusion {
@@ -4452,9 +4490,7 @@ impl ComfyApp {
             let pane = ui.available_rect_before_wrap();
             self.result_viewer(ui, host);
             // Keep Queue reachable while inspecting a batch frame.
-            if matches!(self.create_pane, CreatePane::Main | CreatePane::Enhance) {
-                self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
-            }
+            self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
             return;
         }
 
@@ -4481,11 +4517,8 @@ impl ComfyApp {
                 self.output(ui, host);
                 ui.add_space(12.0);
             });
-        // Enhance keeps the FABs so tuning a slider and requeueing is not a pane round trip.
-        if matches!(self.create_pane, CreatePane::Main | CreatePane::Enhance) {
-            self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
-            self.create_fab(ui.ctx(), host, pane);
-        }
+        self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
+        self.create_fab(ui.ctx(), host, pane);
     }
 
     /// Queue FAB (+ Cancel while running) shared by Create and Graph (bottom-right).
@@ -4509,19 +4542,37 @@ impl ComfyApp {
 
         let mut queue_clicked = false;
         let mut cancel_clicked = false;
+        let jobs = self.jobs_left;
+        let server_q = self.queue_remaining;
         egui::Area::new(egui::Id::new("queue-fab"))
             .order(egui::Order::Foreground)
             .current_pos(pos)
             .show(ctx, |ui| {
-                let tip = if self.running {
-                    format!("Queue ({} in flight)", self.jobs_left.max(1))
+                let tip = if jobs > 0 {
+                    if server_q > jobs as u32 {
+                        format!("Queue another ({jobs} yours, {server_q} on server)")
+                    } else {
+                        format!("Queue another ({jobs} in flight)")
+                    }
+                } else if server_q > 0 {
+                    format!("Queue (server has {server_q})")
                 } else {
                     "Queue".into()
                 };
-                let btn = egui::Button::new(egui::RichText::new(icons::RUN).size(22.0))
+                let label = if jobs > 0 {
+                    egui::RichText::new(format!("{}{jobs}", icons::RUN)).size(18.0)
+                } else {
+                    egui::RichText::new(icons::RUN).size(22.0)
+                };
+                let fill = if jobs > 0 {
+                    egui::Color32::from_rgb(55, 90, 55)
+                } else {
+                    egui::Color32::from_rgb(45, 55, 85)
+                };
+                let btn = egui::Button::new(label)
                     .min_size(egui::vec2(48.0, 48.0))
                     .corner_radius(24.0)
-                    .fill(egui::Color32::from_rgb(45, 55, 85));
+                    .fill(fill);
                 let resp = ui.add_enabled(can_queue, btn).on_hover_text(tip);
                 if resp.dragged() {
                     let delta = resp.drag_delta();
@@ -4541,11 +4592,24 @@ impl ComfyApp {
                 .order(egui::Order::Foreground)
                 .fixed_pos(cancel_pos)
                 .show(ctx, |ui| {
-                    let btn = egui::Button::new(egui::RichText::new(icons::STOP).size(22.0))
+                    let stop_label = if jobs > 1 {
+                        egui::RichText::new(format!("{}{jobs}", icons::STOP)).size(18.0)
+                    } else {
+                        egui::RichText::new(icons::STOP).size(22.0)
+                    };
+                    let btn = egui::Button::new(stop_label)
                         .min_size(egui::vec2(48.0, 48.0))
                         .corner_radius(24.0)
                         .fill(egui::Color32::from_rgb(120, 55, 55));
-                    if ui.add(btn).on_hover_text("Cancel").clicked() {
+                    if ui
+                        .add(btn)
+                        .on_hover_text(if jobs > 1 {
+                            format!("Cancel all ({jobs} in flight)")
+                        } else {
+                            "Cancel".into()
+                        })
+                        .clicked()
+                    {
                         cancel_clicked = true;
                     }
                 });
@@ -4581,17 +4645,6 @@ impl ComfyApp {
 
         let can_open_graph =
             self.params.missing_model_part().is_none() && self.schemas.is_some();
-        let clip = host.clipboard_text();
-        let has_wf = self.workflow_clip.is_some()
-            || clip.as_deref().is_some_and(|t| {
-                let t = t.trim();
-                t.starts_with('{') || t.starts_with('[')
-            });
-        let has_sampler = self.sampler_clip.is_some()
-            || clip.as_deref().and_then(SamplerPack::from_clipboard_json).is_some();
-        let has_loras = self.lora_clip.is_some()
-            || clip.as_deref().and_then(LoraPack::from_clipboard_json).is_some();
-        let has_apps = clip.as_deref().and_then(AppPack::from_clipboard_json).is_some();
         let has_steps = !self.params.apps.is_empty();
 
         enum FabAct {
@@ -4606,6 +4659,22 @@ impl ComfyApp {
         }
         let mut act: Option<FabAct> = None;
         let open = self.create_fab_open;
+        // Full clipboard reads allocate the entire clip on the Java heap — never do that every
+        // frame. Snapshot + classify once when the menu opens; drop when it closes.
+        if open {
+            if self.create_fab_clip.is_none() {
+                // Classify then drop the string so a huge workflow clip isn't retained.
+                self.create_fab_clip =
+                    host.clipboard_text().as_deref().map(FabClipSnap::from_text);
+            }
+        } else {
+            self.create_fab_clip = None;
+        }
+        let snap = self.create_fab_clip.as_ref();
+        let has_wf = self.workflow_clip.is_some() || snap.is_some_and(|s| s.has_wf);
+        let has_sampler = self.sampler_clip.is_some() || snap.is_some_and(|s| s.has_sampler);
+        let has_loras = self.lora_clip.is_some() || snap.is_some_and(|s| s.has_loras);
+        let has_apps = snap.is_some_and(|s| s.has_apps);
 
         let mut menu_rect = egui::Rect::NOTHING;
         if open {
@@ -5008,11 +5077,9 @@ impl ComfyApp {
                 }
             }
         }
-        let sys_clip = host.clipboard_text().filter(|t| {
-            let t = t.trim();
-            t.starts_with('{') || t.starts_with('[')
-        });
-        let has_clip = self.workflow_clip.is_some() || sys_clip.is_some();
+        // Prefer the in-app clip; only touch the system clipboard when pasting.
+        let has_clip = self.workflow_clip.is_some()
+            || host.clipboard_has_text();
         let mut close = false;
         let mut add = false;
         let mut paste = false;
@@ -5065,7 +5132,12 @@ impl ComfyApp {
             close = true;
         }
         if paste {
-            let body = self.workflow_clip.clone().or(sys_clip);
+            let body = self.workflow_clip.clone().or_else(|| {
+                host.clipboard_text().filter(|t| {
+                    let t = t.trim();
+                    t.starts_with('{') || t.starts_with('[')
+                })
+            });
             if let (Some(body), Some(schemas)) = (body, self.schemas.clone()) {
                 self.graph_status.clear();
                 self.wf_loading = true;
@@ -5102,12 +5174,20 @@ impl ComfyApp {
         let mut close = false;
         let mut toggle_bypass = false;
         let mut auto_wire = false;
+        let mut duplicate = false;
         let resp = egui::Area::new(egui::Id::new("graph-node-menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen)
             .constrain(true)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    if ui
+                        .button(format!("{} Duplicate", icons::ADD))
+                        .on_hover_text("Copy this node (values + input wires)")
+                        .clicked()
+                    {
+                        duplicate = true;
+                    }
                     let bypass_label = if bypassed {
                         format!("{} Unbypass", icons::CHECK)
                     } else {
@@ -5136,6 +5216,10 @@ impl ComfyApp {
         if outside_click {
             close = true;
         }
+        if duplicate {
+            self.duplicate_node(nid, host);
+            close = true;
+        }
         if toggle_bypass {
             if let Some(doc) = self.active_doc_mut() {
                 if !doc.bypassed.remove(&nid) {
@@ -5152,6 +5236,49 @@ impl ComfyApp {
         if close {
             self.node_menu = None;
         }
+    }
+
+    /// Clone a node with its widget values and incoming wires, offset from the original.
+    fn duplicate_node(&mut self, nid: NodeId, host: &Host) {
+        if self.active_doc().is_some_and(|d| d.view.locked) {
+            self.graph_status = "Graph is locked — unlock to duplicate".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let Some(doc) = self.active_doc_mut() else { return };
+        let Some(info) = doc.graph.snarl.get_node_info(nid) else {
+            self.graph_status = "Node gone".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let data = info.value.clone();
+        let open = info.open;
+        let pos = info.pos + egui::vec2(48.0, 48.0);
+        let class = data.object.name.clone();
+        let n_inputs = data.inputs.len();
+        let was_bypassed = doc.bypassed.contains(&nid);
+
+        let mut incoming: Vec<(OutPinId, usize)> = Vec::new();
+        for input in 0..n_inputs {
+            let pin = doc.graph.snarl.in_pin(InPinId { node: nid, input });
+            for remote in pin.remotes {
+                incoming.push((remote, input));
+            }
+        }
+
+        let new_id = doc.graph.snarl.insert_node(pos, data);
+        if let Some(info) = doc.graph.snarl.get_node_info_mut(new_id) {
+            info.open = open;
+        }
+        for (from, input) in incoming {
+            doc.graph.snarl.connect(from, InPinId { node: new_id, input });
+        }
+        if was_bypassed {
+            doc.bypassed.insert(new_id);
+        }
+        doc.props_node = Some(new_id);
+        self.graph_status = format!("Duplicated {class}");
+        host.haptic(Haptic::Success);
     }
 
     /// Apply catalog strengths (and prompt triggers when a positive CLIP encode exists).
@@ -8000,6 +8127,7 @@ fn selection_overlay(ui: &egui::Ui, rect: egui::Rect, selected: bool) {
 }
 
 fn wrap_meta(ui: &mut egui::Ui, label: &str, value: &str) {
+    let value = sanitize_ui_text(ui, value);
     if value.trim().is_empty() {
         return;
     }
@@ -8313,12 +8441,17 @@ fn combo(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) 
 
 fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) {
     let w = ui.available_width().max(80.0);
+    let selected = if current.is_empty() {
+        "—".to_string()
+    } else {
+        elide(&sanitize_ui_text(ui, current), 48)
+    };
     egui::ComboBox::from_id_salt(id)
-        .selected_text(if current.is_empty() { "—".to_string() } else { elide(current, 48) })
+        .selected_text(selected)
         .width(w)
         .show_ui(ui, |ui| {
             for opt in options.iter().take(300) {
-                ui.selectable_value(current, opt.clone(), elide(opt, 56));
+                ui.selectable_value(current, opt.clone(), elide(&sanitize_ui_text(ui, opt), 56));
             }
         });
 }
