@@ -158,6 +158,29 @@ pub fn show_ime_force() -> bool {
     ok
 }
 
+/// Whether the keyboard was dismissed without the app asking (back button / gesture). Clears
+/// the latch, so exactly one caller observes each dismissal.
+pub fn take_dismissed() -> bool {
+    let dismissed = crate::host::with_native_activity(|env, activity| {
+        if !is_egui_activity(env, activity)? {
+            return Ok(false);
+        }
+        env.call_method(activity, "takeImeDismissed", "()Z", &[])?.z()
+    })
+    .unwrap_or(false);
+    if dismissed && TRACE {
+        log::info!("egui-android ime: external dismissal");
+    }
+    dismissed
+}
+
+/// Drop events carried to the next frame (field switch / dismissal).
+pub fn clear_carry() {
+    if let Ok(mut g) = CARRY.lock() {
+        g.clear();
+    }
+}
+
 /// Drop the egui→EditText dedupe cache so the next sync pushes even if text matches.
 pub fn invalidate_last_sync() {
     if let Ok(mut g) = LAST_SYNC.lock() {
@@ -245,27 +268,31 @@ pub fn sync_selection_to_ime(start: usize, end: usize, clear_composing: bool) {
     }
 }
 
-/// Report a user-driven caret move (tap in the field) to the EditText so the IME edits at the
-/// right position. Ends any composition on both sides — the preedit egui shows becomes plain
-/// committed text, matching what the tap did visually.
-pub fn notify_user_caret(start: usize, end: usize) {
-    if LAST_SYNC.lock().map(|g| g.is_none()).unwrap_or(true) {
+/// Mirror egui's caret into the EditText whenever it moves for a reason the IME did not cause
+/// (tap, arrow key, reflow). The IME reads the mirror to decide what it may do: Samsung's
+/// spacebar trackpad polls `getTextAfterCursor(1)` before every rightward/downward step and
+/// refuses to move when it comes back empty, so a caret left at the end of the mirror makes the
+/// trackpad one-directional. No-op while a composition is active (the IME owns the caret then)
+/// and when the mirror already agrees.
+///
+/// Non-collapsed egui selections mirror as a caret at the selection end: pushing a real range
+/// puts the selectable EditText into selection mode, which dismisses the keyboard.
+pub fn sync_caret_to_ime(start: usize, end: usize) {
+    if LAST_PREEDIT.lock().map(|g| !g.is_empty()).unwrap_or(false) {
         return;
     }
-    let caret = if start == end { start } else { end };
-    let had_preedit = LAST_PREEDIT.lock().map(|g| !g.is_empty()).unwrap_or(false);
-    let same = LAST_SYNC
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|(_, s, e)| *s == caret as i32 && *e == caret as i32))
-        .unwrap_or(false);
-    if same && !had_preedit {
-        return;
+    let caret = if start == end { start } else { end } as i32;
+    let stale = match LAST_SYNC.lock() {
+        Ok(g) => match g.as_ref() {
+            // Not seeded yet — sync_focused_text_edit owns the first push.
+            None => return,
+            Some((_, s, e)) => *s != caret || *e != caret,
+        },
+        Err(_) => return,
+    };
+    if stale {
+        sync_selection_to_ime(caret as usize, caret as usize, false);
     }
-    if had_preedit {
-        clear_preedit_tracking();
-    }
-    sync_selection_to_ime(caret, caret, had_preedit);
 }
 
 /// Drain pending InputConnection events from Kotlin.

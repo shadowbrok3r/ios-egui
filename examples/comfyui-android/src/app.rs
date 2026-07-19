@@ -24,7 +24,7 @@ use crate::schema::{self, SchemaSet};
 use crate::uiwf;
 use crate::types::{
     ActiveLora, Album, AppPack, AppStep, CHECKPOINT_RECENT_MAX, CheckpointCatalog, CheckpointSort,
-    dedupe_loras,
+    dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, Img2ImgSource, LoraCatalog, LoraPack, Mode,
     ModelKind, Params, SamplerPack, Settings, append_negatives, checkpoint_family, fallback_vec,
@@ -929,6 +929,10 @@ impl ComfyApp {
             }
             Msg::LoraCatalog(catalog) => {
                 self.lora_catalog = catalog;
+                // Paste may have landed before the catalog; peel triggers out now.
+                if !self.params.loras.is_empty() {
+                    self.pull_lora_triggers_from_positive();
+                }
             }
             Msg::LoraCatalogError(err) => {
                 self.log.warn(format!("lora catalog: {err}"));
@@ -4261,7 +4265,6 @@ impl ComfyApp {
         if let Some(n) = &meta.negative {
             self.params.negative = n.clone();
         }
-        // Workflow positive already includes triggers — keep the dedicated field clear.
         self.params.lora_triggers.clear();
         self.apply_sampler_pack(&SamplerPack {
             sampler: meta.sampler.clone(),
@@ -4286,7 +4289,42 @@ impl ComfyApp {
                 })
                 .collect(),
         });
+        // Workflow positives usually bake LoRA tags into the CLIP text — split them back out.
+        self.pull_lora_triggers_from_positive();
         self.create_pane = CreatePane::Main;
+    }
+
+    /// Move catalog trigger words for the active LoRA stack out of `positive` into `lora_triggers`.
+    fn pull_lora_triggers_from_positive(&mut self) {
+        let known: Vec<(usize, String)> = self
+            .params
+            .loras
+            .iter()
+            .enumerate()
+            .flat_map(|(i, lora)| {
+                self.lora_catalog
+                    .entry(&lora.file)
+                    .into_iter()
+                    .flat_map(|e| e.trigger_words.iter())
+                    .filter_map(move |t| {
+                        let t = t.trim();
+                        (!t.is_empty()).then(|| (i, t.to_string()))
+                    })
+            })
+            .collect();
+        if known.is_empty() {
+            return;
+        }
+        let moved = extract_triggers_from_positive(
+            &mut self.params.positive,
+            &mut self.params.lora_triggers,
+            &known,
+        );
+        for (idx, inj) in moved {
+            if let Some(slot) = self.params.loras.get_mut(idx) {
+                slot.injected = inj;
+            }
+        }
     }
 
     fn apply_preset(&mut self, name: &str) {

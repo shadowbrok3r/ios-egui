@@ -778,6 +778,48 @@ pub fn strip_injected(dest: &mut String, injected: &str) {
     *dest = kept.join(", ");
 }
 
+/// Pull known LoRA trigger tokens out of `positive` into `lora_triggers`.
+///
+/// `known` is `(lora_index, trigger)` from the catalog for the active stack. Matching is
+/// case-insensitive on comma-separated tokens; catalog spelling is kept in `lora_triggers`.
+/// Returns per-lora joined triggers that were moved (for [`ActiveLora::injected`]).
+pub fn extract_triggers_from_positive(
+    positive: &mut String,
+    lora_triggers: &mut String,
+    known: &[(usize, String)],
+) -> Vec<(usize, String)> {
+    if known.is_empty() || positive.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut kept = Vec::new();
+    let mut moved: Vec<String> = Vec::new();
+    let mut by_lora: std::collections::BTreeMap<usize, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for part in split_triggers(positive) {
+        if let Some((idx, canon)) = known
+            .iter()
+            .find(|(_, t)| t.eq_ignore_ascii_case(&part))
+        {
+            if !trigger_present(&[&moved.join(", "), lora_triggers.as_str()], canon) {
+                moved.push(canon.clone());
+                by_lora.entry(*idx).or_default().push(canon.clone());
+            }
+        } else {
+            kept.push(part);
+        }
+    }
+    if moved.is_empty() {
+        return Vec::new();
+    }
+    *positive = kept.join(", ");
+    let piece = moved.join(", ");
+    merge_triggers(lora_triggers, &piece, "");
+    by_lora
+        .into_iter()
+        .map(|(idx, toks)| (idx, toks.join(", ")))
+        .collect()
+}
+
 /// Append negative words once (comma-separated) if not already present.
 pub fn append_negatives(negative: &mut String, words: &str) {
     let words = words.trim();
@@ -1326,6 +1368,21 @@ mod tests {
             .combined_positive(),
             "masterpiece, a cat"
         );
+    }
+
+    #[test]
+    fn extract_triggers_moves_catalog_tags_out_of_positive() {
+        let mut positive = "styletag, a cat sitting, OtherTag, indoors".to_string();
+        let mut triggers = String::new();
+        let known = vec![
+            (0usize, "StyleTag".into()),
+            (1usize, "OtherTag".into()),
+            (1usize, "missing".into()),
+        ];
+        let moved = extract_triggers_from_positive(&mut positive, &mut triggers, &known);
+        assert_eq!(positive, "a cat sitting, indoors");
+        assert_eq!(triggers, "StyleTag, OtherTag");
+        assert_eq!(moved, vec![(0, "StyleTag".into()), (1, "OtherTag".into())]);
     }
 
     #[test]

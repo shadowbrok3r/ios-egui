@@ -85,6 +85,29 @@ impl eframe::App for Adapter {
                 })
             })
         });
+        // Back button / gesture dismissed the keyboard: no egui input event says so, focus stays,
+        // and the recovery path below would re-show it (and the actions bar would never hide).
+        // Treat it as leaving the field. Before `hold`/focus are read so it takes effect now.
+        if self.ime_bridge_hot && crate::ime_bridge::take_dismissed() {
+            if let Some(id) = self.last_focus {
+                ui.ctx().memory_mut(|m| m.surrender_focus(id));
+            }
+            let _ = crate::ime_bridge::set_soft_keyboard(false);
+            crate::ime_bridge::clear_preedit_tracking();
+            crate::ime_bridge::clear_carry();
+            self.ime_bridge_hot = false;
+            self.ime_seen_open = false;
+            self.ime_recover_arm = 0;
+            self.ime_recover_cooldown = 0;
+            self.ime_hide_arm = 0;
+            self.ime_hold_frames = 0;
+            self.bar_touch = false;
+            self.ime_force_sync = false;
+            self.last_focus = None;
+            self.last_ime = None;
+            self.ime_synced_focus = None;
+            self.pending_events.clear();
+        }
         self.bar_touch |= pressed_in_bar;
         let hold = self.bar_touch || self.ime_hold_frames > 0;
         // egui surrenders focus on the frame a full CLICK lands (SurrenderFocusOn::Clicks checks
@@ -256,18 +279,18 @@ impl eframe::App for Adapter {
                 self.ime_force_sync = false;
             }
         }
-        // User caret moves (tap in the field) must reach the EditText, or the IME keeps editing
-        // at the stale position; also ends composition on both sides like a platform EditText.
+        // Mirror egui's caret into the EditText every frame it differs (the call is a no-op when
+        // it matches or a composition is active). Not gated on a pointer release: the seed can
+        // land frames after the tap that caused it, by which point the release is long gone and
+        // the mirror would keep a stale caret for the rest of the session.
         if self.ime_bridge_hot
-            && !self.bar_touch
-            && ui.ctx().input(|i| i.pointer.primary_released())
+            && !need_sync
             && let Some(id) = self.last_focus
-            && ui.ctx().memory(|m| m.focused() == Some(id))
             && let Some(state) = egui::text_edit::TextEditState::load(ui.ctx(), id)
             && state.cursor.char_range().is_some()
         {
             let (s, e) = crate::ime_bridge::selection_chars(&state);
-            crate::ime_bridge::notify_user_caret(s, e);
+            crate::ime_bridge::sync_caret_to_ime(s, e);
         }
         // Mirror this frame's egui copies (host widgets and plugin viewports alike) into the
         // system clipboard; winit has no Android clipboard backend.

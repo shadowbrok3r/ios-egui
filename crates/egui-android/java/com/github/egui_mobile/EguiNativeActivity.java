@@ -10,9 +10,11 @@ import android.text.Editable;
 import android.text.InputType;
 import android.util.Log;
 import android.view.ActionMode;
+import android.view.KeyEvent;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
+import android.view.WindowInsets;
 import android.view.inputmethod.BaseInputConnection;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputConnection;
@@ -35,6 +37,9 @@ public class EguiNativeActivity extends NativeActivity {
     /** InputConnection batch depth; selection enqueues are deferred until the batch closes. */
     private int batchDepth;
     private boolean batchSawSelChange;
+    /** The keyboard went away without the app asking (back button/gesture). */
+    private volatile boolean imeDismissed;
+    private boolean imeInsetVisible;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -95,6 +100,19 @@ public class EguiNativeActivity extends NativeActivity {
             }
 
             @Override
+            public boolean onKeyPreIme(int keyCode, KeyEvent event) {
+                // Back with the keyboard up = dismiss. Predictive back (API 33+) routes this
+                // through the IME's own OnBackInvokedCallback instead, so the insets listener
+                // below is the primary signal and this is the pre-33 path.
+                if (keyCode == KeyEvent.KEYCODE_BACK
+                        && event != null
+                        && event.getAction() == KeyEvent.ACTION_UP) {
+                    noteImeDismissed();
+                }
+                return super.onKeyPreIme(keyCode, event);
+            }
+
+            @Override
             protected void onSelectionChanged(int selStart, int selEnd) {
                 super.onSelectionChanged(selStart, selEnd);
                 // Trackpad / explicit setSelection only — not caret churn from commitText.
@@ -119,7 +137,42 @@ public class EguiNativeActivity extends NativeActivity {
         // 1×1 on-screen (not off-screen): some IMEs refuse InputConnection for views outside the window.
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(1, 1);
         addContentView(edit, params);
+        // The IME can go away with no input event the app can see (back button/gesture, IME's own
+        // dismiss key). Watch the ime inset for a visible→hidden edge and report it as dismissal.
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            edit.setOnApplyWindowInsetsListener(
+                    (v, insets) -> {
+                        boolean visible = insets.isVisible(WindowInsets.Type.ime());
+                        if (imeInsetVisible && !visible) {
+                            noteImeDismissed();
+                        }
+                        imeInsetVisible = visible;
+                        return v.onApplyWindowInsets(insets);
+                    });
+        }
         imeEdit = edit;
+    }
+
+    /** Latch a keyboard dismissal the app never asked for; Rust drains it and drops focus. */
+    void noteImeDismissed() {
+        imeDismissed = true;
+        softImeRequested = false;
+        lastShowUptimeMs = 0;
+        if (TRACE) Log.i("EguiIme", "ime dismissed externally");
+        if (!nativeWakeBroken) {
+            try {
+                nativeImeWake();
+            } catch (Throwable t) {
+                nativeWakeBroken = true;
+            }
+        }
+    }
+
+    /** Read and clear the external-dismissal latch. */
+    public boolean takeImeDismissed() {
+        boolean was = imeDismissed;
+        imeDismissed = false;
+        return was;
     }
 
     /** Current selection as an S event with code-point offsets. */
@@ -335,6 +388,8 @@ public class EguiNativeActivity extends NativeActivity {
         }
         softImeRequested = true;
         lastShowUptimeMs = now;
+        // A stale latch from before this show would immediately tear the new session down.
+        imeDismissed = false;
         InputMethodManager imm =
                 (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         imm.showSoftInput(edit, 0);
@@ -348,6 +403,10 @@ public class EguiNativeActivity extends NativeActivity {
                             (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
                     softImeRequested = false;
                     lastShowUptimeMs = 0;
+                    // Our own hide must not latch as an external dismissal when the ime inset
+                    // edge lands a few frames later.
+                    imeDismissed = false;
+                    imeInsetVisible = false;
                     if (edit != null) {
                         imm.hideSoftInputFromWindow(edit.getWindowToken(), 0);
                         // Keep the view attached and focusable so the next showIme is reliable.
