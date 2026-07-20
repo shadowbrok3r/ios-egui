@@ -23,6 +23,7 @@ use crate::{cooc, lint, tags};
 use crate::logger::{self, Logger};
 use crate::player::Player;
 use crate::schema::{self, SchemaSet};
+use crate::tag_index;
 use crate::uiwf;
 use crate::types::{
     ActiveLora, Album, AppPack, AppStep, AppliedCharacter, CHECKPOINT_RECENT_MAX, CharacterCard,
@@ -30,8 +31,8 @@ use crate::types::{
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, Img2ImgSource, LoraCatalog, LoraPack, Mode,
-    ModelKind, Params, PromptHist, SamplerPack, Settings, append_negatives, checkpoint_family,
-    fallback_vec, file_basename, merge_triggers, push_prompt_hist, strip_injected,
+    ModelKind, Params, PromptHist, RatingFilter, SamplerPack, Settings, append_negatives,
+    checkpoint_family, fallback_vec, file_basename, merge_triggers, push_prompt_hist, strip_injected,
 };
 #[cfg(feature = "local-npu")]
 use crate::types::LocalBackend;
@@ -732,7 +733,17 @@ struct ComfyApp {
     /// Cached prompt lint issues plus the fingerprint they were computed from.
     lint_issues: Vec<lint::LintIssue>,
     lint_fp: u64,
-
+    /// Persistent on-device auto-tag index (gallery key -> WD14 tags); loaded off-thread on first use.
+    tag_index: tag_index::TagIndex,
+    tag_index_loaded: bool,
+    tag_index_loading: Option<std::sync::mpsc::Receiver<tag_index::TagIndex>>,
+    /// New index entries stored since the last save (writes are batched, never per frame).
+    #[cfg(feature = "local-npu")]
+    tag_index_dirty: usize,
+    /// Gallery client-side tag search box (session-only).
+    tag_q: String,
+    /// Active facet-chip tag filters, AND-combined with the search box (session-only).
+    tag_facets: Vec<String>,
 
     /// D3 Anima smoke worker result.
     #[cfg(feature = "local-npu")]
@@ -763,6 +774,18 @@ struct ComfyApp {
     /// Cached WD14 tagger pack dir under the app external files dir, if one is present.
     #[cfg(feature = "local-npu")]
     wd14_pack: Option<std::path::PathBuf>,
+    /// Settings: background-tag the server gallery when idle.
+    #[cfg(feature = "local-npu")]
+    auto_tag: bool,
+    /// Awaiting full bytes for an auto-tag job: the item key being fetched.
+    #[cfg(feature = "local-npu")]
+    autotag_pending: Option<String>,
+    /// In-flight auto-tag worker result: (item key, ranked tags or error).
+    #[cfg(feature = "local-npu")]
+    autotag_rx: Option<std::sync::mpsc::Receiver<(String, Result<local_wd14::TagResult, String>)>>,
+    /// Item keys whose auto-tag failed this session; not retried until restart.
+    #[cfg(feature = "local-npu")]
+    autotag_failed: HashSet<String>,
     /// Settings: route Create Queue to on-device HTP instead of the ComfyUI server.
     #[cfg(feature = "local-npu")]
     local_npu: bool,
@@ -1041,6 +1064,13 @@ impl ComfyApp {
             cooc_loading: None,
             lint_issues: Vec::new(),
             lint_fp: 0,
+            tag_index: tag_index::TagIndex::default(),
+            tag_index_loaded: false,
+            tag_index_loading: None,
+            #[cfg(feature = "local-npu")]
+            tag_index_dirty: 0,
+            tag_q: String::new(),
+            tag_facets: Vec::new(),
             #[cfg(feature = "local-npu")]
             d3_rx: None,
             #[cfg(feature = "local-npu")]
@@ -1065,6 +1095,14 @@ impl ComfyApp {
             wd14_sheet: None,
             #[cfg(feature = "local-npu")]
             wd14_pack: None,
+            #[cfg(feature = "local-npu")]
+            auto_tag: false,
+            #[cfg(feature = "local-npu")]
+            autotag_pending: None,
+            #[cfg(feature = "local-npu")]
+            autotag_rx: None,
+            #[cfg(feature = "local-npu")]
+            autotag_failed: HashSet::new(),
             #[cfg(feature = "local-npu")]
             local_npu: false,
             #[cfg(feature = "local-npu")]
@@ -1730,7 +1768,22 @@ impl ComfyApp {
                 if w > 0 {
                     self.thumb_aspects.insert(key.clone(), h as f32 / w as f32);
                 }
-                if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
+                #[cfg(feature = "local-npu")]
+                let for_pump = self.autotag_pending.as_deref() == Some(key.as_str());
+                #[cfg(not(feature = "local-npu"))]
+                let for_pump = false;
+                if for_pump {
+                    #[cfg(feature = "local-npu")]
+                    {
+                        self.autotag_pending = None;
+                        // A generation or Read-tags may have started while this fetch was in flight;
+                        // defer rather than contend for the HTP. The bytes are disk-cached, so the
+                        // pump re-picks this image cheaply once idle.
+                        if !self.running && !self.wd14_running {
+                            self.autotag_run(ctx, host, key, bytes);
+                        }
+                    }
+                } else if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
                     let name = self.gallery_pick_pending.take().map(|(_, n)| n).unwrap_or_default();
                     self.set_picked_input(ctx, name, bytes);
                     self.params.img2img_source = Img2ImgSource::Picked;
@@ -2935,6 +2988,10 @@ impl ComfyApp {
             #[cfg(not(feature = "local-npu"))]
             local_npu: false,
             #[cfg(feature = "local-npu")]
+            auto_tag: self.auto_tag,
+            #[cfg(not(feature = "local-npu"))]
+            auto_tag: false,
+            #[cfg(feature = "local-npu")]
             local_backend: self.local_backend,
             #[cfg(not(feature = "local-npu"))]
             local_backend: Default::default(),
@@ -3002,6 +3059,7 @@ impl ComfyApp {
         #[cfg(feature = "local-npu")]
         {
             self.local_npu = saved.local_npu;
+            self.auto_tag = saved.auto_tag;
             self.local_backend = saved.local_backend;
             self.local_pack = saved.local_pack;
         }
@@ -3394,6 +3452,13 @@ impl ComfyApp {
                     );
                     ui.add_space(6.0);
                     ui.weak("Pick the on-device model, test it, or import a pack in Create -> Models.");
+                    ui.add_space(6.0);
+                    ui.checkbox(&mut self.auto_tag, "Auto-tag gallery (NPU)");
+                    ui.weak(
+                        "Tags the whole server gallery on-device while idle; results power the \
+                         gallery tag search, facet chips and rating filter. Pauses during \
+                         generation. Needs a wd14 pack.",
+                    );
                     ui.add_space(4.0);
                     if ui.button("Unload NPU cache").clicked() {
                         crate::local_engine::drop_cache();
@@ -3778,6 +3843,57 @@ impl ComfyApp {
             tags::parse_chips(&self.params.positive).into_iter().map(|c| c.tag).collect();
         if self.cooc.observe(&tags) {
             self.save_cooc(host);
+        }
+    }
+
+    /// On-disk path of the persistent auto-tag index.
+    fn tag_index_path(host: &Host) -> Option<String> {
+        host.documents_dir().map(|d| format!("{d}/comfyui/tag_index.json"))
+    }
+
+    /// Load the auto-tag index once on a background thread; empty on absence or parse failure.
+    fn ensure_tag_index_warm(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.tag_index_loaded {
+            return;
+        }
+        if let Some(rx) = &self.tag_index_loading {
+            match rx.try_recv() {
+                Ok(index) => {
+                    self.tag_index = index;
+                    self.tag_index_loaded = true;
+                    self.tag_index_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.tag_index_loaded = true;
+                    self.tag_index_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            }
+        } else {
+            let path = Self::tag_index_path(host);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let index = path
+                    .and_then(|p| std::fs::read_to_string(&p).ok())
+                    .and_then(|t| serde_json::from_str::<tag_index::TagIndex>(&t).ok())
+                    .unwrap_or_default();
+                let _ = tx.send(index);
+            });
+            self.tag_index_loading = Some(rx);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Persist the auto-tag index and clear the batched-write counter.
+    #[cfg(feature = "local-npu")]
+    fn save_tag_index(&mut self, host: &Host) {
+        self.tag_index_dirty = 0;
+        let Some(path) = Self::tag_index_path(host) else { return };
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string(&self.tag_index) {
+            let _ = std::fs::write(&path, json);
         }
     }
 
@@ -10153,6 +10269,60 @@ impl ComfyApp {
         self.album_manage_open = open;
     }
 
+    /// Compact client-side tag filter row: search box, rating selector, and facet chips over the
+    /// currently visible items. All filtering is local (auto-tag index); nothing re-queries.
+    fn gallery_tag_bar(&mut self, ui: &mut egui::Ui, facets: &[(String, usize)]) {
+        if self.tag_index.is_empty() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            let rating_w = 88.0;
+            let clear = !self.tag_q.is_empty() || !self.tag_facets.is_empty();
+            let clear_w = if clear { 34.0 } else { 0.0 };
+            let box_w = (ui.available_width() - rating_w - clear_w - 12.0).max(72.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.tag_q)
+                    .hint_text(format!("{} tags", icons::SEARCH))
+                    .desired_width(box_w),
+            );
+            let rating_label = match self.gallery_view.rating {
+                RatingFilter::All => format!("{} All", icons::STAR),
+                RatingFilter::Safe => "Safe".to_string(),
+                RatingFilter::Nsfw => "NSFW".to_string(),
+            };
+            ui.menu_button(rating_label, |ui| {
+                for r in RatingFilter::ALL {
+                    ui.selectable_value(&mut self.gallery_view.rating, *r, r.label());
+                }
+                ui.separator();
+                ui.weak("Unindexed images count as Safe.");
+            });
+            if clear && ui.button(icons::CLOSE).on_hover_text("Clear tag filters").clicked() {
+                self.tag_q.clear();
+                self.tag_facets.clear();
+            }
+        });
+        if !facets.is_empty() {
+            crate::theme::scroll_horizontal().id_salt("gallery_facets").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (tag, count) in facets {
+                        let on = self.tag_facets.iter().any(|f| f == tag);
+                        if ui
+                            .selectable_label(on, format!("{tag} ({count})"))
+                            .clicked()
+                        {
+                            if on {
+                                self.tag_facets.retain(|f| f != tag);
+                            } else {
+                                self.tag_facets.push(tag.clone());
+                            }
+                        }
+                    }
+                });
+            });
+        }
+    }
+
     fn gallery_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         let connected = matches!(self.conn, Conn::Connected);
         // A finished WD14 read floats over the gallery, viewer open or not.
@@ -10204,6 +10374,11 @@ impl ComfyApp {
                         self.gallery_total
                     ));
                 }
+            }
+            #[cfg(feature = "local-npu")]
+            if let Some((done, listed)) = self.autotag_progress() {
+                ui.separator();
+                ui.weak(format!("Auto-tag {done}/{listed}"));
             }
         });
         if !self.gallery_status.is_empty() {
@@ -10258,15 +10433,28 @@ impl ComfyApp {
             );
         }
 
-        // Media filter is client-side: group over the matching subset only (indices stay original).
+        // Client-side filters: media, then the local auto-tag layer (search box, facet chips, rating).
         let media = self.gallery_view.media;
+        let rating = self.gallery_view.rating;
+        let tag_q = self.tag_q.trim().to_string();
         let visible: Vec<usize> = self
             .gallery
             .iter()
             .enumerate()
             .filter(|(_, it)| media.matches(it.is_video))
+            .filter(|(_, it)| {
+                let key = it.key();
+                (tag_q.is_empty() || self.tag_index.matches(&key, &tag_q))
+                    && self.tag_facets.iter().all(|f| self.tag_index.matches(&key, f))
+                    && rating.matches(self.tag_index.is_nsfw(&key))
+            })
             .map(|(i, _)| i)
             .collect();
+        // Facet chips reflect the currently visible set.
+        let facet_keys: Vec<String> =
+            visible.iter().filter_map(|&i| self.gallery.get(i).map(|it| it.key())).collect();
+        let facets = self.tag_index.top_tags(&facet_keys, 12);
+        self.gallery_tag_bar(ui, &facets);
         let groups = crate::gallery::group_selected(
             &self.gallery,
             &visible,
@@ -11610,6 +11798,7 @@ impl ComfyApp {
         let has_workflow = v.item.has_workflow;
         let item_models = v.item.models.clone();
         let meta = v.meta.clone();
+        let indexed_tags = self.tag_index.display_names(&v.item.key());
         let mut copy_positive: Option<String> = None;
         let mut copy_negative: Option<String> = None;
         let mut copy_sampler = false;
@@ -11753,6 +11942,20 @@ impl ComfyApp {
                                 ui.weak("No embedded workflow on this file.");
                             } else {
                                 ui.weak("Could not load workflow metadata.");
+                            }
+                            // Read-only auto-tag chips (the Read tags sheet stays the interactive path).
+                            if !indexed_tags.is_empty() {
+                                ui.add_space(6.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(COPY_W);
+                                    ui.strong(format!("{} Tags", icons::SEARCH));
+                                });
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.add_space(COPY_W);
+                                    for t in &indexed_tags {
+                                        ui.weak(format!("{} {}", icons::DOT, t));
+                                    }
+                                });
                             }
                         });
                     });
@@ -12163,6 +12366,138 @@ impl ComfyApp {
         }
     }
 
+    /// New index entries to accumulate before a batched write.
+    #[cfg(feature = "local-npu")]
+    const AUTOTAG_SAVE_EVERY: usize = 8;
+
+    /// Spawn the WD14 tagger for `key`'s bytes; the ranked result returns tagged with `key`.
+    #[cfg(feature = "local-npu")]
+    fn autotag_run(&mut self, ctx: &egui::Context, host: &Host, key: String, bytes: Vec<u8>) {
+        let (Some(lib_dir), Some(pack_dir)) = (host.native_lib_dir(), self.wd14_pack.clone()) else {
+            // Prerequisites vanished mid-fetch; drop the job so the pump moves on.
+            self.autotag_failed.insert(key);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.autotag_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::local_engine::read_tags(std::path::PathBuf::from(lib_dir), pack_dir, bytes);
+            let _ = tx.send((key, result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drain a finished auto-tag into the index; feed cooc, batch-save, and mark failures.
+    #[cfg(feature = "local-npu")]
+    fn poll_autotag(&mut self, host: &Host) {
+        let Some(rx) = self.autotag_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok((key, Ok(result))) => {
+                self.autotag_rx = None;
+                self.store_tags(host, key, result);
+            }
+            Ok((key, Err(e))) => {
+                self.autotag_rx = None;
+                self.log.warn(format!("auto-tag {}: {e}", elide(&key, 48)));
+                self.autotag_failed.insert(key);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.autotag_rx = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Convert a WD14 read into an index entry, feed the personal cooc model once, batch-persist.
+    #[cfg(feature = "local-npu")]
+    fn store_tags(&mut self, host: &Host, key: String, result: local_wd14::TagResult) {
+        let conv =
+            |t: &local_wd14::ScoredTag| tag_index::Scored { name: t.name.clone(), prob: t.prob };
+        let entry = tag_index::TagEntry {
+            version: tag_index::SCHEMA_VERSION,
+            general: result.general.iter().map(conv).collect(),
+            character: result.character.iter().map(conv).collect(),
+            rating: result.rating.as_ref().map(conv),
+        };
+        if self.cooc_loaded {
+            let names: Vec<String> =
+                entry.general.iter().chain(&entry.character).map(|t| t.name.clone()).collect();
+            if self.cooc.observe(&names) {
+                self.save_cooc(host);
+            }
+        }
+        self.tag_index.insert(key, entry);
+        self.tag_index_dirty += 1;
+        if self.tag_index_dirty >= Self::AUTOTAG_SAVE_EVERY {
+            self.save_tag_index(host);
+        }
+    }
+
+    /// Pick and start the next idle auto-tag job. One image at a time; a generation starting just
+    /// stops it choosing new work (an in-flight tag holds the run_lock and finishes).
+    #[cfg(feature = "local-npu")]
+    fn pump_autotag(&mut self, ctx: &egui::Context, host: &Host) {
+        // A fetch or tag is in flight — let it finish; not a pause, so don't flush.
+        if self.autotag_pending.is_some() || self.autotag_rx.is_some() {
+            return;
+        }
+        let idle = self.auto_tag
+            && self.wd14_pack.is_some()
+            && matches!(self.conn, Conn::Connected)
+            && !self.running
+            && !self.wd14_running
+            && self.tag_index_loaded
+            && !self.gallery.is_empty();
+        let next = idle
+            .then(|| {
+                self.gallery.iter().find_map(|it| {
+                    if it.is_video {
+                        return None;
+                    }
+                    let key = it.key();
+                    if self.tag_index.contains(&key) || self.autotag_failed.contains(&key) {
+                        return None;
+                    }
+                    Some((key, it.subfolder.clone(), it.filename.clone()))
+                })
+            })
+            .flatten();
+        match next {
+            Some((key, subfolder, filename)) => {
+                self.autotag_pending = Some(key);
+                let cache_dir = host.documents_dir();
+                self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
+                ctx.request_repaint();
+            }
+            // Paused (preconditions unmet) or nothing left: flush the batched writes once.
+            None => {
+                if self.tag_index_dirty > 0 {
+                    self.save_tag_index(host);
+                }
+            }
+        }
+    }
+
+    /// Indexed images / listed images, for the gallery's auto-tag progress line.
+    #[cfg(feature = "local-npu")]
+    fn autotag_progress(&self) -> Option<(usize, usize)> {
+        if !self.auto_tag || self.wd14_pack.is_none() {
+            return None;
+        }
+        let mut listed = 0usize;
+        let mut done = 0usize;
+        for it in &self.gallery {
+            if it.is_video {
+                continue;
+            }
+            listed += 1;
+            if self.tag_index.contains(&it.key()) {
+                done += 1;
+            }
+        }
+        (listed > 0 && done < listed).then_some((done, listed))
+    }
+
 }
 
 impl EguiApp for ComfyApp {
@@ -12211,6 +12546,12 @@ impl EguiApp for ComfyApp {
         self.poll_d3_anima();
         #[cfg(feature = "local-npu")]
         self.poll_wd14();
+        self.ensure_tag_index_warm(ui.ctx(), host);
+        #[cfg(feature = "local-npu")]
+        {
+            self.poll_autotag(host);
+            self.pump_autotag(ui.ctx(), host);
+        }
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
         if self.log_lines.len() > logger::MAX_LINES {
             let excess = self.log_lines.len() - logger::MAX_LINES;

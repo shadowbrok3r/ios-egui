@@ -1338,6 +1338,37 @@ impl GalleryMedia {
     pub const ALL: &'static [Self] = &[Self::All, Self::Images, Self::Videos];
 }
 
+/// Rating filter for the gallery, applied client-side over the local auto-tag index. Unindexed
+/// items (rating unknown) count as Safe, so a fresh library isn't emptied by the filter.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum RatingFilter {
+    #[default]
+    All,
+    Safe,
+    Nsfw,
+}
+
+impl RatingFilter {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All ratings",
+            Self::Safe => "Safe only",
+            Self::Nsfw => "NSFW only",
+        }
+    }
+
+    /// Whether an item passes; `nsfw` is `None` when the item is unindexed (counted as Safe).
+    pub fn matches(self, nsfw: Option<bool>) -> bool {
+        match self {
+            Self::All => true,
+            Self::Safe => nsfw != Some(true),
+            Self::Nsfw => nsfw == Some(true),
+        }
+    }
+
+    pub const ALL: &'static [Self] = &[Self::All, Self::Safe, Self::Nsfw];
+}
+
 /// The gallery's query + layout state, persisted so the view survives restarts.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GalleryView {
@@ -1349,6 +1380,9 @@ pub struct GalleryView {
     /// Images / videos / everything, filtered client-side.
     #[serde(default)]
     pub media: GalleryMedia,
+    /// Safe / NSFW / all, filtered client-side over the auto-tag index.
+    #[serde(default)]
+    pub rating: RatingFilter,
     pub sort: GallerySort,
     pub group: GalleryGroup,
     /// Tiles per row, 1..=3. At 1 the tiles show near-full-resolution images.
@@ -1372,6 +1406,7 @@ impl Default for GalleryView {
             model: String::new(),
             album: None,
             media: GalleryMedia::All,
+            rating: RatingFilter::All,
             sort: GallerySort::Newest,
             group: GalleryGroup::Folder,
             columns: 3,
@@ -1493,6 +1528,9 @@ pub struct Settings {
     /// Route Create Queue through on-device HTP (feature `local-npu`); ignores remote ComfyUI.
     #[serde(default)]
     pub local_npu: bool,
+    /// Background-tag the whole server gallery when idle (feature `local-npu`).
+    #[serde(default)]
+    pub auto_tag: bool,
     /// Which on-device pipeline `local_npu` runs; absent in older settings, so SD1.5 by default.
     #[serde(default)]
     pub local_backend: LocalBackend,
