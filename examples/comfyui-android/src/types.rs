@@ -1425,7 +1425,7 @@ impl FontSizes {
     }
 }
 
-/// Persisted to `<documents>/comfyui_settings.json` so the server + last params survive reinstalls.
+/// Persisted to `<documents>/comfyui_settings.json` and mirrored under the app external files dir.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     pub server_url: String,

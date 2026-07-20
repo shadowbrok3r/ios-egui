@@ -54,6 +54,10 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 zip = { version = "2", default-features = false, features = ["deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Encrypted Settings backup (URL, API key, session, characters, presets).
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
 # Log lines mirror to logcat (egui-android installs android_logger); `adb logcat -s comfyui`.
 log = "0.4"
 # TLS (feature `tls`): rustls + a static Mozilla CA bundle, so https verifies with no Android
@@ -138,3 +142,6 @@ name = "android.permission.READ_MEDIA_IMAGES"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.READ_EXTERNAL_STORAGE"
 max_sdk_version = 32
+# List/read /sdcard/ComfyUI model packs that survive uninstall (sideload; grant All files access).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.MANAGE_EXTERNAL_STORAGE"

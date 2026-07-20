@@ -11,6 +11,7 @@
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
 mod apps;
+mod backup;
 mod cooc;
 mod engine;
 mod gallery;

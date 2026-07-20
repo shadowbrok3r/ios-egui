@@ -71,6 +71,21 @@ pub fn scan_packs(root: &Path) -> Vec<PackEntry> {
     out
 }
 
+/// Merge packs from several roots; first-seen dir wins.
+pub fn scan_packs_many(roots: &[&Path]) -> Vec<PackEntry> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in roots {
+        for p in scan_packs(root) {
+            if seen.insert(p.dir.clone()) {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 /// Create-tab settings a local pack recommends: fixed latent size plus sampler defaults.
 pub struct LocalDefaults {
     pub width: u32,
@@ -637,6 +652,11 @@ pub fn find_wd14_pack(root: &Path) -> Option<PathBuf> {
         .map(|e| e.path())
         .filter(|d| d.is_dir())
         .find(|d| local_wd14::Wd14Pack::is_wd14_pack(d))
+}
+
+/// The first WD14 pack under any of `roots`.
+pub fn find_wd14_pack_many(roots: &[&Path]) -> Option<PathBuf> {
+    roots.iter().find_map(|r| find_wd14_pack(r))
 }
 
 /// Run the WD14 tagger on encoded image bytes; blocking, ranked tags or an error string. Serialized

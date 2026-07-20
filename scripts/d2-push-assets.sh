@@ -3,7 +3,7 @@
 # Defaults point at a local QAIRT model tree + the HF SD1.5 text encoder.
 #
 # Usage:
-#   scripts/d2-push-assets.sh [--tcp HOST:PORT] [--pkg com.example.comfyui]
+#   scripts/d2-push-assets.sh [--tcp HOST:PORT] [--pkg com.example.comfyui] [--durable]
 #   MODEL_DIR=... CLIP=... scripts/d2-push-assets.sh --tcp 100.89.76.57:36069
 set -euo pipefail
 
@@ -17,6 +17,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --tcp) TCP="$2"; shift 2 ;;
     --pkg) PKG="$2"; shift 2 ;;
+    --durable) EXTRA+=(--durable); shift ;;
     -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
     *) EXTRA+=("$1"); shift ;;
   esac

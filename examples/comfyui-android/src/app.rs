@@ -480,6 +480,17 @@ struct ComfyApp {
     params: Params,
     last_saved: Option<String>,
     last_save_check: f64,
+    /// When set, autosave will not overwrite on-disk settings (corrupt / unreadable file).
+    settings_write_blocked: Option<String>,
+    /// Passphrase for encrypted config export.
+    backup_pass: String,
+    backup_pass_confirm: String,
+    /// Passphrase for encrypted config import.
+    import_pass: String,
+    /// Status line under the Backup section.
+    backup_note: String,
+    /// Cached `*.comfybk` paths (name, full path) under documents + external files.
+    backup_list: Vec<(String, String)>,
 
     running: bool,
     progress: (u32, u32),
@@ -886,6 +897,12 @@ impl ComfyApp {
             params: Params::default(),
             last_saved: None,
             last_save_check: 0.0,
+            settings_write_blocked: None,
+            backup_pass: String::new(),
+            backup_pass_confirm: String::new(),
+            import_pass: String::new(),
+            backup_note: String::new(),
+            backup_list: Vec::new(),
             running: false,
             progress: (0, 0),
             status: String::new(),
@@ -2866,6 +2883,21 @@ impl ComfyApp {
         host.documents_dir().map(|d| format!("{d}/comfyui_settings.json"))
     }
 
+    /// Mirror under the app external files dir (same tree as model packs; `adb pull`-able).
+    fn settings_backup_path(host: &Host) -> Option<String> {
+        let docs = host.documents_dir()?;
+        let pkg = std::path::Path::new(&docs).parent()?.file_name()?.to_str()?;
+        Some(format!("/storage/emulated/0/Android/data/{pkg}/files/comfyui_settings.json"))
+    }
+
+    /// Internal file first, then the external mirror.
+    fn settings_candidates(host: &Host) -> Vec<String> {
+        [Self::settings_path(host), Self::settings_backup_path(host)]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// Page size for gallery list / Load more, clamped to the server's accepted range.
     fn gallery_page_size(&self) -> u64 {
         self.gallery_page.clamp(20, GALLERY_PAGE_MAX)
@@ -2935,6 +2967,51 @@ impl ComfyApp {
         }
     }
 
+    fn apply_saved_settings(&mut self, saved: Settings) {
+        self.server_url = saved.server_url;
+        self.api_key = saved.api_key;
+        self.server_output_root = saved.server_output_root;
+        self.username = saved.username;
+        self.session = saved.session;
+        self.params = saved.params;
+        // Picked device-photo bytes are session-only; fall back to the current result on restore.
+        if self.params.img2img_source == Img2ImgSource::Picked {
+            self.params.img2img_source = Img2ImgSource::CurrentOutput;
+        }
+        // The masked photo went with the Picked bytes, so drop the flag on restore too.
+        self.params.inpaint_mask = false;
+        self.gallery_view = saved.gallery;
+        self.gallery_q = saved.gallery_q;
+        self.gallery_page = saved.gallery_page.clamp(20, GALLERY_PAGE_MAX);
+        self.auto_follow = saved.auto_follow;
+        self.auto_arrange = saved.auto_arrange;
+        self.fonts = saved.fonts;
+        self.fonts.clamp();
+        self.gallery_view.columns = self.gallery_view.columns.clamp(1, 3);
+        self.presets = saved.presets;
+        self.selected_preset = saved.selected_preset;
+        self.characters = saved.characters;
+        self.active_character = saved.active_character;
+        self.checkpoint_sort = saved.checkpoint_sort;
+        self.checkpoint_favorites = saved.checkpoint_favorites;
+        self.checkpoint_recent = saved.checkpoint_recent;
+        self.confirm_gallery_delete = saved.confirm_gallery_delete;
+        self.create_setup_open = saved.create_setup_open;
+        self.create_companions_open = saved.create_companions_open;
+        self.prompt_history = saved.prompt_history;
+        #[cfg(feature = "local-npu")]
+        {
+            self.local_npu = saved.local_npu;
+            self.local_backend = saved.local_backend;
+            self.local_pack = saved.local_pack;
+        }
+        if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
+            self.restore_workflow = Some((saved.workflow_name, json));
+        }
+        self.settings_write_blocked = None;
+        self.last_saved = self.settings_json();
+    }
+
     fn load_settings(&mut self, host: &Host) {
         let apps = AppSet::load(host.documents_dir().as_deref());
         for (file, why) in &apps.bad {
@@ -2944,73 +3021,197 @@ impl ComfyApp {
         self.apps = Arc::new(apps);
         #[cfg(feature = "local-npu")]
         self.ensure_local_packs(host, false);
+        self.refresh_backup_list(host);
 
-        let Some(path) = Self::settings_path(host) else {
+        let candidates = Self::settings_candidates(host);
+        if candidates.is_empty() {
             return;
-        };
-        if let Ok(text) = std::fs::read_to_string(&path)
-            && let Ok(saved) = serde_json::from_str::<Settings>(&text)
-        {
-            self.server_url = saved.server_url;
-            self.api_key = saved.api_key;
-            self.server_output_root = saved.server_output_root;
-            self.username = saved.username;
-            self.session = saved.session;
-            self.params = saved.params;
-            // Picked device-photo bytes are session-only; fall back to the current result on restore.
-            if self.params.img2img_source == Img2ImgSource::Picked {
-                self.params.img2img_source = Img2ImgSource::CurrentOutput;
+        }
+
+        let mut saw_unreadable = false;
+        for path in &candidates {
+            let text = match std::fs::read_to_string(path) {
+                Ok(t) if !t.trim().is_empty() => t,
+                Ok(_) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    saw_unreadable = true;
+                    self.log.error(format!("settings: cannot read {path}: {e}"));
+                    continue;
+                }
+            };
+            match serde_json::from_str::<Settings>(&text) {
+                Ok(saved) => {
+                    self.log.info(format!("settings: loaded from {path}"));
+                    self.apply_saved_settings(saved);
+                    return;
+                }
+                Err(e) => {
+                    saw_unreadable = true;
+                    self.log.error(format!(
+                        "settings: parse failed for {path}: {e} — refusing to overwrite"
+                    ));
+                }
             }
-            // The masked photo went with the Picked bytes, so drop the flag on restore too.
-            self.params.inpaint_mask = false;
-            self.gallery_view = saved.gallery;
-            self.gallery_q = saved.gallery_q;
-            self.gallery_page = saved.gallery_page.clamp(20, GALLERY_PAGE_MAX);
-            self.auto_follow = saved.auto_follow;
-            self.auto_arrange = saved.auto_arrange;
-            self.fonts = saved.fonts;
-            self.fonts.clamp();
-            self.gallery_view.columns = self.gallery_view.columns.clamp(1, 3);
-            self.presets = saved.presets;
-            self.selected_preset = saved.selected_preset;
-            self.characters = saved.characters;
-            self.active_character = saved.active_character;
-            self.checkpoint_sort = saved.checkpoint_sort;
-            self.checkpoint_favorites = saved.checkpoint_favorites;
-            self.checkpoint_recent = saved.checkpoint_recent;
-            self.confirm_gallery_delete = saved.confirm_gallery_delete;
-            self.create_setup_open = saved.create_setup_open;
-            self.create_companions_open = saved.create_companions_open;
-            self.prompt_history = saved.prompt_history;
-            #[cfg(feature = "local-npu")]
-            {
-                self.local_npu = saved.local_npu;
-                self.local_backend = saved.local_backend;
-                self.local_pack = saved.local_pack;
-            }
-            if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
-                self.restore_workflow = Some((saved.workflow_name, json));
-            }
-            self.last_saved = self.settings_json();
+        }
+
+        // A corrupt on-disk file must not be replaced by empty defaults on the next autosave.
+        if saw_unreadable {
+            let msg = "settings file present but unreadable — autosave paused until you fix or delete it"
+                .to_string();
+            self.settings_write_blocked = Some(msg.clone());
+            self.log.error(msg);
         }
     }
 
-    /// Persist settings whenever they differ from the last write, checked at most once a second —
-    /// the server URL and API key survive restarts even if a connect never succeeds.
+    /// Persist settings whenever they differ from the last write, checked at most once a second.
+    /// Writes the internal file and an external mirror; never clobbers a corrupt on-disk file.
     fn autosave_settings(&mut self, ctx: &egui::Context, host: &Host) {
         let now = ctx.input(|i| i.time);
         if now - self.last_save_check < 1.0 {
             return;
         }
         self.last_save_check = now;
+        if self.settings_write_blocked.is_some() {
+            return;
+        }
         let Some(json) = self.settings_json() else { return };
         if self.last_saved.as_deref() == Some(&json) {
             return;
         }
-        let Some(path) = Self::settings_path(host) else { return };
-        if std::fs::write(&path, &json).is_ok() {
+        let paths = Self::settings_candidates(host);
+        if paths.is_empty() {
+            return;
+        }
+        let mut wrote = false;
+        for path in &paths {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(path, &json).is_ok() {
+                wrote = true;
+            }
+        }
+        if wrote {
             self.last_saved = Some(json);
         }
+    }
+
+    /// Public durable model root: survives app uninstall (unlike Android/data/<pkg>/files).
+    fn durable_models_dir() -> &'static str {
+        "/storage/emulated/0/ComfyUI"
+    }
+
+    fn refresh_backup_list(&mut self, host: &Host) {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Some(d) = host.documents_dir() {
+            dirs.push(d.into());
+        }
+        if let Some(p) = Self::settings_backup_path(host) {
+            if let Some(parent) = std::path::Path::new(&p).parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+        dirs.push(Self::durable_models_dir().into());
+        self.backup_list = crate::backup::list_backups(&dirs);
+        self.backup_note = format!("{} backup(s) found", self.backup_list.len());
+    }
+
+    fn export_encrypted_backup(&mut self, host: &Host) {
+        if self.backup_pass != self.backup_pass_confirm {
+            self.backup_note = "passphrases do not match".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let Some(settings) = self.settings_json().and_then(|j| serde_json::from_str(&j).ok()) else {
+            self.backup_note = "could not snapshot settings".into();
+            return;
+        };
+        let blob = match crate::backup::encrypt(&settings, &self.backup_pass) {
+            Ok(b) => b,
+            Err(e) => {
+                self.backup_note = e;
+                host.haptic(Haptic::Warning);
+                return;
+            }
+        };
+        let name = crate::backup::default_filename();
+        let mut written: Vec<String> = Vec::new();
+        for dir in [
+            host.documents_dir(),
+            Self::settings_backup_path(host)
+                .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.display().to_string())),
+            Some(Self::durable_models_dir().into()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let path = format!("{dir}/{name}");
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&path, &blob).is_ok() {
+                written.push(path);
+            }
+        }
+        if written.is_empty() {
+            self.backup_note = "failed to write backup file".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        self.backup_pass.clear();
+        self.backup_pass_confirm.clear();
+        self.backup_note = format!("wrote {} — use Share to copy off-device", written[0]);
+        host.share_file(written[0].clone());
+        self.refresh_backup_list(host);
+        host.haptic(Haptic::Success);
+        self.log.info(format!("backup: exported {}", written.join(", ")));
+    }
+
+    fn import_encrypted_backup(&mut self, host: &Host, path: &str) {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.backup_note = format!("read {path}: {e}");
+                host.haptic(Haptic::Warning);
+                return;
+            }
+        };
+        match crate::backup::decrypt(&bytes, &self.import_pass) {
+            Ok(saved) => {
+                let n_chars = saved.characters.len();
+                let n_presets = saved.presets.len();
+                self.apply_saved_settings(saved);
+                self.import_pass.clear();
+                self.last_saved = None;
+                self.autosave_settings_now(host);
+                self.backup_note = format!(
+                    "imported {n_chars} character(s), {n_presets} preset(s), credentials restored"
+                );
+                host.haptic(Haptic::Success);
+                self.log.info(format!("backup: imported from {path}"));
+                if !self.server_url.trim().is_empty() {
+                    self.connect(host);
+                }
+            }
+            Err(e) => {
+                self.backup_note = e;
+                host.haptic(Haptic::Warning);
+            }
+        }
+    }
+
+    /// Immediate dual-write after import (bypasses the 1s autosave throttle).
+    fn autosave_settings_now(&mut self, host: &Host) {
+        self.settings_write_blocked = None;
+        let Some(json) = self.settings_json() else { return };
+        for path in Self::settings_candidates(host) {
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&path, &json);
+        }
+        self.last_saved = Some(json);
     }
 
     fn connect(&mut self, host: &Host) {
@@ -3279,7 +3480,70 @@ impl ComfyApp {
             });
 
             ui.add_space(12.0);
+            ui.heading(format!("{} Backup", icons::SAVE));
+            ui.group(|ui| {
+                ui.weak("Encrypts server URL, API key, session, characters, presets, and Create settings.");
+                ui.weak("Password is never included. Share the .comfybk file off-device before reinstall.");
+                ui.label("Export passphrase");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.backup_pass)
+                        .password(true)
+                        .hint_text("min 8 chars")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.label("Confirm");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.backup_pass_confirm)
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Export encrypted backup").clicked() {
+                        self.export_encrypted_backup(host);
+                    }
+                    if ui.button("Refresh list").clicked() {
+                        self.refresh_backup_list(host);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label("Import passphrase");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.import_pass)
+                        .password(true)
+                        .desired_width(f32::INFINITY),
+                );
+                if self.backup_list.is_empty() {
+                    ui.weak("No .comfybk files in app files yet — export one, or adb push a backup here.");
+                } else {
+                    for (name, path) in self.backup_list.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label(&name);
+                            if ui.button("Import").clicked() {
+                                self.import_encrypted_backup(host, &path);
+                            }
+                            if ui.button("Share").clicked() {
+                                host.share_file(path);
+                            }
+                        });
+                    }
+                }
+                if !self.backup_note.is_empty() {
+                    ui.label(&self.backup_note);
+                }
+            });
+
+            ui.add_space(12.0);
             ui.weak("Server, key, account and generation settings save automatically.");
+            ui.weak("Mirrored to Android/data/…/files/comfyui_settings.json (adb pull-able).");
+            ui.weak("Password is never stored — only the session token after Sign in.");
+            ui.weak("Models: prefer /sdcard/ComfyUI/ (survives uninstall); app files/ is wiped with the app.");
+            if let Some(why) = &self.settings_write_blocked {
+                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), why);
+                if ui.button("Force overwrite broken settings").clicked() {
+                    self.settings_write_blocked = None;
+                    self.last_saved = None;
+                }
+            }
             ui.add_space(12.0);
         });
     }
@@ -11677,23 +11941,24 @@ impl ComfyApp {
         Some(format!("/storage/emulated/0/Android/data/{pkg}/files"))
     }
 
-    /// Scan the external files dir for model packs once; `force` re-reads it.
+    /// Scan app external files + durable `/sdcard/ComfyUI` for model packs; `force` re-reads.
     #[cfg(feature = "local-npu")]
     fn ensure_local_packs(&mut self, host: &Host, force: bool) {
         if self.local_packs_scanned && !force {
             return;
         }
         self.local_packs_scanned = true;
-        let root = self.external_files_dir(host);
-        self.local_packs = match &root {
-            Some(root) => crate::local_engine::scan_packs(std::path::Path::new(root)),
-            None => Vec::new(),
-        };
-        self.wd14_pack = root
-            .as_deref()
-            .and_then(|root| crate::local_engine::find_wd14_pack(std::path::Path::new(root)));
+        let app_root = self.external_files_dir(host);
+        let durable = Self::durable_models_dir();
+        let mut roots: Vec<&std::path::Path> = Vec::new();
+        if let Some(r) = app_root.as_deref() {
+            roots.push(std::path::Path::new(r));
+        }
+        roots.push(std::path::Path::new(durable));
+        self.local_packs = crate::local_engine::scan_packs_many(&roots);
+        self.wd14_pack = crate::local_engine::find_wd14_pack_many(&roots);
         self.log.info(format!(
-            "local-npu: {} pack(s) found: {}; wd14 pack: {}",
+            "local-npu: {} pack(s) found: {}; wd14 pack: {} (roots: app files + {durable})",
             self.local_packs.len(),
             self.local_packs.iter().map(|p| p.label()).collect::<Vec<_>>().join(", "),
             self.wd14_pack.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into())
