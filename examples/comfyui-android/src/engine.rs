@@ -1335,8 +1335,10 @@ async fn run_generate(
     ctx: egui::Context,
     log: Logger,
 ) {
-    // Resolve and upload the img2img input, if any.
-    let input_image = if params.mode == Mode::Img2Img {
+    // Resolve and upload the img2img / video start image, if any.
+    let wants_input = params.mode == Mode::Img2Img
+        || (params.mode == Mode::Video && !params.video.video_t2v);
+    let input_image = if wants_input {
         let bytes = match params.img2img_source {
             Img2ImgSource::CurrentOutput | Img2ImgSource::Picked => current,
             Img2ImgSource::Url => match fetch_bytes(&params.input_url, &authed, &log).await {
@@ -1350,7 +1352,7 @@ async fn run_generate(
             },
         };
         let Some(bytes) = bytes else {
-            let _ = tx.send(Msg::GenError("No input image for img2img".into()));
+            let _ = tx.send(Msg::GenError("No input image selected".into()));
             ctx.request_repaint();
             return;
         };
@@ -1383,7 +1385,8 @@ async fn run_generate(
         None
     };
 
-    let (wf, _out, report) = workflow::build(&params, input_image, &gcx.apps, &gcx.schemas);
+    let (wf, _out, report) =
+        workflow::build_dispatch(&params, input_image, &gcx.apps, &gcx.schemas);
     let note = report.note();
     if !note.is_empty() {
         log.info(format!("enhance: {note}"));

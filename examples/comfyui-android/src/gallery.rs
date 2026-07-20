@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::types::{GalleryGroup, GalleryItem};
+use crate::types::{ActiveLora, CharacterCard, GalleryGroup, GalleryItem, Params, file_basename};
 
 /// One LoRA referenced by a gallery image's embedded workflow.
 #[derive(Clone, Debug, Default)]
@@ -49,6 +49,114 @@ impl ImageMeta {
             && self.negative.is_none()
             && self.sampler.is_none()
     }
+}
+
+/// A remix field the diff sheet can toggle, naming which Params slot the meta would overwrite.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RemixField {
+    Model,
+    Positive,
+    Negative,
+    Sampler,
+    Scheduler,
+    Steps,
+    Cfg,
+    Seed,
+    Loras,
+}
+
+/// One row of the remix diff sheet: a field whose incoming value differs from the current Params.
+#[derive(Clone, Debug)]
+pub struct RemixDiffRow {
+    pub field: RemixField,
+    pub label: &'static str,
+    pub current: String,
+    pub new: String,
+}
+
+/// Convert a gallery image's scraped LoRAs into the Create tab's active-stack shape.
+pub fn meta_to_active_loras(loras: &[LoraMeta]) -> Vec<ActiveLora> {
+    loras
+        .iter()
+        .map(|l| ActiveLora {
+            file: l.name.clone(),
+            strength_model: l.strength_model as f32,
+            strength_clip: l.strength_clip.unwrap_or(l.strength_model) as f32,
+            injected: String::new(),
+            model_only: l.model_only,
+        })
+        .collect()
+}
+
+fn lora_line(loras: &[ActiveLora]) -> String {
+    if loras.is_empty() {
+        return "none".into();
+    }
+    loras
+        .iter()
+        .map(|l| format!("{} ({:.2})", l.file, l.strength_model))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn lora_sig(loras: &[ActiveLora]) -> Vec<(String, i32, i32, bool)> {
+    loras
+        .iter()
+        .map(|l| {
+            (
+                l.file.clone(),
+                (l.strength_model * 100.0).round() as i32,
+                (l.strength_clip * 100.0).round() as i32,
+                l.model_only,
+            )
+        })
+        .collect()
+}
+
+/// Every field this image's meta would change vs `params`; unchanged or unset fields are omitted.
+pub fn remix_diff_rows(meta: &ImageMeta, params: &Params) -> Vec<RemixDiffRow> {
+    let mut rows = Vec::new();
+    {
+        let mut push = |field, label, current: String, new: String| {
+            if current != new {
+                rows.push(RemixDiffRow { field, label, current, new });
+            }
+        };
+        if let Some(new) = meta.unet.clone().or_else(|| meta.models.first().cloned()) {
+            push(RemixField::Model, "Model", params.model_file().to_string(), new);
+        }
+        if let Some(p) = meta.positive.clone() {
+            push(RemixField::Positive, "Positive", params.positive.clone(), p);
+        }
+        if let Some(n) = meta.negative.clone() {
+            push(RemixField::Negative, "Negative", params.negative.clone(), n);
+        }
+        if let Some(s) = meta.sampler.clone() {
+            push(RemixField::Sampler, "Sampler", params.sampler.clone(), s);
+        }
+        if let Some(s) = meta.scheduler.clone() {
+            push(RemixField::Scheduler, "Scheduler", params.scheduler.clone(), s);
+        }
+        if let Some(n) = meta.steps {
+            push(RemixField::Steps, "Steps", params.steps.to_string(), (n as u32).to_string());
+        }
+        if let Some(c) = meta.cfg {
+            push(RemixField::Cfg, "CFG", format!("{:.2}", params.cfg), format!("{:.2}", c as f32));
+        }
+        if let Some(s) = meta.seed.filter(|&s| s >= 0) {
+            push(RemixField::Seed, "Seed", params.seed.to_string(), (s as u64).to_string());
+        }
+    }
+    let new_loras = meta_to_active_loras(&meta.loras);
+    if lora_sig(&new_loras) != lora_sig(&params.loras) {
+        rows.push(RemixDiffRow {
+            field: RemixField::Loras,
+            label: "LoRAs",
+            current: lora_line(&params.loras),
+            new: lora_line(&new_loras),
+        });
+    }
+    rows
 }
 
 /// Pull models / LoRAs / prompts / sampler settings out of API- or UI-format workflow JSON.
@@ -675,14 +783,19 @@ pub struct Group {
 /// one group instead of fragmenting.
 // The UI always goes through `group_selected` now; this stays as the host-test entry point.
 #[cfg_attr(target_os = "android", allow(dead_code))]
-pub fn group_items(items: &[GalleryItem], group: GalleryGroup) -> Vec<Group> {
+pub fn group_items(items: &[GalleryItem], group: GalleryGroup, characters: &[CharacterCard]) -> Vec<Group> {
     let all: Vec<usize> = (0..items.len()).collect();
-    group_selected(items, &all, group)
+    group_selected(items, &all, group, characters)
 }
 
 /// [`group_items`] over a subset: `sel` holds indices into `items` (e.g. after a media filter),
 /// and the returned groups carry those same original indices.
-pub fn group_selected(items: &[GalleryItem], sel: &[usize], group: GalleryGroup) -> Vec<Group> {
+pub fn group_selected(
+    items: &[GalleryItem],
+    sel: &[usize],
+    group: GalleryGroup,
+    characters: &[CharacterCard],
+) -> Vec<Group> {
     if group == GalleryGroup::None || sel.is_empty() {
         return vec![Group {
             key: "all".to_string(),
@@ -697,6 +810,7 @@ pub fn group_selected(items: &[GalleryItem], sel: &[usize], group: GalleryGroup)
         let key = match group {
             GalleryGroup::Model => item.model_label(),
             GalleryGroup::Date => item.date_label(),
+            GalleryGroup::Character => character_label(item, characters),
             GalleryGroup::Folder | GalleryGroup::None => item.subfolder.clone(),
         };
         match index.get(&key) {
@@ -706,6 +820,7 @@ pub fn group_selected(items: &[GalleryItem], sel: &[usize], group: GalleryGroup)
                 let label = match group {
                     GalleryGroup::Model => item.model_label(),
                     GalleryGroup::Date => item.date_label(),
+                    GalleryGroup::Character => key.clone(),
                     GalleryGroup::Folder | GalleryGroup::None => item.group_label(),
                 };
                 groups.push(Group { key, label, items: vec![i] });
@@ -713,6 +828,24 @@ pub fn group_selected(items: &[GalleryItem], sel: &[usize], group: GalleryGroup)
         }
     }
     groups
+}
+
+/// Character bucket for an item: the first card whose LoRA stack names a model the item's graph
+/// referenced (case-insensitive basename match against `item.models`), else "No character".
+///
+/// The list API returns no prompt text per item, so identity-tag matching is not possible here;
+/// LoRA-name matching is the robust signal available before opening a viewer.
+fn character_label(item: &GalleryItem, characters: &[CharacterCard]) -> String {
+    for c in characters {
+        let hit = c.loras.iter().any(|l| {
+            let base = file_basename(&l.file);
+            !base.is_empty() && item.models.iter().any(|m| file_basename(m).eq_ignore_ascii_case(base))
+        });
+        if hit {
+            return c.name.clone();
+        }
+    }
+    "No character".to_string()
 }
 
 /// Decoded thumbnails, evicted oldest-first against a memory budget.
@@ -941,7 +1074,7 @@ mod tests {
             item("u1/b", "2.png", &[]),
             item("u1/a", "3.png", &[]),
         ];
-        let groups = group_items(&items, GalleryGroup::Folder);
+        let groups = group_items(&items, GalleryGroup::Folder, &[]);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].label, "a");
         // The interleaved third item rejoins its group rather than starting a new one.
@@ -957,7 +1090,7 @@ mod tests {
             item("u1/a", "3.png", &[]),
             item("u1/b", "4.png", &["sdxl.safetensors"]),
         ];
-        let groups = group_items(&items, GalleryGroup::Model);
+        let groups = group_items(&items, GalleryGroup::Model, &[]);
         assert_eq!(groups.len(), 3);
         assert_eq!(groups[0].label, "sdxl.safetensors");
         // Across folders, same model, one group.
@@ -971,9 +1104,39 @@ mod tests {
     #[test]
     fn no_grouping_yields_one_flat_group() {
         let items = vec![item("u1/a", "1.png", &[]), item("u1/b", "2.png", &[])];
-        let groups = group_items(&items, GalleryGroup::None);
+        let groups = group_items(&items, GalleryGroup::None, &[]);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].items, vec![0, 1]);
+    }
+
+    #[test]
+    fn groups_by_character_via_lora_name_match() {
+        let card = |name: &str, lora: &str| CharacterCard {
+            name: name.into(),
+            loras: vec![crate::types::ActiveLora {
+                file: lora.into(),
+                strength_model: 1.0,
+                strength_clip: 1.0,
+                injected: String::new(),
+                model_only: false,
+            }],
+            ..Default::default()
+        };
+        let chars = vec![card("Mia", "loras/mia_v2.safetensors"), card("Rin", "rin.safetensors")];
+        let items = vec![
+            item("u1/a", "1.png", &["sdxl.safetensors", "mia_v2.safetensors"]),
+            item("u1/a", "2.png", &["sdxl.safetensors"]),
+            item("u1/a", "3.png", &["RIN.safetensors"]),
+            item("u1/a", "4.png", &["mia_v2.safetensors"]),
+        ];
+        let groups = group_items(&items, GalleryGroup::Character, &chars);
+        assert_eq!(groups[0].label, "Mia");
+        // Matched by basename, case-insensitively; interleaved Mia items share one group.
+        assert_eq!(groups[0].items, vec![0, 3]);
+        assert_eq!(groups[1].label, "No character");
+        assert_eq!(groups[1].items, vec![1]);
+        assert_eq!(groups[2].label, "Rin");
+        assert_eq!(groups[2].items, vec![2]);
     }
 
     #[test]
@@ -984,7 +1147,7 @@ mod tests {
             item("u1/out/2026-07-16", "c.png", &[]),
             item("u1/out", "plain.png", &[]),
         ];
-        let groups = group_items(&items, GalleryGroup::Date);
+        let groups = group_items(&items, GalleryGroup::Date, &[]);
         assert_eq!(groups.len(), 3);
         assert_eq!(groups[0].label, "2026-07-16");
         assert_eq!(groups[0].items, vec![0, 2]);
@@ -994,8 +1157,8 @@ mod tests {
 
     #[test]
     fn empty_listing_groups_cleanly() {
-        assert_eq!(group_items(&[], GalleryGroup::Folder).len(), 1);
-        assert!(group_items(&[], GalleryGroup::Folder)[0].items.is_empty());
+        assert_eq!(group_items(&[], GalleryGroup::Folder, &[]).len(), 1);
+        assert!(group_items(&[], GalleryGroup::Folder, &[])[0].items.is_empty());
     }
 
     /// A tile is fetched once, not once per frame it stays visible.
@@ -1038,5 +1201,102 @@ mod tests {
         }
         assert_eq!(c.len(), 1);
         assert_eq!(c.bytes, 4 * 1024 * 1024);
+    }
+
+    fn base_params() -> Params {
+        Params {
+            checkpoint: "current.safetensors".into(),
+            positive: "old prompt".into(),
+            negative: "old neg".into(),
+            steps: 20,
+            cfg: 7.0,
+            sampler: "euler".into(),
+            scheduler: "normal".into(),
+            seed: 100,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remix_diff_lists_only_changed_fields() {
+        let meta = ImageMeta {
+            models: vec!["current.safetensors".into()],
+            positive: Some("new prompt".into()),
+            negative: Some("old neg".into()),
+            sampler: Some("dpmpp_2m".into()),
+            scheduler: Some("normal".into()),
+            steps: Some(30),
+            cfg: Some(7.0),
+            seed: Some(555),
+            ..Default::default()
+        };
+        let rows = remix_diff_rows(&meta, &base_params());
+        let fields: Vec<_> = rows.iter().map(|r| r.field).collect();
+        // Model, negative, scheduler, cfg all match the current params and must be dropped.
+        assert!(!fields.contains(&RemixField::Model));
+        assert!(!fields.contains(&RemixField::Negative));
+        assert!(!fields.contains(&RemixField::Scheduler));
+        assert!(!fields.contains(&RemixField::Cfg));
+        assert!(fields.contains(&RemixField::Positive));
+        assert!(fields.contains(&RemixField::Sampler));
+        assert!(fields.contains(&RemixField::Steps));
+        assert!(fields.contains(&RemixField::Seed));
+        let seed = rows.iter().find(|r| r.field == RemixField::Seed).unwrap();
+        assert_eq!(seed.current, "100");
+        assert_eq!(seed.new, "555");
+    }
+
+    #[test]
+    fn remix_diff_model_prefers_unet_topology() {
+        let meta = ImageMeta {
+            unet: Some("flux1-dev.safetensors".into()),
+            models: vec!["ignored.safetensors".into()],
+            ..Default::default()
+        };
+        let rows = remix_diff_rows(&meta, &base_params());
+        let model = rows.iter().find(|r| r.field == RemixField::Model).unwrap();
+        assert_eq!(model.current, "current.safetensors");
+        assert_eq!(model.new, "flux1-dev.safetensors");
+    }
+
+    #[test]
+    fn remix_diff_flags_a_changed_lora_stack() {
+        let meta = ImageMeta {
+            loras: vec![LoraMeta {
+                name: "style.safetensors".into(),
+                strength_model: 0.8,
+                strength_clip: Some(0.7),
+                model_only: false,
+            }],
+            ..Default::default()
+        };
+        let rows = remix_diff_rows(&meta, &base_params());
+        let lora = rows.iter().find(|r| r.field == RemixField::Loras).unwrap();
+        assert_eq!(lora.current, "none");
+        assert!(lora.new.contains("style.safetensors"));
+    }
+
+    #[test]
+    fn remix_diff_hides_matching_lora_stack() {
+        let meta = ImageMeta {
+            loras: vec![LoraMeta {
+                name: "style.safetensors".into(),
+                strength_model: 0.8,
+                strength_clip: Some(0.8),
+                model_only: false,
+            }],
+            ..Default::default()
+        };
+        let mut params = base_params();
+        params.loras = meta_to_active_loras(&meta.loras);
+        let rows = remix_diff_rows(&meta, &params);
+        assert!(rows.iter().all(|r| r.field != RemixField::Loras));
+    }
+
+    #[test]
+    fn remix_diff_ignores_a_negative_seed() {
+        let meta = ImageMeta { seed: Some(-1), ..Default::default() };
+        let rows = remix_diff_rows(&meta, &base_params());
+        assert!(rows.iter().all(|r| r.field != RemixField::Seed));
     }
 }

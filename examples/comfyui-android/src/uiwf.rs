@@ -280,7 +280,7 @@ fn node_mode(v: &Value) -> u64 {
     v.get("mode").and_then(Value::as_u64).unwrap_or(0)
 }
 
-fn is_widget(kind: &InputKind) -> bool {
+pub fn is_widget(kind: &InputKind) -> bool {
     matches!(
         kind,
         InputKind::Enum { .. }

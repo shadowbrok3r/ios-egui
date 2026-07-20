@@ -967,6 +967,14 @@ impl GraphView {
 
             let mut widgets_values = Vec::new();
             for input in &data.inputs {
+                // Only schema widgets belong in widgets_values; a link input that carries a
+                // stray value would shift every later widget on the next positional read.
+                if let Some(s) = schema
+                    && let Some(si) = s.inputs.iter().find(|si| si.name == input.name)
+                    && !crate::uiwf::is_widget(&si.kind)
+                {
+                    continue;
+                }
                 let value = match &input.value {
                     FlowValueType::Array { selected, .. } => json!(selected),
                     FlowValueType::String { value, .. } => json!(value),

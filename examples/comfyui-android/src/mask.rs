@@ -132,6 +132,74 @@ pub fn pressure_brush(base_radius_uv: f32, force: Option<f32>) -> Brush {
     }
 }
 
+/// Maximum inpaint zoom, as a multiple of the fitted (1x) view.
+pub const MAX_ZOOM: f32 = 8.0;
+
+/// Presentation-only zoom/pan for the paint surface. `zoom` is a multiple of the fitted size
+/// (1 = fit), `pan` is the on-screen offset of the image center from the centered fit, in points.
+/// Purely a view transform: it maps the image, overlay, and pointer coords, never the baked mask.
+/// The fit rect is passed as `(center_x, center_y, w, h)` in screen points.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ViewXform {
+    pub zoom: f32,
+    pub pan: (f32, f32),
+}
+
+impl ViewXform {
+    /// The fitted, un-panned view.
+    pub const FIT: Self = Self { zoom: 1.0, pan: (0.0, 0.0) };
+
+    /// On-screen image rect as `(min_x, min_y, w, h)`.
+    pub fn view_rect(&self, fit: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        let (cx, cy, fw, fh) = fit;
+        let (w, h) = (fw * self.zoom, fh * self.zoom);
+        (cx + self.pan.0 - w * 0.5, cy + self.pan.1 - h * 0.5, w, h)
+    }
+
+    /// Image uv (0..1, clamped) under screen point `p`.
+    pub fn screen_to_uv(&self, fit: (f32, f32, f32, f32), p: (f32, f32)) -> (f32, f32) {
+        let (mx, my, w, h) = self.view_rect(fit);
+        let u = if w > 0.0 { (p.0 - mx) / w } else { 0.0 };
+        let v = if h > 0.0 { (p.1 - my) / h } else { 0.0 };
+        (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0))
+    }
+
+    /// Screen point of image uv (inverse of `screen_to_uv`, unclamped).
+    pub fn uv_to_screen(&self, fit: (f32, f32, f32, f32), uv: (f32, f32)) -> (f32, f32) {
+        let (mx, my, w, h) = self.view_rect(fit);
+        (mx + uv.0 * w, my + uv.1 * h)
+    }
+
+    /// Clamp zoom to `1..MAX_ZOOM` and pan so the image can't be dragged off-screen. `fit_size`
+    /// is the fitted image size, `area_size` the full paint region; the fit is centered in it.
+    pub fn clamped(mut self, fit_size: (f32, f32), area_size: (f32, f32)) -> Self {
+        self.zoom = self.zoom.clamp(1.0, MAX_ZOOM);
+        let mx = (fit_size.0 * self.zoom - area_size.0).abs() * 0.5;
+        let my = (fit_size.1 * self.zoom - area_size.1).abs() * 0.5;
+        self.pan = (self.pan.0.clamp(-mx, mx), self.pan.1.clamp(-my, my));
+        self
+    }
+
+    /// Zoom by `factor` about screen focus `p` (image content under `p` stays put), then pan by
+    /// `translate`, then clamp. `fit` is `(center_x, center_y, w, h)`, `area_size` the paint region.
+    pub fn pinch(
+        self,
+        fit: (f32, f32, f32, f32),
+        area_size: (f32, f32),
+        factor: f32,
+        p: (f32, f32),
+        translate: (f32, f32),
+    ) -> Self {
+        let (fcx, fcy, fw, fh) = fit;
+        let (u, v) = self.screen_to_uv(fit, p);
+        let zoom = (self.zoom * factor).clamp(1.0, MAX_ZOOM);
+        let (hw, hh) = (fw * zoom * 0.5, fh * zoom * 0.5);
+        let cx = p.0 - (2.0 * u - 1.0) * hw + translate.0;
+        let cy = p.1 - (2.0 * v - 1.0) * hh + translate.1;
+        Self { zoom, pan: (cx - fcx, cy - fcy) }.clamped((fw, fh), area_size)
+    }
+}
+
 /// Pointer tool as seen by the paint surface, surfaced from the android-activity motion-event
 /// side channel (`getToolType`). `Unknown` covers pre-first-event and non-touch pointers.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -255,6 +323,47 @@ mod tests {
         assert!(accept_paint(Eraser, true));
         assert!(accept_paint(Mouse, true));
         assert!(accept_paint(Unknown, true));
+    }
+
+    #[test]
+    fn view_screen_uv_roundtrips() {
+        let fit = (100.0, 80.0, 200.0, 160.0);
+        let views = [
+            ViewXform::FIT,
+            ViewXform { zoom: 3.0, pan: (25.0, -15.0) },
+            ViewXform { zoom: 8.0, pan: (-40.0, 40.0) },
+        ];
+        for v in views {
+            for &p in &[(20.0, 10.0), (100.0, 80.0), (150.0, 120.0)] {
+                let uv = v.screen_to_uv(fit, p);
+                let back = v.uv_to_screen(fit, uv);
+                assert!((back.0 - p.0).abs() < 1e-2 && (back.1 - p.1).abs() < 1e-2);
+            }
+        }
+    }
+
+    #[test]
+    fn view_clamps_zoom_and_pan() {
+        let (fit_size, area) = ((200.0, 160.0), (200.0, 300.0));
+        assert_eq!(ViewXform { zoom: 100.0, pan: (0.0, 0.0) }.clamped(fit_size, area).zoom, MAX_ZOOM);
+        assert_eq!(ViewXform { zoom: 0.1, pan: (0.0, 0.0) }.clamped(fit_size, area).zoom, 1.0);
+        // Zoom 1: no x slack (width fits), y slack is half the letterbox gutter.
+        let v = ViewXform { zoom: 1.0, pan: (50.0, 200.0) }.clamped(fit_size, area);
+        assert_eq!(v.pan, (0.0, 70.0));
+        // Zoom 4: x pan bounded to |800-200|/2 = 300.
+        assert_eq!(ViewXform { zoom: 4.0, pan: (100.0, 0.0) }.clamped(fit_size, area).pan.0, 100.0);
+        assert_eq!(ViewXform { zoom: 4.0, pan: (1e4, 0.0) }.clamped(fit_size, area).pan.0, 300.0);
+    }
+
+    #[test]
+    fn view_pinch_keeps_focus_fixed() {
+        let (fit, area) = ((150.0, 150.0, 300.0, 300.0), (300.0, 300.0));
+        let focus = (75.0, 210.0);
+        let uv0 = ViewXform::FIT.screen_to_uv(fit, focus);
+        let v1 = ViewXform::FIT.pinch(fit, area, 2.0, focus, (0.0, 0.0));
+        assert_eq!(v1.zoom, 2.0);
+        let back = v1.uv_to_screen(fit, uv0);
+        assert!((back.0 - focus.0).abs() < 0.1 && (back.1 - focus.1).abs() < 0.1);
     }
 
     #[test]

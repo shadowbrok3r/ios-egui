@@ -1,0 +1,121 @@
+{
+  "id": "hand.detailer",
+  "name": "Hand fix (FaceDetailer)",
+  "group": "Faces",
+  "description": "Impact Pack detail pass over detected hands.",
+  "version": 1,
+  "requires": [
+    { "class": "FaceDetailer", "pack": "ComfyUI-Impact-Pack" },
+    { "class": "UltralyticsDetectorProvider", "pack": "ComfyUI-Impact-Pack" },
+    { "class": "SAMLoader", "pack": "ComfyUI-Impact-Pack", "optional": true }
+  ],
+  "knobs": [
+    {
+      "id": "detector",
+      "label": "Hand detector",
+      "ty": {
+        "Enum": {
+          "class": "UltralyticsDetectorProvider",
+          "input": "model_name",
+          "prefix": "bbox/"
+        }
+      },
+      "default": "bbox/hand_yolov8s.pt"
+    },
+    {
+      "id": "denoise",
+      "label": "Strength",
+      "ty": { "Float": { "min": 0.1, "max": 0.9, "step": 0.05 } },
+      "default": 0.45,
+      "tooltip": "How much each hand is redrawn. Too high warps the pose; too low leaves the fingers as they were."
+    },
+    {
+      "id": "hand_prompt",
+      "label": "Hand prompt",
+      "ty": { "Text": { "multiline": false } },
+      "default": "perfect hands, five fingers, detailed fingers",
+      "tooltip": "Describes the hands only. A corrective prompt steers the redraw toward well-formed fingers. Clear it to reuse the main prompt."
+    },
+    {
+      "id": "steps",
+      "label": "Steps",
+      "ty": { "Int": { "min": 1, "max": 100, "step": 1 } },
+      "default": 20,
+      "advanced": true,
+      "tooltip": "Spent per detected hand, so this multiplies. Independent of the main Steps slider."
+    },
+    {
+      "id": "guide_size",
+      "label": "Detail size",
+      "ty": { "Int": { "min": 256, "max": 1024, "step": 64 } },
+      "default": 384,
+      "advanced": true
+    },
+    {
+      "id": "bbox_threshold",
+      "label": "Detection threshold",
+      "ty": { "Float": { "min": 0.1, "max": 0.95, "step": 0.05 } },
+      "default": 0.5,
+      "advanced": true
+    },
+    {
+      "id": "feather",
+      "label": "Feather",
+      "ty": { "Int": { "min": 0, "max": 64, "step": 1 } },
+      "default": 5,
+      "advanced": true
+    }
+  ],
+  "nodes": [
+    {
+      "id": "det",
+      "class": "UltralyticsDetectorProvider",
+      "inputs": { "model_name": "$knob:detector" }
+    },
+    {
+      "id": "sam",
+      "class": "SAMLoader",
+      "needs": "SAMLoader",
+      "inputs": { "model_name": "sam_vit_b_01ec64.pth", "device_mode": "AUTO" }
+    },
+    {
+      "id": "fd",
+      "class": "FaceDetailer",
+      "inputs": {
+        "image": "$image",
+        "model": "$model",
+        "clip": "$clip",
+        "vae": "$vae",
+        "positive": "$positive",
+        "negative": "$negative",
+        "bbox_detector": "$node:det:0",
+        "sam_model_opt": "$node:sam:0",
+        "seed": "$seed+2",
+        "steps": "$knob:steps",
+        "cfg": "$param:cfg",
+        "sampler_name": "$param:sampler",
+        "scheduler": "$param:scheduler",
+        "denoise": "$knob:denoise",
+        "guide_size": "$knob:guide_size",
+        "guide_size_for": true,
+        "max_size": 1024,
+        "feather": "$knob:feather",
+        "noise_mask": true,
+        "force_inpaint": true,
+        "bbox_threshold": "$knob:bbox_threshold",
+        "bbox_dilation": 10,
+        "bbox_crop_factor": 3.0,
+        "sam_detection_hint": "center-1",
+        "sam_dilation": 0,
+        "sam_threshold": 0.93,
+        "sam_bbox_expansion": 0,
+        "sam_mask_hint_threshold": 0.7,
+        "sam_mask_hint_use_negative": "False",
+        "drop_size": 10,
+        "wildcard": "$knob:hand_prompt",
+        "cycle": 1
+      }
+    }
+  ],
+  "output": { "node": "fd", "slot": 0 }
+}

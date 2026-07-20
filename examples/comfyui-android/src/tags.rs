@@ -163,6 +163,16 @@ impl TagDict {
         out.truncate(limit);
         out
     }
+
+    /// Danbooru category of the entry whose folded name equals `tag`, if any.
+    pub fn category_of(&self, tag: &str) -> Option<u8> {
+        let q = fold(tag);
+        if q.is_empty() {
+            return None;
+        }
+        let lo = self.entries.partition_point(|e| fold(&e.name) < q);
+        self.entries.get(lo).filter(|e| fold(&e.name) == q).map(|e| e.category)
+    }
 }
 
 /// Convenience: [`TagDict::bundled`] then [`TagDict::suggest`].
@@ -415,6 +425,34 @@ pub fn move_chip(text: &str, idx: usize, dir: i8) -> String {
     out
 }
 
+/// Move chip `from` to insertion gap `to` (0..=len); chips rejoin verbatim with `, `.
+pub fn move_chip_to(text: &str, from: usize, to: usize) -> String {
+    let chips = parse_chips(text);
+    let n = chips.len();
+    if from >= n || to > n {
+        return text.to_string();
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    let item = order.remove(from);
+    let insert_at = if to > from { to - 1 } else { to };
+    order.insert(insert_at.min(order.len()), item);
+    if order.iter().copied().eq(0..n) {
+        return text.to_string();
+    }
+    order.iter().map(|&i| &text[chips[i].range.clone()]).collect::<Vec<_>>().join(", ")
+}
+
+/// Append `tag` as a new top-level chip, joined with `, ` after any existing content.
+pub fn push_chip(text: &str, tag: &str) -> String {
+    let head = text.trim_end();
+    let head = head.strip_suffix(',').unwrap_or(head).trim_end();
+    if head.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{head}, {tag}")
+    }
+}
+
 /// Drop later duplicate tags (case/underscore-insensitive), keeping the first survivor verbatim.
 pub fn dedupe(text: &str) -> String {
     let chips = parse_chips(text);
@@ -522,6 +560,23 @@ mod tests {
         assert_eq!(moved, "long hair, 1girl, detailed");
         assert_eq!(parse_chips(&moved)[0].tag, "long hair");
 
+        // move_chip_to relocates to an arbitrary gap, rejoining chips verbatim.
+        assert_eq!(move_chip_to(text, 0, 3), "long hair, detailed, 1girl");
+        assert_eq!(move_chip_to(text, 2, 0), "detailed, 1girl, long hair");
+        assert_eq!(move_chip_to(text, 1, 1), text);
+        assert_eq!(move_chip_to(text, 1, 2), text);
+        // weight wrappers survive the move intact.
+        assert_eq!(
+            move_chip_to("1girl, (long hair:1.2), detailed", 0, 2),
+            "(long hair:1.2), 1girl, detailed"
+        );
+
+        // push_chip joins a bare tag with ", ", tolerating trailing commas/space.
+        assert_eq!(push_chip("a, b", "c"), "a, b, c");
+        assert_eq!(push_chip("", "c"), "c");
+        assert_eq!(push_chip("a, ", "c"), "a, c");
+        assert_eq!(push_chip("a,", "c"), "a, c");
+
         // dedupe keeps the first survivor's formatting.
         assert_eq!(
             dedupe("(masterpiece:1.2), long_hair, masterpiece, LONG HAIR"),
@@ -551,6 +606,24 @@ mod tests {
         let b = dict.suggest("boo", 5);
         assert_eq!(b.len(), 1);
         assert_eq!(b[0].name, "breasts");
+    }
+
+    #[test]
+    fn category_of_reads_folded_names_and_aliases() {
+        const CATS: &str = "van_gogh,1,50,\n\
+            touhou,3,900,\n\
+            hatsune_miku,4,800,miku\n\
+            highres,5,1000,\n";
+        let dict = TagDict::parse_csv_gz(&gz(CATS)).unwrap();
+        assert_eq!(dict.category_of("van gogh"), Some(1));
+        assert_eq!(dict.category_of("VAN_GOGH"), Some(1));
+        assert_eq!(dict.category_of("touhou"), Some(3));
+        assert_eq!(dict.category_of("hatsune miku"), Some(4));
+        // aliases carry their canonical's category.
+        assert_eq!(dict.category_of("miku"), Some(4));
+        assert_eq!(dict.category_of("highres"), Some(5));
+        assert_eq!(dict.category_of("nope"), None);
+        assert_eq!(dict.category_of(""), None);
     }
 
     #[test]

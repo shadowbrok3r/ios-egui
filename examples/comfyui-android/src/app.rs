@@ -15,7 +15,7 @@ use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, int
 
 use crate::apps::{AppDef, AppSet, KnobTy, Status};
 use crate::engine::{Engine, GenCtx, Msg};
-use crate::gallery::{self, ImageMeta, ThumbCache};
+use crate::gallery::{self, ImageMeta, RemixDiffRow, RemixField, ThumbCache};
 use crate::graphview::{self, GraphView, LongPress, LoraPick, elide, elide_width, sanitize_ui_text};
 use crate::icons;
 use crate::mask;
@@ -25,8 +25,9 @@ use crate::player::Player;
 use crate::schema::{self, SchemaSet};
 use crate::uiwf;
 use crate::types::{
-    ActiveLora, Album, AppPack, AppStep, CHECKPOINT_RECENT_MAX, CheckpointCatalog, CheckpointSort,
-    dedupe_loras, extract_triggers_from_positive,
+    ActiveLora, Album, AppPack, AppStep, AppliedCharacter, CHECKPOINT_RECENT_MAX, CharacterCard,
+    CharacterPack, CheckpointCatalog, CheckpointSort,
+    character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, Img2ImgSource, LoraCatalog, LoraPack, Mode,
     ModelKind, Params, SamplerPack, Settings, append_negatives, checkpoint_family, fallback_vec,
@@ -71,6 +72,14 @@ enum CreatePane {
     Loras,
     Enhance,
     Presets,
+    Characters,
+}
+
+/// An in-progress character edit: which card is being replaced (by name), plus the working copy.
+struct CharacterDraft {
+    /// The existing card's name being edited; `None` for a brand-new card.
+    editing: Option<String>,
+    card: CharacterCard,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -187,6 +196,75 @@ struct Viewer {
     meta_loading: bool,
 }
 
+/// Which remix fields an apply should write. All-true reproduces the one-tap Remix.
+#[derive(Clone, Copy)]
+struct RemixApply {
+    model: bool,
+    positive: bool,
+    negative: bool,
+    sampler: bool,
+    scheduler: bool,
+    steps: bool,
+    cfg: bool,
+    seed: bool,
+    loras: bool,
+}
+
+impl RemixApply {
+    const ALL: Self = Self {
+        model: true,
+        positive: true,
+        negative: true,
+        sampler: true,
+        scheduler: true,
+        steps: true,
+        cfg: true,
+        seed: true,
+        loras: true,
+    };
+    const NONE: Self = Self {
+        model: false,
+        positive: false,
+        negative: false,
+        sampler: false,
+        scheduler: false,
+        steps: false,
+        cfg: false,
+        seed: false,
+        loras: false,
+    };
+    fn set(&mut self, field: RemixField, on: bool) {
+        match field {
+            RemixField::Model => self.model = on,
+            RemixField::Positive => self.positive = on,
+            RemixField::Negative => self.negative = on,
+            RemixField::Sampler => self.sampler = on,
+            RemixField::Scheduler => self.scheduler = on,
+            RemixField::Steps => self.steps = on,
+            RemixField::Cfg => self.cfg = on,
+            RemixField::Seed => self.seed = on,
+            RemixField::Loras => self.loras = on,
+        }
+    }
+}
+
+/// The gallery image behind an open remix sheet, kept for the "as img2img" action.
+enum RemixInput {
+    Picked { name: String, bytes: Vec<u8> },
+    Url(String),
+    None,
+}
+
+/// Per-field remix diff sheet: pick which of an image's settings to port into Create.
+struct RemixSheet {
+    meta: ImageMeta,
+    rows: Vec<RemixDiffRow>,
+    /// Parallel to `rows`; each field is applied only while checked.
+    enabled: Vec<bool>,
+    input: RemixInput,
+    seeds: usize,
+}
+
 /// A device photo chosen as img2img input this session; the bytes are never persisted.
 struct PickedInput {
     name: String,
@@ -222,6 +300,12 @@ struct InpaintState {
     dbg_saw_touch: bool,
     /// Keep the center brush-size preview visible until this time (seconds).
     brush_preview_until: f64,
+    /// Presentation-only zoom/pan for the paint surface; reset to fit when a new image opens.
+    view: mask::ViewXform,
+    /// A paint stroke is mid-gesture, so a second finger can cancel it before pinching.
+    stroke_active: bool,
+    /// A two-finger gesture is in progress; blocks painting until all pointers lift.
+    nav_latch: bool,
 }
 
 /// One open workflow editor document (multi-tab Graph workspace).
@@ -345,6 +429,12 @@ struct ComfyApp {
     selected_preset: String,
     preset_save_open: bool,
     preset_name_edit: String,
+    /// On-device recurring-character cards.
+    characters: Vec<CharacterCard>,
+    /// Undo bookkeeping for the currently applied character (at most one at a time).
+    active_character: Option<AppliedCharacter>,
+    /// Open card editor, or `None` when showing the card list.
+    character_draft: Option<CharacterDraft>,
     /// Builtin enhance apps plus any under `{documents}/comfyui/apps`.
     apps: Arc<AppSet>,
     /// Where a picked app goes: the Create chain, or the canvas at a graph position.
@@ -513,8 +603,13 @@ struct ComfyApp {
     picked_input_grid_open: bool,
     /// Full-screen finger-paint inpainting session (session-only, never persisted).
     inpaint: Option<InpaintState>,
-    /// A Remix tap is waiting on the viewer's workflow meta to finish loading.
+    /// A Remix tap is waiting on the viewer's workflow meta before opening the diff sheet.
     viewer_remix_pending: bool,
+    /// Open per-field remix diff sheet.
+    remix_sheet: Option<RemixSheet>,
+    /// Long-press-on-Remix clock; a held press applies the full meta instantly.
+    viewer_remix_press: Option<f64>,
+    viewer_remix_long_fired: bool,
     /// How many separate Create jobs one Queue tap enqueues (1..=8).
     queue_variants: usize,
     /// Long-press menu on empty graph canvas: `(graph_pos, screen_pos, armed)`.
@@ -551,6 +646,8 @@ struct ComfyApp {
     create_companions_open: bool,
     /// Positive prompt shown as editable chips (session-only: the Settings struct is off-limits).
     prompt_chips: bool,
+    /// Negative prompt shown as editable chips (session-only).
+    neg_prompt_chips: bool,
     /// Bundled tag dictionary parsed and ready to query off-thread.
     tag_dict_warm: bool,
     /// Completion signal for the background tag-dictionary warmup.
@@ -608,6 +705,67 @@ struct ComfyApp {
     local_packs_scanned: bool,
 }
 
+/// Which prompt string a chip/text view edits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptField {
+    Positive,
+    Negative,
+}
+
+impl PromptField {
+    /// The `TextEdit` id backing this field's editor.
+    fn edit_id(self) -> egui::Id {
+        egui::Id::new(match self {
+            Self::Positive => "create_positive_edit",
+            Self::Negative => "create_negative_edit",
+        })
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Positive => "what you want to see",
+            Self::Negative => "what to avoid",
+        }
+    }
+
+    fn rows(self) -> usize {
+        match self {
+            Self::Positive => 3,
+            Self::Negative => 2,
+        }
+    }
+
+    /// The opposite field, target of a cross-field chip move.
+    fn other(self) -> Self {
+        match self {
+            Self::Positive => Self::Negative,
+            Self::Negative => Self::Positive,
+        }
+    }
+
+    /// Chip-menu label for moving a chip to the other field.
+    fn move_label(self) -> &'static str {
+        match self {
+            Self::Positive => "To negative",
+            Self::Negative => "To positive",
+        }
+    }
+
+    /// Stable discriminant salting per-field widget ids and drag payloads.
+    fn disc(self) -> u8 {
+        match self {
+            Self::Positive => 0,
+            Self::Negative => 1,
+        }
+    }
+}
+
+/// Chip drag payload: the source field's discriminant and the dragged chip index.
+struct ChipDrag {
+    field: u8,
+    idx: usize,
+}
+
 impl ComfyApp {
     fn new(_cc: &CreateContext) -> Self {
         let log = Logger::new();
@@ -653,6 +811,9 @@ impl ComfyApp {
             selected_preset: String::new(),
             preset_save_open: false,
             preset_name_edit: String::new(),
+            characters: Vec::new(),
+            active_character: None,
+            character_draft: None,
             apps: Arc::new(AppSet::builtin()),
             app_picker: None,
             app_filter: String::new(),
@@ -755,6 +916,9 @@ impl ComfyApp {
             picked_input_grid_open: false,
             inpaint: None,
             viewer_remix_pending: false,
+            remix_sheet: None,
+            viewer_remix_press: None,
+            viewer_remix_long_fired: false,
             queue_variants: 1,
             canvas_menu: None,
             node_menu: None,
@@ -773,6 +937,7 @@ impl ComfyApp {
             create_setup_open: true,
             create_companions_open: true,
             prompt_chips: false,
+            neg_prompt_chips: false,
             tag_dict_warm: false,
             tag_dict_warming: None,
             tag_dict_override: None,
@@ -1300,7 +1465,11 @@ impl ComfyApp {
                 self.executing = None;
                 if self.jobs_left == 0 {
                     self.running = false;
-                    self.status = "Done".into();
+                    self.status = if self.params.mode == Mode::Video {
+                        "Done — video saved to the Gallery".into()
+                    } else {
+                        "Done".into()
+                    };
                     host.haptic(Haptic::Success);
                     host.notify("ComfyUI", "Generation finished");
                     // New outputs should show up without a manual refresh (retry once for index lag).
@@ -1445,7 +1614,7 @@ impl ComfyApp {
                 }
             }
             Msg::ItemWorkflow { key, json } => {
-                let mut do_remix = false;
+                let mut open_sheet = false;
                 if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
@@ -1463,17 +1632,14 @@ impl ComfyApp {
                     v.workflow_json = Some(json);
                     v.item.has_workflow = true;
                     v.meta_loading = false;
-                    do_remix = self.viewer_remix_pending && !empty;
+                    open_sheet = self.viewer_remix_pending && !empty;
                 }
-                if do_remix {
+                if open_sheet {
                     self.viewer_remix_pending = false;
-                    if let Some(meta) = self.viewer.as_ref().and_then(|v| v.meta.clone()) {
-                        self.remix_from_meta(&meta);
-                    }
-                    self.viewer = None;
-                    self.player = None;
-                    self.viewer_swipe_origin = None;
                     self.gallery_status.clear();
+                    if let Some(meta) = self.viewer.as_ref().and_then(|v| v.meta.clone()) {
+                        self.open_remix_sheet(meta);
+                    }
                     host.haptic(Haptic::Light);
                 }
             }
@@ -1536,6 +1702,9 @@ impl ComfyApp {
             }
             return Ok(());
         }
+        if self.params.mode == Mode::Video {
+            return self.can_queue_video();
+        }
         if let Some(missing) = self.params.missing_model_part() {
             return Err(missing);
         }
@@ -1550,6 +1719,41 @@ impl ComfyApp {
             && (self.params.img2img_source != Img2ImgSource::Picked || self.picked_input.is_none())
         {
             return Err("Re-apply the inpaint mask first");
+        }
+        if !matches!(self.conn, Conn::Connected)
+            && !self.engine.as_ref().is_some_and(|e| e.is_connected())
+        {
+            return Err("Connect to the server first");
+        }
+        Ok(())
+    }
+
+    /// Video-mode preflight: the Wan nodes must exist, the models must be chosen, and a selected
+    /// device-photo source must have a photo.
+    fn can_queue_video(&self) -> Result<(), &'static str> {
+        if let Some(schemas) = self.schemas.as_ref() {
+            if !schemas.has_node("WanImageToVideo") {
+                return Err("This server has no WanImageToVideo node");
+            }
+            if !schemas.has_node("VHS_VideoCombine") {
+                return Err("This server has no VHS_VideoCombine (VideoHelperSuite) node");
+            }
+        }
+        let v = &self.params.video;
+        if v.unet_high.trim().is_empty() || v.unet_low.trim().is_empty() {
+            return Err("Pick the high and low noise Wan models");
+        }
+        if v.clip_name.trim().is_empty() {
+            return Err("Pick a text encoder for Wan");
+        }
+        if v.vae_name.trim().is_empty() {
+            return Err("Pick a VAE for Wan");
+        }
+        if !v.video_t2v
+            && self.params.img2img_source == Img2ImgSource::Picked
+            && self.picked_input.is_none()
+        {
+            return Err("Pick a device photo for the start image first");
         }
         if !matches!(self.conn, Conn::Connected)
             && !self.engine.as_ref().is_some_and(|e| e.is_connected())
@@ -1794,10 +1998,12 @@ impl ComfyApp {
         // (the server may namespace it into a subfolder), but this graph can itself be queued
         // from the Graph tab — so it has to have the img2img SHAPE. Building it with no input
         // would hand back an EmptyLatentImage, and queueing that silently makes a txt2img.
-        let input = (self.params.mode == Mode::Img2Img)
-            .then(|| crate::engine::INPUT_IMAGE_NAME.to_string());
+        let wants_input = self.params.mode == Mode::Img2Img
+            || (self.params.mode == Mode::Video && !self.params.video.video_t2v);
+        let input = wants_input.then(|| crate::engine::INPUT_IMAGE_NAME.to_string());
         let placeholder = input.is_some();
-        let (wf, _, report) = crate::workflow::build(&self.params, input, &self.apps, &schemas);
+        let (wf, _, report) =
+            crate::workflow::build_dispatch(&self.params, input, &self.apps, &schemas);
         self.enhance_note = report.note();
         self.executing = None;
 
@@ -1862,9 +2068,11 @@ impl ComfyApp {
             return;
         };
         let Some(schemas) = self.schemas.clone() else { return };
-        let input = (self.params.mode == Mode::Img2Img)
-            .then(|| crate::engine::INPUT_IMAGE_NAME.to_string());
-        let (wf, _, report) = crate::workflow::build(&self.params, input, &self.apps, &schemas);
+        let wants_input = self.params.mode == Mode::Img2Img
+            || (self.params.mode == Mode::Video && !self.params.video.video_t2v);
+        let input = wants_input.then(|| crate::engine::INPUT_IMAGE_NAME.to_string());
+        let (wf, _, report) =
+            crate::workflow::build_dispatch(&self.params, input, &self.apps, &schemas);
         self.enhance_note = report.note();
         if self.replace_workflow_in_tab(idx, "create.json".into(), &wf).is_err() {
             return;
@@ -1989,6 +2197,80 @@ impl ComfyApp {
         }
     }
 
+    /// The per-source preview + picker for the selected [`Img2ImgSource`], shared by the img2img
+    /// setup block and the Video start-image row.
+    fn image_source_preview(&mut self, ui: &mut egui::Ui, host: &Host) {
+        match self.params.img2img_source {
+            Img2ImgSource::Picked => {
+                let mut change = false;
+                if let Some(picked) = &self.picked_input {
+                    ui.horizontal(|ui| {
+                        if let Some(tex) = &picked.tex {
+                            let sized = egui::load::SizedTexture::from_handle(tex);
+                            ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                        }
+                        ui.vertical(|ui| {
+                            ui.weak(elide(&picked.name, 28));
+                            if ui.button("Change").clicked() {
+                                change = true;
+                            }
+                        });
+                    });
+                } else {
+                    ui.weak("Pick a photo from this device.");
+                    self.picked_input_grid_open = true;
+                }
+                if change {
+                    self.picked_input_grid_open = !self.picked_input_grid_open;
+                }
+                if self.picked_input_grid_open
+                    && let Some((id, name)) = self.device_photo_grid(ui, host)
+                {
+                    match host.load_device_image(id) {
+                        Some(bytes) if !bytes.is_empty() => {
+                            let fname =
+                                if name.is_empty() { format!("device_{id}.jpg") } else { name };
+                            self.set_picked_input(ui.ctx(), fname, bytes);
+                            host.haptic(Haptic::Light);
+                        }
+                        _ => {
+                            self.note = "Couldn't read that photo from the device".into();
+                            host.haptic(Haptic::Error);
+                        }
+                    }
+                }
+            }
+            Img2ImgSource::Url => {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.params.input_url)
+                        .hint_text("https://…/image.png — or pick from Gallery")
+                        .desired_width(f32::INFINITY),
+                );
+                self.tick_img2img_url_preview(ui.ctx());
+                ui.horizontal(|ui| {
+                    if let Some(tex) = &self.img2img_url_tex {
+                        let sized = egui::load::SizedTexture::from_handle(tex);
+                        ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                    } else if self.img2img_url_loading {
+                        ui.spinner();
+                        ui.weak("loading preview…");
+                    } else if !self.img2img_url_err.is_empty() {
+                        ui.weak(elide(&self.img2img_url_err, 64));
+                    }
+                });
+            }
+            Img2ImgSource::CurrentOutput if self.result_bytes.is_none() => {
+                ui.weak("Generate an image first to use it as input.");
+            }
+            Img2ImgSource::CurrentOutput => {
+                if let Some(tex) = &self.result {
+                    let sized = egui::load::SizedTexture::from_handle(tex);
+                    ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
+                }
+            }
+        }
+    }
+
     /// Decode picked photo bytes into a preview texture and stash them as the img2img input.
     fn set_picked_input(&mut self, ctx: &egui::Context, name: String, bytes: Vec<u8>) {
         let tex = crate::engine::decode(&bytes)
@@ -2032,6 +2314,9 @@ impl ComfyApp {
             dbg_contact: false,
             dbg_saw_touch: false,
             brush_preview_until: 0.0,
+            view: mask::ViewXform::FIT,
+            stroke_active: false,
+            nav_latch: false,
         });
     }
 
@@ -2171,6 +2456,13 @@ impl ComfyApp {
                         {
                             do_undo = true;
                         }
+                        if st.view.zoom > 1.001
+                            && crate::theme::fab(aui, icons::FULLSCREEN, crate::theme::fab_bg())
+                                .on_hover_text("Reset zoom to fit")
+                                .clicked()
+                        {
+                            st.view = mask::ViewXform::FIT;
+                        }
                         for (on_flag, icon, tip) in [
                             (&mut st.erase, icons::ERASE, "Wipe mask instead of painting"),
                             (
@@ -2191,9 +2483,52 @@ impl ComfyApp {
                         }
                     });
                 });
-            let (resp, painter) = ui.allocate_painter(area.size(), egui::Sense::drag());
+            let (resp, painter) =
+                ui.allocate_painter(area.size(), egui::Sense::click_and_drag());
+            let fit = (fitted.center().x, fitted.center().y, fitted.width(), fitted.height());
+            let area_size = (area.width(), area.height());
+            // Two-finger pinch/pan navigates and never paints; a second finger cancels the stroke
+            // its first finger may have started in the frames before it registered.
+            let mt = ui.input(|i| i.multi_touch());
+            let any_down = ui.input(|i| i.pointer.any_down());
+            if let Some(mt) = &mt {
+                if st.stroke_active {
+                    if let Some(start) = st.groups.pop() {
+                        st.strokes.truncate(start);
+                        st.canvas = mask::rasterize(st.canvas.w, st.canvas.h, &st.strokes);
+                        st.overlay_dirty = true;
+                    }
+                    st.stroke_active = false;
+                }
+                st.nav_latch = true;
+                st.view = st.view.pinch(
+                    fit,
+                    area_size,
+                    mt.zoom_delta,
+                    (mt.center_pos.x, mt.center_pos.y),
+                    (mt.translation_delta.x, mt.translation_delta.y),
+                );
+            }
+            if st.nav_latch && !any_down {
+                st.nav_latch = false;
+            }
+            // Desktop: ctrl+scroll (folded into zoom_delta) zooms about the pointer when not pinching.
+            if mt.is_none() {
+                let zd = ui.input(|i| i.zoom_delta());
+                if (zd - 1.0).abs() > 1e-3 {
+                    let f = resp.hover_pos().unwrap_or(fitted.center());
+                    st.view = st.view.pinch(fit, area_size, zd, (f.x, f.y), (0.0, 0.0));
+                }
+            }
+            if resp.double_clicked() {
+                st.view = mask::ViewXform::FIT;
+            }
+            let view = {
+                let (mx, my, w, h) = st.view.view_rect(fit);
+                egui::Rect::from_min_size(egui::pos2(mx, my), egui::vec2(w, h))
+            };
             let uv_full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            painter.image(st.base_tex.id(), fitted, uv_full, egui::Color32::WHITE);
+            painter.image(st.base_tex.id(), view, uv_full, egui::Color32::WHITE);
 
             let soft = 0.5;
             // Latest touch force + contact this frame; mouse/desktop reports no touch events.
@@ -2233,27 +2568,31 @@ impl ComfyApp {
             // Stylus barrel button (primary 0x20 / secondary 0x40) or the flipped eraser tip erases.
             let btn_erase = buttons & 0x60 != 0;
             let erase = st.erase || btn_erase || matches!(kind, mask::PointerKind::Eraser);
-            let brush = mask::pressure_brush(st.brush_uv, force);
-            if resp.drag_started() {
-                st.groups.push(st.strokes.len());
-            }
-            if resp.dragged()
+            // Brush radius shrinks with zoom so its screen-pixel size stays constant.
+            let brush = mask::pressure_brush(st.brush_uv / st.view.zoom, force);
+            let can_paint = mt.is_none() && !st.nav_latch;
+            if can_paint
+                && resp.dragged()
                 && mask::accept_paint(kind, st.stylus_only)
                 && let Some(pos) = resp.interact_pointer_pos()
-                && fitted.width() > 0.0
-                && fitted.height() > 0.0
+                && view.width() > 0.0
+                && view.height() > 0.0
             {
+                if !st.stroke_active {
+                    st.groups.push(st.strokes.len());
+                    st.stroke_active = true;
+                }
                 let to_uv = |p: egui::Pos2| {
                     (
-                        ((p.x - fitted.left()) / fitted.width()).clamp(0.0, 1.0),
-                        ((p.y - fitted.top()) / fitted.height()).clamp(0.0, 1.0),
+                        ((p.x - view.left()) / view.width()).clamp(0.0, 1.0),
+                        ((p.y - view.top()) / view.height()).clamp(0.0, 1.0),
                     )
                 };
                 let cur = to_uv(pos);
                 let d = resp.drag_delta();
                 let prev = (
-                    (cur.0 - d.x / fitted.width()).clamp(0.0, 1.0),
-                    (cur.1 - d.y / fitted.height()).clamp(0.0, 1.0),
+                    (cur.0 - d.x / view.width()).clamp(0.0, 1.0),
+                    (cur.1 - d.y / view.height()).clamp(0.0, 1.0),
                 );
                 st.canvas.stroke(prev, cur, brush.radius_uv, soft, brush.intensity, erase);
                 st.strokes.push(mask::StrokeRec {
@@ -2265,6 +2604,9 @@ impl ComfyApp {
                     erase,
                 });
                 st.overlay_dirty = true;
+            }
+            if !resp.dragged() {
+                st.stroke_active = false;
             }
 
             if st.overlay_dirty {
@@ -2285,7 +2627,7 @@ impl ComfyApp {
                 st.overlay_dirty = false;
             }
             if let Some(tex) = &st.overlay_tex {
-                painter.image(tex.id(), fitted, uv_full, egui::Color32::WHITE);
+                painter.image(tex.id(), view, uv_full, egui::Color32::WHITE);
             }
 
             // Brush-size cursor ring at the pointer or stylus hover; reflects pressure and erase.
@@ -2295,10 +2637,10 @@ impl ComfyApp {
                 egui::Color32::from_rgb(230, 70, 70)
             };
             if let Some(pos) = resp.interact_pointer_pos().or(resp.hover_pos()).or(hover_pt)
-                && fitted.contains(pos)
+                && view.contains(pos)
             {
-                let eff = if force.is_some() { brush.radius_uv } else { st.brush_uv };
-                let r = (eff * fitted.size().min_elem()).max(2.0);
+                let eff = if force.is_some() { brush.radius_uv } else { st.brush_uv / st.view.zoom };
+                let r = (eff * view.size().min_elem()).max(2.0);
                 painter.circle_stroke(pos, r, egui::Stroke::new(1.5, brush_col));
             }
 
@@ -2418,6 +2760,8 @@ impl ComfyApp {
             workflow_json,
             presets: self.presets.clone(),
             selected_preset: self.selected_preset.clone(),
+            characters: self.characters.clone(),
+            active_character: self.active_character.clone(),
             checkpoint_sort: self.checkpoint_sort,
             checkpoint_favorites: self.checkpoint_favorites.clone(),
             checkpoint_recent: self.checkpoint_recent.clone(),
@@ -2497,6 +2841,8 @@ impl ComfyApp {
             self.gallery_view.columns = self.gallery_view.columns.clamp(1, 3);
             self.presets = saved.presets;
             self.selected_preset = saved.selected_preset;
+            self.characters = saved.characters;
+            self.active_character = saved.active_character;
             self.checkpoint_sort = saved.checkpoint_sort;
             self.checkpoint_favorites = saved.checkpoint_favorites;
             self.checkpoint_recent = saved.checkpoint_recent;
@@ -2873,6 +3219,12 @@ impl ComfyApp {
                 CreatePane::Presets,
                 if preset_n > 0 { format!("Presets ({preset_n})") } else { "Presets".into() },
             );
+            let char_n = self.characters.len();
+            ui.selectable_value(
+                &mut self.create_pane,
+                CreatePane::Characters,
+                if char_n > 0 { format!("Characters ({char_n})") } else { "Characters".into() },
+            );
         });
         if self.create_pane == CreatePane::Models && prev != CreatePane::Models {
             self.checkpoints_force_collapse = true;
@@ -2889,6 +3241,7 @@ impl ComfyApp {
             CreatePane::Loras => self.create_loras_pane(ui),
             CreatePane::Enhance => self.create_enhance_pane(ui),
             CreatePane::Presets => self.create_presets_pane(ui, host),
+            CreatePane::Characters => self.create_characters_pane(ui, host),
         }
     }
 
@@ -2952,43 +3305,95 @@ impl ComfyApp {
         }
     }
 
-    /// Prefix suggestions as owned `(insert_text, count)` pairs; override first, else bundled if warm.
-    fn tag_suggestions(&self, prefix: &str, limit: usize) -> Vec<(String, u32)> {
+    /// Prefix suggestions as owned `(insert_text, count, category)` tuples; override first, else bundled.
+    fn tag_suggestions(&self, prefix: &str, limit: usize) -> Vec<(String, u32, u8)> {
         let entries = match &self.tag_dict_override {
             Some(d) => d.suggest(prefix, limit),
             None if self.tag_dict_warm => tags::TagDict::bundled().suggest(prefix, limit),
             None => return Vec::new(),
         };
-        entries.iter().map(|e| (e.insert_text(), e.count)).collect()
+        entries.iter().map(|e| (e.insert_text(), e.count, e.category)).collect()
     }
 
-    /// Positive prompt: a label + chip-view toggle, then either the chip editor or the text field.
-    fn positive_prompt_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Prompt");
-            if ui
-                .add(egui::Button::new("chips").selected(self.prompt_chips))
-                .on_hover_text("Edit the prompt as tag chips")
-                .clicked()
-            {
-                self.prompt_chips = !self.prompt_chips;
-            }
-        });
-        if self.prompt_chips {
-            self.positive_chip_view(ui);
-        } else {
-            self.positive_text_view(ui);
+    /// Danbooru category of `tag` from the active dictionary, if known.
+    fn tag_category(&self, tag: &str) -> Option<u8> {
+        match &self.tag_dict_override {
+            Some(d) => d.category_of(tag),
+            None if self.tag_dict_warm => tags::TagDict::bundled().category_of(tag),
+            None => None,
         }
     }
 
-    /// Positive text field plus a tag-autocomplete row under it while the field has focus.
-    fn positive_text_view(&mut self, ui: &mut egui::Ui) {
-        let id = egui::Id::new("create_positive_edit");
-        let out = egui::TextEdit::multiline(&mut self.params.positive)
+    /// The mutable prompt string for `field`.
+    fn field_text_mut(&mut self, field: PromptField) -> &mut String {
+        match field {
+            PromptField::Positive => &mut self.params.positive,
+            PromptField::Negative => &mut self.params.negative,
+        }
+    }
+
+    /// The prompt string for `field`.
+    fn field_text(&self, field: PromptField) -> &String {
+        match field {
+            PromptField::Positive => &self.params.positive,
+            PromptField::Negative => &self.params.negative,
+        }
+    }
+
+    /// Whether `field` is currently in chip-editing mode.
+    fn field_chips(&self, field: PromptField) -> bool {
+        match field {
+            PromptField::Positive => self.prompt_chips,
+            PromptField::Negative => self.neg_prompt_chips,
+        }
+    }
+
+    /// Set `field`'s chip-editing mode.
+    fn set_field_chips(&mut self, field: PromptField, on: bool) {
+        match field {
+            PromptField::Positive => self.prompt_chips = on,
+            PromptField::Negative => self.neg_prompt_chips = on,
+        }
+    }
+
+    /// Positive prompt: label + chip toggle, then the chip editor or text field.
+    fn positive_prompt_ui(&mut self, ui: &mut egui::Ui) {
+        self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
+    }
+
+    /// Negative prompt: label + chip toggle, then the chip editor or text field.
+    fn negative_prompt_ui(&mut self, ui: &mut egui::Ui) {
+        self.prompt_field_ui(ui, PromptField::Negative, "Negative");
+    }
+
+    /// One prompt field: a `label` + chip-view toggle, then the chip editor or the text field.
+    fn prompt_field_ui(&mut self, ui: &mut egui::Ui, field: PromptField, label: &str) {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let on = self.field_chips(field);
+            if ui
+                .add(egui::Button::new("chips").selected(on))
+                .on_hover_text("Edit as tag chips")
+                .clicked()
+            {
+                self.set_field_chips(field, !on);
+            }
+        });
+        if self.field_chips(field) {
+            self.prompt_chip_view(ui, field);
+        } else {
+            self.prompt_text_view(ui, field);
+        }
+    }
+
+    /// A prompt text field plus a tag-autocomplete row under it while the field has focus.
+    fn prompt_text_view(&mut self, ui: &mut egui::Ui, field: PromptField) {
+        let id = field.edit_id();
+        let out = egui::TextEdit::multiline(self.field_text_mut(field))
             .id(id)
-            .desired_rows(3)
+            .desired_rows(field.rows())
             .desired_width(f32::INFINITY)
-            .hint_text("what you want to see")
+            .hint_text(field.hint())
             .show(ui);
         if !out.response.has_focus() {
             return;
@@ -2996,7 +3401,7 @@ impl ComfyApp {
         let Some(cursor_char) = out.cursor_range.map(|r| r.primary.index.0) else {
             return;
         };
-        let text = self.params.positive.clone();
+        let text = self.field_text(field).clone();
         let cursor_byte =
             text.char_indices().nth(cursor_char).map(|(b, _)| b).unwrap_or(text.len());
         let (range, tok) = tags::token_at(&text, cursor_byte);
@@ -3008,19 +3413,25 @@ impl ComfyApp {
             return;
         }
         let mut accepted: Option<(String, usize)> = None;
-        crate::theme::scroll_horizontal().id_salt("tag_suggest_row").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (name, count) in &sugg {
-                    let label = format!("{name}  {}", fmt_count(*count));
-                    if ui.small_button(sanitize_ui_text(ui, &label)).clicked() {
-                        accepted = Some(tags::accept_suggestion(&text, range.clone(), name));
+        crate::theme::scroll_horizontal()
+            .id_salt(("tag_suggest_row", field.disc()))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (name, count, cat) in &sugg {
+                        let label = format!("{name}  {}", fmt_count(*count));
+                        let mut btn = egui::Button::new(sanitize_ui_text(ui, &label)).small();
+                        if let Some(fill) = crate::theme::tag_category_fill(*cat) {
+                            btn = btn.fill(fill);
+                        }
+                        if ui.add(btn).clicked() {
+                            accepted = Some(tags::accept_suggestion(&text, range.clone(), name));
+                        }
                     }
-                }
+                });
             });
-        });
         if let Some((new_text, cursor_byte)) = accepted {
             let char_idx = new_text[..cursor_byte].chars().count();
-            self.params.positive = new_text;
+            *self.field_text_mut(field) = new_text;
             if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id) {
                 let cur = egui::text::CCursor::new(char_idx);
                 st.cursor.set_char_range(Some(egui::text::CCursorRange::one(cur)));
@@ -3030,11 +3441,15 @@ impl ComfyApp {
         }
     }
 
-    /// Positive prompt rendered as tap-to-edit chips; the text string stays the source of truth.
-    fn positive_chip_view(&mut self, ui: &mut egui::Ui) {
-        let chips = tags::parse_chips(&self.params.positive);
+    /// A prompt rendered as draggable tap-to-edit chips; the text string stays the source of truth.
+    fn prompt_chip_view(&mut self, ui: &mut egui::Ui, field: PromptField) {
+        let text = self.field_text(field).clone();
+        let chips = tags::parse_chips(&text);
+        let disc = field.disc();
         let mut new_text: Option<String> = None;
         let mut to_text = false;
+        let mut reorder: Option<(usize, usize)> = None;
+        let mut to_other: Option<usize> = None;
         ui.horizontal_wrapped(|ui| {
             for (i, chip) in chips.iter().enumerate() {
                 let label = if (chip.weight - 1.0).abs() < 0.005 {
@@ -3042,21 +3457,51 @@ impl ComfyApp {
                 } else {
                     format!("{} x{}", chip.tag, fmt_weight(chip.weight))
                 };
-                ui.menu_button(sanitize_ui_text(ui, &label), |ui| {
+                let mut btn = egui::Button::new(sanitize_ui_text(ui, &label))
+                    .sense(egui::Sense::click_and_drag());
+                if let Some(fill) = self.tag_category(&chip.tag).and_then(crate::theme::tag_category_fill) {
+                    btn = btn.fill(fill);
+                }
+                let resp = ui.add(btn);
+                resp.dnd_set_drag_payload(ChipDrag { field: disc, idx: i });
+                if let (Some(pointer), Some(held)) =
+                    (ui.input(|i| i.pointer.interact_pos()), resp.dnd_hover_payload::<ChipDrag>())
+                {
+                    if held.field == disc {
+                        let rect = resp.rect;
+                        let stroke = egui::Stroke::new(2.0, ui.visuals().selection.stroke.color);
+                        let gap = if pointer.x < rect.center().x {
+                            ui.painter().vline(rect.left(), rect.y_range(), stroke);
+                            i
+                        } else {
+                            ui.painter().vline(rect.right(), rect.y_range(), stroke);
+                            i + 1
+                        };
+                        if let Some(dropped) = resp.dnd_release_payload::<ChipDrag>() {
+                            if dropped.field == disc {
+                                reorder = Some((dropped.idx, gap));
+                            }
+                        }
+                    }
+                }
+                egui::Popup::menu(&resp).show(|ui| {
                     if ui.button("Weight +").clicked() {
-                        new_text = Some(tags::bump_weight(&self.params.positive, i, 0.05));
+                        new_text = Some(tags::bump_weight(&text, i, 0.05));
                     }
                     if ui.button("Weight -").clicked() {
-                        new_text = Some(tags::bump_weight(&self.params.positive, i, -0.05));
+                        new_text = Some(tags::bump_weight(&text, i, -0.05));
                     }
                     if ui.button("Move left").clicked() {
-                        new_text = Some(tags::move_chip(&self.params.positive, i, -1));
+                        new_text = Some(tags::move_chip(&text, i, -1));
                     }
                     if ui.button("Move right").clicked() {
-                        new_text = Some(tags::move_chip(&self.params.positive, i, 1));
+                        new_text = Some(tags::move_chip(&text, i, 1));
+                    }
+                    if ui.button(field.move_label()).clicked() {
+                        to_other = Some(i);
                     }
                     if ui.button(format!("{} Delete", icons::TRASH)).clicked() {
-                        new_text = Some(tags::remove_chip(&self.params.positive, i));
+                        new_text = Some(tags::remove_chip(&text, i));
                     }
                 });
             }
@@ -3064,12 +3509,24 @@ impl ComfyApp {
                 to_text = true;
             }
         });
+        if let Some((from, to)) = reorder {
+            new_text = Some(tags::move_chip_to(&text, from, to));
+        }
+        if let Some(i) = to_other {
+            // Negatives rarely carry attention syntax: the bare tag moves without its weight wrapper.
+            if let Some(tag) = chips.get(i).map(|c| c.tag.clone()) {
+                let other = field.other();
+                let joined = tags::push_chip(self.field_text(other), &tag);
+                *self.field_text_mut(other) = joined;
+                new_text = Some(tags::remove_chip(&text, i));
+            }
+        }
         if let Some(t) = new_text {
-            self.params.positive = t;
+            *self.field_text_mut(field) = t;
         }
         if to_text {
-            self.prompt_chips = false;
-            ui.memory_mut(|m| m.request_focus(egui::Id::new("create_positive_edit")));
+            self.set_field_chips(field, false);
+            ui.memory_mut(|m| m.request_focus(field.edit_id()));
         }
     }
 
@@ -3094,7 +3551,10 @@ impl ComfyApp {
             return;
         }
         self.lint_fp = fp;
-        let ckpt = self.checkpoint_catalog.entry(&model);
+        // Wan takes natural-language motion prompts, not danbooru quality blocks — a checkpoint of
+        // None suppresses the family-quality lints while keeping paren / duplicate / count checks.
+        let ckpt =
+            (self.params.mode != Mode::Video).then(|| self.checkpoint_catalog.entry(&model)).flatten();
         let loras: Vec<_> =
             self.params.loras.iter().map(|al| (al, self.lora_catalog.entry(&al.file))).collect();
         self.lint_issues = lint::lint(&self.params, ckpt, &loras);
@@ -3199,17 +3659,29 @@ impl ComfyApp {
             ui.weak(sanitize_ui_text(ui, &format!("rec: {hint}")));
         }
 
+        let show_video = self.params.mode == Mode::Video
+            || self.schemas.as_ref().is_some_and(|s| s.has_node("WanImageToVideo"));
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
             ui.add_enabled_ui(!anima, |ui| {
                 ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
             });
-        });
-        if anima {
-            if self.params.mode != Mode::Txt2Img {
-                self.params.mode = Mode::Txt2Img;
+            if show_video {
+                ui.selectable_value(&mut self.params.mode, Mode::Video, "Video");
             }
+        });
+        // Anima has no img2img, but its checkpoint is unrelated to Wan video.
+        if anima && self.params.mode == Mode::Img2Img {
+            self.params.mode = Mode::Txt2Img;
+        }
+        if anima && self.params.mode != Mode::Video {
             ui.weak("Anima has no img2img yet — text to image only.");
+        }
+
+        if self.params.mode == Mode::Video {
+            self.create_video_body(ui, host);
+            ui.add_space(130.0);
+            return;
         }
 
         let show_companions = self.params.model_kind == ModelKind::Diffusion;
@@ -3332,84 +3804,7 @@ impl ComfyApp {
                         {
                             self.params.inpaint_mask = false;
                         }
-                        match self.params.img2img_source {
-                            Img2ImgSource::Picked => {
-                                let mut change = false;
-                                if let Some(picked) = &self.picked_input {
-                                    ui.horizontal(|ui| {
-                                        if let Some(tex) = &picked.tex {
-                                            let sized = egui::load::SizedTexture::from_handle(tex);
-                                            ui.add(
-                                                egui::Image::new(sized)
-                                                    .max_size(egui::vec2(96.0, 96.0)),
-                                            );
-                                        }
-                                        ui.vertical(|ui| {
-                                            ui.weak(elide(&picked.name, 28));
-                                            if ui.button("Change").clicked() {
-                                                change = true;
-                                            }
-                                        });
-                                    });
-                                } else {
-                                    ui.weak("Pick a photo from this device.");
-                                    self.picked_input_grid_open = true;
-                                }
-                                if change {
-                                    self.picked_input_grid_open = !self.picked_input_grid_open;
-                                }
-                                if self.picked_input_grid_open
-                                    && let Some((id, name)) = self.device_photo_grid(ui, host)
-                                {
-                                    match host.load_device_image(id) {
-                                        Some(bytes) if !bytes.is_empty() => {
-                                            let fname = if name.is_empty() {
-                                                format!("device_{id}.jpg")
-                                            } else {
-                                                name
-                                            };
-                                            self.set_picked_input(ui.ctx(), fname, bytes);
-                                            host.haptic(Haptic::Light);
-                                        }
-                                        _ => {
-                                            self.note =
-                                                "Couldn't read that photo from the device".into();
-                                            host.haptic(Haptic::Error);
-                                        }
-                                    }
-                                }
-                            }
-                            Img2ImgSource::Url => {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.params.input_url)
-                                        .hint_text("https://…/image.png — or pick from Gallery")
-                                        .desired_width(f32::INFINITY),
-                                );
-                                self.tick_img2img_url_preview(ui.ctx());
-                                ui.horizontal(|ui| {
-                                    if let Some(tex) = &self.img2img_url_tex {
-                                        let sized = egui::load::SizedTexture::from_handle(tex);
-                                        ui.add(
-                                            egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)),
-                                        );
-                                    } else if self.img2img_url_loading {
-                                        ui.spinner();
-                                        ui.weak("loading preview…");
-                                    } else if !self.img2img_url_err.is_empty() {
-                                        ui.weak(elide(&self.img2img_url_err, 64));
-                                    }
-                                });
-                            }
-                            Img2ImgSource::CurrentOutput if self.result_bytes.is_none() => {
-                                ui.weak("Generate an image first to use it as input.");
-                            }
-                            Img2ImgSource::CurrentOutput => {
-                                if let Some(tex) = &self.result {
-                                    let sized = egui::load::SizedTexture::from_handle(tex);
-                                    ui.add(egui::Image::new(sized).max_size(egui::vec2(96.0, 96.0)));
-                                }
-                            }
-                        }
+                        self.image_source_preview(ui, host);
                         // Denoise at the bottom of the section, only relevant for img2img.
                         ui.add_space(4.0);
                         full_width_slider(ui, "Denoise", |ui, w| {
@@ -3433,13 +3828,7 @@ impl ComfyApp {
                 .desired_width(f32::INFINITY)
                 .hint_text("trigger words from LoRAs (auto-filled on Add)"),
         );
-        ui.label("Negative");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.negative)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .hint_text("what to avoid"),
-        );
+        self.negative_prompt_ui(ui);
         if anima {
             ui.weak("Negative only applies when the pack's CFG is above 1.0.");
         }
@@ -3558,6 +3947,189 @@ impl ComfyApp {
 
         // Room for the stacked queue + menu FABs.
         ui.add_space(130.0);
+    }
+
+    /// The Create Main body for [`Mode::Video`]: Wan 2.2 image-to-video.
+    fn create_video_body(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let has_wan = self.schemas.as_ref().is_some_and(|s| s.has_node("WanImageToVideo"));
+        let has_vhs = self.schemas.as_ref().is_some_and(|s| s.has_node("VHS_VideoCombine"));
+        let has_rife = self.schemas.as_ref().is_some_and(|s| s.has_node("RIFE VFI"));
+        let has_clean = self.schemas.as_ref().is_some_and(|s| s.has_node("easy cleanGpuUsed"));
+        if self.schemas.is_some() && (!has_wan || !has_vhs) {
+            let mut missing = Vec::new();
+            if !has_wan {
+                missing.push("WanImageToVideo");
+            }
+            if !has_vhs {
+                missing.push("VHS_VideoCombine (VideoHelperSuite)");
+            }
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("Server is missing: {}", missing.join(", ")),
+            );
+        }
+        ui.weak("Wan 2.2 i2v — describe the motion; canned defaults do the rest.");
+
+        // Prompt + negative, with a one-tap canonical Wan negative.
+        self.positive_prompt_ui(ui);
+        ui.horizontal(|ui| {
+            ui.label("Negative");
+            if ui
+                .small_button("Wan negative")
+                .on_hover_text("Load the canonical Wan negative prompt")
+                .clicked()
+            {
+                self.params.negative = crate::types::WAN_NEGATIVE.to_string();
+            }
+        });
+        ui.add(
+            egui::TextEdit::multiline(&mut self.params.negative)
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .hint_text("what to avoid"),
+        );
+        self.lint_chips_ui(ui);
+
+        // Start image source, with a text-to-video option.
+        ui.add_space(6.0);
+        ui.label("Start image");
+        let t2v = self.params.video.video_t2v;
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(t2v, "None (text to video)").clicked() {
+                self.params.video.video_t2v = true;
+            }
+            for (src, label) in [
+                (Img2ImgSource::CurrentOutput, "Current result"),
+                (Img2ImgSource::Url, "From URL"),
+                (Img2ImgSource::Picked, "Device photo"),
+            ] {
+                let selected = !t2v && self.params.img2img_source == src;
+                if ui.selectable_label(selected, label).clicked() {
+                    self.params.img2img_source = src;
+                    self.params.video.video_t2v = false;
+                }
+            }
+        });
+        if self.params.video.video_t2v {
+            ui.weak("No start image — Wan generates motion from the prompt alone.");
+        } else {
+            self.image_source_preview(ui, host);
+        }
+
+        // Size.
+        ui.add_space(6.0);
+        ui.columns(2, |cols| {
+            cols[0].vertical_centered(|ui| {
+                stepper_u32(ui, "Width", &mut self.params.video.width, 128..=1280, 16);
+            });
+            cols[1].vertical_centered(|ui| {
+                stepper_u32(ui, "Height", &mut self.params.video.height, 128..=1280, 16);
+            });
+        });
+
+        // Length, snapped to Wan's 4n+1, shown in seconds at the 16fps base.
+        ui.add_space(6.0);
+        ui.vertical_centered(|ui| section_title(ui, "Length"));
+        let mut len = self.params.video.length;
+        full_width_slider(ui, "frames", |ui, w| {
+            ui.add_sized([w, 24.0], egui::Slider::new(&mut len, 5..=161));
+        });
+        centered_row(ui, |ui| {
+            if ui.small_button("-4").clicked() {
+                len = len.saturating_sub(4);
+            }
+            if ui.small_button("+4").clicked() {
+                len = len.saturating_add(4);
+            }
+        });
+        let len = crate::workflow::snap_wan_length(len);
+        self.params.video.length = len;
+        ui.vertical_centered(|ui| {
+            ui.weak(format!("{len}f ~ {:.1}s at 16fps", len as f32 / 16.0));
+        });
+
+        // Seed (shared with the image modes).
+        ui.add_space(6.0);
+        ui.label("Seed");
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(!self.params.randomize_seed, |ui| {
+                uint_text_edit_u64(ui, "video_seed", &mut self.params.seed, 0..=u64::MAX);
+            });
+            ui.checkbox(&mut self.params.randomize_seed, "random");
+        });
+
+        // LoRA stacks per expert; strength 0 stays listed but inert.
+        ui.add_space(6.0);
+        let loras = self.installed_loras.clone();
+        video_lora_list(ui, "High noise LoRAs", &mut self.params.video.loras_high, &loras, "vlora_hi");
+        ui.add_space(4.0);
+        video_lora_list(ui, "Low noise LoRAs", &mut self.params.video.loras_low, &loras, "vlora_lo");
+
+        // Advanced: models, sampler math, post-processing.
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Advanced").id_salt("video_advanced").show(ui, |ui| {
+            ui.label("High noise model");
+            combo_full(ui, "v_unet_high", &mut self.params.video.unet_high, &self.unets);
+            ui.label("Low noise model");
+            combo_full(ui, "v_unet_low", &mut self.params.video.unet_low, &self.unets);
+            ui.label("Text encoder");
+            combo_full(ui, "v_clip", &mut self.params.video.clip_name, &self.clip_files);
+            ui.label("VAE");
+            combo_full(ui, "v_vae", &mut self.params.video.vae_name, &self.vaes);
+
+            ui.add_space(4.0);
+            ui.columns(2, |cols| {
+                cols[0].vertical_centered(|ui| {
+                    stepper_u32(ui, "Steps", &mut self.params.video.steps, 1..=40, 1);
+                });
+                cols[1].vertical_centered(|ui| {
+                    stepper_u32(ui, "Split", &mut self.params.video.split_step, 1..=40, 1);
+                });
+            });
+            self.params.video.split_step = self.params.video.split_step.min(self.params.video.steps);
+            ui.columns(2, |cols| {
+                cols[0].vertical_centered(|ui| {
+                    stepper_f32(ui, "CFG high", &mut self.params.video.cfg_high, 1.0..=10.0, 0.1);
+                });
+                cols[1].vertical_centered(|ui| {
+                    stepper_f32(ui, "CFG low", &mut self.params.video.cfg_low, 1.0..=10.0, 0.1);
+                });
+            });
+            ui.vertical_centered(|ui| {
+                stepper_f32(ui, "Shift", &mut self.params.video.shift, 1.0..=12.0, 0.5);
+            });
+
+            ui.add_space(4.0);
+            ui.columns(2, |cols| {
+                let mut sampler = self.params.video.sampler.clone();
+                let mut scheduler = self.params.video.scheduler.clone();
+                let samplers = self.samplers.clone();
+                let schedulers = self.schedulers.clone();
+                cols[0].vertical_centered(|ui| {
+                    section_title(ui, "Sampler");
+                    combo_full(ui, "v_sampler", &mut sampler, &samplers);
+                });
+                cols[1].vertical_centered(|ui| {
+                    section_title(ui, "Scheduler");
+                    combo_full(ui, "v_scheduler", &mut scheduler, &schedulers);
+                });
+                self.params.video.sampler = sampler;
+                self.params.video.scheduler = scheduler;
+            });
+
+            ui.add_space(6.0);
+            ui.add_enabled_ui(has_rife, |ui| {
+                ui.checkbox(&mut self.params.video.rife, "RIFE frame interpolation (2x -> 32fps)");
+            });
+            if !has_rife {
+                ui.weak("Server has no 'RIFE VFI' node — interpolation is skipped.");
+            } else if self.params.video.rife {
+                stepper_u32(ui, "RIFE x", &mut self.params.video.rife_multiplier, 2..=4, 1);
+            }
+            if has_clean {
+                ui.checkbox(&mut self.params.video.gpu_clean, "Free VRAM between stages");
+            }
+        });
     }
 
     fn create_models_pane(&mut self, ui: &mut egui::Ui) {
@@ -3991,6 +4563,283 @@ impl ComfyApp {
             }
             host.haptic(Haptic::Warning);
         }
+    }
+
+    fn create_characters_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
+        ui.set_max_width(list_w);
+
+        if self.character_draft.is_some() {
+            self.character_editor(ui, host, list_w);
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .button(format!("{} New", icons::ADD))
+                .on_hover_text("Create a character card")
+                .clicked()
+            {
+                self.character_draft =
+                    Some(CharacterDraft { editing: None, card: CharacterCard::default() });
+            }
+            if ui.button("Import").on_hover_text("Paste a shared character pack").clicked() {
+                self.import_character(host);
+            }
+        });
+
+        if let Some(active) = self.active_character.as_ref().map(|a| a.name.clone()) {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.weak(format!("{} Active: {}", icons::CHECK, elide(&active, 22)));
+                if ui.small_button("Remove").clicked() {
+                    self.remove_active_character();
+                    host.haptic(Haptic::Light);
+                }
+            });
+        }
+
+        if self.characters.is_empty() {
+            ui.add_space(4.0);
+            ui.weak(format!(
+                "No characters yet — tap {} New, or Save as character from a gallery image.",
+                icons::ADD
+            ));
+            return;
+        }
+
+        enum Act {
+            Apply(usize),
+            Remove,
+            Edit(usize),
+            Share(usize),
+            Delete(String),
+        }
+        let active = self.active_character.as_ref().map(|a| a.name.clone());
+        let mut act: Option<Act> = None;
+        for (i, card) in self.characters.clone().iter().enumerate() {
+            let is_active = active.as_deref() == Some(card.name.as_str());
+            let header = if is_active {
+                format!("{} {}", icons::CHECK, elide(&card.name, 26))
+            } else {
+                elide(&card.name, 30)
+            };
+            ui.group(|ui| {
+                ui.set_max_width(list_w - 8.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if is_active {
+                            if ui.small_button("Remove").clicked() {
+                                act = Some(Act::Remove);
+                            }
+                        } else if ui.small_button("Apply").clicked() {
+                            act = Some(Act::Apply(i));
+                        }
+                        ui.add_space(4.0);
+                        let max_w = (ui.available_width() - 4.0).max(32.0);
+                        let title = elide_width(ui, &sanitize_ui_text(ui, &header), max_w);
+                        ui.strong(title);
+                    });
+                });
+                egui::CollapsingHeader::new("Details")
+                    .id_salt(("character_row", card.name.as_str()))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.set_max_width(list_w - 24.0);
+                        character_meta_body(ui, card);
+                        ui.horizontal(|ui| {
+                            if ui.small_button(format!("{} Edit", icons::STYLUS)).clicked() {
+                                act = Some(Act::Edit(i));
+                            }
+                            if ui
+                                .small_button("Share")
+                                .on_hover_text("Copy this card as a pack")
+                                .clicked()
+                            {
+                                act = Some(Act::Share(i));
+                            }
+                            if ui.small_button(icons::TRASH).clicked() {
+                                act = Some(Act::Delete(card.name.clone()));
+                            }
+                        });
+                    });
+            });
+        }
+        match act {
+            Some(Act::Apply(i)) => {
+                self.apply_character(i);
+                host.haptic(Haptic::Light);
+            }
+            Some(Act::Remove) => {
+                self.remove_active_character();
+                host.haptic(Haptic::Light);
+            }
+            Some(Act::Edit(i)) => {
+                if let Some(card) = self.characters.get(i).cloned() {
+                    self.character_draft =
+                        Some(CharacterDraft { editing: Some(card.name.clone()), card });
+                }
+            }
+            Some(Act::Share(i)) => {
+                if let Some(card) = self.characters.get(i).cloned() {
+                    host.copy_text(CharacterPack { card }.to_clipboard_json());
+                    host.haptic(Haptic::Light);
+                    self.status = "Character copied".into();
+                }
+            }
+            Some(Act::Delete(name)) => {
+                if self.active_character.as_ref().is_some_and(|a| a.name == name) {
+                    self.remove_active_character();
+                }
+                self.characters.retain(|c| c.name != name);
+                host.haptic(Haptic::Warning);
+            }
+            None => {}
+        }
+    }
+
+    /// The card editor, shown in place of the list while [`Self::character_draft`] is set.
+    fn character_editor(&mut self, ui: &mut egui::Ui, host: &Host, list_w: f32) {
+        let Some(mut draft) = self.character_draft.take() else { return };
+        let w = list_w - 8.0;
+        ui.heading(if draft.editing.is_some() { "Edit character" } else { "New character" });
+
+        ui.add_space(4.0);
+        ui.label("Name");
+        ui.add(
+            egui::TextEdit::singleline(&mut draft.card.name)
+                .hint_text("character name")
+                .desired_width(w),
+        );
+
+        ui.add_space(4.0);
+        ui.label("Identity tags");
+        ui.add(
+            egui::TextEdit::multiline(&mut draft.card.identity)
+                .hint_text("1girl, silver hair, red eyes, twin braids")
+                .desired_width(w)
+                .desired_rows(2),
+        );
+
+        ui.add_space(4.0);
+        ui.label("Trigger words");
+        ui.add(
+            egui::TextEdit::singleline(&mut draft.card.triggers)
+                .hint_text("LoRA activator tokens")
+                .desired_width(w),
+        );
+
+        ui.add_space(4.0);
+        ui.label("Negatives");
+        ui.add(
+            egui::TextEdit::singleline(&mut draft.card.negatives)
+                .hint_text("per-character negatives")
+                .desired_width(w),
+        );
+
+        ui.add_space(4.0);
+        ui.label("Face prompt");
+        ui.add(
+            egui::TextEdit::singleline(&mut draft.card.face_prompt)
+                .hint_text("optional; fed to the Face fix app")
+                .desired_width(w),
+        );
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Checkpoint:");
+            let shown = if draft.card.checkpoint.trim().is_empty() {
+                "none".to_string()
+            } else {
+                file_basename(&draft.card.checkpoint).to_string()
+            };
+            ui.weak(elide(&sanitize_ui_text(ui, &shown), 28));
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Use current model")
+                .on_hover_text("Copy the model selected in Create")
+                .clicked()
+            {
+                draft.card.checkpoint = self.params.model_file().to_string();
+            }
+            if !draft.card.checkpoint.trim().is_empty() && ui.small_button("Clear").clicked() {
+                draft.card.checkpoint.clear();
+                draft.card.switch_checkpoint = false;
+            }
+        });
+        if !draft.card.checkpoint.trim().is_empty() {
+            ui.checkbox(&mut draft.card.switch_checkpoint, "Switch to this checkpoint on apply");
+        }
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!("LoRAs ({})", draft.card.loras.len()));
+            if ui
+                .small_button("Capture current stack")
+                .on_hover_text("Copy the active LoRA stack from Create")
+                .clicked()
+            {
+                draft.card.loras = self
+                    .params
+                    .loras
+                    .iter()
+                    .map(|l| ActiveLora { injected: String::new(), ..l.clone() })
+                    .collect();
+            }
+        });
+        let mut drop_lora: Option<usize> = None;
+        for (i, lora) in draft.card.loras.clone().iter().enumerate() {
+            ui.horizontal(|ui| {
+                if ui.small_button(icons::CLOSE).clicked() {
+                    drop_lora = Some(i);
+                }
+                ui.weak(sanitize_ui_text(
+                    ui,
+                    &format!("{} @{:.2}", file_basename(&lora.file), lora.strength_model),
+                ));
+            });
+        }
+        if let Some(i) = drop_lora {
+            draft.card.loras.remove(i);
+        }
+
+        ui.add_space(8.0);
+        let named = !draft.card.name.trim().is_empty();
+        let mut close = false;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(named, egui::Button::new(format!("{} Save", icons::SAVE))).clicked() {
+                let mut card = draft.card.clone();
+                card.name = card.name.trim().to_string();
+                self.save_character(draft.editing.clone(), card);
+                host.haptic(Haptic::Success);
+                close = true;
+            }
+            if ui.button("Cancel").clicked() {
+                close = true;
+            }
+        });
+        if !named {
+            ui.weak("Name the character to save.");
+        }
+        if !close {
+            self.character_draft = Some(draft);
+        }
+    }
+
+    fn import_character(&mut self, host: &Host) {
+        let pack = host.clipboard_text().as_deref().and_then(CharacterPack::from_clipboard_json);
+        let Some(pack) = pack else {
+            self.status = "No character pack on the clipboard".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        // Open the imported card in the editor for review before saving.
+        self.character_draft = Some(CharacterDraft { editing: None, card: pack.card });
+        self.status = "Character imported — review and save".into();
+        host.haptic(Haptic::Light);
     }
 
     /// Which loader a model needs: the caller's hint, else the catalog's `directory`, else which
@@ -5455,72 +6304,291 @@ impl ComfyApp {
     }
 
     fn apply_image_meta(&mut self, meta: &ImageMeta) {
+        self.apply_image_meta_sel(meta, RemixApply::ALL);
+    }
+
+    /// Write only the `sel`-enabled fields of `meta` into Params; unchecked slots keep their value.
+    fn apply_image_meta_sel(&mut self, meta: &ImageMeta, sel: RemixApply) {
         // A UNET in the graph means the diffusion topology; the image's own encoders and VAE beat
         // whatever select_model would have seeded.
-        if let Some(unet) = &meta.unet {
-            self.select_model(unet, Some(ModelKind::Diffusion));
-            if !meta.clips.is_empty() {
-                self.params.clip_names = meta.clips.clone();
+        if sel.model {
+            if let Some(unet) = &meta.unet {
+                self.select_model(unet, Some(ModelKind::Diffusion));
+                if !meta.clips.is_empty() {
+                    self.params.clip_names = meta.clips.clone();
+                }
+                if let Some(t) = &meta.clip_type {
+                    self.params.clip_type = t.clone();
+                }
+                if let Some(v) = &meta.vae {
+                    self.params.vae_name = v.clone();
+                }
+                if let Some(d) = &meta.weight_dtype {
+                    self.params.weight_dtype = d.clone();
+                }
+            } else if let Some(m) = meta.models.first() {
+                self.select_model(m, Some(ModelKind::Checkpoint));
             }
-            if let Some(t) = &meta.clip_type {
-                self.params.clip_type = t.clone();
-            }
-            if let Some(v) = &meta.vae {
-                self.params.vae_name = v.clone();
-            }
-            if let Some(d) = &meta.weight_dtype {
-                self.params.weight_dtype = d.clone();
-            }
-        } else if let Some(m) = meta.models.first() {
-            self.select_model(m, Some(ModelKind::Checkpoint));
         }
-        if let Some(p) = &meta.positive {
-            self.params.positive = p.clone();
+        if sel.positive {
+            if let Some(p) = &meta.positive {
+                self.params.positive = p.clone();
+            }
         }
-        if let Some(n) = &meta.negative {
-            self.params.negative = n.clone();
+        if sel.negative {
+            if let Some(n) = &meta.negative {
+                self.params.negative = n.clone();
+            }
         }
-        self.params.lora_triggers.clear();
         self.apply_sampler_pack(&SamplerPack {
-            sampler: meta.sampler.clone(),
-            scheduler: meta.scheduler.clone(),
-            steps: meta.steps.map(|n| n as u32),
-            cfg: meta.cfg.map(|n| n as f32),
+            sampler: sel.sampler.then(|| meta.sampler.clone()).flatten(),
+            scheduler: sel.scheduler.then(|| meta.scheduler.clone()).flatten(),
+            steps: sel.steps.then(|| meta.steps.map(|n| n as u32)).flatten(),
+            cfg: sel.cfg.then(|| meta.cfg.map(|n| n as f32)).flatten(),
         });
-        if let Some(v) = meta.seed.filter(|&s| s >= 0) {
-            self.params.seed = v as u64;
-            self.params.randomize_seed = false;
+        if sel.seed {
+            if let Some(v) = meta.seed.filter(|&s| s >= 0) {
+                self.params.seed = v as u64;
+                self.params.randomize_seed = false;
+            }
         }
-        self.apply_lora_pack(&LoraPack {
-            loras: meta
-                .loras
-                .iter()
-                .map(|l| ActiveLora {
-                    file: l.name.clone(),
-                    strength_model: l.strength_model as f32,
-                    strength_clip: l.strength_clip.unwrap_or(l.strength_model) as f32,
-                    injected: String::new(),
-                    model_only: l.model_only,
-                })
-                .collect(),
-        });
-        // Workflow positives usually bake LoRA tags into the CLIP text — split them back out.
-        self.pull_lora_triggers_from_positive();
+        if sel.loras {
+            self.params.lora_triggers.clear();
+            self.apply_lora_pack(&LoraPack { loras: gallery::meta_to_active_loras(&meta.loras) });
+            // Workflow positives usually bake LoRA tags into the CLIP text — split them back out.
+            self.pull_lora_triggers_from_positive();
+        }
         self.create_pane = CreatePane::Main;
     }
 
     /// Load a gallery image's scraped meta into Create for an exact re-generation.
     fn remix_from_meta(&mut self, meta: &ImageMeta) {
-        self.apply_image_meta(meta);
-        // Repair a diffusion model's companions against this server's installed files.
+        self.remix_from_meta_sel(meta, RemixApply::ALL);
+    }
+
+    /// Remix, applying only the `sel`-enabled fields, then repair companions and jump to Create.
+    fn remix_from_meta_sel(&mut self, meta: &ImageMeta, sel: RemixApply) {
+        self.apply_image_meta_sel(meta, sel);
+        // Repair a diffusion model's companions against this server's installed files; when the
+        // model row is unchecked this ports the prompt / LoRAs onto the current checkpoint.
         if self.params.model_kind == ModelKind::Diffusion {
             self.resolve_companions(Companions::Repair);
         }
         // Disable seed randomization so the seed reproduces.
-        self.params.randomize_seed = false;
+        if sel.seed {
+            self.params.randomize_seed = false;
+        }
         self.selected_preset.clear();
         self.tab = Tab::Generate;
         self.note = "Remixed into Create".into();
+    }
+
+    /// Build the per-field remix diff sheet for `meta`, capturing the viewer image for img2img reuse.
+    fn open_remix_sheet(&mut self, meta: ImageMeta) {
+        let rows = gallery::remix_diff_rows(&meta, &self.params);
+        let enabled = vec![true; rows.len()];
+        let input = match self.viewer.as_ref() {
+            Some(v) if v.bytes.is_some() => {
+                RemixInput::Picked { name: v.item.filename.clone(), bytes: v.bytes.clone().unwrap() }
+            }
+            Some(v) => {
+                match self.engine.as_ref().and_then(|e| e.view_url(&v.item.subfolder, &v.item.filename))
+                {
+                    Some(url) => RemixInput::Url(url),
+                    None => RemixInput::None,
+                }
+            }
+            None => RemixInput::None,
+        };
+        self.remix_sheet = Some(RemixSheet { meta, rows, enabled, input, seeds: 6 });
+    }
+
+    /// Map the sheet's checked rows onto a [`RemixApply`]; unlisted (unchanged) fields stay off.
+    fn remix_apply_from_sheet(sheet: &RemixSheet) -> RemixApply {
+        let mut sel = RemixApply::NONE;
+        for (row, on) in sheet.rows.iter().zip(&sheet.enabled) {
+            if *on {
+                sel.set(row.field, true);
+            }
+        }
+        sel
+    }
+
+    /// Set the remembered gallery image as the img2img input, defaulting denoise for refining.
+    fn remix_set_img2img(&mut self, ctx: &egui::Context, input: RemixInput) {
+        match input {
+            RemixInput::Picked { name, bytes } => {
+                self.set_picked_input(ctx, name, bytes);
+                self.params.mode = Mode::Img2Img;
+                self.params.img2img_source = Img2ImgSource::Picked;
+            }
+            RemixInput::Url(url) => {
+                self.params.mode = Mode::Img2Img;
+                self.params.img2img_source = Img2ImgSource::Url;
+                self.params.input_url = url;
+            }
+            RemixInput::None => return,
+        }
+        // The meta carries no denoise; back a full-strength value off so img2img actually refines.
+        if self.params.denoise >= 0.9 {
+            self.params.denoise = 0.6;
+        }
+        self.note = "Remixed as img2img".into();
+    }
+
+    /// Queue `n` full-quality jobs at seed+1..=seed+n using the image's exact meta.
+    fn queue_neighbor_seeds(&mut self, ctx: &egui::Context, host: &Host, meta: &ImageMeta, n: usize) {
+        self.apply_image_meta(meta);
+        if self.params.model_kind == ModelKind::Diffusion {
+            self.resolve_companions(Companions::Repair);
+        }
+        self.params.randomize_seed = false;
+        self.selected_preset.clear();
+        if let Err(e) = self.can_queue_create() {
+            self.status = e.into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let n = n.clamp(1, 8);
+        let base = self.params.seed;
+        for i in 1..=n as u64 {
+            self.params.seed = base.wrapping_add(i);
+            self.start_generation(ctx, host);
+        }
+        // Restore the source seed so the Create tab still shows the image's own.
+        self.params.seed = base;
+        self.tab = Tab::Generate;
+        self.note = format!("Queued {n} neighbor seeds");
+    }
+
+    /// Tear down the fullscreen viewer and any remix sheet, remembering the gallery scroll.
+    fn close_viewer(&mut self) {
+        self.gallery_scroll_restore = Some(self.gallery_scroll_y);
+        self.viewer = None;
+        self.player = None;
+        self.viewer_swipe_origin = None;
+        self.viewer_remix_pending = false;
+        self.remix_sheet = None;
+        self.gallery_status.clear();
+    }
+
+    /// Per-field remix diff sheet: toggle which of an image's settings port into Create.
+    fn remix_sheet_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.remix_sheet.is_none() {
+            return;
+        }
+        #[derive(Clone, Copy)]
+        enum SAct {
+            Apply,
+            ApplyImg2Img,
+            Seeds,
+            Cancel,
+        }
+        let mut open = true;
+        let mut act: Option<SAct> = None;
+        let sheet = self.remix_sheet.as_ref().unwrap();
+        let mut toggles = sheet.enabled.clone();
+        let mut seeds = sheet.seeds;
+        let has_input = !matches!(sheet.input, RemixInput::None);
+        let rows = &sheet.rows;
+        let max_h = (ctx.content_rect().height() * 0.5).clamp(160.0, 360.0);
+        centered(egui::Window::new(format!("{} Remix", icons::GENERATE)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                if rows.is_empty() {
+                    ui.weak("These settings already match the current Create tab.");
+                } else {
+                    ui.weak("Pick which settings to port into Create.");
+                    ui.add_space(4.0);
+                    crate::theme::scroll_vertical().show(ui, |ui| {
+                        ui.set_max_height(max_h);
+                        ui.set_min_width(320.0);
+                        for (i, row) in rows.iter().enumerate() {
+                            let mut on = toggles[i];
+                            ui.checkbox(&mut on, row.label);
+                            toggles[i] = on;
+                            ui.horizontal(|ui| {
+                                ui.add_space(24.0);
+                                ui.weak(format!(
+                                    "{}  ->  {}",
+                                    elide(&row.current, 44),
+                                    elide(&row.new, 44)
+                                ));
+                            });
+                            ui.add_space(2.0);
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(format!("{} Apply", icons::CHECK))).clicked() {
+                        act = Some(SAct::Apply);
+                    }
+                    if ui
+                        .add_enabled(
+                            has_input,
+                            egui::Button::new(format!("{} img2img", icons::IMAGE)),
+                        )
+                        .on_hover_text("Apply and set this image as the img2img input")
+                        .clicked()
+                    {
+                        act = Some(SAct::ApplyImg2Img);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        act = Some(SAct::Cancel);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Neighbor seeds");
+                    if ui.small_button("-").clicked() {
+                        seeds = seeds.saturating_sub(1).max(1);
+                    }
+                    ui.monospace(seeds.to_string());
+                    if ui.small_button("+").clicked() {
+                        seeds = (seeds + 1).min(8);
+                    }
+                    if ui
+                        .add(egui::Button::new(format!("{} Queue", icons::RUN)))
+                        .on_hover_text(
+                            "Queue seed+1..seed+N at full quality from this image's exact settings",
+                        )
+                        .clicked()
+                    {
+                        act = Some(SAct::Seeds);
+                    }
+                });
+            });
+        if let Some(s) = self.remix_sheet.as_mut() {
+            s.enabled = toggles;
+            s.seeds = seeds;
+        }
+        match act {
+            Some(SAct::Apply) | Some(SAct::ApplyImg2Img) => {
+                let Some(sheet) = self.remix_sheet.take() else { return };
+                let sel = Self::remix_apply_from_sheet(&sheet);
+                self.remix_from_meta_sel(&sheet.meta, sel);
+                if matches!(act, Some(SAct::ApplyImg2Img)) {
+                    self.remix_set_img2img(ctx, sheet.input);
+                }
+                self.close_viewer();
+                host.haptic(Haptic::Light);
+            }
+            Some(SAct::Seeds) => {
+                let Some(sheet) = self.remix_sheet.take() else { return };
+                self.queue_neighbor_seeds(ctx, host, &sheet.meta, sheet.seeds);
+                self.close_viewer();
+            }
+            Some(SAct::Cancel) => self.remix_sheet = None,
+            None => {
+                if !open {
+                    self.remix_sheet = None;
+                }
+            }
+        }
     }
 
     /// Move catalog trigger words for the active LoRA stack out of `positive` into `lora_triggers`.
@@ -5594,6 +6662,121 @@ impl ComfyApp {
         }
         self.presets.retain(|p| p.name != name);
         self.selected_preset.clear();
+    }
+
+    /// Apply the character card at `idx`: identity tags, LoRAs, triggers, negatives, and (opt-in)
+    /// checkpoint + face-detailer prompt. Reverses any already-active card first.
+    fn apply_character(&mut self, idx: usize) {
+        let Some(card) = self.characters.get(idx).cloned() else { return };
+        self.remove_active_character();
+
+        // Catalog trigger/negative words for each of the card's LoRAs.
+        let words: HashMap<String, (String, String)> = card
+            .loras
+            .iter()
+            .map(|l| {
+                let pair = self
+                    .lora_catalog
+                    .entry(&l.file)
+                    .map(|e| (e.trigger_text(), e.negative_text()))
+                    .unwrap_or_default();
+                (l.file.clone(), pair)
+            })
+            .collect();
+
+        let mut applied =
+            self.params.apply_character(&card, |f| words.get(f).cloned().unwrap_or_default());
+
+        if card.switch_checkpoint && !card.checkpoint.trim().is_empty() {
+            applied.switched_checkpoint = true;
+            applied.prev_checkpoint = self.params.checkpoint.clone();
+            applied.prev_unet = self.params.unet_name.clone();
+            applied.prev_model_kind = Some(self.params.model_kind);
+            self.select_model(&card.checkpoint, None);
+        }
+
+        if !card.face_prompt.trim().is_empty() {
+            if let Some(step) =
+                self.params.apps.iter_mut().find(|a| a.app == "face.detailer" && a.enabled)
+            {
+                applied.face_touched = true;
+                applied.face_prev =
+                    step.values.get("face_prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                step.values
+                    .insert("face_prompt".into(), serde_json::Value::String(card.face_prompt.clone()));
+            }
+        }
+
+        self.active_character = Some(applied);
+        self.selected_preset.clear();
+    }
+
+    /// Reverse the active character: strip its tokens, drop its LoRAs, restore any switched
+    /// checkpoint and face-detailer prompt.
+    fn remove_active_character(&mut self) {
+        let Some(applied) = self.active_character.take() else { return };
+        self.params.remove_character(&applied);
+        if applied.switched_checkpoint {
+            self.params.checkpoint = applied.prev_checkpoint.clone();
+            self.params.unet_name = applied.prev_unet.clone();
+            if let Some(k) = applied.prev_model_kind {
+                self.params.model_kind = k;
+            }
+        }
+        if applied.face_touched {
+            if let Some(step) = self.params.apps.iter_mut().find(|a| a.app == "face.detailer") {
+                step.values
+                    .insert("face_prompt".into(), serde_json::Value::String(applied.face_prev.clone()));
+            }
+        }
+        self.selected_preset.clear();
+    }
+
+    /// Insert or replace a card by name, keeping the list sorted. If the edited card was active,
+    /// reverse the old application and reapply the saved version.
+    fn save_character(&mut self, editing: Option<String>, card: CharacterCard) {
+        let active = self.active_character.as_ref().map(|a| a.name.clone());
+        let reapply = match (&editing, &active) {
+            (Some(old), Some(act)) => old == act,
+            (None, Some(act)) => act == &card.name,
+            _ => false,
+        };
+        if let Some(old) = editing.as_ref().filter(|o| *o != &card.name) {
+            self.characters.retain(|c| &c.name != old);
+        }
+        if let Some(slot) = self.characters.iter_mut().find(|c| c.name == card.name) {
+            *slot = card.clone();
+        } else {
+            self.characters.push(card.clone());
+            self.characters.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        }
+        if reapply {
+            self.remove_active_character();
+            if let Some(i) = self.characters.iter().position(|c| c.name == card.name) {
+                self.apply_character(i);
+            }
+        }
+    }
+
+    /// Seed a new card from a gallery image's scraped meta: identity from the prompt (quality tags
+    /// dropped), LoRAs + strengths copied, checkpoint recorded. The user edits before saving.
+    fn character_from_meta(meta: &ImageMeta) -> CharacterCard {
+        let identity =
+            meta.positive.as_deref().map(character_tags_from_prompt).unwrap_or_default();
+        let loras = meta
+            .loras
+            .iter()
+            .map(|l| ActiveLora {
+                file: l.name.clone(),
+                strength_model: l.strength_model as f32,
+                strength_clip: l.strength_clip.unwrap_or(l.strength_model) as f32,
+                injected: String::new(),
+                model_only: l.model_only,
+            })
+            .collect();
+        let checkpoint =
+            meta.unet.clone().or_else(|| meta.models.first().cloned()).unwrap_or_default();
+        CharacterCard { identity, loras, checkpoint, ..Default::default() }
     }
 
     fn output(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -7765,6 +8948,7 @@ impl ComfyApp {
         let connected = matches!(self.conn, Conn::Connected);
         if self.viewer.is_some() {
             self.gallery_viewer(ui, host);
+            self.remix_sheet_window(ui.ctx(), host);
             self.album_create_window(ui.ctx());
             self.delete_confirm_window(ui.ctx(), host);
             return;
@@ -7870,8 +9054,12 @@ impl ComfyApp {
             .filter(|(_, it)| media.matches(it.is_video))
             .map(|(i, _)| i)
             .collect();
-        let groups =
-            crate::gallery::group_selected(&self.gallery, &visible, self.gallery_view.group);
+        let groups = crate::gallery::group_selected(
+            &self.gallery,
+            &visible,
+            self.gallery_view.group,
+            &self.characters,
+        );
         let cols = self.gallery_view.columns.clamp(1, 3);
         let mut open: Option<usize> = None;
         let mut load_more = false;
@@ -8463,6 +9651,9 @@ impl ComfyApp {
         self.filmstrip_center = true;
         self.viewer_swipe_origin = None;
         self.viewer_remix_pending = false;
+        self.remix_sheet = None;
+        self.viewer_remix_press = None;
+        self.viewer_remix_long_fired = false;
         self.viewer = Some(Viewer {
             item,
             idx,
@@ -8530,6 +9721,8 @@ impl ComfyApp {
             Save,
             Share,
             Remix,
+            RemixInstant,
+            SaveCharacter,
             UseAsInput,
             Inpaint,
             OpenWorkflow,
@@ -8660,6 +9853,7 @@ impl ComfyApp {
             let albums_known = v.albums.is_some();
             // Remix once the scraped meta is non-empty, or while it is still loading (deferred).
             let can_remix = v.meta.as_ref().is_some_and(|m| !m.is_empty()) || v.meta_loading;
+            let mut remix_held = false;
             egui::Panel::bottom("viewer-actions").show(ui, |ui| {
                 const BTN_H: f32 = 36.0;
                 const ICON_W: f32 = 40.0;
@@ -8692,16 +9886,27 @@ impl ComfyApp {
                     {
                         act = Some(Act::Share);
                     }
-                    if ui
+                    let remix = ui
                         .add_enabled(
                             can_remix,
                             egui::Button::new(format!("{} Remix", icons::GENERATE))
                                 .min_size(egui::vec2(0.0, BTN_H)),
                         )
-                        .on_hover_text("Load this image's prompt + settings into Create")
+                        .on_hover_text("Tap: choose fields  -  Hold: instant remix");
+                    if remix.clicked() {
+                        act = Some(Act::Remix);
+                    }
+                    remix_held = remix.is_pointer_button_down_on();
+                    if ui
+                        .add_enabled(
+                            can_remix,
+                            egui::Button::new(format!("{} Character", icons::USER))
+                                .min_size(egui::vec2(0.0, BTN_H)),
+                        )
+                        .on_hover_text("Save this image's tags + LoRAs as a character card")
                         .clicked()
                     {
-                        act = Some(Act::Remix);
+                        act = Some(Act::SaveCharacter);
                     }
                     if ui
                         .add(
@@ -8783,6 +9988,24 @@ impl ComfyApp {
                 });
                 ui.add_space(2.0);
             });
+            // A held Remix skips the diff sheet and applies the full meta instantly.
+            let meta_ready = self.remix_sheet.is_none()
+                && self.viewer.as_ref().and_then(|v| v.meta.as_ref()).is_some_and(|m| !m.is_empty());
+            if remix_held && meta_ready {
+                let now = ui.input(|i| i.time);
+                ui.ctx().request_repaint();
+                match self.viewer_remix_press {
+                    None => self.viewer_remix_press = Some(now),
+                    Some(t) if now - t > 0.5 && !self.viewer_remix_long_fired => {
+                        self.viewer_remix_long_fired = true;
+                        act = Some(Act::RemixInstant);
+                    }
+                    _ => {}
+                }
+            } else {
+                self.viewer_remix_press = None;
+                self.viewer_remix_long_fired = false;
+            }
             act = self.filmstrip(ui).map(Act::Show).or(act);
 
             let v = self.viewer.as_ref().unwrap();
@@ -8818,6 +10041,7 @@ impl ComfyApp {
             }
             // Horizontal swipe changes the picture (dominant X drag from the image area).
             if act.is_none()
+                && self.remix_sheet.is_none()
                 && let Some(dir) = self.viewer_horizontal_swipe(ui, image_rect)
             {
                 let cur = self.viewer.as_ref().unwrap().idx;
@@ -8894,17 +10118,42 @@ impl ComfyApp {
                 if let Some(meta) =
                     self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
                 {
+                    self.open_remix_sheet(meta);
+                    host.haptic(Haptic::Light);
+                } else {
+                    // Workflow still fetching — open the sheet when Msg::ItemWorkflow lands.
+                    self.viewer_remix_pending = true;
+                    self.gallery_status = "Loading workflow to remix…".into();
+                }
+            }
+            Some(Act::RemixInstant) => {
+                if let Some(meta) =
+                    self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
+                {
                     self.remix_from_meta(&meta);
+                    self.close_viewer();
+                    host.haptic(Haptic::Medium);
+                }
+            }
+            Some(Act::SaveCharacter) => {
+                if let Some(meta) =
+                    self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
+                {
+                    self.character_draft = Some(CharacterDraft {
+                        editing: None,
+                        card: Self::character_from_meta(&meta),
+                    });
                     self.viewer = None;
                     self.player = None;
                     self.viewer_swipe_origin = None;
                     self.viewer_remix_pending = false;
                     self.gallery_status.clear();
+                    self.tab = Tab::Generate;
+                    self.create_pane = CreatePane::Characters;
+                    self.note = "New character — review and save".into();
                     host.haptic(Haptic::Light);
                 } else {
-                    // Workflow still fetching — finish the remix when Msg::ItemWorkflow lands.
-                    self.viewer_remix_pending = true;
-                    self.gallery_status = "Loading workflow to remix…".into();
+                    self.gallery_status = "Loading workflow…".into();
                 }
             }
             Some(Act::UseAsInput) => {
@@ -10183,6 +11432,7 @@ fn preset_meta_body(ui: &mut egui::Ui, preset: &CreatePreset) {
         match p.mode {
             Mode::Txt2Img => "Text to Image",
             Mode::Img2Img => "Image to Image",
+            Mode::Video => "Video",
         },
     );
     wrap_meta(ui, "Prompt", &p.positive);
@@ -10201,6 +11451,32 @@ fn preset_meta_body(ui: &mut egui::Ui, preset: &CreatePreset) {
     if !p.loras.is_empty() {
         let names: Vec<&str> = p.loras.iter().map(|l| l.file.as_str()).collect();
         wrap_meta(ui, "LoRAs", &names.join(", "));
+    }
+}
+
+/// Wrapped character-card fields for a collapsing details body.
+fn character_meta_body(ui: &mut egui::Ui, card: &CharacterCard) {
+    wrap_meta(ui, "Identity", &card.identity);
+    if !card.triggers.trim().is_empty() {
+        wrap_meta(ui, "Triggers", &card.triggers);
+    }
+    if !card.negatives.trim().is_empty() {
+        wrap_meta(ui, "Negatives", &card.negatives);
+    }
+    if !card.loras.is_empty() {
+        let names: Vec<String> = card
+            .loras
+            .iter()
+            .map(|l| format!("{} @{:.2}", file_basename(&l.file), l.strength_model))
+            .collect();
+        wrap_meta(ui, "LoRAs", &names.join(", "));
+    }
+    if !card.checkpoint.trim().is_empty() {
+        let sw = if card.switch_checkpoint { " (switch on apply)" } else { "" };
+        wrap_meta(ui, "Checkpoint", &format!("{}{}", file_basename(&card.checkpoint), sw));
+    }
+    if !card.face_prompt.trim().is_empty() {
+        wrap_meta(ui, "Face prompt", &card.face_prompt);
     }
 }
 
@@ -10321,6 +11597,45 @@ fn combo(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) 
                 ui.selectable_value(current, opt.clone(), elide(opt, 56));
             }
         });
+}
+
+/// A model-only LoRA stack for one Wan expert: file combo + strength per row, add / remove.
+/// Zero-strength rows stay listed (spare slots) but the graph builder skips them.
+fn video_lora_list(
+    ui: &mut egui::Ui,
+    title: &str,
+    list: &mut Vec<crate::types::ActiveLora>,
+    installed: &[String],
+    salt: &str,
+) {
+    section_title(ui, title);
+    let mut remove: Option<usize> = None;
+    for (i, lora) in list.iter_mut().enumerate() {
+        ui.group(|ui| {
+            combo_full(ui, &format!("{salt}_{i}"), &mut lora.file, installed);
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut lora.strength_model, 0.0..=2.0).text("Model"));
+                if ui.small_button("Remove").clicked() {
+                    remove = Some(i);
+                }
+            });
+            if lora.strength_model == 0.0 || lora.file.trim().is_empty() {
+                ui.weak("inert — spare slot");
+            }
+        });
+    }
+    if let Some(i) = remove {
+        list.remove(i);
+    }
+    if ui.button(format!("{} LoRA", icons::ADD)).clicked() {
+        list.push(crate::types::ActiveLora {
+            file: String::new(),
+            strength_model: 1.0,
+            strength_clip: 1.0,
+            injected: String::new(),
+            model_only: true,
+        });
+    }
 }
 
 fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) {

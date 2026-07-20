@@ -90,6 +90,19 @@ fn fab_with_sense(
     resp
 }
 
+/// Subtle dark fill tinting a tag chip/suggestion by Danbooru category, or `None` for unknown.
+/// 0 general, 1 artist, 3 copyright, 4 character, 5 meta; light text stays readable on each.
+pub fn tag_category_fill(cat: u8) -> Option<Color32> {
+    match cat {
+        0 => Some(rgb(28, 40, 60)),
+        1 => Some(rgb(60, 32, 36)),
+        3 => Some(rgb(52, 32, 58)),
+        4 => Some(rgb(28, 52, 38)),
+        5 => Some(rgb(58, 48, 30)),
+        _ => None,
+    }
+}
+
 /// Apply the theme to a context: dark, near-black, purple/magenta accented.
 pub fn apply(ctx: &egui::Context) {
     let text = rgb(232, 232, 232);

@@ -1240,10 +1240,12 @@ pub struct AppSet {
     pub bad: Vec<(String, String)>,
 }
 
-/// Shipped apps. All but `face.detailer` need only stock ComfyUI nodes.
+/// Shipped apps. All but the `*.detailer` set need only stock ComfyUI nodes.
 const BUILTIN: &[(&str, &str)] = &[
     ("hires_fix.json", include_str!("apps_builtin/hires_fix.json")),
     ("face_detailer.json", include_str!("apps_builtin/face_detailer.json")),
+    ("hand_detailer.json", include_str!("apps_builtin/hand_detailer.json")),
+    ("eye_detailer.json", include_str!("apps_builtin/eye_detailer.json")),
     ("upscale_model.json", include_str!("apps_builtin/upscale_model.json")),
     ("upscale_scale.json", include_str!("apps_builtin/upscale_scale.json")),
     ("sharpen.json", include_str!("apps_builtin/sharpen.json")),
@@ -1491,6 +1493,28 @@ mod tests {
         for socket in ["model", "clip", "vae", "positive", "negative"] {
             assert!(fd.inputs[socket].as_slot().is_some(), "{socket} not wired");
         }
+    }
+
+    #[test]
+    fn hand_detailer_ships_a_corrective_wildcard_and_own_seed() {
+        let set = AppSet::builtin();
+        let schemas = schemas();
+        let g = WorkflowGraph::new();
+        let mut c = ctx(&g);
+        let steps = vec![AppStep::new(set.get("hand.detailer").unwrap())];
+        let report = apply(&g, &mut c, &steps, &set, &schemas, &params());
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+
+        let wf = g.borrow();
+        let fd = &wf.0[&c.image.0.node_id];
+        assert_eq!(fd.class_type, "FaceDetailer");
+        // Unlike the face pass, the hand pass ships a default wildcard to steer the redraw.
+        assert_eq!(
+            fd.inputs["wildcard"],
+            WorkflowInput::String("perfect hands, five fingers, detailed fingers".into())
+        );
+        // Its own seed offset keeps the noise distinct when stacked with the face pass.
+        assert_eq!(fd.inputs["seed"], WorkflowInput::I64(44));
     }
 
     #[test]

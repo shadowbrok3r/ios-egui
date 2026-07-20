@@ -4,11 +4,12 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-/// Generation mode: a fresh image from noise, or refine an existing image.
+/// Generation mode: a fresh image from noise, refine an existing image, or a Wan i2v video.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Mode {
     Txt2Img,
     Img2Img,
+    Video,
 }
 
 /// Where the img2img input image comes from (Android's runtime has no file picker yet).
@@ -44,6 +45,101 @@ pub struct ActiveLora {
     /// Chain through `LoraLoaderModelOnly`, leaving the CLIP untouched.
     #[serde(default)]
     pub model_only: bool,
+}
+
+/// Canonical Wan negative prompt (anti-3D prefix + the standard Chinese quality block).
+pub const WAN_NEGATIVE: &str = "(((realistic))), ((photograph)), 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
+
+/// Wan 2.2 image-to-video settings, seeded with the user's proven-working defaults.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VideoParams {
+    /// `UNETLoader.unet_name` for the high-noise expert.
+    pub unet_high: String,
+    /// `UNETLoader.unet_name` for the low-noise expert.
+    pub unet_low: String,
+    /// `UNETLoader.weight_dtype`; empty means `"default"`.
+    pub weight_dtype: String,
+    /// `CLIPLoader.clip_name`.
+    pub clip_name: String,
+    /// `CLIPLoader.type`.
+    pub clip_type: String,
+    /// `CLIPLoader.device`; empty omits the input.
+    pub clip_device: String,
+    /// `VAELoader.vae_name`.
+    pub vae_name: String,
+    pub width: u32,
+    pub height: u32,
+    /// Frame count; Wan requires `length % 4 == 1`.
+    pub length: u32,
+    /// Model-only LoRAs chained onto the high-noise expert.
+    pub loras_high: Vec<ActiveLora>,
+    /// Model-only LoRAs chained onto the low-noise expert.
+    pub loras_low: Vec<ActiveLora>,
+    /// `ModelSamplingSD3.shift`.
+    pub shift: f32,
+    /// Total sampler steps shared by both experts.
+    pub steps: u32,
+    /// Step at which the high expert hands off to the low expert.
+    pub split_step: u32,
+    pub cfg_high: f32,
+    pub cfg_low: f32,
+    pub sampler: String,
+    pub scheduler: String,
+    /// Render a text-to-video graph with no start image.
+    #[serde(default)]
+    pub video_t2v: bool,
+    /// Append a `RIFE VFI` frame-interpolation pass when the server has the node.
+    pub rife: bool,
+    /// `RIFE VFI.ckpt_name`.
+    pub rife_ckpt: String,
+    /// `RIFE VFI.multiplier`; output frame rate is `16 * rife_multiplier`.
+    pub rife_multiplier: u32,
+    /// Insert `easy cleanGpuUsed` passthroughs to free VRAM, when the server has the node.
+    pub gpu_clean: bool,
+}
+
+impl Default for VideoParams {
+    fn default() -> Self {
+        let model_lora = |file: &str, s: f32| ActiveLora {
+            file: file.to_string(),
+            strength_model: s,
+            strength_clip: s,
+            injected: String::new(),
+            model_only: true,
+        };
+        Self {
+            unet_high: "Wan/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors".into(),
+            unet_low: "Wan/wan2.2_i2v_low_noise_14B_fp8_scaled.safetensors".into(),
+            weight_dtype: "default".into(),
+            clip_name: "umt5_xxl_fp8_e4m3fn_scaled.safetensors".into(),
+            clip_type: "wan".into(),
+            clip_device: "cpu".into(),
+            vae_name: "wan_2.1_vae.safetensors".into(),
+            width: 560,
+            height: 720,
+            length: 81,
+            loras_high: vec![
+                model_lora("Wan/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors", 0.7),
+                model_lora("Wan/SmoothMixAnimationStyle_High.safetensors", 0.6),
+            ],
+            loras_low: vec![
+                model_lora("Wan/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", 1.0),
+                model_lora("Wan/SmoothMixAnimation_Low.safetensors", 0.6),
+            ],
+            shift: 5.0,
+            steps: 8,
+            split_step: 4,
+            cfg_high: 2.5,
+            cfg_low: 1.0,
+            sampler: "euler".into(),
+            scheduler: "simple".into(),
+            video_t2v: false,
+            rife: true,
+            rife_ckpt: "rife49.pth".into(),
+            rife_multiplier: 2,
+            gpu_clean: true,
+        }
+    }
 }
 
 /// Everything a KSampler txt2img/img2img workflow needs, plus the UI's mode selection.
@@ -97,6 +193,9 @@ pub struct Params {
     /// Ordered enhance chain appended after the base graph's VAE decode.
     #[serde(default)]
     pub apps: Vec<AppStep>,
+    /// Wan i2v settings used when `mode` is [`Mode::Video`].
+    #[serde(default)]
+    pub video: VideoParams,
 }
 
 /// One configured app in the Create tab's enhance chain.
@@ -191,6 +290,7 @@ impl Default for Params {
             input_url: String::new(),
             loras: Vec::new(),
             apps: Vec::new(),
+            video: VideoParams::default(),
         }
     }
 }
@@ -346,6 +446,150 @@ impl LoraPack {
         let loras: Vec<ActiveLora> = serde_json::from_value(v.get("loras")?.clone()).ok()?;
         let loras = dedupe_loras(loras);
         (!loras.is_empty()).then_some(Self { loras })
+    }
+}
+
+/// A reusable recurring character: identity tags, its LoRA stack, trigger words, per-character
+/// negatives, an optional preferred checkpoint, and an optional face-detailer prompt.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CharacterCard {
+    pub name: String,
+    /// Danbooru identity tags merged into the positive prompt (`1girl, silver hair, red eyes`).
+    #[serde(default)]
+    pub identity: String,
+    /// LoRA activator tokens merged into `lora_triggers`.
+    #[serde(default)]
+    pub triggers: String,
+    /// Appended to the negative prompt while applied.
+    #[serde(default)]
+    pub negatives: String,
+    /// LoRAs added to the active stack, with strengths.
+    #[serde(default)]
+    pub loras: Vec<ActiveLora>,
+    /// Preferred checkpoint / diffusion-model filename (empty = keep current).
+    #[serde(default)]
+    pub checkpoint: String,
+    /// Switch to [`Self::checkpoint`] on apply; never silent, a per-card opt-in.
+    #[serde(default)]
+    pub switch_checkpoint: bool,
+    /// Face-detailer wildcard prompt, piped into the `face.detailer` app when enabled.
+    #[serde(default)]
+    pub face_prompt: String,
+}
+
+/// Exactly what applying a [`CharacterCard`] changed, so removal reverses it token-for-token.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AppliedCharacter {
+    pub name: String,
+    /// Tokens added to `positive`.
+    #[serde(default)]
+    pub pos_injected: String,
+    /// Tokens added to `lora_triggers` (identity triggers + each added LoRA's catalog triggers).
+    #[serde(default)]
+    pub trig_injected: String,
+    /// Tokens added to `negative`.
+    #[serde(default)]
+    pub neg_injected: String,
+    /// LoRA files added to the stack.
+    #[serde(default)]
+    pub loras: Vec<String>,
+    /// Checkpoint restored on removal when the card switched models.
+    #[serde(default)]
+    pub prev_checkpoint: String,
+    #[serde(default)]
+    pub prev_unet: String,
+    #[serde(default)]
+    pub prev_model_kind: Option<ModelKind>,
+    #[serde(default)]
+    pub switched_checkpoint: bool,
+    /// Face-detailer `face_prompt` restored on removal when the card set it.
+    #[serde(default)]
+    pub face_touched: bool,
+    #[serde(default)]
+    pub face_prev: String,
+}
+
+/// Append a comma-joined token piece to an accumulator, skipping blanks.
+fn push_tokens(dest: &mut String, piece: &str) {
+    let piece = piece.trim();
+    if piece.is_empty() {
+        return;
+    }
+    if dest.is_empty() {
+        *dest = piece.to_string();
+    } else {
+        dest.push_str(", ");
+        dest.push_str(piece);
+    }
+}
+
+impl Params {
+    /// Inject a character's identity tags, trigger words, negatives, and LoRA stack, recording what
+    /// changed so [`Self::remove_character`] reverses it exactly. `lora_words(file)` yields the
+    /// catalog `(triggers, negatives)` for each newly added LoRA.
+    pub fn apply_character(
+        &mut self,
+        card: &CharacterCard,
+        lora_words: impl Fn(&str) -> (String, String),
+    ) -> AppliedCharacter {
+        let mut applied = AppliedCharacter { name: card.name.clone(), ..Default::default() };
+        applied.pos_injected = merge_triggers(&mut self.positive, &card.identity, &self.lora_triggers);
+        let mut trig = merge_triggers(&mut self.lora_triggers, &card.triggers, &self.positive);
+        let mut neg = merge_triggers(&mut self.negative, &card.negatives, "");
+        for lora in &card.loras {
+            if self.loras.iter().any(|l| l.file == lora.file) {
+                continue;
+            }
+            let (t, n) = lora_words(&lora.file);
+            let inj = merge_triggers(&mut self.lora_triggers, &t, &self.positive);
+            push_tokens(&mut trig, &inj);
+            let neg_inj = merge_triggers(&mut self.negative, &n, "");
+            push_tokens(&mut neg, &neg_inj);
+            self.loras.push(ActiveLora {
+                file: lora.file.clone(),
+                strength_model: lora.strength_model,
+                strength_clip: lora.strength_clip,
+                injected: String::new(),
+                model_only: lora.model_only,
+            });
+            applied.loras.push(lora.file.clone());
+        }
+        applied.trig_injected = trig;
+        applied.neg_injected = neg;
+        applied
+    }
+
+    /// Reverse [`Self::apply_character`]'s prompt/LoRA edits. Checkpoint and face-detailer
+    /// restoration are the caller's, since those touch app state beyond `Params`.
+    pub fn remove_character(&mut self, applied: &AppliedCharacter) {
+        strip_injected(&mut self.positive, &applied.pos_injected);
+        strip_injected(&mut self.lora_triggers, &applied.trig_injected);
+        strip_injected(&mut self.negative, &applied.neg_injected);
+        let drop: HashSet<&str> = applied.loras.iter().map(String::as_str).collect();
+        self.loras.retain(|l| !drop.contains(l.file.as_str()));
+    }
+}
+
+/// A [`CharacterCard`] copied to the clipboard for sharing / import.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CharacterPack {
+    pub card: CharacterCard,
+}
+
+impl CharacterPack {
+    pub const CLIP_TYPE: &'static str = "comfyui_android_character_v1";
+
+    pub fn to_clipboard_json(&self) -> String {
+        serde_json::json!({ "type": Self::CLIP_TYPE, "card": self.card }).to_string()
+    }
+
+    pub fn from_clipboard_json(raw: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) != Some(Self::CLIP_TYPE) {
+            return None;
+        }
+        let card: CharacterCard = serde_json::from_value(v.get("card")?.clone()).ok()?;
+        (!card.name.trim().is_empty()).then_some(Self { card })
     }
 }
 
@@ -906,6 +1150,39 @@ pub fn append_negatives(negative: &mut String, words: &str) {
     }
 }
 
+/// Keep the character-defining tags from a scraped prompt, dropping quality / meta boilerplate.
+/// Used by "Save as character" to seed a card's identity block from a gallery image.
+pub fn character_tags_from_prompt(prompt: &str) -> String {
+    split_triggers(prompt)
+        .into_iter()
+        .filter(|t| !is_quality_tag(t))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A generic quality / rating / meta tag rather than a character-identity tag.
+fn is_quality_tag(tag: &str) -> bool {
+    let t = tag.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return true;
+    }
+    if t.starts_with("score_") || t.starts_with("rating:") || t.starts_with("source_") {
+        return true;
+    }
+    const DROP: &[&str] = &[
+        "masterpiece", "best quality", "high quality", "normal quality", "low quality",
+        "worst quality", "amazing quality", "great quality", "good quality", "very aesthetic",
+        "aesthetic", "absurdres", "highres", "high resolution", "lowres", "ultra-detailed",
+        "ultra detailed", "extremely detailed", "highly detailed", "detailed", "intricate details",
+        "8k", "4k", "2k", "uhd", "hdr", "raw photo", "sharp focus", "depth of field", "bokeh",
+        "cinematic lighting", "professional lighting", "studio lighting", "dramatic lighting",
+        "official art", "game cg", "illustration", "artist name", "signature", "watermark", "text",
+        "logo", "username", "web address", "dated", "newest", "oldest", "sfw", "nsfw",
+        "photorealistic", "realistic", "render", "unreal engine",
+    ];
+    DROP.contains(&t.as_str())
+}
+
 /// How the gallery orders results. Mirrors comfy-gate's `sort` values; the server silently falls
 /// back to `new` for anything it doesn't know, and offers no sort-by-model.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -950,6 +1227,7 @@ pub enum GalleryGroup {
     Folder,
     Model,
     Date,
+    Character,
 }
 
 impl GalleryGroup {
@@ -959,6 +1237,8 @@ impl GalleryGroup {
             Self::Folder => "folder",
             Self::Model => "model",
             Self::Date => "date",
+            // No server-side ordering exists for characters; the split is entirely client-side.
+            Self::Character => "none",
         }
     }
 
@@ -968,10 +1248,12 @@ impl GalleryGroup {
             Self::Folder => "Folder",
             Self::Model => "Model",
             Self::Date => "Date",
+            Self::Character => "Character",
         }
     }
 
-    pub const ALL: &'static [Self] = &[Self::Folder, Self::Model, Self::Date, Self::None];
+    pub const ALL: &'static [Self] =
+        &[Self::Folder, Self::Model, Self::Date, Self::Character, Self::None];
 }
 
 /// Media-type filter for the gallery listing. Applied client-side (the listing API has no media
@@ -1133,6 +1415,12 @@ pub struct Settings {
     /// Name of the last-applied Create preset (empty = none / custom).
     #[serde(default)]
     pub selected_preset: String,
+    /// On-device recurring-character cards.
+    #[serde(default)]
+    pub characters: Vec<CharacterCard>,
+    /// The currently applied character's undo bookkeeping (so removal survives a restart).
+    #[serde(default)]
+    pub active_character: Option<AppliedCharacter>,
     /// Create Checkpoints list sort (name vs most recently used).
     #[serde(default)]
     pub checkpoint_sort: CheckpointSort,
@@ -1382,6 +1670,38 @@ mod tests {
     }
 
     #[test]
+    fn params_without_video_field_default_to_the_proven_wan_settings() {
+        let old = r#"{
+            "checkpoint": "sdxl.safetensors", "positive": "a cat", "negative": "blurry",
+            "steps": 20, "cfg": 7.0, "width": 1024, "height": 1024, "batch_size": 1,
+            "sampler": "euler", "scheduler": "normal", "seed": 0, "randomize_seed": true,
+            "denoise": 0.6, "mode": "Txt2Img", "img2img_source": "CurrentOutput", "input_url": ""
+        }"#;
+        let p: Params = serde_json::from_str(old).expect("old params must still deserialize");
+        assert_eq!(p.video.length, 81);
+        assert_eq!(p.video.steps, 8);
+        assert_eq!(p.video.split_step, 4);
+        assert_eq!(p.video.loras_high.len(), 2);
+        assert_eq!(p.video.loras_low.len(), 2);
+        assert!(p.video.loras_high.iter().all(|l| l.model_only));
+        assert!((p.video.cfg_high - 2.5).abs() < 1e-6);
+        assert!(p.video.rife && p.video.gpu_clean && !p.video.video_t2v);
+        // Round-trips.
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Params = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.video.clip_type, "wan");
+        assert_eq!(back.video.rife_multiplier, 2);
+    }
+
+    #[test]
+    fn params_round_trip_with_video_mode() {
+        let p = Params { mode: Mode::Video, ..Default::default() };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Params = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mode, Mode::Video);
+    }
+
+    #[test]
     fn params_round_trip_with_picked_img2img_source() {
         let p = Params {
             img2img_source: Img2ImgSource::Picked,
@@ -1498,6 +1818,105 @@ mod tests {
             .combined_positive(),
             "masterpiece, a cat"
         );
+    }
+
+    fn card_lora(file: &str, s: f32) -> ActiveLora {
+        ActiveLora {
+            file: file.into(),
+            strength_model: s,
+            strength_clip: s,
+            injected: String::new(),
+            model_only: false,
+        }
+    }
+
+    #[test]
+    fn character_pack_round_trips_through_the_clipboard() {
+        let card = CharacterCard {
+            name: "Mia".into(),
+            identity: "1girl, silver hair, red eyes, twin braids".into(),
+            triggers: "miachar".into(),
+            negatives: "bad anatomy".into(),
+            loras: vec![card_lora("mia_v2.safetensors", 0.8)],
+            checkpoint: "novaAnime.safetensors".into(),
+            switch_checkpoint: true,
+            face_prompt: "close-up of Mia's face".into(),
+        };
+        let json = CharacterPack { card: card.clone() }.to_clipboard_json();
+        let back = CharacterPack::from_clipboard_json(&json).expect("valid pack");
+        assert_eq!(back.card, card);
+        // Foreign / malformed payloads are rejected.
+        assert!(CharacterPack::from_clipboard_json(&LoraPack::default().to_clipboard_json()).is_none());
+        assert!(CharacterPack::from_clipboard_json("not json").is_none());
+        // A nameless card is not a shareable pack.
+        let nameless = CharacterPack { card: CharacterCard::default() };
+        assert!(CharacterPack::from_clipboard_json(&nameless.to_clipboard_json()).is_none());
+    }
+
+    #[test]
+    fn applying_then_removing_a_character_restores_params_exactly() {
+        let mut p = Params {
+            positive: "a girl, outdoors".into(),
+            negative: "text, watermark, low quality".into(),
+            lora_triggers: "masterpiece".into(),
+            loras: vec![card_lora("base.safetensors", 1.0)],
+            ..Default::default()
+        };
+        let before = serde_json::to_string(&p).unwrap();
+        let card = CharacterCard {
+            name: "Mia".into(),
+            identity: "silver hair, red eyes, twin braids".into(),
+            triggers: "miachar".into(),
+            negatives: "bad anatomy".into(),
+            loras: vec![card_lora("mia.safetensors", 0.8)],
+            ..Default::default()
+        };
+        let applied = p.apply_character(&card, |f| {
+            if f == "mia.safetensors" {
+                ("mia trigger".into(), "extra fingers".into())
+            } else {
+                (String::new(), String::new())
+            }
+        });
+        assert!(p.positive.contains("silver hair") && p.positive.contains("twin braids"));
+        assert!(p.lora_triggers.contains("miachar") && p.lora_triggers.contains("mia trigger"));
+        assert!(p.negative.contains("bad anatomy") && p.negative.contains("extra fingers"));
+        assert_eq!(p.loras.len(), 2);
+        p.remove_character(&applied);
+        assert_eq!(serde_json::to_string(&p).unwrap(), before, "remove must restore Params exactly");
+    }
+
+    #[test]
+    fn applying_a_character_does_not_duplicate_present_tokens_or_loras() {
+        let mut p = Params {
+            positive: "silver hair, a girl".into(),
+            lora_triggers: String::new(),
+            loras: vec![card_lora("mia.safetensors", 1.0)],
+            ..Default::default()
+        };
+        let before = serde_json::to_string(&p).unwrap();
+        let card = CharacterCard {
+            name: "Mia".into(),
+            identity: "silver hair, red eyes".into(),
+            loras: vec![card_lora("mia.safetensors", 0.5)],
+            ..Default::default()
+        };
+        let applied = p.apply_character(&card, |_| (String::new(), String::new()));
+        // "silver hair" was already there; only "red eyes" is added, and the pre-existing LoRA is
+        // left untouched (its strength is not overwritten, and it is not in the undo set).
+        assert_eq!(p.positive, "silver hair, a girl, red eyes");
+        assert_eq!(p.loras.len(), 1);
+        assert!((p.loras[0].strength_model - 1.0).abs() < 1e-6);
+        assert!(applied.loras.is_empty());
+        p.remove_character(&applied);
+        assert_eq!(serde_json::to_string(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn character_tags_drop_quality_boilerplate() {
+        let prompt =
+            "masterpiece, best quality, 1girl, silver hair, red eyes, absurdres, score_9, watermark";
+        assert_eq!(character_tags_from_prompt(prompt), "1girl, silver hair, red eyes");
     }
 
     #[test]
