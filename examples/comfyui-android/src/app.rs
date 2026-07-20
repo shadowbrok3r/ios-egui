@@ -197,6 +197,32 @@ struct Viewer {
     meta_loading: bool,
 }
 
+/// A grade-pass swipe session over a burst's recent results.
+struct Triage {
+    /// Gallery keys in deck order (aesthetic score descending when scored, else newest first).
+    deck: Vec<String>,
+    /// Index of the current undecided card.
+    pos: usize,
+    kept: usize,
+    trashed: usize,
+    /// Keys swiped right, batch album-added on commit.
+    keep: Vec<String>,
+    /// Keys swiped left, batch soft-deleted on commit.
+    trash: Vec<String>,
+    /// Album kept cards join on commit; `None` leaves them in the gallery only.
+    album: Option<i64>,
+    /// Last recorded decision, for one-step Undo.
+    last: Option<TriagePick>,
+}
+
+/// A triage card outcome: swipe right keeps, left trashes, up reuses as img2img input.
+#[derive(Clone, Copy)]
+enum TriagePick {
+    Keep,
+    Trash,
+    Input,
+}
+
 /// Which remix fields an apply should write. All-true reproduces the one-tap Remix.
 #[derive(Clone, Copy)]
 struct RemixApply {
@@ -697,6 +723,18 @@ struct ComfyApp {
     filmstrip_center: bool,
     /// Press origin for a viewer left/right swipe (egui clears `press_origin` on release).
     viewer_swipe_origin: Option<egui::Pos2>,
+    /// Active grade-pass triage deck over recent results; `None` when not triaging.
+    triage: Option<Triage>,
+    /// Press origin for a triage card swipe (left/right/up).
+    triage_swipe_origin: Option<egui::Pos2>,
+    /// Gallery keys before the post-burst refresh, to diff out genuinely new results.
+    pre_burst_keys: HashSet<String>,
+    /// Result image count captured at burst end, consumed when the post-burst listing lands.
+    pending_triage_n: usize,
+    /// Remaining attempts to collect `untriaged` from an incoming offset-0 gallery listing.
+    triage_collect: u8,
+    /// Keys of recent burst results not yet triaged; drives the Triage entry chips.
+    untriaged: Vec<String>,
     /// Re-fetch the gallery listing at this time (server indexing lag after generate).
     gallery_refresh_at: Option<f64>,
     /// Create-tab menu FAB position; `None` = default under the queue FAB.
@@ -1090,6 +1128,12 @@ impl ComfyApp {
             thumb_aspects: HashMap::new(),
             filmstrip_center: false,
             viewer_swipe_origin: None,
+            triage: None,
+            triage_swipe_origin: None,
+            pre_burst_keys: HashSet::new(),
+            pending_triage_n: 0,
+            triage_collect: 0,
+            untriaged: Vec::new(),
             gallery_refresh_at: None,
             create_fab_pos: None,
             create_fab_open: false,
@@ -1747,6 +1791,10 @@ impl ComfyApp {
                     host.notify("ComfyUI", "Generation finished");
                     // New outputs should show up without a manual refresh (retry once for index lag).
                     if matches!(self.conn, Conn::Connected) {
+                        // Snapshot the pre-refresh listing to diff out the post-burst results.
+                        self.pre_burst_keys = self.gallery.iter().map(|it| it.key()).collect();
+                        self.pending_triage_n = self.results.len();
+                        self.triage_collect = 2;
                         self.refresh_gallery();
                         self.gallery_refresh_at = Some(ctx.input(|i| i.time) + 2.0);
                     }
@@ -1842,6 +1890,13 @@ impl ComfyApp {
                     self.gallery = page.items;
                 } else {
                     self.gallery.extend(page.items);
+                }
+                if self.triage_collect > 0 && page.offset == 0 {
+                    self.triage_collect -= 1;
+                    self.collect_untriaged();
+                    if !self.untriaged.is_empty() {
+                        self.triage_collect = 0;
+                    }
                 }
                 self.gallery_status.clear();
                 // With a model filter, album, or grouping active, the whole set has to be present
@@ -8385,6 +8440,18 @@ impl ComfyApp {
             ui.label(elide(&self.status, 300));
         }
 
+        // After a multi-job burst, offer a grade-pass over the fresh results.
+        if !self.running && self.untriaged.len() >= 2 {
+            ui.add_space(4.0);
+            if ui
+                .button(format!("{} Triage {} new results", icons::STAR, self.untriaged.len()))
+                .on_hover_text("Swipe through this batch: keep, trash, or reuse as input")
+                .clicked()
+            {
+                self.open_triage(host);
+            }
+        }
+
         // Pinned rather than transient: a skipped upscale must outlive the status line.
         if !self.enhance_note.is_empty() {
             ui.add_space(4.0);
@@ -10668,6 +10735,10 @@ impl ComfyApp {
         // A finished WD14 read floats over the gallery, viewer open or not.
         #[cfg(feature = "local-npu")]
         self.wd14_sheet_window(ui.ctx(), host);
+        if self.triage.is_some() {
+            self.triage_view(ui, host);
+            return;
+        }
         if self.viewer.is_some() {
             self.gallery_viewer(ui, host);
             self.remix_sheet_window(ui.ctx(), host);
@@ -10687,8 +10758,18 @@ impl ComfyApp {
             self.exit_select_mode();
         }
 
+        let mut open_triage = false;
         ui.horizontal(|ui| {
             ui.strong(format!("{} Gallery", icons::GALLERY));
+            if self.untriaged.len() >= 2 {
+                if ui
+                    .button(format!("{} Triage ({})", icons::STAR, self.untriaged.len()))
+                    .on_hover_text("Grade-pass the recent results — swipe to keep, trash, or reuse")
+                    .clicked()
+                {
+                    open_triage = true;
+                }
+            }
             if let Some(name) = self
                 .gallery_view
                 .album
@@ -10721,6 +10802,12 @@ impl ComfyApp {
                 ui.weak(format!("Auto-tag {done}/{listed}"));
             }
         });
+        if open_triage {
+            self.open_triage(host);
+            if self.triage.is_some() {
+                return;
+            }
+        }
         if !self.gallery_status.is_empty() {
             ui.colored_label(
                 egui::Color32::from_rgb(230, 160, 120),
@@ -11630,6 +11717,395 @@ impl ComfyApp {
             self.viewer_swipe_origin = None;
         }
         None
+    }
+
+    /// Recompute untriaged keys: still images new since the pre-burst snapshot, else the N newest.
+    fn collect_untriaged(&mut self) {
+        let n = self.pending_triage_n;
+        let prev = std::mem::take(&mut self.pre_burst_keys);
+        if prev.is_empty() && n == 0 {
+            self.untriaged.clear();
+            return;
+        }
+        let mut cand: Vec<usize> = (0..self.gallery.len())
+            .filter(|&i| !self.gallery[i].is_video)
+            .filter(|&i| prev.is_empty() || !prev.contains(&self.gallery[i].key()))
+            .collect();
+        cand.sort_by(|&a, &b| {
+            self.gallery[b].mtime.unwrap_or(0.0).total_cmp(&self.gallery[a].mtime.unwrap_or(0.0))
+        });
+        if n > 0 {
+            cand.truncate(n);
+        }
+        self.untriaged = cand.into_iter().map(|i| self.gallery[i].key()).collect();
+    }
+
+    /// Deck order: aesthetic score descending when any card is scored, else newest first.
+    fn triage_deck_order(&self, keys: &[String]) -> Vec<String> {
+        let scored = keys.iter().any(|k| self.clip_index.score(k).is_some());
+        let mtime: HashMap<String, f64> =
+            self.gallery.iter().map(|it| (it.key(), it.mtime.unwrap_or(0.0))).collect();
+        let mut order = keys.to_vec();
+        order.sort_by(|a, b| {
+            if scored {
+                match (self.clip_index.score(a), self.clip_index.score(b)) {
+                    (Some(x), Some(y)) => y.total_cmp(&x),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                }
+            } else {
+                let ma = mtime.get(a).copied().unwrap_or(0.0);
+                let mb = mtime.get(b).copied().unwrap_or(0.0);
+                mb.total_cmp(&ma)
+            }
+        });
+        order
+    }
+
+    /// Enter the grade-pass triage overlay over the current untriaged results.
+    fn open_triage(&mut self, host: &Host) {
+        let present: HashSet<String> =
+            self.gallery.iter().filter(|it| !it.is_video).map(|it| it.key()).collect();
+        self.untriaged.retain(|k| present.contains(k));
+        if self.untriaged.is_empty() {
+            return;
+        }
+        let deck = self.triage_deck_order(&self.untriaged);
+        self.tab = Tab::Gallery;
+        self.viewer = None;
+        self.triage_swipe_origin = None;
+        self.triage = Some(Triage {
+            deck,
+            pos: 0,
+            kept: 0,
+            trashed: 0,
+            keep: Vec::new(),
+            trash: Vec::new(),
+            album: None,
+            last: None,
+        });
+        host.haptic(Haptic::Light);
+    }
+
+    /// Map gallery keys to `(subfolder, filename)` pairs for engine calls.
+    fn items_for_keys(&self, keys: &[String]) -> Vec<(String, String)> {
+        let by_key: HashMap<String, &GalleryItem> =
+            self.gallery.iter().map(|it| (it.key(), it)).collect();
+        keys.iter()
+            .filter_map(|k| by_key.get(k).map(|it| (it.subfolder.clone(), it.filename.clone())))
+            .collect()
+    }
+
+    /// Flush the batched decisions: soft-delete left-swipes, album-add kept, drop decided keys.
+    fn commit_triage(&mut self, host: &Host) {
+        let Some(t) = self.triage.take() else { return };
+        self.triage_swipe_origin = None;
+        let decided: HashSet<String> = t.deck[..t.pos.min(t.deck.len())].iter().cloned().collect();
+        self.untriaged.retain(|k| !decided.contains(k));
+        if let Some(id) = t.album {
+            let items = self.items_for_keys(&t.keep);
+            if !items.is_empty() {
+                self.engine.as_ref().unwrap().album_add(id, items);
+            }
+        }
+        if !t.trash.is_empty() {
+            let items = self.items_for_keys(&t.trash);
+            if !items.is_empty() {
+                let n = items.len();
+                self.engine.as_ref().unwrap().delete_images(items);
+                self.gallery_status = format!("Triage: moved {n} to trash");
+                host.haptic(Haptic::Warning);
+            }
+        }
+    }
+
+    /// Record a card decision and advance; swipe-up loads the image as input and closes the deck.
+    fn triage_pick(&mut self, pick: TriagePick, host: &Host) {
+        let key = {
+            let Some(t) = self.triage.as_mut() else { return };
+            let Some(key) = t.deck.get(t.pos).cloned() else { return };
+            match pick {
+                TriagePick::Keep => {
+                    t.keep.push(key.clone());
+                    t.kept += 1;
+                }
+                TriagePick::Trash => {
+                    t.trash.push(key.clone());
+                    t.trashed += 1;
+                }
+                TriagePick::Input => {}
+            }
+            t.pos += 1;
+            t.last = Some(pick);
+            key
+        };
+        match pick {
+            TriagePick::Keep => host.haptic(Haptic::Light),
+            TriagePick::Trash => host.haptic(Haptic::Warning),
+            TriagePick::Input => {
+                self.use_key_as_input(&key, host);
+                self.commit_triage(host);
+                host.haptic(Haptic::Medium);
+            }
+        }
+    }
+
+    /// Revert the last keep/trash decision, stepping the deck back one card.
+    fn undo_triage(&mut self, host: &Host) {
+        let Some(t) = self.triage.as_mut() else { return };
+        let Some(last) = t.last.take() else { return };
+        if t.pos == 0 {
+            return;
+        }
+        t.pos -= 1;
+        match last {
+            TriagePick::Keep => {
+                t.keep.pop();
+                t.kept = t.kept.saturating_sub(1);
+            }
+            TriagePick::Trash => {
+                t.trash.pop();
+                t.trashed = t.trashed.saturating_sub(1);
+            }
+            TriagePick::Input => {}
+        }
+        host.haptic(Haptic::Light);
+    }
+
+    /// Fetch a gallery image's full bytes as the img2img input and jump to Create.
+    fn use_key_as_input(&mut self, key: &str, host: &Host) {
+        let Some(item) = self.gallery.iter().find(|it| it.key() == key).cloned() else { return };
+        let cache_dir = host.documents_dir();
+        self.gallery_pick_pending = Some((item.key(), item.filename.clone()));
+        self.engine.as_ref().unwrap().fetch_full(item.subfolder, item.filename, cache_dir);
+        self.params.mode = Mode::Img2Img;
+        self.tab = Tab::Generate;
+        self.note = "Gallery image set as img2img input".into();
+    }
+
+    /// Card swipe over `rect`: right keeps, left trashes, up reuses; small/downward drags ignored.
+    fn triage_swipe(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Option<TriagePick> {
+        let (pressed, released, down, pos) = ui.input(|i| {
+            (
+                i.pointer.any_pressed(),
+                i.pointer.any_released(),
+                i.pointer.any_down(),
+                i.pointer.latest_pos().or(i.pointer.interact_pos()),
+            )
+        });
+        if pressed {
+            self.triage_swipe_origin = pos.filter(|p| rect.contains(*p));
+        }
+        if released {
+            let origin = self.triage_swipe_origin.take()?;
+            let pos = pos?;
+            let d = pos - origin;
+            let (ax, ay) = (d.x.abs(), d.y.abs());
+            if ax < 56.0 && ay < 56.0 {
+                return None;
+            }
+            if ax > ay {
+                return Some(if d.x > 0.0 { TriagePick::Keep } else { TriagePick::Trash });
+            }
+            if d.y < 0.0 {
+                return Some(TriagePick::Input);
+            }
+            return None;
+        }
+        if !down {
+            self.triage_swipe_origin = None;
+        }
+        None
+    }
+
+    /// Fullscreen grade-pass deck: swipe/tap to keep, trash, or reuse; batch committed on exit.
+    fn triage_view(&mut self, ui: &mut egui::Ui, host: &Host) {
+        if ui.ctx().input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+        }) {
+            self.commit_triage(host);
+            return;
+        }
+        enum TA {
+            Pick(TriagePick),
+            Undo,
+            SetAlbum(Option<i64>),
+            Skip,
+            Done,
+        }
+        let mut act: Option<TA> = None;
+        let (total, pos, kept, trashed, album, cur_key) = {
+            let t = self.triage.as_ref().unwrap();
+            (t.deck.len(), t.pos, t.kept, t.trashed, t.album, t.deck.get(t.pos).cloned())
+        };
+        let left = total.saturating_sub(pos);
+
+        ui.horizontal(|ui| {
+            ui.strong(format!("{} Grade pass", icons::STAR));
+            ui.separator();
+            if pos < total {
+                ui.weak(format!("{}/{}", pos + 1, total));
+                if let Some(k) = &cur_key {
+                    if let Some(s) = self.clip_index.score(k) {
+                        ui.weak(format!("· score {s:.2}"));
+                    }
+                }
+                ui.separator();
+            }
+            ui.weak(format!("Kept {kept} · Trashed {trashed} · {left} left"));
+        });
+        ui.separator();
+
+        let can_undo = pos > 0;
+        egui::Panel::bottom("triage-actions").show(ui, |ui| {
+            const BTN_H: f32 = 40.0;
+            const GAP: f32 = 4.0;
+            ui.add_space(2.0);
+            if cur_key.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let w = ((ui.available_width() - GAP * 3.0) / 4.0).max(40.0);
+                    let size = egui::vec2(w, BTN_H);
+                    if ui
+                        .add_sized(size, egui::Button::new(format!("{} Trash", icons::TRASH)))
+                        .on_hover_text("Swipe left")
+                        .clicked()
+                    {
+                        act = Some(TA::Pick(TriagePick::Trash));
+                    }
+                    if ui
+                        .add_sized(size, egui::Button::new(format!("{} Input", icons::IMAGE)))
+                        .on_hover_text("Swipe up — use as img2img input")
+                        .clicked()
+                    {
+                        act = Some(TA::Pick(TriagePick::Input));
+                    }
+                    if ui
+                        .add_enabled(can_undo, egui::Button::new(icons::UNDO).min_size(size))
+                        .on_hover_text("Undo last")
+                        .clicked()
+                    {
+                        act = Some(TA::Undo);
+                    }
+                    if ui
+                        .add_sized(size, egui::Button::new(format!("{} Keep", icons::CHECK)))
+                        .on_hover_text("Swipe right")
+                        .clicked()
+                    {
+                        act = Some(TA::Pick(TriagePick::Keep));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.weak(format!("{} Keep to", icons::ALBUM));
+                    let label = album
+                        .and_then(|id| self.albums.iter().find(|a| a.id == id))
+                        .map(|a| elide(&a.name, 20))
+                        .unwrap_or_else(|| "gallery only".into());
+                    up_menu(ui, label, |ui| {
+                        if ui.selectable_label(album.is_none(), "Gallery only").clicked() {
+                            act = Some(TA::SetAlbum(None));
+                            ui.close();
+                        }
+                        for a in &self.albums {
+                            if ui.selectable_label(album == Some(a.id), elide(&a.name, 28)).clicked() {
+                                act = Some(TA::SetAlbum(Some(a.id)));
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let w = ((ui.available_width() - GAP) / 2.0).max(40.0);
+                    let size = egui::vec2(w, BTN_H);
+                    if ui
+                        .add_enabled(
+                            can_undo,
+                            egui::Button::new(format!("{} Undo", icons::UNDO)).min_size(size),
+                        )
+                        .clicked()
+                    {
+                        act = Some(TA::Undo);
+                    }
+                    if ui
+                        .add_sized(size, egui::Button::new(format!("{} Done", icons::CHECK)))
+                        .clicked()
+                    {
+                        act = Some(TA::Done);
+                    }
+                });
+            }
+            ui.add_space(2.0);
+        });
+
+        if let Some(key) = cur_key.clone() {
+            match self.gallery.iter().find(|it| it.key() == key).cloned() {
+                Some(item) => {
+                    let size = 1024u32;
+                    let thumb_key = item.thumb_key(size);
+                    let rect = ui.available_rect_before_wrap();
+                    match self.thumbs.get(&thumb_key) {
+                        Some(tex) => {
+                            let sized = egui::load::SizedTexture::from_handle(tex);
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(
+                                        egui::Image::new(sized)
+                                            .max_size(rect.size())
+                                            .maintain_aspect_ratio(true),
+                                    );
+                                });
+                            });
+                        }
+                        None => {
+                            if self.thumbs.claim(&thumb_key) {
+                                self.engine.as_ref().unwrap().fetch_thumb(
+                                    item.subfolder.clone(),
+                                    item.filename.clone(),
+                                    size,
+                                );
+                            }
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                                ui.centered_and_justified(|ui| ui.spinner());
+                            });
+                        }
+                    }
+                    if act.is_none()
+                        && let Some(pick) = self.triage_swipe(ui, rect)
+                    {
+                        act = Some(TA::Pick(pick));
+                    }
+                }
+                None => act = Some(TA::Skip),
+            }
+        } else {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(format!("All {total} triaged — kept {kept}, trashed {trashed}."));
+                ui.weak("Trashed images go to the server trash on Done.");
+            });
+        }
+
+        match act {
+            Some(TA::Pick(p)) => self.triage_pick(p, host),
+            Some(TA::Undo) => self.undo_triage(host),
+            Some(TA::SetAlbum(a)) => {
+                if let Some(t) = &mut self.triage {
+                    t.album = a;
+                }
+            }
+            Some(TA::Skip) => {
+                if let Some(t) = &mut self.triage {
+                    t.pos += 1;
+                    t.last = None;
+                }
+            }
+            Some(TA::Done) => self.commit_triage(host),
+            None => {}
+        }
     }
 
     fn gallery_viewer(&mut self, ui: &mut egui::Ui, host: &Host) {
