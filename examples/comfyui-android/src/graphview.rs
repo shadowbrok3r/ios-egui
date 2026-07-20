@@ -249,10 +249,10 @@ impl GraphView {
     /// once `final_node_rect` has filled real sizes.
     pub fn arrange_on_load(&mut self, snarl: &mut Snarl<FlowNodeData>) {
         log::info!("graphview: auto-arrange on load ({} nodes)", snarl.nodes_pos_ids().count());
-        self.needs_auto_arrange = false;
-        self.arrange_now(snarl);
-        self.arrange_queued = true;
-        self.arrange_wait = 0;
+        // Exactly what the manual Auto-arrange button does: fit, wait for measured sizes, then
+        // arrange. A nominal-size pre-arrange here spread nodes so wide that off-screen ones
+        // never got measured and the refine settled on placeholder sizes.
+        self.request_arrange();
     }
 
     /// Center the view on a node position (graph space).
