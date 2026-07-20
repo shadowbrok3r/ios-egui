@@ -1,0 +1,14 @@
+[package]
+name = "local-clip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "On-device CLIP ViT-B/32 image embeddings + LAION aesthetic score: pure preprocessing (RGB NCHW normalize) and vector math (L2/cosine/linear head) host-testable; the visual tower runs on the Qualcomm HTP via qnn-rs."
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+log = { workspace = true }
+memmap2 = "0.9"
+qnn-rs = { path = "../qnn-rs" }
+thiserror = "2.0.19"

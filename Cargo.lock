@@ -3863,6 +3863,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "local-clip"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "log",
+ "memmap2",
+ "qnn-rs",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "local-sd"
 version = "0.1.0"
 dependencies = [
