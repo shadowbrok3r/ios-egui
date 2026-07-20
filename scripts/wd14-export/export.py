@@ -241,11 +241,16 @@ def main() -> None:
     if stage_ge("convert", args.from_stage):
         # DLC route: no host model-lib compile, and it works on SDK extractions without share/QNN.
         conv = sdk_tool(sdk, "qairt-converter")
-        conv_args = ["--input_network", str(onnx_static), "--output_path", str(model_dlc), "--float_bitwidth", "16"]
+        conv_args = ["--input_network", str(onnx_static), "--output_path", str(model_dlc),
+                     "--float_bitwidth", "16"]
         if args.fp32_activations:
+            # fp32 activations make the graph IO fp32 by themselves (the local-wd14 contract).
             ov = work / "fp32_overrides.json"
             write_fp32_overrides(onnx_static, ov)
             conv_args += ["--quantization_overrides", str(ov)]
+        else:
+            # Keep IO fp32 while internals stay fp16; combining this with the overrides segfaults.
+            conv_args += ["--preserve_io_datatype"]
         run_py_tool(args.python, conv, conv_args, sdk)
         if not model_dlc.exists():
             die(f"converter did not write {model_dlc}")

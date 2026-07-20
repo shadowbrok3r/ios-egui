@@ -88,8 +88,6 @@ struct CharacterDraft {
 enum SettingsPane {
     Server,
     Logs,
-    #[cfg(feature = "local-npu")]
-    Diagnostics,
 }
 
 /// Destination for the app picker's selection.
@@ -724,31 +722,19 @@ struct ComfyApp {
     lint_issues: Vec<lint::LintIssue>,
     lint_fp: u64,
 
-    /// D1 NPU self-test worker result, delivered off the render thread.
-    #[cfg(feature = "local-npu")]
-    d1_rx: Option<std::sync::mpsc::Receiver<local_sd::SelftestReport>>,
-    /// A self-test worker is in flight.
-    #[cfg(feature = "local-npu")]
-    d1_running: bool,
-    /// Last self-test diagnostic dump, shown in the Diagnostics pane.
-    #[cfg(feature = "local-npu")]
-    d1_last: Option<String>,
-    /// Last self-test pass/fail.
-    #[cfg(feature = "local-npu")]
-    d1_ok: Option<bool>,
 
-    /// D2 text2img smoke worker result.
-    #[cfg(feature = "local-npu")]
-    d2_rx: Option<std::sync::mpsc::Receiver<local_sd::Text2ImgReport>>,
-    #[cfg(feature = "local-npu")]
-    d2_running: bool,
-    #[cfg(feature = "local-npu")]
-    d2_last: Option<String>,
-    #[cfg(feature = "local-npu")]
-    d2_ok: Option<bool>,
     /// D3 Anima smoke worker result.
     #[cfg(feature = "local-npu")]
     d3_rx: Option<std::sync::mpsc::Receiver<crate::local_engine::AnimaSmoke>>,
+    /// Pack import: URL box, worker channel and last status line.
+    #[cfg(feature = "local-npu")]
+    pack_url: String,
+    #[cfg(feature = "local-npu")]
+    pack_name: String,
+    #[cfg(feature = "local-npu")]
+    pack_import_rx: Option<std::sync::mpsc::Receiver<crate::local_engine::ImportMsg>>,
+    #[cfg(feature = "local-npu")]
+    pack_import_status: String,
     #[cfg(feature = "local-npu")]
     d3_running: bool,
     #[cfg(feature = "local-npu")]
@@ -1039,23 +1025,15 @@ impl ComfyApp {
             lint_issues: Vec::new(),
             lint_fp: 0,
             #[cfg(feature = "local-npu")]
-            d1_rx: None,
-            #[cfg(feature = "local-npu")]
-            d1_running: false,
-            #[cfg(feature = "local-npu")]
-            d1_last: None,
-            #[cfg(feature = "local-npu")]
-            d1_ok: None,
-            #[cfg(feature = "local-npu")]
-            d2_rx: None,
-            #[cfg(feature = "local-npu")]
-            d2_running: false,
-            #[cfg(feature = "local-npu")]
-            d2_last: None,
-            #[cfg(feature = "local-npu")]
-            d2_ok: None,
-            #[cfg(feature = "local-npu")]
             d3_rx: None,
+            #[cfg(feature = "local-npu")]
+            pack_url: String::new(),
+            #[cfg(feature = "local-npu")]
+            pack_name: String::new(),
+            #[cfg(feature = "local-npu")]
+            pack_import_rx: None,
+            #[cfg(feature = "local-npu")]
+            pack_import_status: String::new(),
             #[cfg(feature = "local-npu")]
             d3_running: false,
             #[cfg(feature = "local-npu")]
@@ -3079,15 +3057,11 @@ impl ComfyApp {
                 SettingsPane::Logs,
                 format!("{} Logs", icons::LOGS),
             );
-            #[cfg(feature = "local-npu")]
-            ui.selectable_value(&mut self.settings_pane, SettingsPane::Diagnostics, "Diagnostics");
         });
         ui.separator();
         match self.settings_pane {
             SettingsPane::Server => self.settings_server_pane(ui, host),
             SettingsPane::Logs => self.logs_tab(ui, host),
-            #[cfg(feature = "local-npu")]
-            SettingsPane::Diagnostics => self.diagnostics_pane(ui, host),
         }
     }
 
@@ -3218,51 +3192,7 @@ impl ComfyApp {
                          Anima packs are 1024² and carry an ANIMA marker file.",
                     );
                     ui.add_space(6.0);
-                    ui.horizontal(|ui| {
-                        ui.label("Model pack");
-                        if ui.small_button(icons::REFRESH).clicked() {
-                            self.ensure_local_packs(host, true);
-                        }
-                    });
-                    if self.local_packs.is_empty() {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(230, 180, 120),
-                            "No packs found under the app files dir.",
-                        );
-                    }
-                    let current = self
-                        .selected_pack()
-                        .map(|p| p.label())
-                        .unwrap_or_else(|| "none".to_string());
-                    let mut pick: Option<(String, LocalBackend)> = None;
-                    egui::ComboBox::from_id_salt("local_pack")
-                        .width(ui.available_width())
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for p in &self.local_packs {
-                                if ui.selectable_label(p.name == self.local_pack, p.label()).clicked() {
-                                    pick = Some((p.name.clone(), p.backend));
-                                }
-                            }
-                        });
-                    if let Some((name, backend)) = pick
-                        && (name != self.local_pack || backend != self.local_backend)
-                    {
-                        self.local_pack = name;
-                        self.local_backend = backend;
-                        crate::local_engine::drop_cache();
-                        self.log.info(format!(
-                            "local-npu: pack -> {} ({}), asset caches dropped",
-                            self.local_pack,
-                            self.local_backend.label()
-                        ));
-                    }
-                    if let Some(p) = self.selected_pack() {
-                        ui.weak(elide(&p.dir.display().to_string(), 70));
-                    }
-                    if self.local_backend == LocalBackend::Anima {
-                        ui.weak("Anima: 1024² txt2img, euler (flow match), no img2img yet.");
-                    }
+                    ui.weak("Pick the on-device model, test it, or import a pack in Create -> Models.");
                     ui.add_space(4.0);
                     if ui.button("Unload NPU cache").clicked() {
                         crate::local_engine::drop_cache();
@@ -3371,23 +3301,41 @@ impl ComfyApp {
                 if lora_n > 0 { format!("LoRAs ({lora_n})") } else { "LoRAs".into() },
             );
             let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
-            ui.selectable_value(
-                &mut self.create_pane,
-                CreatePane::Enhance,
-                if app_n > 0 { format!("Enhance ({app_n})") } else { "Enhance".into() },
-            );
+            let enhance = if app_n > 0 {
+                format!("{}{app_n}", icons::GENERATE)
+            } else {
+                icons::GENERATE.into()
+            };
+            ui.selectable_value(&mut self.create_pane, CreatePane::Enhance, enhance)
+                .on_hover_text(if app_n > 0 {
+                    format!("Enhance ({app_n})")
+                } else {
+                    "Enhance".into()
+                });
             let preset_n = self.presets.len();
-            ui.selectable_value(
-                &mut self.create_pane,
-                CreatePane::Presets,
-                if preset_n > 0 { format!("Presets ({preset_n})") } else { "Presets".into() },
-            );
+            let presets = if preset_n > 0 {
+                format!("{}{preset_n}", icons::SAVE)
+            } else {
+                icons::SAVE.into()
+            };
+            ui.selectable_value(&mut self.create_pane, CreatePane::Presets, presets)
+                .on_hover_text(if preset_n > 0 {
+                    format!("Presets ({preset_n})")
+                } else {
+                    "Presets".into()
+                });
             let char_n = self.characters.len();
-            ui.selectable_value(
-                &mut self.create_pane,
-                CreatePane::Characters,
-                if char_n > 0 { format!("Characters ({char_n})") } else { "Characters".into() },
-            );
+            let characters = if char_n > 0 {
+                format!("{}{char_n}", icons::USER)
+            } else {
+                icons::USER.into()
+            };
+            ui.selectable_value(&mut self.create_pane, CreatePane::Characters, characters)
+                .on_hover_text(if char_n > 0 {
+                    format!("Characters ({char_n})")
+                } else {
+                    "Characters".into()
+                });
         });
         if self.create_pane == CreatePane::Models && prev != CreatePane::Models {
             self.checkpoints_force_collapse = true;
@@ -3400,7 +3348,7 @@ impl ComfyApp {
         ui.spacing_mut().interact_size.y = 20.0;
         match self.create_pane {
             CreatePane::Main => self.create_main_pane(ui, host),
-            CreatePane::Models => self.create_models_pane(ui),
+            CreatePane::Models => self.create_models_pane(ui, host),
             CreatePane::Loras => self.create_loras_pane(ui),
             CreatePane::Enhance => self.create_enhance_pane(ui),
             CreatePane::Presets => self.create_presets_pane(ui, host),
@@ -4472,7 +4420,190 @@ impl ComfyApp {
         });
     }
 
-    fn create_models_pane(&mut self, ui: &mut egui::Ui) {
+    /// Import a pack by URL: download the zip and unpack it into the app files dir.
+    #[cfg(feature = "local-npu")]
+    fn local_import_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
+        self.poll_pack_import(host);
+        let busy = self.pack_import_rx.is_some();
+        ui.add_space(6.0);
+        ui.collapsing("Import a pack", |ui| {
+            ui.weak("Paste a direct .zip link (e.g. a HuggingFace resolve URL). Files land in the app files dir and appear above.");
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pack_name)
+                        .desired_width(140.0)
+                        .hint_text("folder name"),
+                );
+            });
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pack_url)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("https://.../pack.zip"),
+            );
+            let name_ok = !self.pack_name.trim().is_empty()
+                && !self.pack_name.contains('/')
+                && !self.pack_name.starts_with('.');
+            let ready = !busy && name_ok && self.pack_url.trim().starts_with("http");
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(ready, egui::Button::new("Download and install")).clicked() {
+                    self.start_pack_import(ui.ctx(), host);
+                }
+                if busy {
+                    ui.spinner();
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(300));
+                }
+            });
+            if !self.pack_import_status.is_empty() {
+                let st = self.pack_import_status.clone();
+                ui.weak(sanitize_ui_text(ui, &st));
+            }
+        });
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn local_import_ui(&mut self, _ui: &mut egui::Ui, _host: &Host) {}
+
+    #[cfg(feature = "local-npu")]
+    fn start_pack_import(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(root) = self.external_files_dir(host) else {
+            self.pack_import_status = "app files dir unavailable".into();
+            return;
+        };
+        let name = self.pack_name.trim().to_string();
+        let url = self.pack_url.trim().to_string();
+        self.pack_import_status = "starting...".into();
+        self.log.info(format!("local-npu: importing pack '{name}' from {url}"));
+        self.pack_import_rx = Some(crate::local_engine::spawn_import(
+            url,
+            std::path::PathBuf::from(root),
+            name,
+            ctx.clone(),
+        ));
+    }
+
+    #[cfg(feature = "local-npu")]
+    fn poll_pack_import(&mut self, host: &Host) {
+        let Some(rx) = self.pack_import_rx.as_ref() else { return };
+        let mut done = false;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                crate::local_engine::ImportMsg::Progress(s) => self.pack_import_status = s,
+                crate::local_engine::ImportMsg::Done(r) => {
+                    done = true;
+                    match r {
+                        Ok(s) => {
+                            self.pack_import_status = s.clone();
+                            self.log.info(format!("local-npu: {s}"));
+                        }
+                        Err(e) => {
+                            self.pack_import_status = format!("failed: {e}");
+                            self.log.error(format!("local-npu: import failed: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        if done {
+            self.pack_import_rx = None;
+            self.ensure_local_packs(host, true);
+        }
+    }
+
+    /// On-device model list: packs installed in the app files dir, plus test and import.
+    #[cfg(feature = "local-npu")]
+    fn local_models_section(&mut self, ui: &mut egui::Ui, host: &Host) {
+        if !self.local_npu {
+            return;
+        }
+        self.ensure_local_packs(host, false);
+        let warn = egui::Color32::from_rgb(230, 180, 120);
+        let packs = self.local_packs.clone();
+        let mut pick: Option<(String, LocalBackend)> = None;
+        let mut rescan = false;
+        let mut test: Option<std::path::PathBuf> = None;
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong("On this phone");
+                if ui.small_button(icons::REFRESH).on_hover_text("Rescan the app files dir").clicked() {
+                    rescan = true;
+                }
+            });
+            ui.weak("These run on the NPU. The pack supplies the model, so the server list below is unused.");
+            ui.add_space(4.0);
+            if packs.is_empty() {
+                ui.colored_label(warn, "No packs installed yet - import one below.");
+            }
+            for p in &packs {
+                let on = p.name == self.local_pack && p.backend == self.local_backend;
+                let label = if on {
+                    format!("{} {}", icons::CHECK, p.label())
+                } else {
+                    format!("     {}", p.label())
+                };
+                if ui.selectable_label(on, sanitize_ui_text(ui, &label)).clicked() {
+                    pick = Some((p.name.clone(), p.backend));
+                }
+            }
+            if let Some(sel) = self.selected_pack().cloned() {
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let can_test = sel.backend == LocalBackend::Anima && !self.d3_running;
+                    if ui
+                        .add_enabled(can_test, egui::Button::new(format!("{} Test pack", icons::RUN)))
+                        .on_hover_text("Two-step render to prove this pack loads and produces an image")
+                        .clicked()
+                    {
+                        test = Some(sel.dir.clone());
+                    }
+                    if self.d3_running {
+                        ui.spinner();
+                        ui.weak("testing...");
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                    if let Some(ok) = self.d3_ok {
+                        let (c, t) = if ok {
+                            (egui::Color32::from_rgb(120, 220, 140), "pack OK")
+                        } else {
+                            (egui::Color32::from_rgb(230, 120, 120), "pack FAILED")
+                        };
+                        ui.colored_label(c, t);
+                    }
+                });
+                ui.weak(sanitize_ui_text(ui, &elide(&sel.dir.display().to_string(), 64)));
+            }
+        });
+        self.local_import_ui(ui, host);
+        ui.add_space(6.0);
+        ui.weak("Server models (not used while Local NPU is on)");
+        ui.add_space(2.0);
+        if rescan {
+            self.ensure_local_packs(host, true);
+        }
+        if let Some((name, backend)) = pick
+            && (name != self.local_pack || backend != self.local_backend)
+        {
+            self.local_pack = name;
+            self.local_backend = backend;
+            crate::local_engine::drop_cache();
+            self.log.info(format!(
+                "local-npu: pack -> {} ({}), asset caches dropped",
+                self.local_pack,
+                self.local_backend.label()
+            ));
+        }
+        if let Some(dir) = test
+            && let Some(lib) = host.native_lib_dir()
+        {
+            self.start_d3_anima(ui.ctx(), lib, dir);
+        }
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn local_models_section(&mut self, _ui: &mut egui::Ui, _host: &Host) {}
+
+    fn create_models_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        self.local_models_section(ui, host);
         let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
         ui.set_max_width(list_w);
 
@@ -6018,7 +6149,7 @@ impl ComfyApp {
         };
         let mut open = true;
         let mut pick: Option<String> = None;
-        centered(egui::Window::new(title).open(&mut open)).show(ctx, |ui| {
+        centered(ctx, egui::Window::new(title).open(&mut open)).show(ctx, |ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.app_filter)
                     .hint_text("filter")
@@ -6378,7 +6509,7 @@ impl ComfyApp {
         let mut open = true;
         let mut save = false;
         let mut draft = self.publish.take().unwrap();
-        centered(egui::Window::new("Save tab as app").open(&mut open)).show(ctx, |ui| {
+        centered(ctx, egui::Window::new("Save tab as app").open(&mut open)).show(ctx, |ui| {
             ui.label("Name");
             ui.add(
                 egui::TextEdit::singleline(&mut draft.name).desired_width(ui.available_width()),
@@ -6938,7 +7069,7 @@ impl ComfyApp {
         let want_ref = self.schemas.as_ref().is_some_and(|s| s.has_node("easy imageColorMatch"));
         let has_rife = self.schemas.as_ref().is_some_and(|s| s.has_node("RIFE VFI"));
         let mut open_picker = false;
-        centered(egui::Window::new(format!("{} Finish pass", icons::GENERATE)))
+        centered(ctx, egui::Window::new(format!("{} Finish pass", icons::GENERATE)))
             .collapsible(false)
             .open(&mut open)
             .default_width(360.0)
@@ -7112,31 +7243,45 @@ impl ComfyApp {
         let mut seeds = sheet.seeds;
         let has_input = !matches!(sheet.input, RemixInput::None);
         let rows = &sheet.rows;
-        let max_h = (ctx.content_rect().height() * 0.5).clamp(160.0, 360.0);
-        centered(egui::Window::new(format!("{} Remix", icons::GENERATE)))
+        // The window never exceeds 70% of the app height and never the viewport width;
+        // the row list scrolls inside whatever the chrome leaves.
+        let max_win_h = ctx.content_rect().height() * 0.70;
+        let max_h = (max_win_h - 190.0).max(96.0);
+        let win_w = (ctx.content_rect().width() - 24.0).clamp(240.0, 380.0);
+        let body_w = win_w - 28.0;
+        centered(ctx, egui::Window::new(format!("{} Remix", icons::GENERATE)))
             .collapsible(false)
             .open(&mut open)
-            .default_width(360.0)
+            .default_width(win_w)
+            .max_width(win_w)
+            .max_height(max_win_h)
             .show(ctx, |ui| {
+                ui.set_max_width(body_w);
                 if rows.is_empty() {
                     ui.weak("These settings already match the current Create tab.");
                 } else {
                     ui.weak("Pick which settings to port into Create.");
                     ui.add_space(4.0);
-                    crate::theme::scroll_vertical().show(ui, |ui| {
-                        ui.set_max_height(max_h);
-                        ui.set_min_width(320.0);
+                    crate::theme::scroll_vertical().max_height(max_h).show(ui, |ui| {
+                        ui.set_max_width(body_w);
                         for (i, row) in rows.iter().enumerate() {
                             let mut on = toggles[i];
                             ui.checkbox(&mut on, row.label);
                             toggles[i] = on;
-                            ui.horizontal(|ui| {
-                                ui.add_space(24.0);
-                                ui.weak(format!(
-                                    "{}  ->  {}",
-                                    elide(&row.current, 44),
-                                    elide(&row.new, 44)
-                                ));
+                            ui.indent(("remix_row", i), |ui| {
+                                ui.set_max_width(body_w - 20.0);
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(elide(&row.current, 120)).weak().small(),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("-> {}", elide(&row.new, 120))).small(),
+                                    )
+                                    .wrap(),
+                                );
                             });
                             ui.add_space(2.0);
                         }
@@ -7239,7 +7384,7 @@ impl ComfyApp {
         let total = running.len() + pending.len();
         let mut close = false;
         let max_h = (ctx.content_rect().height() * 0.5).clamp(160.0, 360.0);
-        centered(egui::Window::new(format!("{} Queue", icons::RUN)))
+        centered(ctx, egui::Window::new(format!("{} Queue", icons::RUN)))
             .collapsible(false)
             .open(&mut open)
             .default_width(360.0)
@@ -8838,7 +8983,7 @@ impl ComfyApp {
         let mut open = true;
         let mut submit = false;
         let active_name = self.active_doc().map(|d| d.name.clone()).unwrap_or_default();
-        centered(egui::Window::new("Save workflow"))
+        centered(ctx, egui::Window::new("Save workflow"))
             .collapsible(false)
             .open(&mut open)
             .default_width(340.0)
@@ -8896,7 +9041,7 @@ impl ComfyApp {
         let mut open = true;
         let mut jump: Option<(NodeId, egui::Pos2)> = None;
         let props = self.active_doc().and_then(|d| d.props_node);
-        centered(egui::Window::new("Find node"))
+        centered(ctx, egui::Window::new("Find node"))
             .collapsible(false)
             .open(&mut open)
             .default_size([340.0, 400.0])
@@ -9284,7 +9429,7 @@ impl ComfyApp {
         }
         let mut open = true;
         let mut picked: Option<String> = None;
-        centered(egui::Window::new("Server workflows"))
+        centered(ctx, egui::Window::new("Server workflows"))
             .collapsible(false)
             .open(&mut open)
             .default_size([340.0, 420.0])
@@ -9359,7 +9504,7 @@ impl ComfyApp {
         let mut inserted: Option<NodeId> = None;
         let insert_pos = self.add_pos;
         let loras = self.installed_loras.clone();
-        centered(egui::Window::new("Add node"))
+        centered(ctx, egui::Window::new("Add node"))
             .collapsible(false)
             .open(&mut open)
             .default_size([340.0, 420.0])
@@ -9646,7 +9791,7 @@ impl ComfyApp {
             return;
         }
         let mut open = true;
-        centered(egui::Window::new("Manage albums"))
+        centered(ctx, egui::Window::new("Manage albums"))
             .collapsible(false)
             .open(&mut open)
             .default_width(360.0)
@@ -10166,7 +10311,7 @@ impl ComfyApp {
         let mut open = true;
         let mut create = false;
         let mut cancel = false;
-        centered(egui::Window::new("New album"))
+        centered(ctx, egui::Window::new("New album"))
             .collapsible(false)
             .open(&mut open)
             .default_width(320.0)
@@ -10212,7 +10357,7 @@ impl ComfyApp {
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
-        centered(egui::Window::new("Delete images?"))
+        centered(ctx, egui::Window::new("Delete images?"))
             .collapsible(false)
             .open(&mut open)
             .default_width(320.0)
@@ -10404,7 +10549,7 @@ impl ComfyApp {
         let mut open = true;
         let mut pick: Option<usize> = None;
         let mut refresh = false;
-        centered(egui::Window::new(format!("{} From gallery", icons::GALLERY)))
+        centered(ctx, egui::Window::new(format!("{} From gallery", icons::GALLERY)))
             .collapsible(false)
             .open(&mut open)
             .default_size([360.0, 460.0])
@@ -10621,7 +10766,6 @@ impl ComfyApp {
         enum Act {
             Close,
             Save,
-            Share,
             Remix,
             RemixInstant,
             SaveCharacter,
@@ -10789,16 +10933,6 @@ impl ComfyApp {
                     {
                         act = Some(Act::Save);
                     }
-                    if ui
-                        .add_enabled(
-                            can_save,
-                            egui::Button::new("Share").min_size(egui::vec2(0.0, BTN_H)),
-                        )
-                        .on_hover_text("Share via other apps")
-                        .clicked()
-                    {
-                        act = Some(Act::Share);
-                    }
                     if v.item.is_video {
                         let btn = ui.add_enabled(
                             finish_disabled.is_none(),
@@ -10825,61 +10959,53 @@ impl ComfyApp {
                         act = Some(Act::Remix);
                     }
                     remix_held = remix.is_pointer_button_down_on();
-                    if ui
-                        .add_enabled(
-                            can_remix,
-                            egui::Button::new(format!("{} Character", icons::USER))
-                                .min_size(egui::vec2(0.0, BTN_H)),
-                        )
-                        .on_hover_text("Save this image's tags + LoRAs as a character card")
-                        .clicked()
-                    {
-                        act = Some(Act::SaveCharacter);
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(format!("{} Use", icons::IMAGE))
-                                .min_size(egui::vec2(0.0, BTN_H)),
-                        )
-                        .on_hover_text("Use as img2img input")
-                        .clicked()
-                    {
-                        act = Some(Act::UseAsInput);
-                    }
-                    #[cfg(feature = "local-npu")]
-                    if ui
-                        .add_enabled(
-                            can_read_tags,
-                            egui::Button::new(format!("{} Read tags", icons::SEARCH))
-                                .min_size(egui::vec2(0.0, BTN_H)),
-                        )
-                        .on_hover_text("Tag this image on the NPU (WD14 danbooru tagger)")
-                        .clicked()
-                    {
-                        act = Some(Act::ReadTags);
-                    }
-                    if ui
-                        .add_enabled(
-                            can_save,
-                            egui::Button::new(format!("{} Fix area", icons::MODEL))
-                                .min_size(egui::vec2(0.0, BTN_H)),
-                        )
-                        .on_hover_text("Paint a mask to inpaint")
-                        .clicked()
-                    {
-                        act = Some(Act::Inpaint);
-                    }
-                    if ui
-                        .add_enabled(
-                            can_open_wf,
-                            egui::Button::new(format!("{} Workflow", icons::GRAPH))
-                                .min_size(egui::vec2(0.0, BTN_H)),
-                        )
-                        .on_hover_text("Open embedded workflow")
-                        .clicked()
-                    {
-                        act = Some(Act::OpenWorkflow);
-                    }
+                    // The occasional actions live in one menu so the bar stays a single row.
+                    up_menu_sized(ui, "More", egui::vec2(0.0, BTN_H), |ui| {
+                        if ui
+                            .add_enabled(can_remix, egui::Button::new(format!("{} Save as character", icons::USER)))
+                            .on_hover_text("Save this image's tags + LoRAs as a character card")
+                            .clicked()
+                        {
+                            act = Some(Act::SaveCharacter);
+                            ui.close();
+                        }
+                        if ui.button(format!("{} Use as img2img input", icons::IMAGE)).clicked() {
+                            act = Some(Act::UseAsInput);
+                            ui.close();
+                        }
+                        #[cfg(feature = "local-npu")]
+                        if ui
+                            .add_enabled(can_read_tags, egui::Button::new(format!("{} Read tags", icons::SEARCH)))
+                            .on_hover_text("Tag this image on the NPU (WD14 danbooru tagger)")
+                            .clicked()
+                        {
+                            act = Some(Act::ReadTags);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(can_save, egui::Button::new(format!("{} Fix area (inpaint)", icons::MODEL)))
+                            .on_hover_text("Paint a mask to inpaint")
+                            .clicked()
+                        {
+                            act = Some(Act::Inpaint);
+                            ui.close();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(can_open_wf, egui::Button::new(format!("{} Open workflow", icons::GRAPH)))
+                            .clicked()
+                        {
+                            act = Some(Act::OpenWorkflow);
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(can_open_wf, egui::Button::new(format!("{} Copy workflow", icons::PROPS)))
+                            .clicked()
+                        {
+                            act = Some(Act::CopyWorkflow);
+                            ui.close();
+                        }
+                    });
                     // Opens upward so the list clears the Android nav / gesture bar.
                     let album_label = format!("{}{}", icons::ALBUM, icons::ADD);
                     up_menu_sized(ui, album_label, egui::vec2(ICON_W + 8.0, BTN_H), |ui| {
@@ -11044,15 +11170,6 @@ impl ComfyApp {
                 let v = self.viewer.as_ref().unwrap();
                 let (bytes, name) = (v.bytes.clone().unwrap(), v.item.filename.clone());
                 self.gallery_status = self.save_bytes(host, &bytes, &name);
-            }
-            Some(Act::Share) => {
-                if let Some((bytes, name)) = self
-                    .viewer
-                    .as_ref()
-                    .and_then(|v| v.bytes.clone().map(|b| (b, v.item.filename.clone())))
-                {
-                    self.gallery_status = self.share_bytes(host, &bytes, &name);
-                }
             }
             Some(Act::Remix) => {
                 if let Some(meta) =
@@ -11528,12 +11645,6 @@ impl ComfyApp {
         Some(format!("/storage/emulated/0/Android/data/{pkg}/files"))
     }
 
-    /// The SD1.5 asset dir the D1/D2 diagnostics read.
-    #[cfg(feature = "local-npu")]
-    fn qnn_model_dir(&self, host: &Host) -> Option<String> {
-        Some(format!("{}/qnn", self.external_files_dir(host)?))
-    }
-
     /// Scan the external files dir for model packs once; `force` re-reads it.
     #[cfg(feature = "local-npu")]
     fn ensure_local_packs(&mut self, host: &Host, force: bool) {
@@ -11572,102 +11683,6 @@ impl ComfyApp {
     #[cfg(not(feature = "local-npu"))]
     fn anima_active(&self) -> bool {
         false
-    }
-
-    /// Spawn the D1 self-test on a worker thread; the report returns via the channel.
-    #[cfg(feature = "local-npu")]
-    fn start_d1_selftest(&mut self, ctx: &egui::Context, lib_dir: String, model_bin: String) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.d1_rx = Some(rx);
-        self.d1_running = true;
-        self.d1_ok = None;
-        self.log.info(format!("D1-SELFTEST starting (libs={lib_dir}, model={model_bin})"));
-        let cfg = local_sd::SelftestConfig {
-            system_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnSystem.so")),
-            backend_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnHtp.so")),
-            model_bin: std::path::PathBuf::from(model_bin),
-            skel_dir: Some(std::path::PathBuf::from(lib_dir)),
-            set_performance_mode: true,
-            graph: None,
-        };
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let report = local_sd::device_selftest(cfg);
-            let _ = tx.send(report);
-            ctx.request_repaint();
-        });
-    }
-
-    /// Drain a finished self-test, mirror its diagnostic to logcat, and keep it for the pane.
-    #[cfg(feature = "local-npu")]
-    fn poll_d1_selftest(&mut self) {
-        let Some(rx) = self.d1_rx.as_ref() else { return };
-        match rx.try_recv() {
-            Ok(report) => {
-                self.d1_rx = None;
-                self.d1_running = false;
-                self.d1_ok = Some(report.ok);
-                let pretty = report.pretty();
-                for line in pretty.lines() {
-                    self.log.info(format!("D1-SELFTEST {line}"));
-                }
-                self.d1_last = Some(pretty);
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.d1_rx = None;
-                self.d1_running = false;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-    }
-
-    /// Spawn D2 text2img (CLIP + UNet + VAE) on a worker thread.
-    #[cfg(feature = "local-npu")]
-    fn start_d2_text2img(&mut self, ctx: &egui::Context, lib_dir: String, model_dir: String) {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.d2_rx = Some(rx);
-        self.d2_running = true;
-        self.d2_ok = None;
-        self.log.info(format!("D2-TEXT2IMG starting (libs={lib_dir}, models={model_dir})"));
-        let cfg = local_sd::Text2ImgConfig {
-            system_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnSystem.so")),
-            backend_lib: std::path::PathBuf::from(format!("{lib_dir}/libQnnHtp.so")),
-            skel_dir: Some(std::path::PathBuf::from(lib_dir)),
-            unet_bin: std::path::PathBuf::from(format!("{model_dir}/unet.bin")),
-            vae_decoder_bin: std::path::PathBuf::from(format!("{model_dir}/vae_decoder.bin")),
-            tokenizer: std::path::PathBuf::from(format!("{model_dir}/tokenizer.json")),
-            clip_weights: std::path::PathBuf::from(format!("{model_dir}/clip.safetensors")),
-            output_png: std::path::PathBuf::from(format!("{model_dir}/d2-smoke.png")),
-            ..local_sd::Text2ImgConfig::default()
-        };
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let report = local_sd::device_text2img(cfg);
-            let _ = tx.send(report);
-            ctx.request_repaint();
-        });
-    }
-
-    #[cfg(feature = "local-npu")]
-    fn poll_d2_text2img(&mut self) {
-        let Some(rx) = self.d2_rx.as_ref() else { return };
-        match rx.try_recv() {
-            Ok(report) => {
-                self.d2_rx = None;
-                self.d2_running = false;
-                self.d2_ok = Some(report.ok);
-                let pretty = report.pretty();
-                for line in pretty.lines() {
-                    self.log.info(format!("D2-TEXT2IMG {line}"));
-                }
-                self.d2_last = Some(pretty);
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.d2_rx = None;
-                self.d2_running = false;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
     }
 
     /// Spawn the D3 Anima smoke on a worker thread.
@@ -11783,7 +11798,7 @@ impl ComfyApp {
         let mut act: Option<WAct> = None;
         let result = self.wd14_sheet.clone().unwrap();
         let max_h = (ctx.content_rect().height() * 0.5).clamp(160.0, 380.0);
-        centered(egui::Window::new(format!("{} Tags", icons::SEARCH)))
+        centered(ctx, egui::Window::new(format!("{} Tags", icons::SEARCH)))
             .collapsible(false)
             .open(&mut open)
             .default_width(360.0)
@@ -11851,165 +11866,6 @@ impl ComfyApp {
         }
     }
 
-    /// Settings → Diagnostics: D1 NPU smoke, D2 SD1.5 text2img smoke, D3 Anima smoke.
-    #[cfg(feature = "local-npu")]
-    fn diagnostics_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
-        let lib_dir = host.native_lib_dir();
-        let model_dir = self.qnn_model_dir(host);
-        let model_bin = model_dir.as_ref().map(|d| format!("{d}/unet.bin"));
-        self.ensure_local_packs(host, false);
-        let anima_pack = crate::local_engine::pick_pack(
-            &self.local_packs,
-            &self.local_pack,
-            LocalBackend::Anima,
-        )
-        .cloned();
-        let warn = egui::Color32::from_rgb(230, 180, 120);
-        let busy = self.d1_running || self.d2_running || self.d3_running;
-        crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.heading("D1 NPU self-test");
-            ui.weak("Loads the APK-bundled QNN HTP libs + pushed unet.bin, runs one execute on the NPU.");
-            ui.group(|ui| {
-                if let Some(d) = lib_dir.as_deref() {
-                    ui.weak(format!("libs: {d}"));
-                } else {
-                    ui.colored_label(warn, "libs: nativeLibraryDir unavailable (not on device?)");
-                }
-                if let Some(m) = model_bin.as_deref() {
-                    ui.weak(format!("model: {m}"));
-                } else {
-                    ui.colored_label(warn, "model: documents dir unavailable");
-                }
-                ui.add_space(8.0);
-                let ready = lib_dir.is_some() && model_bin.is_some() && !busy;
-                let btn = egui::Button::new("Run D1 NPU self-test").min_size(egui::vec2(220.0, 34.0));
-                if ui.add_enabled(ready, btn).clicked()
-                    && let (Some(lib), Some(model)) = (lib_dir.clone(), model_bin.clone())
-                {
-                    self.start_d1_selftest(ui.ctx(), lib, model);
-                }
-                if self.d1_running {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak("running… (adb logcat -s comfyui)");
-                    });
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-                }
-            });
-            if let Some(ok) = self.d1_ok {
-                ui.add_space(8.0);
-                let (c, t) = if ok {
-                    (egui::Color32::from_rgb(120, 220, 140), "PASSED")
-                } else {
-                    (egui::Color32::from_rgb(230, 120, 120), "FAILED")
-                };
-                ui.colored_label(c, format!("last run: {t}"));
-            }
-            if let Some(last) = &self.d1_last {
-                ui.add_space(4.0);
-                ui.group(|ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(last).monospace())
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                });
-            }
-
-            ui.add_space(16.0);
-            ui.heading("D2 text2img smoke");
-            ui.weak("CLIP (CPU) + UNet/VAE (HTP). Needs unet.bin, vae_decoder.bin, tokenizer.json, clip.safetensors.");
-            ui.group(|ui| {
-                if let Some(d) = model_dir.as_deref() {
-                    ui.weak(format!("models: {d}"));
-                    ui.weak(format!("output: {d}/d2-smoke.png"));
-                } else {
-                    ui.colored_label(warn, "models: documents dir unavailable");
-                }
-                ui.add_space(8.0);
-                let ready = lib_dir.is_some() && model_dir.is_some() && !busy;
-                let btn = egui::Button::new("Run D2 text2img (8 steps)").min_size(egui::vec2(240.0, 34.0));
-                if ui.add_enabled(ready, btn).clicked()
-                    && let (Some(lib), Some(models)) = (lib_dir.clone(), model_dir.clone())
-                {
-                    self.start_d2_text2img(ui.ctx(), lib, models);
-                }
-                if self.d2_running {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak("running… (~1–3 min; adb logcat -s comfyui local_sd)");
-                    });
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-                }
-            });
-            if let Some(ok) = self.d2_ok {
-                ui.add_space(8.0);
-                let (c, t) = if ok {
-                    (egui::Color32::from_rgb(120, 220, 140), "PASSED")
-                } else {
-                    (egui::Color32::from_rgb(230, 120, 120), "FAILED")
-                };
-                ui.colored_label(c, format!("last run: {t}"));
-            }
-            if let Some(last) = &self.d2_last {
-                ui.add_space(4.0);
-                ui.group(|ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(last).monospace())
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                });
-            }
-
-            ui.add_space(16.0);
-            ui.heading("D3 Anima smoke");
-            ui.weak("Qwen/T5 prep (CPU) + CLIP/DiT/VAE (HTP) from an ANIMA pack, 2 steps at 1024².");
-            ui.group(|ui| {
-                match &anima_pack {
-                    Some(p) => {
-                        ui.weak(format!("pack: {}", p.dir.display()));
-                        ui.weak(format!("output: {}/d3-smoke.png", p.dir.display()));
-                    }
-                    None => {
-                        ui.colored_label(warn, "pack: no ANIMA pack under the app files dir");
-                    }
-                }
-                ui.add_space(8.0);
-                let ready = lib_dir.is_some() && anima_pack.is_some() && !busy;
-                let btn = egui::Button::new("Run D3 Anima smoke (2 steps)").min_size(egui::vec2(240.0, 34.0));
-                if ui.add_enabled(ready, btn).clicked()
-                    && let (Some(lib), Some(p)) = (lib_dir.clone(), anima_pack.clone())
-                {
-                    self.start_d3_anima(ui.ctx(), lib, p.dir);
-                }
-                if self.d3_running {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.weak("running… (~30s; adb logcat -s comfyui:V local_anima:V qnn_rs:V)");
-                    });
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-                }
-            });
-            if let Some(ok) = self.d3_ok {
-                ui.add_space(8.0);
-                let (c, t) = if ok {
-                    (egui::Color32::from_rgb(120, 220, 140), "PASSED")
-                } else {
-                    (egui::Color32::from_rgb(230, 120, 120), "FAILED")
-                };
-                ui.colored_label(c, format!("last run: {t}"));
-            }
-            if let Some(last) = &self.d3_last {
-                ui.add_space(4.0);
-                ui.group(|ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(last).monospace())
-                            .wrap_mode(egui::TextWrapMode::Extend),
-                    );
-                });
-            }
-        });
-    }
 }
 
 impl EguiApp for ComfyApp {
@@ -12053,9 +11909,7 @@ impl EguiApp for ComfyApp {
             }
         }
         #[cfg(feature = "local-npu")]
-        self.poll_d1_selftest();
         #[cfg(feature = "local-npu")]
-        self.poll_d2_text2img();
         #[cfg(feature = "local-npu")]
         self.poll_d3_anima();
         #[cfg(feature = "local-npu")]
@@ -12331,10 +12185,13 @@ fn menu_popup<R>(
 /// A top-anchored `egui::Window` can push its title bar above the app's content area — up under
 /// the status-bar icons. Centering keeps every window fully inside the usable area, and it
 /// re-centers above the keyboard when the content shrinks for the IME.
-fn centered(window: egui::Window<'_>) -> egui::Window<'_> {
+fn centered<'a>(ctx: &egui::Context, window: egui::Window<'a>) -> egui::Window<'a> {
+    // Long values (paths, prompts, model names) otherwise grow a window past the viewport.
+    let cap = (ctx.content_rect().width() - 24.0).max(240.0);
     window
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .order(egui::Order::Tooltip)
+        .max_width(cap)
 }
 
 /// Draw a play-button badge centered on a tile, marking it as a video.

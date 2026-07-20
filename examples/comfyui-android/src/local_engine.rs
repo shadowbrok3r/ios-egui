@@ -679,6 +679,114 @@ fn image_stats(image: &local_anima::Image) -> String {
     format!("{}x{} mean={mean:.1} min={min} max={max}", image.width, image.height)
 }
 
+/// Progress from a pack import worker.
+pub enum ImportMsg {
+    Progress(String),
+    Done(Result<String, String>),
+}
+
+/// Fetch a pack zip and unpack it into `root/<name>`.
+///
+/// Archive layout varies (published packs nest under `output/qnn_models_*`), so files are
+/// flattened onto the pack dir by basename and the result is classified before the import
+/// counts as a success.
+pub fn spawn_import(
+    url: String,
+    root: PathBuf,
+    name: String,
+    ctx: Context,
+) -> std::sync::mpsc::Receiver<ImportMsg> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let send = |m: ImportMsg| {
+            let _ = tx.send(m);
+            ctx.request_repaint();
+        };
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => return send(ImportMsg::Done(Err(format!("runtime: {e}")))),
+        };
+        let dest = root.join(&name);
+        let tmp = root.join(format!(".{name}.zip.part"));
+        let res = rt.block_on(async {
+            send(ImportMsg::Progress("connecting...".into()));
+            let resp = reqwest::Client::new()
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| format!("request: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("server returned {}", resp.status()));
+            }
+            let total = resp.content_length();
+            std::fs::create_dir_all(&root).map_err(|e| format!("mkdir: {e}"))?;
+            let mut f = std::fs::File::create(&tmp).map_err(|e| format!("create: {e}"))?;
+            let mut got = 0u64;
+            let mut tick = 0u64;
+            let mut resp = resp;
+            while let Some(chunk) = resp.chunk().await.map_err(|e| format!("read: {e}"))? {
+                use std::io::Write;
+                f.write_all(&chunk).map_err(|e| format!("write: {e}"))?;
+                got += chunk.len() as u64;
+                if got - tick > 32 * 1024 * 1024 {
+                    tick = got;
+                    let msg = match total {
+                        Some(t) if t > 0 => format!(
+                            "downloading {:.0}% ({:.1}/{:.1} GB)",
+                            got as f64 / t as f64 * 100.0,
+                            got as f64 / 1e9,
+                            t as f64 / 1e9
+                        ),
+                        _ => format!("downloading {:.1} GB", got as f64 / 1e9),
+                    };
+                    send(ImportMsg::Progress(msg));
+                }
+            }
+            Ok::<(), String>(())
+        });
+        if let Err(e) = res {
+            let _ = std::fs::remove_file(&tmp);
+            return send(ImportMsg::Done(Err(e)));
+        }
+        send(ImportMsg::Progress("extracting...".into()));
+        let unpack = (|| -> Result<usize, String> {
+            let f = std::fs::File::open(&tmp).map_err(|e| format!("open zip: {e}"))?;
+            let mut zipf = zip::ZipArchive::new(f).map_err(|e| format!("not a zip: {e}"))?;
+            std::fs::create_dir_all(&dest).map_err(|e| format!("mkdir: {e}"))?;
+            let mut n = 0usize;
+            for i in 0..zipf.len() {
+                let mut e = zipf.by_index(i).map_err(|e| format!("entry {i}: {e}"))?;
+                if e.is_dir() {
+                    continue;
+                }
+                let Some(base) = e.enclosed_name().and_then(|p| p.file_name().map(|s| s.to_owned()))
+                else {
+                    continue;
+                };
+                let out = dest.join(base);
+                let mut w = std::fs::File::create(&out).map_err(|e| format!("write {out:?}: {e}"))?;
+                std::io::copy(&mut e, &mut w).map_err(|e| format!("copy: {e}"))?;
+                n += 1;
+            }
+            Ok(n)
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        match unpack {
+            Err(e) => send(ImportMsg::Done(Err(e))),
+            Ok(n) => match classify_pack(&dest) {
+                Some(b) => send(ImportMsg::Done(Ok(format!(
+                    "imported '{name}' ({}) - {n} files",
+                    b.label()
+                )))),
+                None => send(ImportMsg::Done(Err(format!(
+                    "unpacked {n} files but '{name}' is not a usable pack (no ANIMA marker or unet.bin)"
+                )))),
+            },
+        }
+    });
+    rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
