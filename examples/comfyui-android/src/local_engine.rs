@@ -673,6 +673,59 @@ pub fn find_clip_pack_many(roots: &[&Path]) -> Option<PathBuf> {
     roots.iter().find_map(|r| find_clip_pack(r))
 }
 
+/// The prompt-Rewriter pack marker file; the pack may not exist yet on any device.
+const RWTR_MARKER: &str = "RWTR";
+
+/// The first subdirectory under `root` carrying the Rewriter marker, if any.
+pub fn find_rewriter_pack(root: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| d.is_dir())
+        .find(|d| d.join(RWTR_MARKER).is_file())
+}
+
+/// The first Rewriter pack under any of `roots`.
+pub fn find_rewriter_pack_many(roots: &[&Path]) -> Option<PathBuf> {
+    roots.iter().find_map(|r| find_rewriter_pack(r))
+}
+
+/// Newest modification time among `dir`'s direct entries, falling back to the dir's own mtime.
+pub fn dir_newest_mtime(dir: &Path) -> Option<std::time::SystemTime> {
+    let mut newest = std::fs::metadata(dir).ok()?.modified().ok();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if let Ok(m) = e.metadata().and_then(|md| md.modified()) {
+                newest = Some(newest.map_or(m, |n| n.max(m)));
+            }
+        }
+    }
+    newest
+}
+
+/// Short relative age from a second count: "just now", "5m ago", "3h ago", "2d ago", "4w ago".
+pub fn humanize_ago(secs: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    const YEAR: u64 = 365 * DAY;
+    if secs < MIN {
+        "just now".into()
+    } else if secs < HOUR {
+        format!("{}m ago", secs / MIN)
+    } else if secs < DAY {
+        format!("{}h ago", secs / HOUR)
+    } else if secs < WEEK {
+        format!("{}d ago", secs / DAY)
+    } else if secs < YEAR {
+        format!("{}w ago", secs / WEEK)
+    } else {
+        format!("{}y ago", secs / YEAR)
+    }
+}
+
 /// Embed encoded image bytes with the CLIP pack; blocking, L2-normalized embedding plus the
 /// aesthetic score when the pack ships a head. Serialized with generation like `read_tags`.
 pub fn embed_clip(
@@ -907,6 +960,31 @@ mod tests {
     #[test]
     fn scan_of_a_missing_root_is_empty() {
         assert!(scan_packs(Path::new("/nope/does/not/exist")).is_empty());
+    }
+
+    #[test]
+    fn finds_the_rewriter_pack_by_marker() {
+        let root = tmp("comfyui-packs-rwtr");
+        let rw = root.join("rewriter");
+        std::fs::create_dir_all(&rw).unwrap();
+        std::fs::write(rw.join("RWTR"), b"").unwrap();
+        assert_eq!(find_rewriter_pack(&root), Some(rw));
+        assert!(find_rewriter_pack(Path::new("/nope/does/not/exist")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn humanize_ago_buckets_by_unit() {
+        assert_eq!(humanize_ago(0), "just now");
+        assert_eq!(humanize_ago(59), "just now");
+        assert_eq!(humanize_ago(60), "1m ago");
+        assert_eq!(humanize_ago(5 * 60), "5m ago");
+        assert_eq!(humanize_ago(3600), "1h ago");
+        assert_eq!(humanize_ago(3 * 3600), "3h ago");
+        assert_eq!(humanize_ago(24 * 3600), "1d ago");
+        assert_eq!(humanize_ago(2 * 24 * 3600), "2d ago");
+        assert_eq!(humanize_ago(7 * 24 * 3600), "1w ago");
+        assert_eq!(humanize_ago(365 * 24 * 3600), "1y ago");
     }
 
     #[test]

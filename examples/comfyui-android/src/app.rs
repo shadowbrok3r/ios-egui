@@ -794,6 +794,9 @@ struct ComfyApp {
     /// Cached WD14 tagger pack dir under the app external files dir, if one is present.
     #[cfg(feature = "local-npu")]
     wd14_pack: Option<std::path::PathBuf>,
+    /// Cached prompt-Rewriter pack dir, if one carrying the RWTR marker is present.
+    #[cfg(feature = "local-npu")]
+    rewriter_pack: Option<std::path::PathBuf>,
     /// Settings: background-tag the server gallery when idle.
     #[cfg(feature = "local-npu")]
     auto_tag: bool,
@@ -881,6 +884,21 @@ impl PromptField {
 struct ChipDrag {
     field: u8,
     idx: usize,
+}
+
+/// A pack dir's root: ("app files", wiped=true) under the app external files dir, ("/sdcard/ComfyUI",
+/// false) under the durable dir, else the parent path.
+#[cfg(feature = "local-npu")]
+fn pack_root_note(dir: &std::path::Path, app_root: Option<&str>, durable: &str) -> (String, bool) {
+    if let Some(app) = app_root
+        && dir.starts_with(app)
+    {
+        return ("app files".into(), true);
+    }
+    if dir.starts_with(durable) {
+        return ("/sdcard/ComfyUI".into(), false);
+    }
+    (dir.parent().map(|p| p.display().to_string()).unwrap_or_default(), false)
 }
 
 impl ComfyApp {
@@ -1129,6 +1147,8 @@ impl ComfyApp {
             wd14_sheet: None,
             #[cfg(feature = "local-npu")]
             wd14_pack: None,
+            #[cfg(feature = "local-npu")]
+            rewriter_pack: None,
             #[cfg(feature = "local-npu")]
             auto_tag: false,
             #[cfg(feature = "local-npu")]
@@ -3589,6 +3609,7 @@ impl ComfyApp {
                         self.log.info("local-npu: asset caches dropped");
                     }
                 });
+                self.local_pack_status_panel(ui, host);
             }
 
             ui.add_space(12.0);
@@ -5013,13 +5034,14 @@ impl ComfyApp {
         });
     }
 
-    /// Import a pack by URL: download the zip and unpack it into the app files dir.
+    /// Import a pack by URL: download the zip and unpack it into the app files dir. `open` forces
+    /// the section expanded (from the Model packs status rows); `None` keeps the remembered state.
     #[cfg(feature = "local-npu")]
-    fn local_import_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
+    fn local_import_ui(&mut self, ui: &mut egui::Ui, host: &Host, open: Option<bool>) {
         self.poll_pack_import(host);
         let busy = self.pack_import_rx.is_some();
         ui.add_space(6.0);
-        ui.collapsing("Import a pack", |ui| {
+        egui::CollapsingHeader::new("Import a pack").open(open).show(ui, |ui| {
             ui.weak("Paste a direct .zip link (e.g. a HuggingFace resolve URL). Files land in the app files dir and appear above.");
             ui.horizontal(|ui| {
                 ui.label("Name");
@@ -5055,7 +5077,7 @@ impl ComfyApp {
     }
 
     #[cfg(not(feature = "local-npu"))]
-    fn local_import_ui(&mut self, _ui: &mut egui::Ui, _host: &Host) {}
+    fn local_import_ui(&mut self, _ui: &mut egui::Ui, _host: &Host, _open: Option<bool>) {}
 
     #[cfg(feature = "local-npu")]
     fn start_pack_import(&mut self, ctx: &egui::Context, host: &Host) {
@@ -5099,6 +5121,85 @@ impl ComfyApp {
         }
         if done {
             self.pack_import_rx = None;
+            self.ensure_local_packs(host, true);
+        }
+    }
+
+    /// Settings: a status row per known on-device pack kind - each discovered generation pack plus
+    /// fixed WD14 / CLIP / Rewriter rows - with a found/missing dot, location, wiped-on-reinstall
+    /// flag, and a humanized last-updated time. Missing rows open the URL importer below.
+    #[cfg(feature = "local-npu")]
+    fn local_pack_status_panel(&mut self, ui: &mut egui::Ui, host: &Host) {
+        self.ensure_local_packs(host, false);
+        let app_root = self.external_files_dir(host);
+        let durable = Self::durable_models_dir();
+        let green = egui::Color32::from_rgb(120, 220, 140);
+        let warn = egui::Color32::from_rgb(230, 180, 120);
+        let dim = ui.visuals().weak_text_color();
+        // (kind, backend label, found dir, expected-path hint when missing)
+        let mut rows: Vec<(String, Option<String>, Option<std::path::PathBuf>, String)> = Vec::new();
+        for p in &self.local_packs {
+            rows.push((p.name.clone(), Some(p.backend.label().to_string()), Some(p.dir.clone()), String::new()));
+        }
+        let gen_count = rows.len();
+        rows.push(("WD14 tagger".into(), None, self.wd14_pack.clone(), format!("{durable}/wd14")));
+        rows.push(("CLIP embeddings".into(), None, self.clip_pack.clone(), format!("{durable}/clip")));
+        rows.push(("Rewriter".into(), None, self.rewriter_pack.clone(), format!("{durable}/rewriter")));
+        let mut rescan = false;
+        let mut open_import = false;
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong("Model packs");
+                let rescan_btn = format!("{} Rescan", icons::REFRESH);
+                if ui.small_button(rescan_btn).on_hover_text("Rescan both pack roots").clicked() {
+                    rescan = true;
+                }
+            });
+            ui.weak("On-device packs and where they live. App-files packs are wiped on reinstall.");
+            ui.add_space(4.0);
+            if gen_count == 0 {
+                ui.horizontal(|ui| {
+                    ui.colored_label(dim, icons::DOT);
+                    ui.weak("No generation packs found.");
+                });
+            }
+            let n = rows.len();
+            for (i, (kind, backend, dir, hint)) in rows.iter().enumerate() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(if dir.is_some() { green } else { dim }, icons::DOT);
+                    let title = match backend {
+                        Some(b) => format!("{kind} ({b})"),
+                        None => kind.clone(),
+                    };
+                    ui.strong(sanitize_ui_text(ui, &title));
+                    if let Some(dir) = dir {
+                        let base = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                        let (loc, wiped) = pack_root_note(dir, app_root.as_deref(), durable);
+                        ui.weak(sanitize_ui_text(ui, &format!("{base} - {loc}")));
+                        if let Some(secs) = crate::local_engine::dir_newest_mtime(dir)
+                            .and_then(|m| m.elapsed().ok())
+                            .map(|d| d.as_secs())
+                        {
+                            ui.weak(format!("updated {}", crate::local_engine::humanize_ago(secs)));
+                        }
+                        if wiped {
+                            ui.colored_label(warn, "(wiped on reinstall - move to /sdcard/ComfyUI)");
+                        }
+                    } else {
+                        ui.weak(sanitize_ui_text(ui, &format!("missing - expected {hint}")));
+                        if ui.small_button("Import…").clicked() {
+                            open_import = true;
+                        }
+                    }
+                });
+                if i + 1 < n {
+                    ui.add_space(2.0);
+                }
+            }
+        });
+        self.local_import_ui(ui, host, open_import.then_some(true));
+        if rescan {
             self.ensure_local_packs(host, true);
         }
     }
@@ -5166,7 +5267,7 @@ impl ComfyApp {
                 ui.weak(sanitize_ui_text(ui, &elide(&sel.dir.display().to_string(), 64)));
             }
         });
-        self.local_import_ui(ui, host);
+        self.local_import_ui(ui, host, None);
         ui.add_space(6.0);
         ui.weak("Server models (not used while Local NPU is on)");
         ui.add_space(2.0);
@@ -12407,6 +12508,7 @@ impl ComfyApp {
         self.local_packs = crate::local_engine::scan_packs_many(&roots);
         self.wd14_pack = crate::local_engine::find_wd14_pack_many(&roots);
         self.clip_pack = crate::local_engine::find_clip_pack_many(&roots);
+        self.rewriter_pack = crate::local_engine::find_rewriter_pack_many(&roots);
         self.log.info(format!(
             "local-npu: {} pack(s) found: {}; wd14 pack: {} (roots: app files + {durable})",
             self.local_packs.len(),
