@@ -10955,7 +10955,8 @@ impl ComfyApp {
                 const BTN_H: f32 = 36.0;
                 const GAP: f32 = 4.0;
                 ui.add_space(2.0);
-                let n = if v.item.is_video { 7.0 } else { 6.0 };
+                // Back · Save · [Finish] · Remix · Trash · More — More last so delete isn't the far-right tap.
+                let n = if v.item.is_video { 6.0 } else { 5.0 };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP;
                     let btn_w = ((ui.available_width() - GAP * (n - 1.0)) / n).max(36.0);
@@ -10995,7 +10996,13 @@ impl ComfyApp {
                         act = Some(Act::Remix);
                     }
                     remix_held = remix.is_pointer_button_down_on();
-                    // The occasional actions live in one menu so the bar stays a single row.
+                    if ui
+                        .add_sized(size, egui::Button::new(icons::TRASH))
+                        .on_hover_text("Delete image")
+                        .clicked()
+                    {
+                        act = Some(Act::Delete);
+                    }
                     up_menu_sized(ui, icons::MENU, size, |ui| {
                         if ui
                             .add_enabled(can_remix, egui::Button::new(format!("{} Save as character", icons::USER)))
@@ -11041,11 +11048,8 @@ impl ComfyApp {
                             act = Some(Act::CopyWorkflow);
                             ui.close();
                         }
-                    })
-                    .on_hover_text("More");
-                    // Opens upward so the list clears the Android nav / gesture bar.
-                    let album_label = format!("{}{}", icons::ALBUM, icons::ADD);
-                    up_menu_sized(ui, album_label, size, |ui| {
+                        ui.separator();
+                        ui.weak(format!("{} Albums", icons::ALBUM));
                         if ui
                             .button(format!("{} New album…", icons::ADD))
                             .on_hover_text("Create an album and add this image")
@@ -11054,41 +11058,31 @@ impl ComfyApp {
                             act = Some(Act::AlbumCreate);
                             ui.close();
                         }
-                        ui.separator();
                         if !albums_known {
                             ui.weak("loading…");
-                            return;
-                        }
-                        if self.albums.is_empty() {
+                        } else if self.albums.is_empty() {
                             ui.weak("No albums yet.");
-                            return;
-                        }
-                        let member = self.viewer.as_ref().unwrap().albums.as_ref().unwrap();
-                        for a in &self.albums {
-                            let is_in = member.contains(&a.id);
-                            let label = if is_in {
-                                format!("{} {}", icons::CHECK, elide(&a.name, 28))
-                            } else {
-                                format!("     {}", elide(&a.name, 28))
-                            };
-                            if ui.selectable_label(is_in, label).clicked() {
-                                act = Some(if is_in {
-                                    Act::AlbumRemove(a.id)
+                        } else {
+                            let member = self.viewer.as_ref().unwrap().albums.as_ref().unwrap();
+                            for a in &self.albums {
+                                let is_in = member.contains(&a.id);
+                                let label = if is_in {
+                                    format!("{} {}", icons::CHECK, elide(&a.name, 28))
                                 } else {
-                                    Act::AlbumAdd(a.id)
-                                });
-                                ui.close();
+                                    format!("     {}", elide(&a.name, 28))
+                                };
+                                if ui.selectable_label(is_in, label).clicked() {
+                                    act = Some(if is_in {
+                                        Act::AlbumRemove(a.id)
+                                    } else {
+                                        Act::AlbumAdd(a.id)
+                                    });
+                                    ui.close();
+                                }
                             }
                         }
                     })
-                    .on_hover_text("Albums");
-                    if ui
-                        .add_sized(size, egui::Button::new(icons::TRASH))
-                        .on_hover_text("Delete image")
-                        .clicked()
-                    {
-                        act = Some(Act::Delete);
-                    }
+                    .on_hover_text("More");
                 });
                 ui.add_space(2.0);
             });
