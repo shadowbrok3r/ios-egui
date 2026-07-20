@@ -52,9 +52,13 @@ python3 scripts/wd14-export/export.py --from context --out ~/wd14 --work ~/wd14-
 
 ### Precision
 
-`--float_bitwidth 16` (fp16) is the default and is usually correct. If the resulting
-tags look saturated (many at ~100 %, or garbage), the fp16 activations may be
-overflowing — re-run with:
+`--float_bitwidth 16` (fp16) is the default and is usually correct. The graph's IO
+tensors come out fp16 too — qnn-rs handles f16 tensor IO (quant::f32_to_f16 /
+f16_to_f32), so this needs nothing on the app side. Known-broken alternatives on
+QAIRT 2.48 + DLC: `--preserve_io_datatype` fails HTP finalize (q::QNN_Convert), and
+`--quantization_overrides` segfaults the converter. If the resulting tags look
+saturated (many at ~100 %, or garbage), the fp16 activations may be overflowing —
+try the overrides route on a newer SDK:
 
 ```sh
 python3 scripts/wd14-export/export.py --fp32-activations --out ~/wd14

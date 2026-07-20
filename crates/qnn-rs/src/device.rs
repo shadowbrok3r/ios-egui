@@ -521,6 +521,7 @@ fn quantize_input(t: &TensorInfo, data: &[f32]) -> Result<Vec<u8>> {
     use DataType::*;
     let bytes = match t.dtype {
         Float32 => data.iter().flat_map(|&x| x.to_le_bytes()).collect(),
+        Float16 => data.iter().flat_map(|&x| quant::f32_to_f16(x).to_le_bytes()).collect(),
         Int8 => data.iter().map(|&x| x.round() as i8 as u8).collect(),
         Int16 => data.iter().flat_map(|&x| (x.round() as i16).to_le_bytes()).collect(),
         Int32 => data.iter().flat_map(|&x| (x.round() as i32).to_le_bytes()).collect(),
@@ -560,6 +561,7 @@ fn dequantize_output(t: &TensorInfo, bytes: &[u8]) -> Result<Vec<f32>> {
     use DataType::*;
     let out: Vec<f32> = match t.dtype {
         Float32 => bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        Float16 => bytes.chunks_exact(2).map(|c| quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         Int8 => bytes.iter().map(|&b| b as i8 as f32).collect(),
         Int16 => bytes.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32).collect(),
         Int32 => bytes.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f32).collect(),

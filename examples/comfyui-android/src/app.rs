@@ -3286,56 +3286,96 @@ impl ComfyApp {
 
     fn create_pane_bar(&mut self, ui: &mut egui::Ui) {
         let prev = self.create_pane;
-        ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.create_pane, CreatePane::Main, "Main");
-            let model_n = self.checkpoints.len() + self.unets.len();
-            ui.selectable_value(
-                &mut self.create_pane,
-                CreatePane::Models,
-                if model_n > 0 { format!("Models ({model_n})") } else { "Models".into() },
-            );
-            let lora_n = self.params.loras.len();
-            ui.selectable_value(
-                &mut self.create_pane,
-                CreatePane::Loras,
-                if lora_n > 0 { format!("LoRAs ({lora_n})") } else { "LoRAs".into() },
-            );
-            let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
-            let enhance = if app_n > 0 {
-                format!("{}{app_n}", icons::GENERATE)
-            } else {
-                icons::GENERATE.into()
+        const N: f32 = 6.0;
+        const GAP: f32 = 4.0;
+        const ROW_H: f32 = 28.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = GAP;
+            let btn_w = ((ui.available_width() - GAP * (N - 1.0)) / N).max(28.0);
+            let size = egui::vec2(btn_w, ROW_H);
+
+            let panes: [(CreatePane, String, String); 6] = {
+                let model_n = self.checkpoints.len() + self.unets.len();
+                let lora_n = self.params.loras.len();
+                let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
+                let preset_n = self.presets.len();
+                let char_n = self.characters.len();
+                [
+                    (CreatePane::Main, "Main".into(), "Main".into()),
+                    (
+                        CreatePane::Models,
+                        if model_n > 0 {
+                            format!("{}{model_n}", icons::MODEL)
+                        } else {
+                            icons::MODEL.into()
+                        },
+                        if model_n > 0 {
+                            format!("Models ({model_n})")
+                        } else {
+                            "Models".into()
+                        },
+                    ),
+                    (
+                        CreatePane::Loras,
+                        if lora_n > 0 { format!("LoRA {lora_n}") } else { "LoRA".into() },
+                        if lora_n > 0 {
+                            format!("LoRAs ({lora_n})")
+                        } else {
+                            "LoRAs".into()
+                        },
+                    ),
+                    (
+                        CreatePane::Enhance,
+                        if app_n > 0 {
+                            format!("{}{app_n}", icons::GENERATE)
+                        } else {
+                            icons::GENERATE.into()
+                        },
+                        if app_n > 0 {
+                            format!("Enhance ({app_n})")
+                        } else {
+                            "Enhance".into()
+                        },
+                    ),
+                    (
+                        CreatePane::Presets,
+                        if preset_n > 0 {
+                            format!("{}{preset_n}", icons::SAVE)
+                        } else {
+                            icons::SAVE.into()
+                        },
+                        if preset_n > 0 {
+                            format!("Presets ({preset_n})")
+                        } else {
+                            "Presets".into()
+                        },
+                    ),
+                    (
+                        CreatePane::Characters,
+                        if char_n > 0 {
+                            format!("{}{char_n}", icons::USER)
+                        } else {
+                            icons::USER.into()
+                        },
+                        if char_n > 0 {
+                            format!("Characters ({char_n})")
+                        } else {
+                            "Characters".into()
+                        },
+                    ),
+                ]
             };
-            ui.selectable_value(&mut self.create_pane, CreatePane::Enhance, enhance)
-                .on_hover_text(if app_n > 0 {
-                    format!("Enhance ({app_n})")
-                } else {
-                    "Enhance".into()
-                });
-            let preset_n = self.presets.len();
-            let presets = if preset_n > 0 {
-                format!("{}{preset_n}", icons::SAVE)
-            } else {
-                icons::SAVE.into()
-            };
-            ui.selectable_value(&mut self.create_pane, CreatePane::Presets, presets)
-                .on_hover_text(if preset_n > 0 {
-                    format!("Presets ({preset_n})")
-                } else {
-                    "Presets".into()
-                });
-            let char_n = self.characters.len();
-            let characters = if char_n > 0 {
-                format!("{}{char_n}", icons::USER)
-            } else {
-                icons::USER.into()
-            };
-            ui.selectable_value(&mut self.create_pane, CreatePane::Characters, characters)
-                .on_hover_text(if char_n > 0 {
-                    format!("Characters ({char_n})")
-                } else {
-                    "Characters".into()
-                });
+
+            for (pane, label, hover) in panes {
+                let selected = self.create_pane == pane;
+                if ui
+                    .add_sized(size, egui::Button::selectable(selected, label))
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    self.create_pane = pane;
+                }
+            }
         });
         if self.create_pane == CreatePane::Models && prev != CreatePane::Models {
             self.checkpoints_force_collapse = true;
@@ -10913,21 +10953,22 @@ impl ComfyApp {
             let mut remix_held = false;
             egui::Panel::bottom("viewer-actions").show(ui, |ui| {
                 const BTN_H: f32 = 36.0;
-                const ICON_W: f32 = 40.0;
+                const GAP: f32 = 4.0;
                 ui.add_space(2.0);
-                ui.horizontal_wrapped(|ui| {
+                let n = if v.item.is_video { 7.0 } else { 6.0 };
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let btn_w = ((ui.available_width() - GAP * (n - 1.0)) / n).max(36.0);
+                    let size = egui::vec2(btn_w, BTN_H);
                     if ui
-                        .add(egui::Button::new(icons::BACK).min_size(egui::vec2(ICON_W, BTN_H)))
+                        .add_sized(size, egui::Button::new(icons::BACK))
                         .on_hover_text("Back to gallery")
                         .clicked()
                     {
                         act = Some(Act::Close);
                     }
                     if ui
-                        .add_enabled(
-                            can_save,
-                            egui::Button::new(icons::SAVE).min_size(egui::vec2(ICON_W, BTN_H)),
-                        )
+                        .add_enabled(can_save, egui::Button::new(icons::SAVE).min_size(size))
                         .on_hover_text("Save to device")
                         .clicked()
                     {
@@ -10936,12 +10977,11 @@ impl ComfyApp {
                     if v.item.is_video {
                         let btn = ui.add_enabled(
                             finish_disabled.is_none(),
-                            egui::Button::new(format!("{} Finish", icons::GENERATE))
-                                .min_size(egui::vec2(0.0, BTN_H)),
+                            egui::Button::new(icons::RUN).min_size(size),
                         );
                         if btn
                             .on_hover_text(finish_disabled.unwrap_or(
-                                "Colour-match, upscale, RIFE-interpolate and re-encode this video",
+                                "Finish — colour-match, upscale, RIFE-interpolate and re-encode",
                             ))
                             .clicked()
                         {
@@ -10949,18 +10989,14 @@ impl ComfyApp {
                         }
                     }
                     let remix = ui
-                        .add_enabled(
-                            can_remix,
-                            egui::Button::new(format!("{} Remix", icons::GENERATE))
-                                .min_size(egui::vec2(0.0, BTN_H)),
-                        )
-                        .on_hover_text("Tap: choose fields  -  Hold: instant remix");
+                        .add_enabled(can_remix, egui::Button::new(icons::GENERATE).min_size(size))
+                        .on_hover_text("Remix — tap: choose fields, hold: instant");
                     if remix.clicked() {
                         act = Some(Act::Remix);
                     }
                     remix_held = remix.is_pointer_button_down_on();
                     // The occasional actions live in one menu so the bar stays a single row.
-                    up_menu_sized(ui, "More", egui::vec2(0.0, BTN_H), |ui| {
+                    up_menu_sized(ui, icons::MENU, size, |ui| {
                         if ui
                             .add_enabled(can_remix, egui::Button::new(format!("{} Save as character", icons::USER)))
                             .on_hover_text("Save this image's tags + LoRAs as a character card")
@@ -11005,10 +11041,11 @@ impl ComfyApp {
                             act = Some(Act::CopyWorkflow);
                             ui.close();
                         }
-                    });
+                    })
+                    .on_hover_text("More");
                     // Opens upward so the list clears the Android nav / gesture bar.
                     let album_label = format!("{}{}", icons::ALBUM, icons::ADD);
-                    up_menu_sized(ui, album_label, egui::vec2(ICON_W + 8.0, BTN_H), |ui| {
+                    up_menu_sized(ui, album_label, size, |ui| {
                         if ui
                             .button(format!("{} New album…", icons::ADD))
                             .on_hover_text("Create an album and add this image")
@@ -11043,9 +11080,10 @@ impl ComfyApp {
                                 ui.close();
                             }
                         }
-                    });
+                    })
+                    .on_hover_text("Albums");
                     if ui
-                        .add(egui::Button::new(icons::TRASH).min_size(egui::vec2(ICON_W, BTN_H)))
+                        .add_sized(size, egui::Button::new(icons::TRASH))
                         .on_hover_text("Delete image")
                         .clicked()
                     {
@@ -12100,7 +12138,7 @@ fn up_menu<R>(
     label: impl Into<egui::WidgetText>,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    menu_popup(
+    let _ = menu_popup(
         ui,
         label,
         None,
@@ -12116,7 +12154,7 @@ fn up_menu_sized<R>(
     label: impl Into<egui::WidgetText>,
     min_size: egui::Vec2,
     content: impl FnOnce(&mut egui::Ui) -> R,
-) {
+) -> egui::Response {
     menu_popup(
         ui,
         label,
@@ -12124,7 +12162,7 @@ fn up_menu_sized<R>(
         egui::RectAlign::TOP_START,
         &[egui::RectAlign::TOP_END, egui::RectAlign::BOTTOM_START],
         content,
-    );
+    )
 }
 
 /// Header menu: popup opens below the button, right-aligned so it grows left.
@@ -12133,7 +12171,7 @@ fn down_menu<R>(
     label: impl Into<egui::WidgetText>,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    menu_popup(
+    let _ = menu_popup(
         ui,
         label,
         None,
@@ -12150,13 +12188,13 @@ fn menu_popup<R>(
     align: egui::RectAlign,
     alternatives: &'static [egui::RectAlign],
     content: impl FnOnce(&mut egui::Ui) -> R,
-) {
+) -> egui::Response {
     use egui::containers::menu::MenuConfig;
-    let mut btn = egui::Button::new(label.into());
-    if let Some(size) = min_size {
-        btn = btn.min_size(size);
-    }
-    let response = ui.add(btn);
+    let response = if let Some(size) = min_size {
+        ui.add_sized(size, egui::Button::new(label.into()))
+    } else {
+        ui.add(egui::Button::new(label.into()))
+    };
     let config = MenuConfig::default();
     egui::Popup::menu(&response)
         .align(align)
@@ -12177,6 +12215,7 @@ fn menu_popup<R>(
                 })
                 .inner
         });
+    response
 }
 
 
@@ -13116,3 +13155,4 @@ fn inject_lora_triggers(snarl: &mut egui_snarl::Snarl<FlowNodeData>, triggers: &
 }
 
 app!(ComfyApp::new);
+
