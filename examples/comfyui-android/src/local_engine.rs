@@ -241,6 +241,51 @@ fn rgb_to_color_image(width: u32, height: u32, rgb: &[u8]) -> egui::ColorImage {
 pub fn drop_cache() {
     drop_sd_cache();
     drop_anima_cache();
+    drop_util_cache();
+}
+
+/// Evict only the generation caches, keeping the tagger/embedder QNN stack warm between pump jobs.
+fn drop_generation_caches() {
+    drop_sd_cache();
+    drop_anima_cache();
+}
+
+/// Shared QNN stack for the utility models (WD14, CLIP): dlopened libs + the FastRPC PD they keep
+/// alive. Rebuilding this per image costs ~100ms and a dlclose that spews vendor RefBase warnings.
+struct UtilCache {
+    key: String,
+    system: local_wd14::QnnSystem,
+    backend: local_wd14::Backend,
+}
+
+fn util_slot() -> &'static Mutex<Option<UtilCache>> {
+    static SLOT: OnceLock<Mutex<Option<UtilCache>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn drop_util_cache() {
+    if let Ok(mut g) = util_slot().lock() {
+        *g = None;
+    }
+}
+
+/// Load (or reuse) the shared utility QNN stack for `lib_dir`; the guard keeps it borrowable.
+fn warm_util_cache(
+    lib_dir: &Path,
+) -> Result<std::sync::MutexGuard<'static, Option<UtilCache>>, String> {
+    let key = lib_dir.display().to_string();
+    let mut slot = util_slot().lock().map_err(|_| "util cache lock poisoned".to_string())?;
+    if slot.as_ref().map(|c| c.key != key).unwrap_or(true) {
+        *slot = None;
+        local_wd14::prepare_htp_env(lib_dir);
+        let system = local_wd14::QnnSystem::load(lib_dir.join("libQnnSystem.so"))
+            .map_err(|e| format!("QnnSystem: {e}"))?;
+        let backend = local_wd14::Backend::load(lib_dir.join("libQnnHtp.so"))
+            .map_err(|e| format!("Backend: {e}"))?;
+        log::info!("local-npu: utility QNN stack loaded (kept warm between jobs)");
+        *slot = Some(UtilCache { key, system, backend });
+    }
+    Ok(slot)
 }
 
 fn drop_sd_cache() {
@@ -750,19 +795,16 @@ pub fn embed_clip(
     image: Vec<u8>,
 ) -> Result<(Vec<f32>, Option<f32>), String> {
     let _gate = run_lock().lock();
-    drop_cache();
+    drop_generation_caches();
     let t = Instant::now();
-    local_clip::prepare_htp_env(&lib_dir);
     let pack = local_clip::ClipPack::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
-    let system = local_clip::QnnSystem::load(lib_dir.join("libQnnSystem.so"))
-        .map_err(|e| format!("QnnSystem: {e}"))?;
-    let backend =
-        local_clip::Backend::load(lib_dir.join("libQnnHtp.so")).map_err(|e| format!("Backend: {e}"))?;
-    let session = local_clip::Session::new(&backend).map_err(|e| format!("session: {e}"))?;
+    let slot = warm_util_cache(&lib_dir)?;
+    let cache = slot.as_ref().ok_or("util cache empty after load")?;
+    let session = local_clip::Session::new(&cache.backend).map_err(|e| format!("session: {e}"))?;
     if let Err(e) = session.set_htp_performance_mode() {
         log::warn!("local-clip: performance mode unavailable: {e}");
     }
-    let emb = local_clip::embed_bytes(&pack, &session, &system, &image)
+    let emb = local_clip::embed_bytes(&pack, &session, &cache.system, &image)
         .map_err(|e| format!("embed: {e}"))?;
     let score = match pack.aesthetic() {
         Ok(head) => head.map(|h| local_clip::aesthetic_score(&h, &emb)),
@@ -783,21 +825,23 @@ pub fn read_tags(
     image: Vec<u8>,
 ) -> Result<local_wd14::TagResult, String> {
     let _gate = run_lock().lock();
-    drop_cache();
+    drop_generation_caches();
     let t = Instant::now();
-    local_wd14::prepare_htp_env(&lib_dir);
     let pack = local_wd14::Wd14Pack::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
-    let system = local_wd14::QnnSystem::load(lib_dir.join("libQnnSystem.so"))
-        .map_err(|e| format!("QnnSystem: {e}"))?;
-    let backend =
-        local_wd14::Backend::load(lib_dir.join("libQnnHtp.so")).map_err(|e| format!("Backend: {e}"))?;
-    let session = local_wd14::Session::new(&backend).map_err(|e| format!("session: {e}"))?;
+    let slot = warm_util_cache(&lib_dir)?;
+    let cache = slot.as_ref().ok_or("util cache empty after load")?;
+    let session = local_wd14::Session::new(&cache.backend).map_err(|e| format!("session: {e}"))?;
     if let Err(e) = session.set_htp_performance_mode() {
         log::warn!("local-wd14: performance mode unavailable: {e}");
     }
-    let result =
-        local_wd14::tag_bytes(&pack, &session, &system, &image, &local_wd14::Wd14Params::default())
-            .map_err(|e| format!("tag: {e}"))?;
+    let result = local_wd14::tag_bytes(
+        &pack,
+        &session,
+        &cache.system,
+        &image,
+        &local_wd14::Wd14Params::default(),
+    )
+    .map_err(|e| format!("tag: {e}"))?;
     log::info!(
         "local-wd14: {} general, {} character in {:.2}s",
         result.general.len(),
