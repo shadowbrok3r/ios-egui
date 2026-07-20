@@ -1448,6 +1448,13 @@ pub struct Settings {
     /// Selected pack subdir under the app external files dir (empty = first pack of `local_backend`).
     #[serde(default)]
     pub local_pack: String,
+    /// Container-side path of ComfyUI's output dir, used to build VHS_LoadVideoPath finish paths.
+    #[serde(default = "default_server_output_root")]
+    pub server_output_root: String,
+}
+
+pub fn default_server_output_root() -> String {
+    "/data/output/".into()
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),
@@ -1595,6 +1602,17 @@ mod tests {
         assert!(s.local_npu);
         assert_eq!(s.local_backend, LocalBackend::Sd15);
         assert!(s.local_pack.is_empty());
+    }
+
+    /// Settings written before the finish-pass output root existed default it to `/data/output/`.
+    #[test]
+    fn settings_without_output_root_default_to_data_output() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(s.server_output_root, "/data/output/");
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.server_output_root, "/data/output/");
     }
 
     #[test]

@@ -272,6 +272,27 @@ struct PickedInput {
     tex: Option<egui::TextureHandle>,
 }
 
+/// Where the finish-pass colour-match reference frame comes from.
+#[derive(Clone, Copy, PartialEq)]
+enum FinishRef {
+    /// The Create tab's current img2img input photo.
+    CurrentInput,
+    /// A photo picked from the device inside the sheet.
+    Pick,
+}
+
+/// Video "Finish pass" sheet state: server-side post-process for a gallery video.
+struct FinishSheet {
+    /// Container-side path VHS_LoadVideoPath reads.
+    video_path: String,
+    ref_source: FinishRef,
+    /// A device photo picked in-sheet: `(name, bytes)`.
+    picked: Option<(String, Vec<u8>)>,
+    scale_by: f32,
+    rife_multiplier: u32,
+    output_fps: u32,
+}
+
 /// Session-only finger-paint inpainting: strokes over a base image, baked into an alpha mask.
 struct InpaintState {
     source_bytes: Vec<u8>,
@@ -389,6 +410,8 @@ struct ComfyApp {
 
     server_url: String,
     api_key: String,
+    /// Container-side path of ComfyUI's output dir, for building VHS_LoadVideoPath finish paths.
+    server_output_root: String,
     /// Account sign-in. The password is never persisted — only the session token it returns is.
     username: String,
     password: String,
@@ -607,6 +630,10 @@ struct ComfyApp {
     viewer_remix_pending: bool,
     /// Open per-field remix diff sheet.
     remix_sheet: Option<RemixSheet>,
+    /// Open video "Finish pass" sheet (server-side post-process for a gallery video).
+    finish_sheet: Option<FinishSheet>,
+    /// A finish job is in flight; its completion sets the gallery status note.
+    finish_pending: bool,
     /// Long-press-on-Remix clock; a held press applies the full meta instantly.
     viewer_remix_press: Option<f64>,
     viewer_remix_long_fired: bool,
@@ -779,6 +806,7 @@ impl ComfyApp {
             log_cursor: 0,
             server_url: String::new(),
             api_key: String::new(),
+            server_output_root: crate::types::default_server_output_root(),
             username: String::new(),
             password: String::new(),
             session: String::new(),
@@ -917,6 +945,8 @@ impl ComfyApp {
             inpaint: None,
             viewer_remix_pending: false,
             remix_sheet: None,
+            finish_sheet: None,
+            finish_pending: false,
             viewer_remix_press: None,
             viewer_remix_long_fired: false,
             queue_variants: 1,
@@ -1470,6 +1500,9 @@ impl ComfyApp {
                     } else {
                         "Done".into()
                     };
+                    if std::mem::take(&mut self.finish_pending) {
+                        self.gallery_status = "Finished video saved to the Gallery".into();
+                    }
                     host.haptic(Haptic::Success);
                     host.notify("ComfyUI", "Generation finished");
                     // New outputs should show up without a manual refresh (retry once for index lag).
@@ -1488,6 +1521,7 @@ impl ComfyApp {
                 self.progress = (0, 0);
                 self.executing = None;
                 self.preview = None;
+                self.finish_pending = false;
                 self.status = "Cancelled".into();
             }
             Msg::GenError(e) => {
@@ -1496,6 +1530,7 @@ impl ComfyApp {
                 self.executing = None;
                 if self.jobs_left == 0 {
                     self.running = false;
+                    self.finish_pending = false;
                 }
                 self.status = format!("Error: {e}");
                 host.haptic(Haptic::Error);
@@ -2747,6 +2782,7 @@ impl ComfyApp {
         let settings = Settings {
             server_url: self.server_url.clone(),
             api_key: self.api_key.clone(),
+            server_output_root: self.server_output_root.clone(),
             username: self.username.clone(),
             session: self.session.clone(),
             params: self.params.clone(),
@@ -2822,6 +2858,7 @@ impl ComfyApp {
         {
             self.server_url = saved.server_url;
             self.api_key = saved.api_key;
+            self.server_output_root = saved.server_output_root;
             self.username = saved.username;
             self.session = saved.session;
             self.params = saved.params;
@@ -2956,6 +2993,14 @@ impl ComfyApp {
                         .hint_text("optional — sent as X-Api-Key / Bearer")
                         .desired_width(f32::INFINITY),
                 );
+                ui.add_space(6.0);
+                ui.label("Server output root");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.server_output_root)
+                        .hint_text("/data/output/")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.weak("Container path of ComfyUI's output dir — used to finish gallery videos.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let connecting = matches!(self.conn, Conn::Connecting);
@@ -6469,7 +6514,198 @@ impl ComfyApp {
         self.viewer_swipe_origin = None;
         self.viewer_remix_pending = false;
         self.remix_sheet = None;
+        self.finish_sheet = None;
         self.gallery_status.clear();
+    }
+
+    /// Why the video finish pass can't run, if anything is missing. `None` means it can.
+    fn finish_disabled_reason(&self) -> Option<&'static str> {
+        let Some(schemas) = self.schemas.as_ref() else {
+            return Some("Connect to the server first");
+        };
+        if !schemas.has_node("VHS_LoadVideoPath") {
+            return Some("This server has no VHS_LoadVideoPath node");
+        }
+        if !schemas.has_node("VHS_VideoCombine") {
+            return Some("This server has no VHS_VideoCombine node");
+        }
+        None
+    }
+
+    /// Video "Finish pass" sheet: reference source, scale, RIFE multiplier and fps, then Queue.
+    fn finish_sheet_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.finish_sheet.is_none() {
+            return;
+        }
+        enum FAct {
+            Queue,
+            Cancel,
+        }
+        let mut open = true;
+        let mut act: Option<FAct> = None;
+        let sheet = self.finish_sheet.as_ref().unwrap();
+        let mut ref_source = sheet.ref_source;
+        let mut scale_by = sheet.scale_by;
+        let mut rife = sheet.rife_multiplier;
+        let mut fps = sheet.output_fps;
+        let mut picked = sheet.picked.clone();
+        let has_input = self.picked_input.is_some();
+        // Colour-match needs a reference only when the server has the node.
+        let want_ref = self.schemas.as_ref().is_some_and(|s| s.has_node("easy imageColorMatch"));
+        let has_rife = self.schemas.as_ref().is_some_and(|s| s.has_node("RIFE VFI"));
+        let mut open_picker = false;
+        centered(egui::Window::new(format!("{} Finish pass", icons::GENERATE)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.weak("Colour-match, upscale, interpolate and re-encode this video server-side.");
+                ui.add_space(6.0);
+                if want_ref {
+                    ui.strong("Reference frame (colour-match)");
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(has_input, |ui| {
+                            ui.selectable_value(
+                                &mut ref_source,
+                                FinishRef::CurrentInput,
+                                "Current input image",
+                            );
+                        });
+                        ui.selectable_value(&mut ref_source, FinishRef::Pick, "Pick photo");
+                    });
+                    match ref_source {
+                        FinishRef::CurrentInput if !has_input => {
+                            ui.weak("No current input image — pick a photo instead.");
+                        }
+                        FinishRef::Pick => {
+                            if let Some((name, _)) = &picked {
+                                ui.weak(format!("Reference: {}", elide(name, 32)));
+                            }
+                            open_picker = true;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    ui.weak("This server has no colour-match node — that step is skipped.");
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label("Scale");
+                    ui.selectable_value(&mut scale_by, 1.0, "1x");
+                    ui.selectable_value(&mut scale_by, 1.5, "1.5x");
+                    ui.selectable_value(&mut scale_by, 2.0, "2x");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("RIFE multiplier");
+                    if ui.small_button("-").clicked() {
+                        rife = rife.saturating_sub(1).max(1);
+                    }
+                    ui.monospace(rife.to_string());
+                    if ui.small_button("+").clicked() {
+                        rife = (rife + 1).min(8);
+                    }
+                    if !has_rife {
+                        ui.weak("(no RIFE node — interpolation skipped)");
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Output fps");
+                    if ui.small_button("-").clicked() {
+                        fps = fps.saturating_sub(1).max(1);
+                    }
+                    ui.monospace(fps.to_string());
+                    if ui.small_button("+").clicked() {
+                        fps = (fps + 1).min(120);
+                    }
+                });
+                if open_picker
+                    && let Some((id, name)) = self.device_photo_grid(ui, host)
+                {
+                    match host.load_device_image(id) {
+                        Some(bytes) if !bytes.is_empty() => {
+                            let fname =
+                                if name.is_empty() { format!("device_{id}.jpg") } else { name };
+                            picked = Some((fname, bytes));
+                            host.haptic(Haptic::Light);
+                        }
+                        _ => self.note = "Couldn't read that photo from the device".into(),
+                    }
+                }
+                // Colour-match requires a resolved reference; the node's absence lifts that.
+                let ref_ready = !want_ref
+                    || matches!(ref_source, FinishRef::CurrentInput if has_input)
+                    || (ref_source == FinishRef::Pick && picked.is_some());
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let queue = ui.add_enabled(
+                        ref_ready,
+                        egui::Button::new(format!("{} Queue", icons::RUN)),
+                    );
+                    if queue
+                        .on_hover_text(if ref_ready {
+                            "Queue the finish pass; the result lands in the Gallery"
+                        } else {
+                            "Pick a reference frame for colour-match first"
+                        })
+                        .clicked()
+                    {
+                        act = Some(FAct::Queue);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        act = Some(FAct::Cancel);
+                    }
+                });
+            });
+        if let Some(s) = self.finish_sheet.as_mut() {
+            s.ref_source = ref_source;
+            s.scale_by = scale_by;
+            s.rife_multiplier = rife;
+            s.output_fps = fps;
+            s.picked = picked;
+        }
+        match act {
+            Some(FAct::Queue) => {
+                let Some(sheet) = self.finish_sheet.take() else { return };
+                self.queue_finish(&sheet, want_ref, host);
+            }
+            Some(FAct::Cancel) => self.finish_sheet = None,
+            None => {
+                if !open {
+                    self.finish_sheet = None;
+                }
+            }
+        }
+    }
+
+    /// Resolve the reference bytes and queue the finish pass on the engine.
+    fn queue_finish(&mut self, sheet: &FinishSheet, want_ref: bool, host: &Host) {
+        if let Some(reason) = self.finish_disabled_reason() {
+            self.gallery_status = reason.into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        // Only upload a reference when colour-match will actually use it.
+        let reference = want_ref
+            .then(|| match sheet.ref_source {
+                FinishRef::CurrentInput => self.picked_input.as_ref().map(|p| p.bytes.clone()),
+                FinishRef::Pick => sheet.picked.as_ref().map(|(_, b)| b.clone()),
+            })
+            .flatten();
+        let schemas = self.schemas.clone().unwrap_or_default();
+        self.engine.as_mut().unwrap().run_finish(
+            sheet.video_path.clone(),
+            reference,
+            sheet.scale_by,
+            sheet.rife_multiplier,
+            sheet.output_fps,
+            schemas,
+        );
+        self.finish_pending = true;
+        self.running = true;
+        self.jobs_left += 1;
+        self.gallery_status = "Finishing video — it'll appear in the Gallery when done".into();
+        host.haptic(Haptic::Medium);
     }
 
     /// Per-field remix diff sheet: toggle which of an image's settings port into Create.
@@ -8949,6 +9185,7 @@ impl ComfyApp {
         if self.viewer.is_some() {
             self.gallery_viewer(ui, host);
             self.remix_sheet_window(ui.ctx(), host);
+            self.finish_sheet_window(ui.ctx(), host);
             self.album_create_window(ui.ctx());
             self.delete_confirm_window(ui.ctx(), host);
             return;
@@ -9725,6 +9962,7 @@ impl ComfyApp {
             SaveCharacter,
             UseAsInput,
             Inpaint,
+            Finish,
             OpenWorkflow,
             CopyWorkflow,
             ToggleMeta,
@@ -9735,6 +9973,8 @@ impl ComfyApp {
             Show(usize),
         }
         let mut act: Option<Act> = None;
+        // Video-only finish button availability; a reason disables it via hover.
+        let finish_disabled = self.finish_disabled_reason();
         // Android system Back / Esc returns to the gallery list.
         if ui.ctx().input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
@@ -9885,6 +10125,21 @@ impl ComfyApp {
                         .clicked()
                     {
                         act = Some(Act::Share);
+                    }
+                    if v.item.is_video {
+                        let btn = ui.add_enabled(
+                            finish_disabled.is_none(),
+                            egui::Button::new(format!("{} Finish", icons::GENERATE))
+                                .min_size(egui::vec2(0.0, BTN_H)),
+                        );
+                        if btn
+                            .on_hover_text(finish_disabled.unwrap_or(
+                                "Colour-match, upscale, RIFE-interpolate and re-encode this video",
+                            ))
+                            .clicked()
+                        {
+                            act = Some(Act::Finish);
+                        }
                     }
                     let remix = ui
                         .add_enabled(
@@ -10189,6 +10444,29 @@ impl ComfyApp {
                     self.gallery_status.clear();
                     self.open_inpaint(ui.ctx(), bytes, name);
                 }
+            }
+            Some(Act::Finish) => {
+                let v = self.viewer.as_ref().unwrap();
+                let video_path = crate::workflow::finish_video_path(
+                    &self.server_output_root,
+                    &v.item.subfolder,
+                    &v.item.filename,
+                );
+                // Prefer the Create tab's current input photo; else start on the device picker.
+                let ref_source = if self.picked_input.is_some() {
+                    FinishRef::CurrentInput
+                } else {
+                    FinishRef::Pick
+                };
+                self.finish_sheet = Some(FinishSheet {
+                    video_path,
+                    ref_source,
+                    picked: None,
+                    scale_by: 2.0,
+                    rife_multiplier: 2,
+                    output_fps: 32,
+                });
+                host.haptic(Haptic::Light);
             }
             Some(Act::OpenWorkflow) => {
                 let v = self.viewer.as_ref().unwrap();

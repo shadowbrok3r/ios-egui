@@ -354,6 +354,39 @@ impl Engine {
         }));
     }
 
+    /// Queue a video "Finish pass": upload the colour-match reference (when any), build the finish
+    /// graph for the server-side `video_path`, and stream it like a graph job.
+    pub fn run_finish(
+        &mut self,
+        video_path: String,
+        reference: Option<Vec<u8>>,
+        scale_by: f32,
+        rife_multiplier: u32,
+        output_fps: u32,
+        schemas: Arc<SchemaSet>,
+    ) {
+        let Some(client) = self.client.clone() else {
+            let _ = self.tx.send(Msg::GenError("Not connected".into()));
+            return;
+        };
+        self.log.info(format!(
+            "queue finish pass: {video_path} scale={scale_by} rife={rife_multiplier} fps={output_fps}"
+        ));
+        let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
+        let current = self.current_prompt.clone();
+        let inflight = self.inflight.clone();
+        inflight.fetch_add(1, Ordering::SeqCst);
+        self.reap_jobs();
+        self.jobs.push(self.rt.spawn(async move {
+            run_finish_job(
+                client, video_path, reference, scale_by, rife_multiplier, output_fps, schemas, tx,
+                ctx, log, current,
+            )
+            .await;
+            inflight.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+
     /// Abort all local generate/graph jobs (the server may keep finishing queued prompts).
     pub fn cancel(&mut self) {
         #[cfg(feature = "local-npu")]
@@ -1393,6 +1426,60 @@ async fn run_generate(
         let _ = tx.send(Msg::EnhanceNote(note));
     }
     stream_execution(client, wf, ui_workflow, tx, ctx, log, current_prompt).await;
+}
+
+/// Upload the colour-match reference (when any), build the finish graph, and stream it. Mirrors
+/// [`run_generate`]'s upload-then-queue path; the finished video lands in the gallery via VHS.
+#[allow(clippy::too_many_arguments)]
+async fn run_finish_job(
+    client: Client,
+    video_path: String,
+    reference: Option<Vec<u8>>,
+    scale_by: f32,
+    rife_multiplier: u32,
+    output_fps: u32,
+    schemas: Arc<SchemaSet>,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    log: Logger,
+    current_prompt: CurrentPrompt,
+) {
+    let reference_name = if let Some(bytes) = reference {
+        log.info(format!("uploading finish reference ({} bytes)", bytes.len()));
+        match client
+            .upload_image(INPUT_IMAGE_NAME, bytes, rucomfyui::upload::UploadType::Input, true)
+            .await
+        {
+            Ok(resp) => Some(if resp.subfolder.is_empty() {
+                resp.name
+            } else {
+                format!("{}/{}", resp.subfolder, resp.name)
+            }),
+            Err(e) => {
+                log.error(format!("finish reference upload failed: {e}"));
+                let _ = tx.send(Msg::GenError(format!("Upload failed: {e}")));
+                ctx.request_repaint();
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let (wf, report) = workflow::build_finish(
+        &video_path,
+        reference_name.as_deref(),
+        scale_by,
+        rife_multiplier,
+        output_fps,
+        &schemas,
+    );
+    let note = report.note();
+    if !note.is_empty() {
+        log.info(format!("finish: {note}"));
+        let _ = tx.send(Msg::EnhanceNote(note));
+    }
+    stream_execution(client, wf, None, tx, ctx, log, current_prompt).await;
 }
 
 /// POST `/prompt` with `extra_pnginfo.workflow` so `SaveImage` embeds the UI JSON in the PNG.

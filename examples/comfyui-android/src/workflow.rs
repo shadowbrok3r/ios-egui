@@ -7,9 +7,9 @@
 
 use rucomfyui::nodes::all::{
     CLIPLoader, CLIPTextEncode, CheckpointLoaderSimple, DualCLIPLoader, EmptyLatentImage,
-    ImageFromBatch, KSampler, KSamplerAdvanced, LoadImage, LoraLoader, LoraLoaderModelOnly,
-    ModelSamplingSD3, SaveImage, SetLatentNoiseMask, UNETLoader, VAEDecode, VAEEncode, VAELoader,
-    WanImageToVideo,
+    ImageFromBatch, ImageScaleBy, KSampler, KSamplerAdvanced, LoadImage, LoraLoader,
+    LoraLoaderModelOnly, ModelSamplingSD3, SaveImage, SetLatentNoiseMask, UNETLoader, VAEDecode,
+    VAEEncode, VAELoader, WanImageToVideo,
 };
 use rucomfyui::nodes::types::{
     ClipOut, ClipVisionOutputOut, ImageOut, LatentOut, ModelOut, Out, VaeOut,
@@ -334,6 +334,129 @@ pub fn build_video(
     );
 
     (g.into_workflow(), out, report)
+}
+
+/// Container-side path VHS_LoadVideoPath reads: `root/subfolder/filename`, dropping an empty
+/// subfolder so no double slash appears.
+pub fn finish_video_path(root: &str, subfolder: &str, filename: &str) -> String {
+    let root = root.trim_end_matches('/');
+    let sub = subfolder.trim_matches('/');
+    if sub.is_empty() {
+        format!("{root}/{filename}")
+    } else {
+        format!("{root}/{sub}/{filename}")
+    }
+}
+
+/// Build the video "Finish pass" graph, reproducing the load -> colour-match -> upscale -> RIFE ->
+/// re-encode post-process. `video_path` is the container-side path VHS_LoadVideoPath reads;
+/// `reference` is an uploaded server image name for the colour-match LoadImage. Colour-match is
+/// skipped when the `easy imageColorMatch` node or a reference is absent; the upscale is omitted at
+/// `scale_by == 1.0`; RIFE and GPU-clean appear only when `schemas` has their class. VHS is always
+/// emitted. Returns the workflow and a degradation report.
+pub fn build_finish(
+    video_path: &str,
+    reference: Option<&str>,
+    scale_by: f32,
+    rife_multiplier: u32,
+    output_fps: u32,
+    schemas: &SchemaSet,
+) -> (Workflow, Report) {
+    let g = WorkflowGraph::new();
+    let mut report = Report::default();
+
+    let load = dynamic(
+        &g,
+        "VHS_LoadVideoPath",
+        vec![
+            ("video", WorkflowInput::String(video_path.to_string())),
+            ("force_rate", WorkflowInput::I64(0)),
+            ("custom_width", WorkflowInput::I64(0)),
+            ("custom_height", WorkflowInput::I64(0)),
+            ("frame_load_cap", WorkflowInput::I64(0)),
+            ("skip_first_frames", WorkflowInput::I64(0)),
+            ("select_every_nth", WorkflowInput::I64(1)),
+            ("format", WorkflowInput::String("AnimateDiff".to_string())),
+        ],
+    );
+    let mut cur: ImageOut = ImageOut::from_dynamic(load, 0);
+
+    // Colour-match the frames against the reference frame, node and reference permitting.
+    match (schemas.has_node("easy imageColorMatch"), reference) {
+        (true, Some(name)) => {
+            let img = g.add(LoadImage::new(name.to_string()));
+            let cm = dynamic(
+                &g,
+                "easy imageColorMatch",
+                vec![
+                    ("method", WorkflowInput::String("reinhard".to_string())),
+                    ("image_output", WorkflowInput::String("Hide".to_string())),
+                    ("save_prefix", WorkflowInput::String("ComfyUI".to_string())),
+                    ("image_ref", img.image.into()),
+                    ("image_target", cur.into()),
+                ],
+            );
+            cur = ImageOut::from_dynamic(cm, 0);
+        }
+        (true, None) => report.warnings.push("Colour-match skipped — no reference frame".into()),
+        (false, _) => report
+            .warnings
+            .push("Colour-match skipped — no 'easy imageColorMatch' node".into()),
+    }
+
+    // Lanczos upscale, skipped at 1:1.
+    if (scale_by - 1.0).abs() > f32::EPSILON {
+        cur = g.add(ImageScaleBy::new(cur, "lanczos".to_string(), scale_by));
+    }
+
+    // Free VRAM before the interpolation pass when the node exists.
+    if schemas.has_node("easy cleanGpuUsed") {
+        let n = dynamic(&g, "easy cleanGpuUsed", vec![("anything", cur.into())]);
+        cur = ImageOut::from_dynamic(n, 0);
+    }
+
+    // RIFE multiplies the frame count; without it the frames stay at the source rate.
+    let mult = rife_multiplier.max(1);
+    let frame_rate = if schemas.has_node("RIFE VFI") {
+        let n = dynamic(
+            &g,
+            "RIFE VFI",
+            vec![
+                ("ckpt_name", WorkflowInput::String("rife49.pth".to_string())),
+                ("clear_cache_after_n_frames", WorkflowInput::I64(10)),
+                ("multiplier", WorkflowInput::I64(mult as i64)),
+                ("fast_mode", WorkflowInput::Boolean(false)),
+                ("ensemble", WorkflowInput::Boolean(true)),
+                ("scale_factor", WorkflowInput::I64(1)),
+                ("frames", cur.into()),
+            ],
+        );
+        cur = ImageOut::from_dynamic(n, 0);
+        output_fps as i64
+    } else {
+        report.warnings.push("RIFE interpolation skipped — no 'RIFE VFI' node".into());
+        (output_fps / mult).max(1) as i64
+    };
+
+    dynamic(
+        &g,
+        "VHS_VideoCombine",
+        vec![
+            ("frame_rate", WorkflowInput::I64(frame_rate)),
+            ("loop_count", WorkflowInput::I64(0)),
+            ("filename_prefix", WorkflowInput::String(OUTPUT_PREFIX.to_string())),
+            ("format", WorkflowInput::String("video/h264-mp4".to_string())),
+            ("pix_fmt", WorkflowInput::String("yuv420p".to_string())),
+            ("crf", WorkflowInput::I64(19)),
+            ("save_metadata", WorkflowInput::Boolean(true)),
+            ("trim_to_audio", WorkflowInput::Boolean(false)),
+            ("pingpong", WorkflowInput::Boolean(false)),
+            ("save_output", WorkflowInput::Boolean(true)),
+            ("images", cur.into()),
+        ],
+    );
+
+    (g.into_workflow(), report)
 }
 
 #[cfg(test)]
@@ -830,5 +953,97 @@ mod tests {
         assert!(!wf.0.values().any(|n| n.class_type == "LoadImage"));
         let wan = wf.0.values().find(|n| n.class_type == "WanImageToVideo").expect("no Wan");
         assert!(!wan.inputs.contains_key("start_image"));
+    }
+
+    /// Every finish node declared, so `has_node` gates nothing off.
+    fn finish_schemas() -> SchemaSet {
+        schemas_with(
+            r#"{
+                "VHS_LoadVideoPath": {"input": {"required": {"video": ["STRING"]}}, "output": ["IMAGE"]},
+                "easy imageColorMatch": {"input": {"required": {"image_ref": ["IMAGE"], "image_target": ["IMAGE"], "method": [["reinhard"]]}}, "output": ["IMAGE"]},
+                "ImageScaleBy": {"input": {"required": {"image": ["IMAGE"], "upscale_method": [["lanczos"]], "scale_by": ["FLOAT", {"default": 1.0}]}}, "output": ["IMAGE"]},
+                "easy cleanGpuUsed": {"input": {"required": {"anything": ["*"]}}, "output": ["*"]},
+                "RIFE VFI": {"input": {"required": {"frames": ["IMAGE"], "ckpt_name": [["rife49.pth"]], "multiplier": ["INT", {"default": 2}]}}, "output": ["IMAGE"]},
+                "VHS_VideoCombine": {"input": {"required": {"images": ["IMAGE"], "frame_rate": ["FLOAT", {"default": 8.0}]}}, "output": []}
+            }"#,
+        )
+    }
+
+    #[test]
+    fn finish_full_schema_chains_the_whole_post_process() {
+        let (wf, report) = build_finish(
+            "/data/output/ns/hero/hero_0001.mp4",
+            Some("ref.png"),
+            2.0,
+            2,
+            32,
+            &finish_schemas(),
+        );
+        assert!(report.warnings.is_empty(), "unexpected warnings: {:?}", report.warnings);
+
+        let vhs = wf.0.iter().find(|(_, n)| n.class_type == "VHS_VideoCombine").expect("no VHS").0;
+        assert_eq!(wf.0[vhs].inputs["frame_rate"].as_i64().unwrap(), 32);
+        assert_eq!(wf.0[vhs].inputs["save_output"].as_bool().unwrap(), true);
+
+        // VHS <- RIFE <- clean <- ImageScaleBy <- colorMatch <- LoadVideoPath.
+        let rife = upstream(&wf, vhs, "images");
+        assert_eq!(class_of(&wf, &rife), "RIFE VFI");
+        assert_eq!(wf.0[&rife].inputs["multiplier"].as_i64().unwrap(), 2);
+        let clean = upstream(&wf, &rife, "frames");
+        assert_eq!(class_of(&wf, &clean), "easy cleanGpuUsed");
+        let scale = upstream(&wf, &clean, "anything");
+        assert_eq!(class_of(&wf, &scale), "ImageScaleBy");
+        assert_eq!(wf.0[&scale].inputs["scale_by"].as_f64().unwrap() as f32, 2.0);
+        let cm = upstream(&wf, &scale, "image");
+        assert_eq!(class_of(&wf, &cm), "easy imageColorMatch");
+        let load = upstream(&wf, &cm, "image_target");
+        assert_eq!(class_of(&wf, &load), "VHS_LoadVideoPath");
+        assert_eq!(wf.0[&load].inputs["video"].as_str().unwrap(), "/data/output/ns/hero/hero_0001.mp4");
+        // The colour-match reference comes from the typed LoadImage.
+        let (ref_load, slot) = wf.0[&cm].inputs["image_ref"].as_slot().unwrap();
+        assert_eq!(wf.0[&ref_load].class_type, "LoadImage");
+        assert_eq!(slot, 0);
+        assert_eq!(wf.0[&ref_load].inputs["image"].as_str().unwrap(), "ref.png");
+    }
+
+    #[test]
+    fn finish_minimal_schema_degrades_straight_to_vhs() {
+        let schemas = schemas_with(
+            r#"{
+                "VHS_LoadVideoPath": {"input": {"required": {"video": ["STRING"]}}, "output": ["IMAGE"]},
+                "VHS_VideoCombine": {"input": {"required": {"images": ["IMAGE"], "frame_rate": ["FLOAT", {"default": 8.0}]}}, "output": []}
+            }"#,
+        );
+        let (wf, report) = build_finish("/data/output/clip.mp4", Some("ref.png"), 1.0, 2, 32, &schemas);
+        assert!(!wf.0.values().any(|n| n.class_type == "easy imageColorMatch"));
+        assert!(!wf.0.values().any(|n| n.class_type == "easy cleanGpuUsed"));
+        assert!(!wf.0.values().any(|n| n.class_type == "RIFE VFI"));
+        assert!(!wf.0.values().any(|n| n.class_type == "ImageScaleBy"));
+        assert!(!wf.0.values().any(|n| n.class_type == "LoadImage"));
+        // VHS reads the loaded video directly; the missing colour-match + RIFE are both reported.
+        let vhs = wf.0.iter().find(|(_, n)| n.class_type == "VHS_VideoCombine").expect("no VHS").0;
+        assert_eq!(class_of(&wf, &upstream(&wf, vhs, "images")), "VHS_LoadVideoPath");
+        assert_eq!(report.warnings.len(), 2);
+    }
+
+    #[test]
+    fn finish_scale_one_omits_the_upscale() {
+        let (wf, _report) =
+            build_finish("/data/output/clip.mp4", Some("ref.png"), 1.0, 2, 32, &finish_schemas());
+        assert!(!wf.0.values().any(|n| n.class_type == "ImageScaleBy"));
+        // Colour-match feeds the GPU-clean node directly with no upscale between them.
+        let clean = wf.0.iter().find(|(_, n)| n.class_type == "easy cleanGpuUsed").expect("no clean").0;
+        assert_eq!(class_of(&wf, &upstream(&wf, clean, "anything")), "easy imageColorMatch");
+    }
+
+    #[test]
+    fn finish_video_path_handles_empty_subfolder() {
+        assert_eq!(
+            finish_video_path("/data/output/", "ns/hero", "hero_0001.mp4"),
+            "/data/output/ns/hero/hero_0001.mp4"
+        );
+        // An empty subfolder must not produce a double slash.
+        assert_eq!(finish_video_path("/data/output/", "", "clip.mp4"), "/data/output/clip.mp4");
+        assert_eq!(finish_video_path("/data/output", "/ns/", "clip.mp4"), "/data/output/ns/clip.mp4");
     }
 }
