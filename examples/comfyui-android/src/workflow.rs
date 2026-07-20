@@ -459,6 +459,34 @@ pub fn build_finish(
     (g.into_workflow(), report)
 }
 
+/// Snap stale `type` values on `*CLIPLoader*` nodes to what the server's schema accepts
+/// (newer ComfyUI trims these enums; scraped workflows carry old values). Returns repair notes.
+pub fn sanitize_clip_types(wf: &mut Workflow, schemas: &SchemaSet) -> Vec<String> {
+    let mut notes = Vec::new();
+    for (_, node) in wf.0.iter_mut() {
+        if !node.class_type.contains("CLIPLoader") {
+            continue;
+        }
+        let options = schemas.enum_options(&node.class_type, "type");
+        if options.is_empty() {
+            continue;
+        }
+        let Some(v) = node.inputs.get_mut("type") else { continue };
+        let Some(cur) = v.as_str().map(str::to_string) else { continue };
+        if options.iter().any(|o| *o == cur) {
+            continue;
+        }
+        let fixed = if options.iter().any(|o| o == "sdxl") {
+            "sdxl".to_string()
+        } else {
+            options[0].clone()
+        };
+        notes.push(format!("{}: type '{cur}' -> '{fixed}'", node.class_type));
+        *v = rucomfyui::workflow::WorkflowInput::String(fixed);
+    }
+    notes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,6 +723,28 @@ mod tests {
         let enc = upstream(&wf, &ks, "latent_image");
         assert_eq!(class_of(&wf, &enc), "VAEEncode");
         assert_eq!(upstream(&wf, &enc, "vae"), upstream(&wf, &dec, "vae"), "two separate VAE loaders");
+    }
+
+    /// A stale clip `type` snaps to a schema-accepted value; valid ones stay untouched.
+    #[test]
+    fn sanitize_snaps_stale_clip_type_to_schema() {
+        let (apps, aset) = (AppSet::default(), SchemaSet::default());
+        let mut p = diffusion_params();
+        p.clip_names = vec!["clip_l.safetensors".into(), "t5xxl.safetensors".into()];
+        let (mut wf, _, _) = build(&p, None, &apps, &aset);
+
+        let schemas = schemas_with(
+            r#"{"DualCLIPLoader": {"input": {"required": {"clip_name1": [["a"]], "clip_name2": [["a"]], "type": [["sdxl", "sd3", "flux"]]}}, "output": ["CLIP"]}}"#,
+        );
+        let notes = sanitize_clip_types(&mut wf, &schemas);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        let dual = wf.0.values().find(|n| n.class_type == "DualCLIPLoader").unwrap();
+        assert_eq!(dual.inputs["type"].as_str().unwrap(), "sdxl");
+        // Second pass: nothing left to fix.
+        assert!(sanitize_clip_types(&mut wf, &schemas).is_empty());
+        // Unknown schema leaves the graph alone.
+        let (mut wf2, _, _) = build(&p, None, &apps, &aset);
+        assert!(sanitize_clip_types(&mut wf2, &SchemaSet::default()).is_empty());
     }
 
     /// Two encoders fold into a DualCLIPLoader, whose ComfyUI keys drop the underscore.

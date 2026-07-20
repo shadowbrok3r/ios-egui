@@ -2273,6 +2273,12 @@ impl ComfyApp {
         };
         self.graph_status.clear();
         self.pending_job_labels.push_back("Graph".into());
+        let mut wf = wf;
+        if let Some(schemas) = self.schemas.as_deref() {
+            for n in crate::workflow::sanitize_clip_types(&mut wf, schemas) {
+                self.log.info(format!("repair: {n}"));
+            }
+        }
         self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json));
         host.haptic(Haptic::Medium);
     }
@@ -4562,14 +4568,15 @@ impl ComfyApp {
                         .params
                         .clip_names
                         .first()
-                        .map(|s| elide(s, 18))
+                        .map(|s| file_basename(s).to_string())
                         .unwrap_or_else(|| "no encoder".into());
                     let vae = if self.params.vae_name.is_empty() {
-                        "no VAE".into()
+                        "no VAE".to_string()
                     } else {
-                        elide(&self.params.vae_name, 18)
+                        file_basename(&self.params.vae_name).to_string()
                     };
-                    format!("Text encoder / VAE · {clip} · {vae}")
+                    // Header text never wraps; a long title pushes the whole pane off-screen.
+                    format!("Encoders · {}", elide(&format!("{clip} · {vae}"), 26))
                 }
                 (false, true, false) => match self.params.img2img_source {
                     Img2ImgSource::CurrentOutput => "Image source · Current result".into(),

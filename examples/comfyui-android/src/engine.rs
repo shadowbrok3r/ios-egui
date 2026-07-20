@@ -1484,8 +1484,11 @@ async fn run_generate(
         None
     };
 
-    let (wf, _out, report) =
+    let (mut wf, _out, report) =
         workflow::build_dispatch(&params, input_image, &gcx.apps, &gcx.schemas);
+    for n in workflow::sanitize_clip_types(&mut wf, &gcx.schemas) {
+        log.info(format!("repair: {n}"));
+    }
     let note = report.note();
     if !note.is_empty() {
         log.info(format!("enhance: {note}"));
