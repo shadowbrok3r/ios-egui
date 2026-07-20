@@ -19,9 +19,10 @@ tls = [
     "dep:webpki-roots",
     "tokio-tungstenite/rustls-tls-webpki-roots",
 ]
-# On-device Qualcomm HTP NPU (D1/D2 diagnostics + Create-tab Local NPU). Off by default;
-# pulls local-sd (candle CPU + qnn-rs). Build with `cargo ndk ... --features tls,local-npu`.
-local-npu = ["dep:local-sd"]
+# On-device Qualcomm HTP NPU (D1/D2/D3 diagnostics + Create-tab Local NPU). Off by default;
+# pulls local-sd (SD1.5, candle CPU + qnn-rs) and local-anima (Anima DiT packs).
+# Build with `cargo ndk ... --features tls,local-npu`.
+local-npu = ["dep:local-sd", "dep:local-anima"]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
@@ -59,6 +60,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = { version = "0.26", optional = true }
 # On-device SD1.5 / D1 NPU self-test (feature `local-npu`). Heavy (candle); kept optional.
 local-sd = { path = "../../crates/local-sd", optional = true }
+# On-device Anima DiT text2img (feature `local-npu`): 1024² packs on the HTP.
+local-anima = { path = "../../crates/local-anima", optional = true }
 
 [dev-dependencies]
 skrifa = "0.42"

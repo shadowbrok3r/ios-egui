@@ -32,6 +32,8 @@ use crate::types::{
     ModelKind, Params, SamplerPack, Settings, append_negatives, checkpoint_family, fallback_vec,
     file_basename, merge_triggers, strip_injected,
 };
+#[cfg(feature = "local-npu")]
+use crate::types::LocalBackend;
 
 /// Ceiling on auto-loaded gallery items, so a huge namespace can't page forever.
 const GALLERY_LOAD_ALL_CAP: u64 = 5000;
@@ -581,9 +583,29 @@ struct ComfyApp {
     d2_last: Option<String>,
     #[cfg(feature = "local-npu")]
     d2_ok: Option<bool>,
+    /// D3 Anima smoke worker result.
+    #[cfg(feature = "local-npu")]
+    d3_rx: Option<std::sync::mpsc::Receiver<crate::local_engine::AnimaSmoke>>,
+    #[cfg(feature = "local-npu")]
+    d3_running: bool,
+    #[cfg(feature = "local-npu")]
+    d3_last: Option<String>,
+    #[cfg(feature = "local-npu")]
+    d3_ok: Option<bool>,
     /// Settings: route Create Queue to on-device HTP instead of the ComfyUI server.
     #[cfg(feature = "local-npu")]
     local_npu: bool,
+    /// Settings: which on-device pipeline the Local NPU path runs.
+    #[cfg(feature = "local-npu")]
+    local_backend: LocalBackend,
+    /// Settings: selected pack subdir name under the app external files dir.
+    #[cfg(feature = "local-npu")]
+    local_pack: String,
+    /// Cached external-files-dir scan; refreshed on demand from Settings.
+    #[cfg(feature = "local-npu")]
+    local_packs: Vec<crate::local_engine::PackEntry>,
+    #[cfg(feature = "local-npu")]
+    local_packs_scanned: bool,
 }
 
 impl ComfyApp {
@@ -773,7 +795,23 @@ impl ComfyApp {
             #[cfg(feature = "local-npu")]
             d2_ok: None,
             #[cfg(feature = "local-npu")]
+            d3_rx: None,
+            #[cfg(feature = "local-npu")]
+            d3_running: false,
+            #[cfg(feature = "local-npu")]
+            d3_last: None,
+            #[cfg(feature = "local-npu")]
+            d3_ok: None,
+            #[cfg(feature = "local-npu")]
             local_npu: false,
+            #[cfg(feature = "local-npu")]
+            local_backend: LocalBackend::default(),
+            #[cfg(feature = "local-npu")]
+            local_pack: String::new(),
+            #[cfg(feature = "local-npu")]
+            local_packs: Vec::new(),
+            #[cfg(feature = "local-npu")]
+            local_packs_scanned: false,
         }
     }
 
@@ -1493,6 +1531,9 @@ impl ComfyApp {
             if self.params.mode != Mode::Txt2Img {
                 return Err("Local NPU is txt2img only for now");
             }
+            if self.selected_pack().is_none() {
+                return Err("No local model pack for this backend — check Settings -> Local NPU");
+            }
             return Ok(());
         }
         if let Some(missing) = self.params.missing_model_part() {
@@ -1617,8 +1658,15 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         };
-        let Some(model_dir) = self.qnn_model_dir(host) else {
-            self.status = "Local NPU: model dir unavailable".into();
+        self.ensure_local_packs(host, false);
+        let Some((model_dir, backend, pack_name)) =
+            self.selected_pack().map(|p| (p.dir.clone(), p.backend, p.name.clone()))
+        else {
+            self.status = format!(
+                "Local NPU: no {} pack found — push one to the app files dir, then Refresh in Settings",
+                self.local_backend.label()
+            );
+            self.log.error(self.status.clone());
             host.haptic(Haptic::Warning);
             return;
         };
@@ -1633,15 +1681,17 @@ impl ComfyApp {
         }
         self.running = true;
         self.jobs_left += 1;
+        let what = format!("{} · {pack_name}", backend.label());
         self.status = if !fresh {
-            format!("Local NPU queued ({} in flight)", self.jobs_left)
+            format!("Local {what} queued ({} in flight)", self.jobs_left)
         } else {
-            "Local NPU queued".into()
+            format!("Local {what} queued")
         };
         self.enhance_note.clear();
         let paths = crate::local_engine::LocalPaths {
             lib_dir: std::path::PathBuf::from(lib_dir),
-            model_dir: std::path::PathBuf::from(model_dir),
+            model_dir,
+            backend,
         };
         self.engine.as_mut().unwrap().generate_local(paths, self.params.clone());
         host.haptic(Haptic::Medium);
@@ -2378,6 +2428,14 @@ impl ComfyApp {
             local_npu: self.local_npu,
             #[cfg(not(feature = "local-npu"))]
             local_npu: false,
+            #[cfg(feature = "local-npu")]
+            local_backend: self.local_backend,
+            #[cfg(not(feature = "local-npu"))]
+            local_backend: Default::default(),
+            #[cfg(feature = "local-npu")]
+            local_pack: self.local_pack.clone(),
+            #[cfg(not(feature = "local-npu"))]
+            local_pack: String::new(),
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -2409,6 +2467,8 @@ impl ComfyApp {
         }
         self.log.info(format!("{} enhance app(s) loaded", apps.by_id.len()));
         self.apps = Arc::new(apps);
+        #[cfg(feature = "local-npu")]
+        self.ensure_local_packs(host, false);
 
         let Some(path) = Self::settings_path(host) else {
             return;
@@ -2446,6 +2506,8 @@ impl ComfyApp {
             #[cfg(feature = "local-npu")]
             {
                 self.local_npu = saved.local_npu;
+                self.local_backend = saved.local_backend;
+                self.local_pack = saved.local_pack;
             }
             if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
                 self.restore_workflow = Some((saved.workflow_name, json));
@@ -2636,18 +2698,66 @@ impl ComfyApp {
             });
             #[cfg(feature = "local-npu")]
             {
+                self.ensure_local_packs(host, false);
                 ui.add_space(12.0);
                 ui.heading("Local NPU");
                 ui.group(|ui| {
                     ui.checkbox(&mut self.local_npu, "Local NPU (experimental)");
                     ui.weak(
-                        "Queue on Create runs on-device HTP (512² SD1.5 txt2img). Needs pushed \
-                         unet.bin / vae_decoder.bin / tokenizer.json / clip.safetensors. \
-                         Assets stay cached after the first run.",
+                        "Queue on Create runs on-device HTP instead of the server. SD1.5 packs are \
+                         512² (unet.bin / vae_decoder.bin / tokenizer.json / clip.safetensors); \
+                         Anima packs are 1024² and carry an ANIMA marker file.",
                     );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Model pack");
+                        if ui.small_button(icons::REFRESH).clicked() {
+                            self.ensure_local_packs(host, true);
+                        }
+                    });
+                    if self.local_packs.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(230, 180, 120),
+                            "No packs found under the app files dir.",
+                        );
+                    }
+                    let current = self
+                        .selected_pack()
+                        .map(|p| p.label())
+                        .unwrap_or_else(|| "none".to_string());
+                    let mut pick: Option<(String, LocalBackend)> = None;
+                    egui::ComboBox::from_id_salt("local_pack")
+                        .width(ui.available_width())
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for p in &self.local_packs {
+                                if ui.selectable_label(p.name == self.local_pack, p.label()).clicked() {
+                                    pick = Some((p.name.clone(), p.backend));
+                                }
+                            }
+                        });
+                    if let Some((name, backend)) = pick
+                        && (name != self.local_pack || backend != self.local_backend)
+                    {
+                        self.local_pack = name;
+                        self.local_backend = backend;
+                        crate::local_engine::drop_cache();
+                        self.log.info(format!(
+                            "local-npu: pack -> {} ({}), asset caches dropped",
+                            self.local_pack,
+                            self.local_backend.label()
+                        ));
+                    }
+                    if let Some(p) = self.selected_pack() {
+                        ui.weak(elide(&p.dir.display().to_string(), 70));
+                    }
+                    if self.local_backend == LocalBackend::Anima {
+                        ui.weak("Anima: 1024² txt2img, euler (flow match), no img2img yet.");
+                    }
+                    ui.add_space(4.0);
                     if ui.button("Unload NPU cache").clicked() {
                         crate::local_engine::drop_cache();
-                        self.log.info("local-npu: asset cache dropped");
+                        self.log.info("local-npu: asset caches dropped");
                     }
                 });
             }
@@ -3048,20 +3158,38 @@ impl ComfyApp {
         let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
         let enhance_label = if app_n > 0 { format!(" · +{app_n} enhance") } else { String::new() };
         #[cfg(feature = "local-npu")]
-        let local_badge = if self.local_npu { " · Local" } else { "" };
+        let local_badge = if self.local_npu {
+            format!(" · Local · {}", self.local_backend.label())
+        } else {
+            String::new()
+        };
         #[cfg(not(feature = "local-npu"))]
-        let local_badge = "";
+        let local_badge = String::new();
         ui.weak(sanitize_ui_text(
             ui,
             &format!("{ckpt_label} · {preset_label}{enhance_label}{local_badge}"),
         ));
         #[cfg(feature = "local-npu")]
         if self.local_npu {
-            ui.colored_label(
-                egui::Color32::from_rgb(120, 200, 230),
-                "Local NPU — Queue runs on-device (txt2img 512²)",
-            );
+            self.ensure_local_packs(host, false);
+            let pack = self.selected_pack().map(|p| p.name.clone());
+            let line = match (&pack, self.local_backend) {
+                (Some(p), LocalBackend::Anima) => {
+                    format!("Local NPU — Anima '{p}' runs on-device (txt2img 1024²)")
+                }
+                (Some(p), LocalBackend::Sd15) => {
+                    format!("Local NPU — SD1.5 '{p}' runs on-device (txt2img 512²)")
+                }
+                (None, b) => format!("Local NPU — no {} pack found (Settings -> Local NPU)", b.label()),
+            };
+            let colour = if pack.is_some() {
+                egui::Color32::from_rgb(120, 200, 230)
+            } else {
+                egui::Color32::from_rgb(230, 180, 120)
+            };
+            ui.colored_label(colour, sanitize_ui_text(ui, &line));
         }
+        let anima = self.anima_active();
         if let Some(hint) = self
             .checkpoint_catalog
             .entry(&model_file)
@@ -3073,8 +3201,16 @@ impl ComfyApp {
 
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
-            ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
+            ui.add_enabled_ui(!anima, |ui| {
+                ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
+            });
         });
+        if anima {
+            if self.params.mode != Mode::Txt2Img {
+                self.params.mode = Mode::Txt2Img;
+            }
+            ui.weak("Anima has no img2img yet — text to image only.");
+        }
 
         let show_companions = self.params.model_kind == ModelKind::Diffusion;
         let show_img_source = self.params.mode == Mode::Img2Img;
@@ -3304,6 +3440,9 @@ impl ComfyApp {
                 .desired_width(f32::INFINITY)
                 .hint_text("what to avoid"),
         );
+        if anima {
+            ui.weak("Negative only applies when the pack's CFG is above 1.0.");
+        }
 
         self.lint_chips_ui(ui);
 
@@ -3313,7 +3452,12 @@ impl ComfyApp {
                 stepper_u32(ui, "Steps", &mut self.params.steps, 5..=150, 1);
             });
             cols[1].vertical_centered(|ui| {
-                stepper_f32(ui, "CFG", &mut self.params.cfg, 1.0..=20.0, 0.5);
+                if anima {
+                    section_title(ui, "CFG");
+                    ui.weak("pack default");
+                } else {
+                    stepper_f32(ui, "CFG", &mut self.params.cfg, 1.0..=20.0, 0.5);
+                }
             });
         });
         ui.add_space(4.0);
@@ -3332,34 +3476,46 @@ impl ComfyApp {
         ui.vertical_centered(|ui| {
             section_title(ui, "Size");
         });
-        centered_row(ui, |ui| {
-            uint_text_edit(ui, "size_w", &mut self.params.width, 64..=2048);
-            ui.label("×");
-            uint_text_edit(ui, "size_h", &mut self.params.height, 64..=2048);
-            size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
+        ui.add_enabled_ui(!anima, |ui| {
+            centered_row(ui, |ui| {
+                uint_text_edit(ui, "size_w", &mut self.params.width, 64..=2048);
+                ui.label("×");
+                uint_text_edit(ui, "size_h", &mut self.params.height, 64..=2048);
+                size_preset_combo(ui, &mut self.params.width, &mut self.params.height);
+            });
         });
+        if anima {
+            ui.vertical_centered(|ui| ui.weak("Anima renders 1024x1024 — size is fixed."));
+        }
         // An enabled step may render at a different size than the one above (hi-res fix works by
         // generating small and scaling up). Show what it will actually do — the stored value is
         // never touched, so this line simply disappears when the step is removed.
         self.param_override_note(ui);
 
         ui.add_space(4.0);
-        let mut sampler = self.params.sampler.clone();
-        let mut scheduler = self.params.scheduler.clone();
-        let samplers = self.samplers.clone();
-        let schedulers = self.schedulers.clone();
-        ui.columns(2, |cols| {
-            cols[0].vertical_centered(|ui| {
+        if anima {
+            ui.vertical_centered(|ui| {
                 section_title(ui, "Sampler");
-                combo_full(ui, "sampler", &mut sampler, &samplers);
+                ui.weak("euler (flow match)");
             });
-            cols[1].vertical_centered(|ui| {
-                section_title(ui, "Scheduler");
-                combo_full(ui, "scheduler", &mut scheduler, &schedulers);
+        } else {
+            let mut sampler = self.params.sampler.clone();
+            let mut scheduler = self.params.scheduler.clone();
+            let samplers = self.samplers.clone();
+            let schedulers = self.schedulers.clone();
+            ui.columns(2, |cols| {
+                cols[0].vertical_centered(|ui| {
+                    section_title(ui, "Sampler");
+                    combo_full(ui, "sampler", &mut sampler, &samplers);
+                });
+                cols[1].vertical_centered(|ui| {
+                    section_title(ui, "Scheduler");
+                    combo_full(ui, "scheduler", &mut scheduler, &schedulers);
+                });
             });
-        });
-        self.params.sampler = sampler;
-        self.params.scheduler = scheduler;
+            self.params.sampler = sampler;
+            self.params.scheduler = scheduler;
+        }
 
         ui.add_space(4.0);
         ui.label("Seed");
@@ -9146,12 +9302,53 @@ impl ComfyApp {
         out
     }
 
-    /// External QNN model dir: internal documents dir's <pkg> → /storage/emulated/0/Android/data/<pkg>/files/qnn.
+    /// App external files dir: internal documents dir's <pkg> → /storage/emulated/0/Android/data/<pkg>/files.
     #[cfg(feature = "local-npu")]
-    fn qnn_model_dir(&self, host: &Host) -> Option<String> {
+    fn external_files_dir(&self, host: &Host) -> Option<String> {
         let docs = host.documents_dir()?;
         let pkg = std::path::Path::new(&docs).parent()?.file_name()?.to_str()?.to_string();
-        Some(format!("/storage/emulated/0/Android/data/{pkg}/files/qnn"))
+        Some(format!("/storage/emulated/0/Android/data/{pkg}/files"))
+    }
+
+    /// The SD1.5 asset dir the D1/D2 diagnostics read.
+    #[cfg(feature = "local-npu")]
+    fn qnn_model_dir(&self, host: &Host) -> Option<String> {
+        Some(format!("{}/qnn", self.external_files_dir(host)?))
+    }
+
+    /// Scan the external files dir for model packs once; `force` re-reads it.
+    #[cfg(feature = "local-npu")]
+    fn ensure_local_packs(&mut self, host: &Host, force: bool) {
+        if self.local_packs_scanned && !force {
+            return;
+        }
+        self.local_packs_scanned = true;
+        self.local_packs = match self.external_files_dir(host) {
+            Some(root) => crate::local_engine::scan_packs(std::path::Path::new(&root)),
+            None => Vec::new(),
+        };
+        self.log.info(format!(
+            "local-npu: {} pack(s) found: {}",
+            self.local_packs.len(),
+            self.local_packs.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    /// The pack the Local NPU path will use, from the persisted name then the backend.
+    #[cfg(feature = "local-npu")]
+    fn selected_pack(&self) -> Option<&crate::local_engine::PackEntry> {
+        crate::local_engine::pick_pack(&self.local_packs, &self.local_pack, self.local_backend)
+    }
+
+    /// True when the Create tab should present the Anima pipeline (fixed size, euler, txt2img).
+    #[cfg(feature = "local-npu")]
+    fn anima_active(&self) -> bool {
+        self.local_npu && self.local_backend == LocalBackend::Anima
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn anima_active(&self) -> bool {
+        false
     }
 
     /// Spawn the D1 self-test on a worker thread; the report returns via the channel.
@@ -9250,14 +9447,61 @@ impl ComfyApp {
         }
     }
 
-    /// Settings → Diagnostics: D1 NPU smoke + D2 text2img smoke.
+    /// Spawn the D3 Anima smoke on a worker thread.
+    #[cfg(feature = "local-npu")]
+    fn start_d3_anima(&mut self, ctx: &egui::Context, lib_dir: String, pack_dir: std::path::PathBuf) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.d3_rx = Some(rx);
+        self.d3_running = true;
+        self.d3_ok = None;
+        self.log.info(format!("D3-ANIMA starting (libs={lib_dir}, pack={})", pack_dir.display()));
+        let prompt = "1girl, portrait, anime".to_string();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let report =
+                crate::local_engine::anima_smoke(std::path::PathBuf::from(lib_dir), pack_dir, 2, prompt);
+            let _ = tx.send(report);
+            ctx.request_repaint();
+        });
+    }
+
+    #[cfg(feature = "local-npu")]
+    fn poll_d3_anima(&mut self) {
+        let Some(rx) = self.d3_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(report) => {
+                self.d3_rx = None;
+                self.d3_running = false;
+                self.d3_ok = Some(report.ok);
+                let pretty = report.pretty();
+                for line in pretty.lines() {
+                    self.log.info(format!("D3-ANIMA {line}"));
+                }
+                self.d3_last = Some(pretty);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.d3_rx = None;
+                self.d3_running = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Settings → Diagnostics: D1 NPU smoke, D2 SD1.5 text2img smoke, D3 Anima smoke.
     #[cfg(feature = "local-npu")]
     fn diagnostics_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
         let lib_dir = host.native_lib_dir();
         let model_dir = self.qnn_model_dir(host);
         let model_bin = model_dir.as_ref().map(|d| format!("{d}/unet.bin"));
+        self.ensure_local_packs(host, false);
+        let anima_pack = crate::local_engine::pick_pack(
+            &self.local_packs,
+            &self.local_pack,
+            LocalBackend::Anima,
+        )
+        .cloned();
         let warn = egui::Color32::from_rgb(230, 180, 120);
-        let busy = self.d1_running || self.d2_running;
+        let busy = self.d1_running || self.d2_running || self.d3_running;
         crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             ui.heading("D1 NPU self-test");
@@ -9352,6 +9596,54 @@ impl ComfyApp {
                     );
                 });
             }
+
+            ui.add_space(16.0);
+            ui.heading("D3 Anima smoke");
+            ui.weak("Qwen/T5 prep (CPU) + CLIP/DiT/VAE (HTP) from an ANIMA pack, 2 steps at 1024².");
+            ui.group(|ui| {
+                match &anima_pack {
+                    Some(p) => {
+                        ui.weak(format!("pack: {}", p.dir.display()));
+                        ui.weak(format!("output: {}/d3-smoke.png", p.dir.display()));
+                    }
+                    None => {
+                        ui.colored_label(warn, "pack: no ANIMA pack under the app files dir");
+                    }
+                }
+                ui.add_space(8.0);
+                let ready = lib_dir.is_some() && anima_pack.is_some() && !busy;
+                let btn = egui::Button::new("Run D3 Anima smoke (2 steps)").min_size(egui::vec2(240.0, 34.0));
+                if ui.add_enabled(ready, btn).clicked()
+                    && let (Some(lib), Some(p)) = (lib_dir.clone(), anima_pack.clone())
+                {
+                    self.start_d3_anima(ui.ctx(), lib, p.dir);
+                }
+                if self.d3_running {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("running… (~30s; adb logcat -s comfyui:V local_anima:V qnn_rs:V)");
+                    });
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                }
+            });
+            if let Some(ok) = self.d3_ok {
+                ui.add_space(8.0);
+                let (c, t) = if ok {
+                    (egui::Color32::from_rgb(120, 220, 140), "PASSED")
+                } else {
+                    (egui::Color32::from_rgb(230, 120, 120), "FAILED")
+                };
+                ui.colored_label(c, format!("last run: {t}"));
+            }
+            if let Some(last) = &self.d3_last {
+                ui.add_space(4.0);
+                ui.group(|ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(last).monospace())
+                            .wrap_mode(egui::TextWrapMode::Extend),
+                    );
+                });
+            }
         });
     }
 }
@@ -9400,6 +9692,8 @@ impl EguiApp for ComfyApp {
         self.poll_d1_selftest();
         #[cfg(feature = "local-npu")]
         self.poll_d2_text2img();
+        #[cfg(feature = "local-npu")]
+        self.poll_d3_anima();
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
         if self.log_lines.len() > logger::MAX_LINES {
             let excess = self.log_lines.len() - logger::MAX_LINES;

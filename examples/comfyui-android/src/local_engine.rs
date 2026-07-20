@@ -1,24 +1,82 @@
-//! Local NPU generate path: CLIP CPU + UNet/VAE HTP via `local_sd`, emitting [`engine::Msg`].
-//! Heavy assets (CLIP, context binaries, QNN libs) are cached for the process after the first load.
+//! Local NPU generate path, emitting [`engine::Msg`]: SD1.5 (CLIP CPU + UNet/VAE HTP via
+//! `local_sd`) or Anima (DiT packs via `local_anima`). Each backend has its own process-wide
+//! asset cache; only one is resident at a time.
 
 use crate::engine::Msg;
 use crate::logger::Logger;
-use crate::types::Params;
+use crate::types::{LocalBackend, Params};
 use egui::Context;
+use local_anima::{AnimaPack, AnimaParams, Session};
 use local_sd::{
     prepare_htp_env, set_htp_performance_mode, text2img, Backend, ClipTextEncoder, ClipTokenizer,
     QnnContext, QnnSystem, Sampler, Text2ImgParams,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
-/// Fixed paths under the app external files `qnn/` dir + native lib dir.
+/// Anima's fixed output size; the pack's graphs are built for this latent grid only.
+pub const ANIMA_SIZE: u32 = 1024;
+
+/// The SD1.5 pack marker file, mirroring `local_anima::pack::MARKER` for Anima.
+const SD15_MARKER: &str = "unet.bin";
+
+/// Selected model pack + native lib dir for one local generate.
 #[derive(Clone, Debug)]
 pub struct LocalPaths {
     pub lib_dir: PathBuf,
     pub model_dir: PathBuf,
+    pub backend: LocalBackend,
+}
+
+/// A model pack directory found under the app external files dir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackEntry {
+    /// Subdirectory name, e.g. `qnn` or `anima_nova`.
+    pub name: String,
+    pub dir: PathBuf,
+    pub backend: LocalBackend,
+}
+
+impl PackEntry {
+    /// `name (SD1.5)` / `name (Anima)`, for the Settings picker.
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.name, self.backend.label())
+    }
+}
+
+/// Classify one directory: the `ANIMA` marker wins, else a bare `unet.bin` is an SD1.5 dir.
+pub fn classify_pack(dir: &Path) -> Option<LocalBackend> {
+    if AnimaPack::is_anima_pack(dir) {
+        return Some(LocalBackend::Anima);
+    }
+    dir.join(SD15_MARKER).is_file().then_some(LocalBackend::Sd15)
+}
+
+/// Usable packs directly under `root`, sorted by name. Unreadable roots yield an empty list.
+pub fn scan_packs(root: &Path) -> Vec<PackEntry> {
+    let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
+    let mut out: Vec<PackEntry> = rd
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let dir = e.path();
+            let name = dir.file_name()?.to_str()?.to_string();
+            Some(PackEntry { backend: classify_pack(&dir)?, name, dir })
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// The `backend` pack called `name`, else the first pack of `backend`. Never crosses backends.
+pub fn pick_pack<'a>(packs: &'a [PackEntry], name: &str, backend: LocalBackend) -> Option<&'a PackEntry> {
+    packs
+        .iter()
+        .find(|p| p.backend == backend && p.name == name)
+        .or_else(|| packs.iter().find(|p| p.backend == backend))
 }
 
 impl LocalPaths {
@@ -55,8 +113,22 @@ struct AssetCache {
     vae_bytes: Vec<u8>,
 }
 
+/// Anima's cached handles. The DiT/VAE context binaries are mmapped per run inside
+/// `local_anima::text2img`, so only the dlopened libs and the pack header live here.
+struct AnimaCache {
+    key: String,
+    pack: AnimaPack,
+    system: QnnSystem,
+    backend: Backend,
+}
+
 fn cache_slot() -> &'static Mutex<Option<AssetCache>> {
     static SLOT: OnceLock<Mutex<Option<AssetCache>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn anima_slot() -> &'static Mutex<Option<AnimaCache>> {
+    static SLOT: OnceLock<Mutex<Option<AnimaCache>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
@@ -106,23 +178,48 @@ fn map_sampler(name: &str) -> (Sampler, Option<String>) {
     (Sampler::EulerAncestral, Some(name.to_string()))
 }
 
-fn rgb_to_color_image(img: &local_sd::Image) -> egui::ColorImage {
-    let mut rgba = Vec::with_capacity(img.rgb.len() / 3 * 4);
-    for c in img.rgb.chunks_exact(3) {
+fn rgb_to_color_image(width: u32, height: u32, rgb: &[u8]) -> egui::ColorImage {
+    let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+    for c in rgb.chunks_exact(3) {
         rgba.extend_from_slice(&[c[0], c[1], c[2], 255]);
     }
-    egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &rgba)
+    egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba)
 }
 
-/// Drop the in-process asset cache (frees ~1GB host RAM). Next generate reloads from disk.
+/// Drop both in-process asset caches (frees ~1GB host RAM). Next generate reloads from disk.
 pub fn drop_cache() {
+    drop_sd_cache();
+    drop_anima_cache();
+}
+
+fn drop_sd_cache() {
     if let Ok(mut g) = cache_slot().lock() {
         *g = None;
     }
 }
 
-/// Blocking text2img; sends Progress / Preview / Result / Done or GenError on `tx`.
+fn drop_anima_cache() {
+    if let Ok(mut g) = anima_slot().lock() {
+        *g = None;
+    }
+}
+
+/// Blocking text2img on the selected backend; sends Progress / Preview / Result / Done or GenError.
 pub fn run(
+    paths: LocalPaths,
+    params: Params,
+    tx: Sender<Msg>,
+    ctx: Context,
+    log: Logger,
+    cancel: Arc<AtomicBool>,
+) {
+    match paths.backend {
+        LocalBackend::Sd15 => run_sd15(paths, params, tx, ctx, log, cancel),
+        LocalBackend::Anima => run_anima(paths, params, tx, ctx, log, cancel),
+    }
+}
+
+fn run_sd15(
     paths: LocalPaths,
     params: Params,
     tx: Sender<Msg>,
@@ -148,6 +245,7 @@ pub fn run(
             return;
         }
     };
+    drop_anima_cache();
 
     let (sampler, sampler_fallback) = map_sampler(&params.sampler);
     log.info(format!(
@@ -156,13 +254,13 @@ pub fn run(
     ));
     send(Msg::Queued);
     if let Some(from) = &sampler_fallback {
-        let note = format!("Local NPU: sampler '{from}' → Euler a (only Euler a / DPM++ 2M)");
+        let note = format!("Local NPU: sampler '{from}' -> Euler a (only Euler a / DPM++ 2M)");
         log.warn(note.clone());
         send(Msg::Status(note));
     }
     if params.width != 512 || params.height != 512 {
         let note = format!(
-            "Local NPU: {}x{} → 512x512 (fixed latent)",
+            "Local NPU: {}x{} -> 512x512 (fixed latent)",
             params.width, params.height
         );
         log.warn(note.clone());
@@ -226,7 +324,7 @@ pub fn run(
                 }
                 let _ = tx.send(Msg::Progress { value: step as u32, max: total as u32 });
                 if let Some(p) = preview {
-                    let _ = tx.send(Msg::Preview(rgb_to_color_image(p)));
+                    let _ = tx.send(Msg::Preview(rgb_to_color_image(p.width, p.height, &p.rgb)));
                 }
                 ctx.request_repaint();
             },
@@ -244,7 +342,7 @@ pub fn run(
         }
 
         let png = image.to_png().map_err(|e| format!("png: {e}"))?;
-        let ci = rgb_to_color_image(&image);
+        let ci = rgb_to_color_image(image.width, image.height, &image.rgb);
         log.info(format!(
             "local-npu: done {}x{} ({} bytes png)",
             image.width,
@@ -262,5 +360,328 @@ pub fn run(
             log.error(format!("local-npu: {e}"));
             send(Msg::GenError(e));
         }
+    }
+}
+
+/// Open the pack and dlopen the QNN libs for `paths`.
+fn load_anima(paths: &LocalPaths, log: &Logger) -> Result<AnimaCache, String> {
+    log.info(format!("local-anima: opening pack {}", paths.model_dir.display()));
+    prepare_htp_env(&paths.lib_dir);
+    let pack = AnimaPack::open(&paths.model_dir).map_err(|e| format!("pack: {e}"))?;
+    let system = QnnSystem::load(paths.system_lib()).map_err(|e| format!("QnnSystem: {e}"))?;
+    let backend = Backend::load(paths.backend_lib()).map_err(|e| format!("Backend: {e}"))?;
+    let c = pack.config();
+    log.info(format!(
+        "local-anima: pack ok {}x{} steps={} cfg={} scheduler={}",
+        c.default_width, c.default_height, c.default_steps, c.default_cfg, c.default_scheduler
+    ));
+    Ok(AnimaCache { key: paths.cache_key(), pack, system, backend })
+}
+
+/// Pack defaults (size, cfg, scheduler) with the Create-tab steps / seed / negative applied.
+fn anima_params(pack: &AnimaPack, params: &Params) -> AnimaParams {
+    let mut p = AnimaParams::from_pack(pack);
+    p.steps = params.steps.max(1) as usize;
+    p.seed = params.seed;
+    p.negative = params.negative.clone();
+    p
+}
+
+fn run_anima(
+    paths: LocalPaths,
+    params: Params,
+    tx: Sender<Msg>,
+    ctx: Context,
+    log: Logger,
+    cancel: Arc<AtomicBool>,
+) {
+    let send = |m: Msg| {
+        let _ = tx.send(m);
+        ctx.request_repaint();
+    };
+
+    if cancel.load(Ordering::Relaxed) {
+        send(Msg::Cancelled);
+        return;
+    }
+
+    let _gate = match run_lock().lock() {
+        Ok(g) => g,
+        Err(_) => {
+            send(Msg::GenError("local-anima: internal lock poisoned".into()));
+            return;
+        }
+    };
+    drop_sd_cache();
+
+    log.info(format!(
+        "local-anima: generate steps={} seed={} pack={}",
+        params.steps,
+        params.seed,
+        paths.model_dir.display()
+    ));
+    send(Msg::Queued);
+    if params.width != ANIMA_SIZE || params.height != ANIMA_SIZE {
+        let note = format!("Anima: {}x{} -> {ANIMA_SIZE}² (fixed latent)", params.width, params.height);
+        log.warn(note.clone());
+        send(Msg::Status(note));
+    }
+
+    let result = (|| -> Result<(), String> {
+        send(Msg::Status("Anima: loading pack…".into()));
+        let key = paths.cache_key();
+        {
+            let mut slot = anima_slot().lock().map_err(|_| "cache lock poisoned".to_string())?;
+            if slot.as_ref().map(|c| c.key != key).unwrap_or(true) {
+                // Free the previous pack's handles before opening the new one.
+                *slot = None;
+                *slot = Some(load_anima(&paths, &log)?);
+            } else {
+                log.info("local-anima: using cached pack");
+            }
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        let prompt = params.combined_positive();
+        let image = {
+            let slot = anima_slot().lock().map_err(|_| "cache lock poisoned".to_string())?;
+            let cache = slot.as_ref().ok_or("cache empty after load")?;
+            let aparams = anima_params(&cache.pack, &params);
+            send(Msg::Status("Anima: creating HTP session…".into()));
+            let session = Session::new(&cache.backend).map_err(|e| format!("session: {e}"))?;
+            // Performance mode only takes after Session::new; before it the DSP appears to crash.
+            if let Err(e) = session.set_htp_performance_mode() {
+                log.warn(format!("local-anima: performance mode unavailable: {e}"));
+            }
+            send(Msg::Status("Anima: sampling…".into()));
+            local_anima::text2img_cancellable(
+                &cache.pack,
+                &session,
+                &cache.system,
+                &prompt,
+                &aparams,
+                |step, total| {
+                    let _ = tx.send(Msg::Progress { value: step as u32, max: total as u32 });
+                    ctx.request_repaint();
+                },
+                Some(&cancel),
+            )
+            .map_err(|e| format!("text2img: {e}"))?
+        };
+
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+
+        let png = image.to_png().map_err(|e| format!("png: {e}"))?;
+        let ci = rgb_to_color_image(image.width, image.height, &image.rgb);
+        log.info(format!(
+            "local-anima: done {}x{} ({} bytes png)",
+            image.width,
+            image.height,
+            png.len()
+        ));
+        send(Msg::Result { image: ci, bytes: png });
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => send(Msg::Done),
+        Err(e) if e.ends_with("cancelled") || cancel.load(Ordering::Relaxed) => send(Msg::Cancelled),
+        Err(e) => {
+            log.error(format!("local-anima: {e}"));
+            send(Msg::GenError(e));
+        }
+    }
+}
+
+/// D3 Anima smoke result: one `key = value` line per stage.
+#[derive(Clone, Debug)]
+pub struct AnimaSmoke {
+    pub ok: bool,
+    pub lines: Vec<String>,
+}
+
+impl AnimaSmoke {
+    pub fn pretty(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+fn kv(key: &str, value: impl AsRef<str>) -> String {
+    format!("{key:<9}= {}", value.as_ref())
+}
+
+/// Open `pack_dir`, run a short generation, and write `d3-smoke.png` into the pack dir.
+pub fn anima_smoke(lib_dir: PathBuf, pack_dir: PathBuf, steps: usize, prompt: String) -> AnimaSmoke {
+    let _gate = run_lock().lock();
+    drop_cache();
+    let started = Instant::now();
+    let out_png = pack_dir.join("d3-smoke.png");
+    let mut lines = vec![
+        kv("pack", pack_dir.display().to_string()),
+        kv("libs", lib_dir.display().to_string()),
+        kv("prompt", &prompt),
+        kv("steps", steps.to_string()),
+        kv("output", out_png.display().to_string()),
+    ];
+    let res = anima_smoke_inner(&lib_dir, &pack_dir, steps, &prompt, &out_png, &mut lines);
+    if let Err(e) = &res {
+        lines.push(kv("error", e));
+    }
+    lines.push(kv("total", format!("{:.2}s", started.elapsed().as_secs_f32())));
+    lines.push(kv("result", if res.is_ok() { "PASS" } else { "FAIL" }));
+    AnimaSmoke { ok: res.is_ok(), lines }
+}
+
+fn anima_smoke_inner(
+    lib_dir: &Path,
+    pack_dir: &Path,
+    steps: usize,
+    prompt: &str,
+    out_png: &Path,
+    lines: &mut Vec<String>,
+) -> Result<(), String> {
+    let t = Instant::now();
+    prepare_htp_env(lib_dir);
+    let pack = AnimaPack::open(pack_dir).map_err(|e| format!("pack open: {e}"))?;
+    lines.push(kv("open", format!("{:.2}s", t.elapsed().as_secs_f32())));
+    let c = pack.config();
+    lines.push(kv(
+        "config",
+        format!(
+            "{}x{} steps={} cfg={} sched={}",
+            c.default_width, c.default_height, c.default_steps, c.default_cfg, c.default_scheduler
+        ),
+    ));
+
+    let t = Instant::now();
+    let system = QnnSystem::load(lib_dir.join("libQnnSystem.so")).map_err(|e| format!("QnnSystem: {e}"))?;
+    let backend = Backend::load(lib_dir.join("libQnnHtp.so")).map_err(|e| format!("Backend: {e}"))?;
+    let session = Session::new(&backend).map_err(|e| format!("session: {e}"))?;
+    if let Err(e) = session.set_htp_performance_mode() {
+        lines.push(kv("perf", format!("unavailable: {e}")));
+    }
+    lines.push(kv("session", format!("{:.2}s", t.elapsed().as_secs_f32())));
+
+    let mut params = AnimaParams::from_pack(&pack);
+    params.steps = steps.max(1);
+    params.seed = 0;
+
+    let t = Instant::now();
+    let mut per_step: Vec<String> = Vec::new();
+    let mut last = Instant::now();
+    let image = local_anima::text2img(&pack, &session, &system, prompt, &params, |i, n| {
+        let dt = last.elapsed().as_secs_f32();
+        last = Instant::now();
+        log::info!("D3-ANIMA step {i}/{n} {dt:.2}s");
+        per_step.push(format!("{dt:.2}s"));
+    })
+    .map_err(|e| format!("text2img: {e}"))?;
+    lines.push(kv("generate", format!("{:.2}s", t.elapsed().as_secs_f32())));
+    lines.push(kv("per-step", per_step.join(" ")));
+    lines.push(kv("image", image_stats(&image)));
+
+    let t = Instant::now();
+    let png = image.to_png().map_err(|e| format!("png: {e}"))?;
+    std::fs::write(out_png, &png).map_err(|e| format!("write {}: {e}", out_png.display()))?;
+    lines.push(kv("png", format!("{} bytes in {:.2}s", png.len(), t.elapsed().as_secs_f32())));
+    Ok(())
+}
+
+/// `WxH mean=… min=… max=…` — a flat/black decode shows up as min == max.
+fn image_stats(image: &local_anima::Image) -> String {
+    let n = image.rgb.len().max(1);
+    let mean = image.rgb.iter().map(|&b| b as f64).sum::<f64>() / n as f64;
+    let (min, max) = image.rgb.iter().fold((255u8, 0u8), |(lo, hi), &b| (lo.min(b), hi.max(b)));
+    format!("{}x{} mean={mean:.1} min={min} max={max}", image.width, image.height)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn classifies_packs_by_marker() {
+        let root = tmp("comfyui-packs-classify");
+        let anima = root.join("anima");
+        std::fs::create_dir_all(&anima).unwrap();
+        std::fs::write(anima.join("ANIMA"), b"").unwrap();
+        let sd = root.join("qnn");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(sd.join("unet.bin"), b"x").unwrap();
+        let empty = root.join("junk");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(classify_pack(&anima), Some(LocalBackend::Anima));
+        assert_eq!(classify_pack(&sd), Some(LocalBackend::Sd15));
+        assert_eq!(classify_pack(&empty), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_lists_only_pack_dirs_sorted() {
+        let root = tmp("comfyui-packs-scan");
+        for name in ["anima_nova", "anima"] {
+            let d = root.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("ANIMA"), b"").unwrap();
+        }
+        let sd = root.join("qnn");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(sd.join("unet.bin"), b"x").unwrap();
+        std::fs::create_dir_all(root.join("cache")).unwrap();
+        std::fs::write(root.join("stray.txt"), b"x").unwrap();
+        let packs = scan_packs(&root);
+        let names: Vec<&str> = packs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["anima", "anima_nova", "qnn"]);
+        assert_eq!(packs[0].backend, LocalBackend::Anima);
+        assert_eq!(packs[2].backend, LocalBackend::Sd15);
+        assert_eq!(packs[1].label(), "anima_nova (Anima)");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_of_a_missing_root_is_empty() {
+        assert!(scan_packs(Path::new("/nope/does/not/exist")).is_empty());
+    }
+
+    #[test]
+    fn pick_stays_within_the_selected_backend() {
+        let packs = vec![
+            PackEntry { name: "anima".into(), dir: "/a".into(), backend: LocalBackend::Anima },
+            PackEntry { name: "anima_nova".into(), dir: "/n".into(), backend: LocalBackend::Anima },
+            PackEntry { name: "qnn".into(), dir: "/q".into(), backend: LocalBackend::Sd15 },
+        ];
+        assert_eq!(pick_pack(&packs, "anima_nova", LocalBackend::Anima).unwrap().name, "anima_nova");
+        assert_eq!(pick_pack(&packs, "", LocalBackend::Sd15).unwrap().name, "qnn");
+        // A name from the other backend falls back to the first pack of the selected one.
+        assert_eq!(pick_pack(&packs, "qnn", LocalBackend::Anima).unwrap().name, "anima");
+        assert!(pick_pack(&packs[..1], "qnn", LocalBackend::Sd15).is_none());
+        assert!(pick_pack(&[], "qnn", LocalBackend::Sd15).is_none());
+    }
+
+    #[test]
+    fn smoke_reports_fail_when_the_pack_is_missing() {
+        let report = anima_smoke("/nope/libs".into(), "/nope/pack".into(), 2, "cat".into());
+        assert!(!report.ok);
+        let pretty = report.pretty();
+        assert!(pretty.contains("result   = FAIL"), "{pretty}");
+        assert!(pretty.contains("error"), "{pretty}");
+    }
+
+    #[test]
+    fn image_stats_report_the_range() {
+        let img = local_anima::Image { width: 2, height: 1, rgb: vec![0, 10, 20, 30, 40, 250] };
+        assert_eq!(image_stats(&img), "2x1 mean=58.3 min=0 max=250");
     }
 }

@@ -1263,6 +1263,7 @@ dependencies = [
  "flate2",
  "futures",
  "image",
+ "local-anima",
  "local-sd",
  "log",
  "reqwest",

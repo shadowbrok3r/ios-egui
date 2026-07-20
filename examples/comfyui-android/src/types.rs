@@ -533,6 +533,26 @@ impl CheckpointSort {
     }
 }
 
+/// Which on-device pipeline the Local NPU path runs (feature `local-npu`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum LocalBackend {
+    /// SD1.5 at 512²: CLIP on CPU, UNet + VAE on HTP, from a `qnn/`-style dir with `unet.bin`.
+    #[default]
+    Sd15,
+    /// Anima DiT at 1024²: a pack dir carrying the `ANIMA` marker.
+    Anima,
+}
+
+#[cfg_attr(not(feature = "local-npu"), allow(dead_code))]
+impl LocalBackend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sd15 => "SD1.5",
+            Self::Anima => "Anima",
+        }
+    }
+}
+
 /// Cap on persisted MRU checkpoint filenames.
 pub const CHECKPOINT_RECENT_MAX: usize = 40;
 
@@ -1134,6 +1154,12 @@ pub struct Settings {
     /// Route Create Queue through on-device HTP (feature `local-npu`); ignores remote ComfyUI.
     #[serde(default)]
     pub local_npu: bool,
+    /// Which on-device pipeline `local_npu` runs; absent in older settings, so SD1.5 by default.
+    #[serde(default)]
+    pub local_backend: LocalBackend,
+    /// Selected pack subdir under the app external files dir (empty = first pack of `local_backend`).
+    #[serde(default)]
+    pub local_pack: String,
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),
@@ -1271,6 +1297,32 @@ fn unix_ymd(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings written before the Anima backend existed still load, as SD1.5.
+    #[test]
+    fn settings_without_local_backend_load_as_sd15() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params, "local_npu": true});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(s.local_npu);
+        assert_eq!(s.local_backend, LocalBackend::Sd15);
+        assert!(s.local_pack.is_empty());
+    }
+
+    #[test]
+    fn settings_round_trip_the_anima_backend() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({
+            "server_url": "", "params": params, "local_npu": true,
+            "local_backend": "Anima", "local_pack": "anima_nova",
+        });
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(s.local_backend, LocalBackend::Anima);
+        assert_eq!(s.local_pack, "anima_nova");
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.local_backend, LocalBackend::Anima);
+        assert_eq!(back.local_pack, "anima_nova");
+    }
 
     #[test]
     fn dedupe_loras_keeps_first_of_each_file() {
