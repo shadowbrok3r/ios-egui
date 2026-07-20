@@ -635,6 +635,8 @@ struct ComfyApp {
     gallery_loading: bool,
     gallery_status: String,
     gallery_q: String,
+    /// Main search box runs CLIP semantic search instead of the server text query.
+    gallery_semantic: bool,
     /// Query + layout of the Gallery tab (model filter, album, sort, grouping, columns).
     gallery_view: GalleryView,
     thumbs: ThumbCache,
@@ -825,7 +827,7 @@ struct ComfyApp {
     clipemb_rx: Option<std::sync::mpsc::Receiver<(String, Result<(Vec<f32>, Option<f32>), String>)>>,
     #[cfg(feature = "local-npu")]
     clipemb_failed: HashSet<String>,
-    /// Semantic-search query box in the Tags menu (session-only).
+    /// Last semantic-search query text; poll_clip_search labels results from it (session-only).
     #[cfg(feature = "local-npu")]
     clip_text_q: String,
     /// Text-embedding worker result (the L2-normalized query embedding or an error string).
@@ -839,8 +841,10 @@ struct ComfyApp {
     gallery_grid_clip: egui::Rect,
     /// Gallery client-side tag search box (session-only).
     tag_q: String,
-    /// Filter box inside the all-tags browser menu (session-only).
+    /// Filter box inside the all-tags browser window (session-only).
     tag_browse_q: String,
+    /// Whether the pinned all-tags browser window is showing (session-only).
+    tags_window_open: bool,
     /// 0 = all, 1 = indexed only, 2 = unindexed only (session-only).
     index_filter: u8,
     /// Active facet-chip tag filters, AND-combined with the search box (session-only).
@@ -1113,6 +1117,7 @@ impl ComfyApp {
             gallery_loading: false,
             gallery_status: String::new(),
             gallery_q: String::new(),
+            gallery_semantic: true,
             gallery_view: GalleryView::default(),
             thumbs: ThumbCache::default(),
             viewer: None,
@@ -1208,6 +1213,7 @@ impl ComfyApp {
             tag_index_dirty: 0,
             gallery_grid_clip: egui::Rect::NOTHING,
             tag_browse_q: String::new(),
+            tags_window_open: false,
             index_filter: 0,
             clip_index: clip_index::ClipIndex::default(),
             clip_index_loaded: false,
@@ -3250,6 +3256,7 @@ impl ComfyApp {
             params: self.params.clone(),
             gallery: self.gallery_view.clone(),
             gallery_q: self.gallery_q.clone(),
+            gallery_semantic: self.gallery_semantic,
             gallery_page: self.gallery_page_size(),
             auto_follow: self.auto_follow,
             auto_arrange: self.auto_arrange,
@@ -3328,6 +3335,7 @@ impl ComfyApp {
         self.params.inpaint_mask = false;
         self.gallery_view = saved.gallery;
         self.gallery_q = saved.gallery_q;
+        self.gallery_semantic = saved.gallery_semantic;
         self.gallery_page = saved.gallery_page.clamp(20, GALLERY_PAGE_MAX);
         self.auto_follow = saved.auto_follow;
         self.auto_arrange = saved.auto_arrange;
@@ -10781,19 +10789,41 @@ impl ComfyApp {
 
     fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool, host: &Host) -> bool {
         let mut changed = false;
+        #[cfg(not(feature = "local-npu"))]
+        let _ = host;
         // One row: search + refresh + View (rightmost). Filters live in View submenus.
         ui.horizontal(|ui| {
             let refresh_w = 40.0;
             let view_w = 72.0;
             let tags_w = 60.0;
             let search_w = (ui.available_width() - refresh_w - view_w - tags_w - 12.0).max(96.0);
+            #[cfg(feature = "local-npu")]
+            let semantic = self.gallery_semantic_active();
+            #[cfg(not(feature = "local-npu"))]
+            let semantic = false;
+            let hint = if semantic {
+                format!("{} describe an image", icons::SEARCH)
+            } else {
+                format!("{} search", icons::SEARCH)
+            };
             let resp = ui.add_sized(
                 egui::vec2(search_w, 28.0),
-                egui::TextEdit::singleline(&mut self.gallery_q)
-                    .hint_text(format!("{} search", icons::SEARCH)),
+                egui::TextEdit::singleline(&mut self.gallery_q).hint_text(hint),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                changed = true;
+                if semantic {
+                    #[cfg(feature = "local-npu")]
+                    {
+                        let q = self.gallery_q.trim().to_string();
+                        if q.is_empty() {
+                            self.similar_filter = None;
+                        } else {
+                            self.start_clip_search(ui.ctx(), host, q);
+                        }
+                    }
+                } else {
+                    changed = true;
+                }
             }
             if ui
                 .add_enabled(connected, egui::Button::new(icons::REFRESH).min_size(egui::vec2(36.0, 28.0)))
@@ -10803,7 +10833,12 @@ impl ComfyApp {
                 changed = true;
             }
 
-            up_menu_sized(ui, "Tags".to_string(), egui::vec2(56.0, 28.0), |ui| self.tags_menu_ui(ui, host));
+            if ui
+                .add_sized(egui::vec2(56.0, 28.0), egui::Button::selectable(self.tags_window_open, "Tags"))
+                .clicked()
+            {
+                self.tags_window_open = !self.tags_window_open;
+            }
 
             up_menu_sized(ui, format!("{} View", icons::GALLERY), egui::vec2(68.0, 28.0), |ui| {
                 if ui
@@ -10814,6 +10849,10 @@ impl ComfyApp {
                     self.select_mode = true;
                 }
                 ui.separator();
+
+                #[cfg(feature = "local-npu")]
+                ui.checkbox(&mut self.gallery_semantic, "Semantic search")
+                    .on_hover_text("Search box describes an image; ranks the CLIP index instead of the server text query");
 
                 ui.menu_button(
                     format!("{} Sort · {}", icons::SORT, self.gallery_view.sort.label()),
@@ -11019,78 +11058,56 @@ impl ComfyApp {
         self.album_manage_open = open;
     }
 
-    /// Compact client-side tag filter row: search box, rating selector, and facet chips over the
-    /// currently visible items. All filtering is local (auto-tag index); nothing re-queries.
-    /// The all-tags browser: search box over every indexed tag with counts, tap to toggle a facet.
-    fn tags_menu_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
-        #[cfg(feature = "local-npu")]
-        self.semantic_search_ui(ui, host);
-        #[cfg(not(feature = "local-npu"))]
-        let _ = host;
-        ui.add(
-            egui::TextEdit::singleline(&mut self.tag_browse_q)
-                .hint_text("filter tags")
-                .desired_width(180.0),
-        );
-        let keys: Vec<String> = self.gallery.iter().map(|it| it.key()).collect();
-        let all = self.tag_index.top_tags(&keys, 400);
-        let q = self.tag_browse_q.trim().to_lowercase();
-        egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-            for (tag, n) in all.iter().filter(|(t, _)| q.is_empty() || t.contains(&q)) {
-                let on = self.tag_facets.contains(tag);
-                if ui.add(egui::Button::selectable(on, format!("{tag}  ({n})"))).clicked() {
-                    if on {
-                        self.tag_facets.retain(|f| f != tag);
-                    } else {
-                        self.tag_facets.push(tag.clone());
-                    }
-                }
-            }
-        });
+    /// Whether the main gallery box should run semantic search: toggle on, pack has the text tower,
+    /// and the CLIP index holds at least one embedding.
+    #[cfg(feature = "local-npu")]
+    fn gallery_semantic_active(&self) -> bool {
+        self.gallery_semantic
+            && self.clip_index.len() > 0
+            && self.clip_pack.as_ref().is_some_and(|d| {
+                d.join(local_clip::TEXT_MODEL_FILE).is_file()
+                    && d.join(local_clip::TOKENIZER_FILE).is_file()
+            })
     }
 
-    /// Typed semantic search at the top of the Tags menu: embed the query on the NPU text tower and
-    /// rank the CLIP index by cosine. Shows one dim line when the pack files or index are missing.
-    #[cfg(feature = "local-npu")]
-    fn semantic_search_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
-        let has_text = self.clip_pack.as_ref().is_some_and(|d| {
-            d.join(local_clip::TEXT_MODEL_FILE).is_file() && d.join(local_clip::TOKENIZER_FILE).is_file()
-        });
-        if has_text && self.clip_index.len() > 0 {
-            ui.label(format!("{} Semantic search", icons::SEARCH));
-            if self.clip_search_running {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new());
-                    ui.label("Embedding query…");
-                });
-            } else {
-                let mut submit = false;
-                ui.horizontal(|ui| {
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.clip_text_q)
-                            .hint_text("describe an image")
-                            .desired_width(150.0),
-                    );
-                    submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    submit |= ui.button("Search").clicked();
-                });
-                if submit {
-                    let q = self.clip_text_q.trim().to_string();
-                    if !q.is_empty() {
-                        self.start_clip_search(ui.ctx(), host, q);
-                        ui.close();
-                    }
-                }
-            }
-        } else {
-            let msg = if !has_text {
-                "Semantic search needs text_model.bin + tokenizer.json in the CLIP pack"
-            } else {
-                "Semantic search: waiting for images to be indexed"
-            };
-            ui.weak(msg);
+    /// Pinned all-tags browser: a filter box over every indexed tag with counts, tap to toggle a
+    /// facet. A real window keeps the TextEdit focused where a menu popup would auto-close on IME.
+    fn tags_window(&mut self, ctx: &egui::Context) {
+        if !self.tags_window_open {
+            return;
         }
-        ui.separator();
+        let mut open = true;
+        centered(ctx, egui::Window::new(format!("{} Tags", icons::SEARCH)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .default_height(420.0)
+            .show(ctx, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tag_browse_q)
+                        .hint_text("filter tags")
+                        .desired_width(f32::INFINITY),
+                );
+                let keys: Vec<String> = self.gallery.iter().map(|it| it.key()).collect();
+                let all = self.tag_index.top_tags(&keys, 400);
+                let q = self.tag_browse_q.trim().to_lowercase();
+                crate::theme::scroll_vertical().max_height(340.0).auto_shrink([false, false]).show(
+                    ui,
+                    |ui| {
+                        for (tag, n) in all.iter().filter(|(t, _)| q.is_empty() || t.contains(&q)) {
+                            let on = self.tag_facets.contains(tag);
+                            if ui.add(egui::Button::selectable(on, format!("{tag}  ({n})"))).clicked() {
+                                if on {
+                                    self.tag_facets.retain(|f| f != tag);
+                                } else {
+                                    self.tag_facets.push(tag.clone());
+                                }
+                            }
+                        }
+                    },
+                );
+            });
+        self.tags_window_open = open;
     }
 
     /// Spawn the CLIP text-embedding worker; the L2-normalized query embedding returns via the
@@ -11102,6 +11119,8 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         };
+        // poll_clip_search labels the result from this held query text.
+        self.clip_text_q = query.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.clip_search_rx = Some(rx);
         self.clip_search_running = true;
@@ -11289,6 +11308,7 @@ impl ComfyApp {
         self.album_manage_window(ui.ctx());
         self.album_create_window(ui.ctx());
         self.delete_confirm_window(ui.ctx(), host);
+        self.tags_window(ui.ctx());
 
         let mut refresh = false;
         egui::Panel::bottom("gallery-controls").show(ui, |ui| {

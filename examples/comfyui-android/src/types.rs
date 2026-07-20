@@ -1488,6 +1488,9 @@ pub struct Settings {
     /// Gallery search box text.
     #[serde(default)]
     pub gallery_q: String,
+    /// Main gallery search box runs CLIP semantic search where the local pack supports it.
+    #[serde(default = "default_true")]
+    pub gallery_semantic: bool,
     /// How many gallery rows to fetch per page / Load more (20..=500).
     #[serde(default = "default_gallery_page")]
     pub gallery_page: u64,
