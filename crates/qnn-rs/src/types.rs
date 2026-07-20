@@ -77,6 +77,22 @@ impl DataType {
         }
     }
 
+    /// True for the plain integer types (not fixed-point, float, or opaque).
+    pub fn is_integer(self) -> bool {
+        matches!(
+            self,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Bool8
+        )
+    }
+
     /// Byte width of one element, or None for sub-byte/opaque types.
     pub fn byte_width(self) -> Option<u32> {
         Some(match self {

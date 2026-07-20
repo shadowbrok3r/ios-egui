@@ -15,7 +15,20 @@ libc = "0.2"
 log = { workspace = true }
 
 [dev-dependencies]
+memmap2 = "0.9"
 
 [[example]]
 name = "dump_context"
 path = "examples/dump_context.rs"
+
+[[example]]
+name = "anima_smoke"
+path = "examples/anima_smoke.rs"
+
+[[example]]
+name = "clip_smoke"
+path = "examples/clip_smoke.rs"
+
+[[example]]
+name = "vae_smoke"
+path = "examples/vae_smoke.rs"

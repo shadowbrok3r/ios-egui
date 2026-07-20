@@ -44,6 +44,9 @@ pub enum Error {
     #[error("unsupported {kind} data type {dtype:?} for tensor '{name}'")]
     UnsupportedDataType { kind: &'static str, name: String, dtype: crate::types::DataType },
 
+    #[error("tensor '{name}' has non-integer data type {dtype:?}; an i32 input cannot be bound to it")]
+    IntInputTypeMismatch { name: String, dtype: crate::types::DataType },
+
     #[error("device execution is not implemented on host; this is on-device milestone D1")]
     Unimplemented,
 }

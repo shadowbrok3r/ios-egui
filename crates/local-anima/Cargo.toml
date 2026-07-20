@@ -1,0 +1,23 @@
+[package]
+name = "local-anima"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "On-device Anima (DiT) text2img pipeline (Qwen/T5 text prep on CPU, CLIP/DiT/VAE on Qualcomm HTP via qnn-rs). Host-testable pure math; device paths compile everywhere."
+
+[dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+log = { workspace = true }
+memmap2 = "0.9"
+qnn-rs = { path = "../qnn-rs" }
+rand = "0.10.2"
+rand_distr = "0.6.0"
+serde = { workspace = true }
+serde_json = "1"
+thiserror = "2.0.19"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+[[example]]
+name = "anima_txt2img"
+path = "examples/anima_txt2img.rs"

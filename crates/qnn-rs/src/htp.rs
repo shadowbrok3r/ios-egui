@@ -25,6 +25,16 @@ pub const DCVS_VOLTAGE_VCORNER_MAX_VOLTAGE_CORNER: u32 = 0xA0;
 // QnnHtpDevice_InfrastructureType_t
 pub const QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF: u32 = 0;
 
+pub const QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY: u32 = 2;
+pub const QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME: u32 = 3;
+
+// QnnHtpContext_ConfigOption_t
+pub const QNN_HTP_CONTEXT_CONFIG_OPTION_REGISTER_MULTI_CONTEXTS: u32 = 2;
+pub const QNN_HTP_CONTEXT_CONFIG_OPTION_USE_EXTENDED_UDMA: u32 = 11;
+
+// QnnHtpContext_GetPropertyOption_t
+pub const QNN_HTP_CONTEXT_GET_PROP_MAX_SPILLFILL_BUFFER_SIZE: u32 = 2;
+
 /// DcvsV3 config; 16 × 4-byte members = 64 bytes (the union ceiling).
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -53,6 +63,8 @@ pub struct QnnHtpPerfInfrastructure_DcvsV3_t {
 #[derive(Copy, Clone)]
 pub union QnnHtpPerfInfrastructure_PowerConfig_union {
     pub dcvsV3Config: QnnHtpPerfInfrastructure_DcvsV3_t,
+    pub rpcControlLatencyConfig: u32,
+    pub rpcPollingTimeConfig: u32,
 }
 
 #[repr(C)]
@@ -95,6 +107,57 @@ pub struct QnnHtpDevice_Infrastructure_t {
     pub infraType: u32,
     pub perfInfra: QnnHtpDevice_PerfInfrastructure_t,
 }
+
+/// `QnnHtpContext_GroupRegistration_t`: head handle (0 = start a new group)
+/// plus the group's shared spill-fill scratch size in bytes.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct QnnHtpContext_GroupRegistration_t {
+    pub firstGroupHandle: *mut c_void,
+    pub maxSpillFillBuffer: u64,
+}
+
+/// The arms of `QnnHtpContext_CustomConfig_t`'s union this crate sets; the
+/// 16-byte `groupRegistration` is the largest and forces 8-byte alignment.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union QnnHtpContext_CustomConfig_union {
+    pub weightSharingEnabled: bool,
+    pub groupRegistration: QnnHtpContext_GroupRegistration_t,
+    pub useExtendedUdma: bool,
+}
+
+/// `QnnHtpContext_CustomConfig_t`; the 4-byte enum is followed by 4 bytes of
+/// padding before the 8-byte-aligned union.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct QnnHtpContext_CustomConfig_t {
+    pub option: u32,
+    pub config: QnnHtpContext_CustomConfig_union,
+}
+
+/// The `uint64_t` arms of `QnnHtpContext_CustomProperty_t`'s union.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union QnnHtpContext_CustomProperty_union {
+    pub bufferStartAlignment: u64,
+    pub spillfillBufferSize: u64,
+}
+
+/// `QnnHtpContext_CustomProperty_t` for `contextGetProperty`; same 4-byte enum
+/// plus padding then union layout as the custom config.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct QnnHtpContext_CustomProperty_t {
+    pub option: u32,
+    pub prop: QnnHtpContext_CustomProperty_union,
+}
+
+const _: () = assert!(std::mem::size_of::<QnnHtpContext_GroupRegistration_t>() == 16);
+const _: () = assert!(std::mem::size_of::<QnnHtpContext_CustomConfig_t>() == 24);
+const _: () = assert!(std::mem::offset_of!(QnnHtpContext_CustomConfig_t, config) == 8);
+const _: () = assert!(std::mem::size_of::<QnnHtpContext_CustomProperty_t>() == 16);
+const _: () = assert!(std::mem::offset_of!(QnnHtpContext_CustomProperty_t, prop) == 8);
 
 const _: () = assert!(std::mem::size_of::<QnnHtpPerfInfrastructure_DcvsV3_t>() == 64);
 const _: () = assert!(std::mem::size_of::<QnnHtpPerfInfrastructure_PowerConfig_t>() == 68);

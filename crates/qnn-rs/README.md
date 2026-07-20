@@ -53,19 +53,41 @@ The device path is implemented against the captured backend function table
 device (NPU + skel present); on host it fails cleanly at `backendCreate`/
 `contextCreateFromBinary`. No `Error::Unimplemented` remains.
 
-- `Context::from_binary(backend, system, bytes)` — parse `ContextBinaryInfo`,
-  then `backendCreate` → `deviceCreate` (if present) → `contextCreateFromBinary`
-  → `graphRetrieve` per graph. Keeps the context/device/backend + graph handles
-  and the parsed metadata; frees them in reverse on `Drop`. Borrows the `Backend`
-  so the loaded library outlives every call.
+- `Session::new(backend)` — unsigned-PD request → `backendCreate` →
+  `deviceCreate` (if present). One session is one DSP/FastRPC session; every
+  context created on it shares that backend + device, and the session is freed
+  after all of them.
+- `Session::load_context(system, bytes, opts)` — parse `ContextBinaryInfo`, then
+  `contextCreateFromBinary` → `graphRetrieve` per graph, keeping the graph
+  handles and metadata. `ContextOpts` carries `spill_fill_bytes` +
+  `group_head` (HTP `REGISTER_MULTI_CONTEXTS`: co-resident contexts share one
+  scratch buffer instead of each allocating its own) and `extended_udma`
+  (`USE_EXTENDED_UDMA`, far-maps weights and spill/fill; v81 and above).
+- `Context::max_spill_fill_size()` — `contextGetProperty` with
+  `QNN_HTP_CONTEXT_GET_PROP_MAX_SPILLFILL_BUFFER_SIZE`. Returns 0 when the
+  binary carries no requirement (pre-2.35 binaries, and both Anima DiT halves),
+  meaning the caller must supply the group size.
+- `Context::from_binary(backend, system, bytes)` — thin wrapper creating a
+  private `Session` for a single context.
 - `Context::execute(graph, &[(name, &[f32])]) -> HashMap<name, Vec<f32>>` —
   quantize each named input to its tensor dtype via the metadata scale-offset,
   build V2 `Qnn_Tensor_t` IO arrays (RAW client buffers, tensor `id` from
   metadata), `graphExecute`, then dequantize outputs to f32.
-- `set_htp_performance_mode(backend)` — `deviceGetInfrastructure` →
-  `createPowerConfigId(0,0)` → `setPowerConfig` with DCVS_V3 burst (DCVS
+- `Context::execute_mixed(graph, &[(name, TensorIn)])` — same, but each input is
+  `TensorIn::F32` (quantized as above) or `TensorIn::I32` (written raw, LE, in
+  the tensor's own integer width, no quantization). An `I32` bound to a
+  float/fixed-point tensor errors with `IntInputTypeMismatch`. Needed for token
+  ids such as Anima `clip.bin`'s `t5_ids` `[1,512] Int32`.
+- `Session::set_htp_performance_mode()` / `set_htp_performance_mode(backend)` —
+  `deviceGetInfrastructure` → `createPowerConfigId(0,0)` → `setPowerConfig` with
+  RPC control latency 100 µs, RPC polling 9999 µs, and DCVS_V3 burst (DCVS
   disabled, bus+core corners pinned to `MAX`, PERFORMANCE_MODE, 40 µs sleep
   latency). The power-config id is kept alive so the vote persists.
+  **Must be called after `Session::new`/`Context::from_binary`.** Before a
+  backend and device exist, `deviceGetInfrastructure` returns 1100
+  (`QNN_COMMON_ERROR_GENERAL`) and the vote never lands; a multi-second graph
+  then outruns the FastRPC timeout and the DSP subsystem restarts, surfacing as
+  `graphExecute` 1007/1011 (`SYSTEM_COMMUNICATION[_FATAL]`).
 - `prepare_htp_env(skel_dir)` — prepend `skel_dir` to `ADSP_LIBRARY_PATH`/
   `DSP_LIBRARY_PATH` (`;`) and `LD_LIBRARY_PATH` (`:`) via `setenv` so the native
   HTP/FastRPC loaders find the skel. Call once before the HTP backend is dlopened.
@@ -73,22 +95,35 @@ device (NPU + skel present); on host it fails cleanly at `backendCreate`/
 Quant/dequant (`floatToTfN`/`tfNToFloat`, `real = (q + offset) * scale`) lives in
 the pure `quant` module and is unit-tested on host (no device needed).
 
-The HTP power-config structs are hand-declared byte-exact in `htp.rs` from
-`HTP/QnnHtpPerfInfrastructure.h` + `HTP/QnnHtpDevice.h` (those headers use C++/
-`bool` and are excluded from `wrapper.h`, so bindgen never emitted them). `const`
+The HTP power-config and context config/property structs are hand-declared
+byte-exact in `htp.rs` from `HTP/QnnHtpPerfInfrastructure.h`,
+`HTP/QnnHtpDevice.h`, and `HTP/QnnHtpContext.h` (those headers use C++/`bool`
+and are excluded from `wrapper.h`, so bindgen never emitted them). `const`
 `size_of`/`offset_of` asserts guard the layout: `DcvsV3_t` = 64 B, `PowerConfig_t`
 = 68 B (matching the header's own `static_assert`), `PerfInfrastructure_t` = 32 B,
-`Infrastructure_t` = 40 B.
+`Infrastructure_t` = 40 B, `GroupRegistration_t` = 16 B, `Context_CustomConfig_t`
+= 24 B and `Context_CustomProperty_t` = 16 B (4-byte enum, 4 bytes of padding,
+then the 8-byte-aligned union).
 
 **HTP context binaries require the HTP backend + skel; the host CPU backend
 cannot execute them** — host stays metadata-parse only.
 
-### Needs on-device validation (S26 Ultra / SM8850 / HTP V81)
+### Validated on device (S26 Ultra / SM8850 / HTP V81, QAIRT 2.48)
 
-- `from_binary` / `execute` / `set_htp_performance_mode` have not run on hardware.
+`examples/anima_smoke.rs` loads both ~2 GB Anima DiT halves co-resident in one
+`Session` and runs split steps. Verified: both halves resident, `graphExecute`
+OK on both, `output[1,16,1,128,128]` finite, ~3.1 s per half (~6.2 s per step,
+~62 s for 10 steps), stable over 10 consecutive steps.
+
+- The burst vote is accepted on V81 and is required, not just an optimization:
+  without it `part1` takes 8.2 s and `part2`'s `graphExecute` fails 1007/1011.
+- Both DiT halves report a spill-fill requirement of 0 bytes, and they execute
+  correctly with or without the shared group. `ANIMA_SF_BYTES=0` disables it.
+
+### Needs on-device validation
+
 - `execute` matches IO by the tensor `id` parsed from the binary (V2 tensors) —
-  confirm a real UNet/VAE step yields sane latents.
-- Confirm the DCVS_V3 burst vote is accepted on V81 and improves latency.
+  confirm a real SD1.5/SDXL UNet/VAE step yields sane latents.
 - Confirm `ADSP_LIBRARY_PATH` resolves the skel and that it is extracted to disk
   (`android:extractNativeLibs="true"`, or extract from assets at runtime).
 
