@@ -794,9 +794,14 @@ struct ComfyApp {
     /// Cached WD14 tagger pack dir under the app external files dir, if one is present.
     #[cfg(feature = "local-npu")]
     wd14_pack: Option<std::path::PathBuf>,
-    /// Cached prompt-Rewriter pack dir, if one carrying the RWTR marker is present.
+    /// Cached rewrite (CPU LLM) pack dir, if one is present.
     #[cfg(feature = "local-npu")]
-    rewriter_pack: Option<std::path::PathBuf>,
+    rewrite_pack: Option<std::path::PathBuf>,
+    /// Prompt-rewrite worker result (rewritten positive prompt or an error string).
+    #[cfg(feature = "local-npu")]
+    rewrite_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    #[cfg(feature = "local-npu")]
+    rewrite_running: bool,
     /// Settings: background-tag the server gallery when idle.
     #[cfg(feature = "local-npu")]
     auto_tag: bool,
@@ -1148,7 +1153,11 @@ impl ComfyApp {
             #[cfg(feature = "local-npu")]
             wd14_pack: None,
             #[cfg(feature = "local-npu")]
-            rewriter_pack: None,
+            rewrite_pack: None,
+            #[cfg(feature = "local-npu")]
+            rewrite_rx: None,
+            #[cfg(feature = "local-npu")]
+            rewrite_running: false,
             #[cfg(feature = "local-npu")]
             auto_tag: false,
             #[cfg(feature = "local-npu")]
@@ -4167,8 +4176,9 @@ impl ComfyApp {
     }
 
     /// Positive prompt: label + chip toggle, then the chip editor or text field, then the scrubber.
-    fn positive_prompt_ui(&mut self, ui: &mut egui::Ui) {
+    fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
+        self.rewrite_menu_ui(ui, host);
         self.prompt_history_ui(ui);
     }
 
@@ -4718,7 +4728,7 @@ impl ComfyApp {
             }
         }
 
-        self.positive_prompt_ui(ui);
+        self.positive_prompt_ui(ui, host);
         ui.label("LoRA triggers");
         ui.add(
             egui::TextEdit::multiline(&mut self.params.lora_triggers)
@@ -4869,7 +4879,7 @@ impl ComfyApp {
         ui.weak("Wan 2.2 i2v — describe the motion; canned defaults do the rest.");
 
         // Prompt + negative, with a one-tap canonical Wan negative.
-        self.positive_prompt_ui(ui);
+        self.positive_prompt_ui(ui, host);
         ui.horizontal(|ui| {
             ui.label("Negative");
             if ui
@@ -5144,7 +5154,7 @@ impl ComfyApp {
         let gen_count = rows.len();
         rows.push(("WD14 tagger".into(), None, self.wd14_pack.clone(), format!("{durable}/wd14")));
         rows.push(("CLIP embeddings".into(), None, self.clip_pack.clone(), format!("{durable}/clip")));
-        rows.push(("Rewriter".into(), None, self.rewriter_pack.clone(), format!("{durable}/rewriter")));
+        rows.push(("Rewriter".into(), None, self.rewrite_pack.clone(), format!("{durable}/rewrite")));
         let mut rescan = false;
         let mut open_import = false;
         ui.add_space(8.0);
@@ -12508,12 +12518,13 @@ impl ComfyApp {
         self.local_packs = crate::local_engine::scan_packs_many(&roots);
         self.wd14_pack = crate::local_engine::find_wd14_pack_many(&roots);
         self.clip_pack = crate::local_engine::find_clip_pack_many(&roots);
-        self.rewriter_pack = crate::local_engine::find_rewriter_pack_many(&roots);
+        self.rewrite_pack = crate::local_engine::find_rewrite_pack_many(&roots);
         self.log.info(format!(
-            "local-npu: {} pack(s) found: {}; wd14 pack: {} (roots: app files + {durable})",
+            "local-npu: {} pack(s) found: {}; wd14 pack: {}; rewrite pack: {} (roots: app files + {durable})",
             self.local_packs.len(),
             self.local_packs.iter().map(|p| p.label()).collect::<Vec<_>>().join(", "),
-            self.wd14_pack.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into())
+            self.wd14_pack.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()),
+            self.rewrite_pack.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into())
         ));
     }
 
@@ -12627,6 +12638,95 @@ impl ComfyApp {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.wd14_rx = None;
                 self.wd14_running = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// The Create-pane Rewrite menu: rewrite the positive prompt on the CPU LLM. Only shown when a
+    /// rewrite pack is present; each item spawns the worker in `start_rewrite`.
+    #[cfg(feature = "local-npu")]
+    fn rewrite_menu_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
+        if self.rewrite_pack.is_none() {
+            return;
+        }
+        use local_rewrite::RewriteKind;
+        let video = self.params.mode == Mode::Video;
+        ui.menu_button("Rewrite", |ui| {
+            if self.rewrite_running {
+                ui.add(egui::Spinner::new());
+                ui.label("Rewriting…");
+                return;
+            }
+            // Video prose targets the Wan i2v prompt; tags target the image models.
+            let kind = if video { RewriteKind::TagsToVideo } else { RewriteKind::ProseToTags };
+            if ui.button(kind.label()).clicked() {
+                self.start_rewrite(ui.ctx(), host, kind);
+                ui.close();
+            }
+            if ui.button(RewriteKind::ToPony.label()).clicked() {
+                self.start_rewrite(ui.ctx(), host, RewriteKind::ToPony);
+                ui.close();
+            }
+            if ui.button(RewriteKind::ToIllustrious.label()).clicked() {
+                self.start_rewrite(ui.ctx(), host, RewriteKind::ToIllustrious);
+                ui.close();
+            }
+        });
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn rewrite_menu_ui(&mut self, _ui: &mut egui::Ui, _host: &Host) {}
+
+    /// Spawn the CPU prompt rewriter on a worker thread; the rewritten positive prompt returns via
+    /// the channel and only replaces the field on success (see `poll_rewrite`).
+    #[cfg(feature = "local-npu")]
+    fn start_rewrite(&mut self, ctx: &egui::Context, host: &Host, kind: local_rewrite::RewriteKind) {
+        let Some(pack_dir) = self.rewrite_pack.clone() else {
+            self.status = "Rewrite: no pack — push one to /storage/emulated/0/ComfyUI/rewrite".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let text = self.params.positive.trim().to_string();
+        if text.is_empty() {
+            self.status = "Rewrite: the prompt is empty".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rewrite_rx = Some(rx);
+        self.rewrite_running = true;
+        self.status = format!("Rewriting ({}) on CPU…", kind.label());
+        self.log.info(format!("local-rewrite: {} (pack={})", kind.label(), pack_dir.display()));
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = crate::local_engine::rewrite_prompt(pack_dir, kind, text);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        host.haptic(Haptic::Medium);
+    }
+
+    /// Drain a finished rewrite: replace the positive prompt on success, else a status note.
+    #[cfg(feature = "local-npu")]
+    fn poll_rewrite(&mut self) {
+        let Some(rx) = self.rewrite_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok(text)) => {
+                self.rewrite_rx = None;
+                self.rewrite_running = false;
+                self.params.positive = text;
+                self.status = "Rewrite done".into();
+            }
+            Ok(Err(e)) => {
+                self.rewrite_rx = None;
+                self.rewrite_running = false;
+                self.log.error(format!("local-rewrite: {e}"));
+                self.status = format!("Rewrite failed: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.rewrite_rx = None;
+                self.rewrite_running = false;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -12966,6 +13066,8 @@ impl EguiApp for ComfyApp {
         self.poll_d3_anima();
         #[cfg(feature = "local-npu")]
         self.poll_wd14();
+        #[cfg(feature = "local-npu")]
+        self.poll_rewrite();
         self.ensure_tag_index_warm(ui.ctx(), host);
         self.ensure_clip_index_warm(ui.ctx(), host);
         #[cfg(feature = "local-npu")]

@@ -1270,6 +1270,7 @@ dependencies = [
  "image",
  "local-anima",
  "local-clip",
+ "local-rewrite",
  "local-sd",
  "local-wd14",
  "log",
@@ -3876,6 +3877,18 @@ dependencies = [
  "memmap2",
  "qnn-rs",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "local-rewrite"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "log",
+ "thiserror 2.0.19",
+ "tokenizers",
 ]
 
 [[package]]

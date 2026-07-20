@@ -1,0 +1,17 @@
+[package]
+name = "local-rewrite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "On-device CPU prompt rewriter: a quantized Qwen2.5-0.5B-Instruct GGUF run through candle. Prompt templates (tags<->prose, model-family dialect) are pure and host-testable; inference is CPU and needs a rewrite pack at runtime."
+
+[dependencies]
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+log = { workspace = true }
+thiserror = "2.0.19"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+
+[dev-dependencies]

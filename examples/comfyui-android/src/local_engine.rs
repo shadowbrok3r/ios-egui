@@ -676,19 +676,13 @@ pub fn find_clip_pack_many(roots: &[&Path]) -> Option<PathBuf> {
 /// The prompt-Rewriter pack marker file; the pack may not exist yet on any device.
 const RWTR_MARKER: &str = "RWTR";
 
-/// The first subdirectory under `root` carrying the Rewriter marker, if any.
-pub fn find_rewriter_pack(root: &Path) -> Option<PathBuf> {
+fn find_rewrite_pack(root: &Path) -> Option<PathBuf> {
     std::fs::read_dir(root)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .filter(|d| d.is_dir())
         .find(|d| d.join(RWTR_MARKER).is_file())
-}
-
-/// The first Rewriter pack under any of `roots`.
-pub fn find_rewriter_pack_many(roots: &[&Path]) -> Option<PathBuf> {
-    roots.iter().find_map(|r| find_rewriter_pack(r))
 }
 
 /// Newest modification time among `dir`'s direct entries, falling back to the dir's own mtime.
@@ -724,6 +718,28 @@ pub fn humanize_ago(secs: u64) -> String {
     } else {
         format!("{}y ago", secs / YEAR)
     }
+}
+
+/// The first rewrite pack under any of `roots`.
+pub fn find_rewrite_pack_many(roots: &[&Path]) -> Option<PathBuf> {
+    roots.iter().find_map(|r| find_rewrite_pack(r))
+}
+
+/// Rewrite `text` with the pack's LLM on the CPU; blocking, the rewritten prompt or an error
+/// string. Independent of the HTP run-lock: candle CPU inference doesn't touch the NPU.
+pub fn rewrite_prompt(
+    pack_dir: PathBuf,
+    kind: local_rewrite::RewriteKind,
+    text: String,
+) -> Result<String, String> {
+    let t = Instant::now();
+    let rw = local_rewrite::Rewriter::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
+    let out = rw.rewrite(kind.system(), &text, 256).map_err(|e| format!("rewrite: {e}"))?;
+    if out.is_empty() {
+        return Err("model returned nothing".into());
+    }
+    log::info!("local-rewrite: {} -> {} chars in {:.2}s", text.len(), out.len(), t.elapsed().as_secs_f32());
+    Ok(out)
 }
 
 /// Embed encoded image bytes with the CLIP pack; blocking, L2-normalized embedding plus the
@@ -968,8 +984,8 @@ mod tests {
         let rw = root.join("rewriter");
         std::fs::create_dir_all(&rw).unwrap();
         std::fs::write(rw.join("RWTR"), b"").unwrap();
-        assert_eq!(find_rewriter_pack(&root), Some(rw));
-        assert!(find_rewriter_pack(Path::new("/nope/does/not/exist")).is_none());
+        assert_eq!(find_rewrite_pack(&root), Some(rw));
+        assert!(find_rewrite_pack(Path::new("/nope/does/not/exist")).is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

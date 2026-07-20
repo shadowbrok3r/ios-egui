@@ -22,7 +22,7 @@ tls = [
 # On-device Qualcomm HTP NPU (D1/D2/D3 diagnostics + Create-tab Local NPU + WD14 Read tags). Off by
 # default; pulls local-sd (SD1.5, candle CPU + qnn-rs), local-anima (Anima DiT packs) and local-wd14
 # (WD14 tagger). Build with `cargo ndk ... --features tls,local-npu`.
-local-npu = ["dep:local-sd", "dep:local-anima", "dep:local-wd14", "dep:local-clip"]
+local-npu = ["dep:local-sd", "dep:local-anima", "dep:local-wd14", "dep:local-clip", "dep:local-rewrite"]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
@@ -71,6 +71,8 @@ local-anima = { path = "../../crates/local-anima", optional = true }
 # On-device WD14 danbooru tagger (feature `local-npu`): a `wd14/` pack on the HTP for Read tags.
 local-wd14 = { path = "../../crates/local-wd14", optional = true }
 local-clip = { path = "../../crates/local-clip", optional = true }
+# On-device CPU prompt rewriter (feature `local-npu`): a `rewrite/` GGUF pack run via candle CPU.
+local-rewrite = { path = "../../crates/local-rewrite", optional = true }
 
 [dev-dependencies]
 skrifa = "0.42"

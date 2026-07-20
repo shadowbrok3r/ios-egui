@@ -19,6 +19,7 @@ members = [
     "crates/local-anima",
     "crates/local-wd14",
     "crates/local-clip",
+    "crates/local-rewrite",
     "examples/hello/rust",
     "examples/desktop-host",
     "examples/plugins-ios/rust",
