@@ -1327,6 +1327,7 @@ impl ComfyApp {
         let doc = self.graph_tabs.get_mut(idx).ok_or_else(|| "no graph tab".to_string())?;
         doc.graph.object_info = object_info;
         let auto = self.auto_arrange;
+        self.log.info(format!("graph load '{name}': auto-arrange {auto}"));
         doc.outputs.clear();
         doc.node_map.clear();
         doc.props_node = None;
@@ -4306,7 +4307,10 @@ impl ComfyApp {
     /// Positive prompt: label + chip toggle, then the chip editor or text field, then the scrubber.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
-        self.rewrite_menu_ui(ui, host);
+        ui.horizontal(|ui| {
+            self.rewrite_menu_ui(ui, host);
+            self.dup_fix_chip_ui(ui);
+        });
         self.prompt_history_ui(ui);
     }
 
@@ -4586,6 +4590,18 @@ impl ComfyApp {
     }
 
     /// One wrapped row of lint chips; a fixable issue applies its fix on tap.
+    /// The duplicate-tags fix as an inline chip beside Rewrite (skipped by the lint row below).
+    fn dup_fix_chip_ui(&mut self, ui: &mut egui::Ui) {
+        self.refresh_lint();
+        let dup = self.lint_issues.iter().find(|i| i.msg.contains("uplicate"));
+        let Some(fix) = dup.and_then(|i| i.fix.clone()) else { return };
+        if ui.button("Dedupe tags").on_hover_text("Remove duplicate tags from the prompt").clicked()
+        {
+            self.apply_fix(fix);
+            self.lint_fp = 0;
+        }
+    }
+
     fn lint_chips_ui(&mut self, ui: &mut egui::Ui) {
         self.refresh_lint();
         if self.lint_issues.is_empty() {
@@ -4595,6 +4611,9 @@ impl ComfyApp {
         let mut applied: Option<lint::Fix> = None;
         ui.horizontal_wrapped(|ui| {
             for issue in &self.lint_issues {
+                if issue.msg.contains("uplicate") {
+                    continue;
+                }
                 let color = match issue.severity {
                     lint::Severity::Warn => ui.visuals().warn_fg_color,
                     lint::Severity::Info => ui.visuals().weak_text_color(),
@@ -4688,12 +4707,17 @@ impl ComfyApp {
         let show_video = self.params.mode == Mode::Video
             || self.schemas.as_ref().is_some_and(|s| s.has_node("WanImageToVideo"));
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.params.mode, Mode::Txt2Img, "Text to Image");
+            let mut mode_btn = |ui: &mut egui::Ui, m: Mode, label: &str| {
+                if ui.add(egui::Button::selectable(self.params.mode == m, label)).clicked() {
+                    self.params.mode = m;
+                }
+            };
+            mode_btn(ui, Mode::Txt2Img, "Text to Image");
             ui.add_enabled_ui(!anima, |ui| {
-                ui.selectable_value(&mut self.params.mode, Mode::Img2Img, "Image to Image");
+                mode_btn(ui, Mode::Img2Img, "Image to Image");
             });
             if show_video {
-                ui.selectable_value(&mut self.params.mode, Mode::Video, "Video");
+                mode_btn(ui, Mode::Video, "Video");
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.reset_button(ui, host);
@@ -10749,10 +10773,10 @@ impl ComfyApp {
             let view_w = 72.0;
             let tags_w = 60.0;
             let search_w = (ui.available_width() - refresh_w - view_w - tags_w - 12.0).max(96.0);
-            let resp = ui.add(
+            let resp = ui.add_sized(
+                egui::vec2(search_w, 28.0),
                 egui::TextEdit::singleline(&mut self.gallery_q)
-                    .hint_text(format!("{} search", icons::SEARCH))
-                    .desired_width(search_w),
+                    .hint_text(format!("{} search", icons::SEARCH)),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 changed = true;
@@ -10765,9 +10789,9 @@ impl ComfyApp {
                 changed = true;
             }
 
-            up_menu(ui, "Tags".to_string(), |ui| self.tags_menu_ui(ui));
+            up_menu_sized(ui, "Tags".to_string(), egui::vec2(56.0, 28.0), |ui| self.tags_menu_ui(ui));
 
-            up_menu(ui, format!("{} View", icons::GALLERY), |ui| {
+            up_menu_sized(ui, format!("{} View", icons::GALLERY), egui::vec2(68.0, 28.0), |ui| {
                 if ui
                     .button(format!("{} Select", icons::CHECK))
                     .on_hover_text("Multi-select — or long-press a photo")
@@ -10996,7 +11020,7 @@ impl ComfyApp {
         egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
             for (tag, n) in all.iter().filter(|(t, _)| q.is_empty() || t.contains(&q)) {
                 let on = self.tag_facets.contains(tag);
-                if ui.selectable_label(on, format!("{tag}  ({n})")).clicked() {
+                if ui.add(egui::Button::selectable(on, format!("{tag}  ({n})"))).clicked() {
                     if on {
                         self.tag_facets.retain(|f| f != tag);
                     } else {
@@ -11031,7 +11055,7 @@ impl ComfyApp {
                     for (tag, count) in facets {
                         let on = self.tag_facets.iter().any(|f| f == tag);
                         if ui
-                            .selectable_label(on, format!("{tag} ({count})"))
+                            .add(egui::Button::selectable(on, format!("{tag} ({count})")))
                             .clicked()
                         {
                             if on {
@@ -14783,6 +14807,7 @@ fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[Stri
 
 /// Underlined section heading.
 fn section_title(ui: &mut egui::Ui, title: &str) {
+    ui.separator();
     ui.label(egui::RichText::new(title).strong().underline());
 }
 
@@ -14864,11 +14889,12 @@ fn uint_text_edit(
     range: std::ops::RangeInclusive<u32>,
 ) {
     let mut s = value.to_string();
+    let h = ui.spacing().interact_size.y;
     if ui
-        .add(
+        .add_sized(
+            egui::vec2(64.0, h),
             egui::TextEdit::singleline(&mut s)
                 .id_salt(id)
-                .desired_width(64.0)
                 .horizontal_align(egui::Align::Center),
         )
         .changed()

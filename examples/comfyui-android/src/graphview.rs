@@ -248,6 +248,7 @@ impl GraphView {
     /// Load-time layout: nominal arrange + fit so every node paints, then queue a refine pass
     /// once `final_node_rect` has filled real sizes.
     pub fn arrange_on_load(&mut self, snarl: &mut Snarl<FlowNodeData>) {
+        log::info!("graphview: auto-arrange on load ({} nodes)", snarl.nodes_pos_ids().count());
         self.needs_auto_arrange = false;
         self.arrange_now(snarl);
         self.arrange_queued = true;
