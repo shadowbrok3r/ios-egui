@@ -69,6 +69,98 @@ pub struct GraphView {
     lora_picks: Vec<LoraPick>,
 }
 
+/// Whether this input is a ComfyUI seed widget that carries `control_after_generate`.
+pub fn is_seed_widget(input: &FlowInput) -> bool {
+    (input.name == "seed" || input.name == "noise_seed")
+        && matches!(
+            input.value,
+            FlowValueType::UnsignedInt { .. } | FlowValueType::SignedInt { .. }
+        )
+}
+
+/// Write a fresh random value into a seed widget.
+pub fn roll_seed_value(input: &mut FlowInput) {
+    let seed = random_u64();
+    match &mut input.value {
+        FlowValueType::UnsignedInt { value, .. } => *value = seed,
+        FlowValueType::SignedInt { value, .. } => *value = seed as i64,
+        _ => {}
+    }
+}
+
+fn random_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Apply `seed_randomize` flags keyed by workflow node id onto snarl nodes after an API load.
+/// Snarl ids are assigned in the same topological insert order as `load_api_workflow`.
+pub fn apply_seed_randomize_from_workflow(
+    snarl: &Snarl<FlowNodeData>,
+    workflow: &rucomfyui::Workflow,
+    from_ui: &std::collections::BTreeMap<(u64, String), bool>,
+    out: &mut HashMap<(NodeId, String), bool>,
+) {
+    out.clear();
+    if from_ui.is_empty() {
+        return;
+    }
+    let layers = workflow.topological_sort_with_depth();
+    let mut wids = Vec::new();
+    for layer in layers {
+        for wid in layer {
+            wids.push(wid.0 as u64);
+        }
+    }
+    let mut nids: Vec<NodeId> = snarl.node_ids().map(|(id, _)| id).collect();
+    nids.sort_by_key(|id| id.0);
+    if wids.len() != nids.len() {
+        return;
+    }
+    for (wid, nid) in wids.into_iter().zip(nids) {
+        for ((id, name), &rand) in from_ui {
+            if *id == wid {
+                out.insert((nid, name.clone()), rand);
+            }
+        }
+    }
+}
+
+/// Set every seed / noise_seed widget on the graph to the same randomize flag.
+pub fn set_all_seed_randomize(
+    snarl: &Snarl<FlowNodeData>,
+    out: &mut HashMap<(NodeId, String), bool>,
+    randomize: bool,
+) {
+    out.clear();
+    for (nid, data) in snarl.node_ids() {
+        for input in &data.inputs {
+            if is_seed_widget(input) {
+                out.insert((nid, input.name.clone()), randomize);
+            }
+        }
+    }
+}
+
+/// Roll seeds marked randomize in place (ComfyUI client-side control_after_generate).
+pub fn apply_pending_seed_rolls(
+    snarl: &mut Snarl<FlowNodeData>,
+    seed_randomize: &HashMap<(NodeId, String), bool>,
+) {
+    for ((nid, name), &rand) in seed_randomize {
+        if !rand {
+            continue;
+        }
+        let Some(data) = snarl.get_node_mut(*nid) else { continue };
+        if let Some(input) = data.inputs.iter_mut().find(|i| i.name == *name) {
+            roll_seed_value(input);
+        }
+    }
+}
+
 impl Default for GraphView {
     fn default() -> Self {
         Self::new(0)
@@ -197,6 +289,7 @@ impl GraphView {
         focus: Option<NodeId>,
         bypassed: &HashSet<NodeId>,
         lora_files: &[String],
+        seed_randomize: &mut HashMap<(NodeId, String), bool>,
     ) -> Option<NodeId> {
         self.sizes.retain(|id, _| g.snarl.get_node(*id).is_some());
         self.arrange_settling = self.arrange_settling.saturating_sub(1);
@@ -248,6 +341,7 @@ impl GraphView {
             focus,
             bypassed,
             lora_picks: &mut self.lora_picks,
+            seed_randomize,
             cmd,
             pan,
             bounds: bounds(&g.snarl, &self.sizes),
@@ -702,6 +796,7 @@ struct Wrapper<'a> {
     focus: Option<NodeId>,
     bypassed: &'a HashSet<NodeId>,
     lora_picks: &'a mut Vec<LoraPick>,
+    seed_randomize: &'a mut HashMap<(NodeId, String), bool>,
     cmd: Option<ViewCmd>,
     /// Screen-space pan to add this frame (locked-mode drag started on a node).
     pan: egui::Vec2,
@@ -732,7 +827,14 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         snarl: &mut Snarl<FlowNodeData>,
     ) -> PinInfo {
         let before = lora_name_selected(snarl, pin.id.node);
-        let info = if self.locked {
+        let seed = snarl
+            .get_node(pin.id.node)
+            .and_then(|n| n.inputs.get(pin.id.input))
+            .is_some_and(is_seed_widget)
+            && pin.remotes.is_empty();
+        let info = if seed {
+            show_seed_input(ui, pin, snarl, self.locked, self.seed_randomize)
+        } else if self.locked {
             let mut info = None;
             ui.add_enabled_ui(false, |ui| info = Some(self.inner.show_input(pin, ui, snarl)));
             info.unwrap_or_else(PinInfo::circle)
@@ -887,6 +989,53 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
     }
 }
 
+/// Seed row on the canvas: value + randomize checkbox (ComfyUI `control_after_generate`).
+fn show_seed_input(
+    ui: &mut egui::Ui,
+    pin: &InPin,
+    snarl: &mut Snarl<FlowNodeData>,
+    locked: bool,
+    seed_randomize: &mut HashMap<(NodeId, String), bool>,
+) -> PinInfo {
+    let node = &mut snarl[pin.id.node];
+    let input = &mut node.inputs[pin.id.input];
+    let key = (pin.id.node, input.name.clone());
+    let mut randomize = seed_randomize.get(&key).copied().unwrap_or(false);
+    let color = {
+        let mut hasher = std::hash::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        format!("{:?}", input.typ).hash(&mut hasher);
+        let hash = (hasher.finish() % 3600) as f32 / 3600.0;
+        egui::ecolor::Hsva::new(hash, 0.5, 0.5, 1.0).into()
+    };
+    ui.add_enabled_ui(!locked, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(&input.name);
+            ui.add_enabled_ui(!randomize, |ui| match &mut input.value {
+                FlowValueType::UnsignedInt { value, min, max, step } => {
+                    ui.add(
+                        egui::DragValue::new(value)
+                            .range(*min..=*max)
+                            .speed((*step as f64).max(1.0)),
+                    );
+                }
+                FlowValueType::SignedInt { value, min, max, step } => {
+                    ui.add(
+                        egui::DragValue::new(value)
+                            .range(*min..=*max)
+                            .speed((*step as f64).max(1.0)),
+                    );
+                }
+                _ => {}
+            });
+            if ui.checkbox(&mut randomize, "random").changed() {
+                seed_randomize.insert(key, randomize);
+            }
+        });
+    });
+    PinInfo::circle().with_fill(color)
+}
+
 // ── UI-format export ──────────────────────────────────────────────────────────
 
 impl GraphView {
@@ -898,6 +1047,7 @@ impl GraphView {
         g: &ComfyUiNodeGraph,
         schemas: &crate::schema::SchemaSet,
         bypassed: &HashSet<NodeId>,
+        seed_randomize: &HashMap<(NodeId, String), bool>,
     ) -> serde_json::Value {
         use serde_json::json;
 
@@ -990,7 +1140,16 @@ impl GraphView {
                     .and_then(|s| s.inputs.iter().find(|si| si.name == input.name))
                     .is_some_and(crate::uiwf::takes_seed_control)
                 {
-                    widgets_values.push(json!("fixed"));
+                    let control = if seed_randomize
+                        .get(&(id, input.name.clone()))
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        "randomize"
+                    } else {
+                        "fixed"
+                    };
+                    widgets_values.push(json!(control));
                 }
             }
 
@@ -1135,6 +1294,7 @@ pub fn node_properties(
     locked: bool,
     lora_files: &[String],
     lora_picks: &mut Vec<LoraPick>,
+    seed_randomize: &mut HashMap<(NodeId, String), bool>,
 ) -> bool {
     let Some(data) = g.snarl.get_node(node) else { return false };
 
@@ -1187,7 +1347,7 @@ pub fn node_properties(
                     }
                     _ => None,
                 };
-                value_editor(ui, egui::Id::new((node, i)), input, locked);
+                value_editor(ui, egui::Id::new((node, i)), node, input, locked, seed_randomize);
                 if input.name == "lora_name"
                     && let FlowValueType::Array { selected, .. } = &input.value
                     && before.as_deref() != Some(selected.as_str())
@@ -1213,7 +1373,44 @@ pub fn node_properties(
 }
 
 /// One editable input row, mirroring the widgets the node body renders.
-fn value_editor(ui: &mut egui::Ui, salt: egui::Id, input: &mut FlowInput, locked: bool) {
+fn value_editor(
+    ui: &mut egui::Ui,
+    salt: egui::Id,
+    node: NodeId,
+    input: &mut FlowInput,
+    locked: bool,
+    seed_randomize: &mut HashMap<(NodeId, String), bool>,
+) {
+    if is_seed_widget(input) {
+        let key = (node, input.name.clone());
+        let mut randomize = seed_randomize.get(&key).copied().unwrap_or(false);
+        ui.add_enabled_ui(!locked, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(&input.name);
+                ui.add_enabled_ui(!randomize, |ui| match &mut input.value {
+                    FlowValueType::UnsignedInt { value, min, max, step } => {
+                        ui.add(
+                            egui::DragValue::new(value)
+                                .range(*min..=*max)
+                                .speed((*step as f64).max(1.0)),
+                        );
+                    }
+                    FlowValueType::SignedInt { value, min, max, step } => {
+                        ui.add(
+                            egui::DragValue::new(value)
+                                .range(*min..=*max)
+                                .speed((*step as f64).max(1.0)),
+                        );
+                    }
+                    _ => {}
+                });
+                if ui.checkbox(&mut randomize, "random").changed() {
+                    seed_randomize.insert(key, randomize);
+                }
+            });
+        });
+        return;
+    }
     ui.add_enabled_ui(!locked, |ui| match &mut input.value {
         FlowValueType::Array { options, selected } => {
             ui.horizontal(|ui| {
@@ -1417,7 +1614,15 @@ mod tests {
                 let mut tapped = None;
                 let _ = ctx.run_ui(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
-                        tapped = view.show(ui, graph, None, None, &HashSet::new(), &[]);
+                        tapped = view.show(
+                            ui,
+                            graph,
+                            None,
+                            None,
+                            &HashSet::new(),
+                            &[],
+                            &mut HashMap::new(),
+                        );
                     });
                 });
                 for (id, pos, data) in graph.snarl.nodes_pos_ids() {
@@ -1695,7 +1900,7 @@ mod tests {
 
             let view = GraphView::default();
             let bypassed = HashSet::new();
-            let exported = view.export_ui(&graph, &schemas, &bypassed);
+            let exported = view.export_ui(&graph, &schemas, &bypassed, &HashMap::new());
             let reimported = crate::uiwf::convert(&exported, &schemas)
                 .unwrap_or_else(|e| panic!("{wf_path}: exported UI json failed to convert: {e}"));
             assert_eq!(

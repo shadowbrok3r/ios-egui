@@ -88,7 +88,13 @@ pub enum Msg {
     /// Server-side workflow file names (`/userdata?dir=workflows`).
     Workflows(Vec<String>),
     /// A workflow fetched and converted to API format, ready for the graph editor.
-    WorkflowLoaded { name: String, workflow: Box<Workflow>, warnings: Vec<String> },
+    WorkflowLoaded {
+        name: String,
+        workflow: Box<Workflow>,
+        warnings: Vec<String>,
+        /// UI node id → seed input → randomize, from `control_after_generate`.
+        seed_randomize: std::collections::BTreeMap<(u64, String), bool>,
+    },
     /// A workflow file written to the server.
     WorkflowSaved(String),
     WorkflowError(String),
@@ -1322,7 +1328,11 @@ fn workflow_msg(name: &str, body: &str, schemas: &SchemaSet, log: &Logger) -> Ms
         uiwf::convert(&value, schemas)
     } else {
         serde_json::from_value::<Workflow>(value)
-            .map(|workflow| uiwf::Converted { workflow, warnings: Vec::new() })
+            .map(|workflow| uiwf::Converted {
+                workflow,
+                warnings: Vec::new(),
+                seed_randomize: Default::default(),
+            })
             .map_err(|e| format!("neither UI- nor API-format workflow: {e}"))
     };
     match converted {
@@ -1339,6 +1349,7 @@ fn workflow_msg(name: &str, body: &str, schemas: &SchemaSet, log: &Logger) -> Ms
                 name: name.to_string(),
                 workflow: Box::new(c.workflow),
                 warnings: c.warnings,
+                seed_randomize: c.seed_randomize,
             }
         }
         Err(e) => {

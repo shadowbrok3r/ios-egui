@@ -342,6 +342,8 @@ struct GraphDoc {
     props_node: Option<NodeId>,
     /// Nodes marked bypassed (ComfyUI mode 4) — spliced out at queue/export time.
     bypassed: HashSet<NodeId>,
+    /// Per seed / noise_seed widget: `true` = randomize before each queue (`control_after_generate`).
+    seed_randomize: HashMap<(NodeId, String), bool>,
     /// Bumped whenever the snarl is replaced, so stale node ids can be detected.
     epoch: u64,
     /// Undo/redo for this tab. Per-tab: tabs are independent documents.
@@ -362,6 +364,7 @@ impl GraphDoc {
             node_map: HashMap::new(),
             props_node: None,
             bypassed: HashSet::new(),
+            seed_randomize: HashMap::new(),
             epoch: 0,
             history: crate::history::History::default(),
             history_rebase: false,
@@ -379,6 +382,7 @@ impl GraphDoc {
         self.node_map.clear();
         self.props_node = None;
         self.bypassed.clear();
+        self.seed_randomize.clear();
         self.view.reset();
         // Snarl ids restart at 0 on a fresh graph, so anything holding old ids must be stale.
         self.epoch += 1;
@@ -1207,6 +1211,7 @@ impl ComfyApp {
         doc.node_map.clear();
         doc.props_node = None;
         doc.bypassed.clear();
+        doc.seed_randomize.clear();
         doc.view.reset();
         doc.epoch += 1;
         doc.graph.load_api_workflow(workflow).map_err(|e| e.to_string())?;
@@ -1222,6 +1227,32 @@ impl ComfyApp {
         Ok(())
     }
 
+    /// Like [`Self::replace_workflow_in_tab`], then apply seed-randomize flags from a UI load or Create.
+    fn replace_workflow_in_tab_with_seeds(
+        &mut self,
+        idx: usize,
+        name: String,
+        workflow: &rucomfyui::Workflow,
+        seed_randomize: &std::collections::BTreeMap<(u64, String), bool>,
+        default_randomize: Option<bool>,
+    ) -> Result<(), String> {
+        self.replace_workflow_in_tab(idx, name, workflow)?;
+        let Some(doc) = self.graph_tabs.get_mut(idx) else {
+            return Err("no graph tab".into());
+        };
+        if let Some(flag) = default_randomize {
+            graphview::set_all_seed_randomize(&doc.graph.snarl, &mut doc.seed_randomize, flag);
+        } else {
+            graphview::apply_seed_randomize_from_workflow(
+                &doc.graph.snarl,
+                workflow,
+                seed_randomize,
+                &mut doc.seed_randomize,
+            );
+        }
+        Ok(())
+    }
+
     fn replace_active_workflow(
         &mut self,
         name: String,
@@ -1229,6 +1260,28 @@ impl ComfyApp {
     ) -> Result<(), String> {
         let idx = self.active_graph;
         self.replace_workflow_in_tab(idx, name, workflow)
+    }
+
+    fn load_workflow_into_tab_with_seeds(
+        &mut self,
+        name: String,
+        workflow: &rucomfyui::Workflow,
+        seed_randomize: &std::collections::BTreeMap<(u64, String), bool>,
+        default_randomize: Option<bool>,
+    ) -> Result<(), String> {
+        let schemas = self.schemas.as_ref().ok_or_else(|| "not connected".to_string())?;
+        let object_info = schema::to_object_info(schemas);
+        let reuse = self.active_doc().is_some_and(|d| d.is_empty());
+        if !reuse {
+            let id = self.next_graph_id;
+            self.next_graph_id += 1;
+            self.graph_tabs.push(GraphDoc::new(id, String::new(), object_info));
+            self.active_graph = self.graph_tabs.len() - 1;
+        } else if let Some(doc) = self.active_doc_mut() {
+            doc.graph.object_info = object_info;
+        }
+        let idx = self.active_graph;
+        self.replace_workflow_in_tab_with_seeds(idx, name, workflow, seed_randomize, default_randomize)
     }
 
     fn close_graph_tab(&mut self, idx: usize) {
@@ -1697,10 +1750,10 @@ impl ComfyApp {
                 self.wf_loading = false;
                 self.wf_names = names;
             }
-            Msg::WorkflowLoaded { name, workflow, warnings } => {
+            Msg::WorkflowLoaded { name, workflow, warnings, seed_randomize } => {
                 self.wf_loading = false;
                 self.executing = None;
-                match self.load_workflow_into_tab(name, &workflow) {
+                match self.load_workflow_into_tab_with_seeds(name, &workflow, &seed_randomize, None) {
                     Ok(()) => {
                         if !warnings.is_empty() {
                             self.log.warn(format!(
@@ -2085,7 +2138,7 @@ impl ComfyApp {
         let ui_workflow = self.schemas.as_ref().and_then(|schemas| {
             self.create_graph_id
                 .and_then(|id| self.graph_tabs.iter().find(|d| d.id == id))
-                .map(|doc| doc.view.export_ui(&doc.graph, schemas, &doc.bypassed))
+                .map(|doc| doc.view.export_ui(&doc.graph, schemas, &doc.bypassed, &doc.seed_randomize))
         });
         let label = {
             let p = self.params.positive.trim();
@@ -2172,8 +2225,10 @@ impl ComfyApp {
             return;
         };
         let Some(doc) = self.active_doc_mut() else { return };
+        // Roll seeds marked randomize before export (ComfyUI control_after_generate client-side).
+        graphview::apply_pending_seed_rolls(&mut doc.graph.snarl, &doc.seed_randomize);
         // UI export + convert respects bypass (mode 4); the snarl API path does not.
-        let ui_json = doc.view.export_ui(&doc.graph, &schemas, &doc.bypassed);
+        let ui_json = doc.view.export_ui(&doc.graph, &schemas, &doc.bypassed, &doc.seed_randomize);
         let converted = match uiwf::convert(&ui_json, &schemas) {
             Ok(c) => c,
             Err(e) => {
@@ -2254,9 +2309,20 @@ impl ComfyApp {
             .and_then(|id| self.graph_tabs.iter().position(|d| d.id == id));
         let result = if let Some(idx) = linked {
             self.active_graph = idx;
-            self.replace_workflow_in_tab(idx, "create.json".into(), &wf)
+            self.replace_workflow_in_tab_with_seeds(
+                idx,
+                "create.json".into(),
+                &wf,
+                &Default::default(),
+                Some(self.params.randomize_seed),
+            )
         } else {
-            self.load_workflow_into_tab("create.json".into(), &wf)
+            self.load_workflow_into_tab_with_seeds(
+                "create.json".into(),
+                &wf,
+                &Default::default(),
+                Some(self.params.randomize_seed),
+            )
         };
         match result {
             Ok(()) => {
@@ -2316,7 +2382,16 @@ impl ComfyApp {
         let (wf, _, report) =
             crate::workflow::build_dispatch(&self.params, input, &self.apps, &schemas);
         self.enhance_note = report.note();
-        if self.replace_workflow_in_tab(idx, "create.json".into(), &wf).is_err() {
+        if self
+            .replace_workflow_in_tab_with_seeds(
+                idx,
+                "create.json".into(),
+                &wf,
+                &Default::default(),
+                Some(self.params.randomize_seed),
+            )
+            .is_err()
+        {
             return;
         }
         if let Some(doc) = self.graph_tabs.get_mut(idx) {
@@ -2337,7 +2412,7 @@ impl ComfyApp {
             self.create_graph_id = None;
             return;
         };
-        let exported = doc.view.export_ui(&doc.graph, schemas, &doc.bypassed);
+        let exported = doc.view.export_ui(&doc.graph, schemas, &doc.bypassed, &doc.seed_randomize);
         let Ok(body) = serde_json::to_string(&exported) else { return };
         let fp = str_fingerprint(&body);
         if fp == self.create_graph_export_fp {
@@ -2359,7 +2434,7 @@ impl ComfyApp {
         let id = self.create_graph_id?;
         let schemas = self.schemas.as_ref()?;
         let doc = self.graph_tabs.iter().find(|d| d.id == id)?;
-        let exported = doc.view.export_ui(&doc.graph, schemas, &doc.bypassed);
+        let exported = doc.view.export_ui(&doc.graph, schemas, &doc.bypassed, &doc.seed_randomize);
         let body = serde_json::to_string(&exported).ok()?;
         Some(str_fingerprint(&body))
     }
@@ -3051,7 +3126,7 @@ impl ComfyApp {
     fn snapshot_workflow(&self) -> (String, Option<String>) {
         if let (Some(doc), Some(schemas)) = (self.active_doc(), self.schemas.as_ref()) {
             if !doc.is_empty() {
-                let exported = doc.view.export_ui(&doc.graph, schemas, &doc.bypassed);
+                let exported = doc.view.export_ui(&doc.graph, schemas, &doc.bypassed, &doc.seed_randomize);
                 if let Ok(body) = serde_json::to_string(&exported) {
                     return (doc.name.clone(), Some(body));
                 }
@@ -8947,7 +9022,15 @@ impl ComfyApp {
             let props = doc.props_node;
             doc.graph.set_live_execution(executing, progress, preview);
             if let Some(tapped) =
-                doc.view.show(ui, &mut doc.graph, executing, props, &doc.bypassed, &loras)
+                doc.view.show(
+                    ui,
+                    &mut doc.graph,
+                    executing,
+                    props,
+                    &doc.bypassed,
+                    &loras,
+                    &mut doc.seed_randomize,
+                )
             {
                 doc.props_node = Some(tapped);
             }
@@ -9229,6 +9312,15 @@ impl ComfyApp {
         }
         if was_bypassed {
             doc.bypassed.insert(new_id);
+        }
+        let seed_flags: Vec<(String, bool)> = doc
+            .seed_randomize
+            .iter()
+            .filter(|((n, _), _)| *n == nid)
+            .map(|((_, name), &v)| (name.clone(), v))
+            .collect();
+        for (name, v) in seed_flags {
+            doc.seed_randomize.insert((new_id, name), v);
         }
         doc.props_node = Some(new_id);
         self.graph_status = format!("Duplicated {class}");
@@ -9528,7 +9620,7 @@ impl ComfyApp {
             self.save_name = name.clone();
             let exported = self.active_doc().and_then(|doc| {
                 let schemas = self.schemas.as_ref()?;
-                Some(doc.view.export_ui(&doc.graph, schemas, &doc.bypassed))
+                Some(doc.view.export_ui(&doc.graph, schemas, &doc.bypassed, &doc.seed_randomize))
             });
             match exported.and_then(|v| serde_json::to_string(&v).ok()) {
                 Some(body) => {
@@ -9656,6 +9748,7 @@ impl ComfyApp {
                         false,
                         &loras,
                         &mut lora_picks,
+                        &mut doc.seed_randomize,
                     );
                 }
                 // For LoadImage-style nodes, a thumbnail picker over the server inputs or the phone.
@@ -10077,6 +10170,11 @@ impl ComfyApp {
                     let nid = doc.graph.snarl.insert_node(insert_pos, FlowNodeData::new(object));
                     if let Some(data) = doc.graph.snarl.get_node_mut(nid) {
                         graphview::ensure_file_combos(data, &doc.graph.object_info, &loras);
+                        for input in &data.inputs {
+                            if graphview::is_seed_widget(input) {
+                                doc.seed_randomize.insert((nid, input.name.clone()), true);
+                            }
+                        }
                     }
                     inserted = Some(nid);
                 }

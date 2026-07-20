@@ -24,6 +24,8 @@ const MODE_MUTE: u64 = 2;
 pub struct Converted {
     pub workflow: Workflow,
     pub warnings: Vec<String>,
+    /// UI/API node id → seed input name → randomize (`control_after_generate == "randomize"`).
+    pub seed_randomize: BTreeMap<(u64, String), bool>,
 }
 
 /// Where a link's value ultimately comes from after skipping virtual/bypassed nodes.
@@ -51,6 +53,7 @@ pub fn convert(ui: &Value, schemas: &SchemaSet) -> Result<Converted, String> {
     let set_nodes = set_node_table(&by_id);
 
     let mut out: BTreeMap<WorkflowNodeId, WorkflowNode> = BTreeMap::new();
+    let mut seed_randomize: BTreeMap<(u64, String), bool> = BTreeMap::new();
 
     for (&id, node) in &by_id {
         let ty = node_type(node);
@@ -83,7 +86,10 @@ pub fn convert(ui: &Value, schemas: &SchemaSet) -> Result<Converted, String> {
         // Widget values in schema order; connections below override converted widgets.
         let mut values = WidgetValues::new(node.get("widgets_values"));
         for input in schema.inputs.iter().filter(|i| is_widget(&i.kind)) {
-            let value = values.next_for(input);
+            let (value, control) = values.next_for(input);
+            if let Some(c) = control {
+                seed_randomize.insert((id, input.name.clone()), c == "randomize");
+            }
             let coerced = value
                 .and_then(|v| coerce(&input.kind, v))
                 .or_else(|| default_input(&input.kind));
@@ -156,7 +162,11 @@ pub fn convert(ui: &Value, schemas: &SchemaSet) -> Result<Converted, String> {
         }
     }
 
-    Ok(Converted { workflow: Workflow::new(out), warnings })
+    Ok(Converted {
+        workflow: Workflow::new(out),
+        warnings,
+        seed_randomize,
+    })
 }
 
 /// `links` rows are `[id, from_node, from_slot, to_node, to_slot, type]` (or objects in newer
@@ -319,23 +329,30 @@ impl<'a> WidgetValues<'a> {
         }
     }
 
-    fn next_for(&mut self, input: &InputSchema) -> Option<&'a Value> {
+    fn next_for(&mut self, input: &InputSchema) -> (Option<&'a Value>, Option<&'a str>) {
         match self {
             Self::Arr { values, cursor } => {
-                let v = values.get(*cursor)?;
+                let v = match values.get(*cursor) {
+                    Some(v) => v,
+                    None => return (None, None),
+                };
                 *cursor += 1;
-                if takes_seed_control(input)
+                let control = if takes_seed_control(input)
                     && values
                         .get(*cursor)
                         .and_then(Value::as_str)
                         .is_some_and(|s| SEED_CONTROLS.contains(&s))
                 {
+                    let s = values[*cursor].as_str();
                     *cursor += 1;
-                }
-                Some(v)
+                    s
+                } else {
+                    None
+                };
+                (Some(v), control)
             }
-            Self::Dict(map) => map.get(&input.name),
-            Self::None => None,
+            Self::Dict(map) => (map.get(&input.name), None),
+            Self::None => (None, None),
         }
     }
 
