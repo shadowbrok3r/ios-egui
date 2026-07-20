@@ -32,6 +32,16 @@ You rewrite an anime image prompt into the Illustrious/NoobAI dialect. Begin wit
 block 'masterpiece, best quality, newest, absurdres, highres' then the source content as \
 comma-separated tags. Remove any score_ quality tags. Output only the rewritten prompt.";
 
+/// System prompt: rewrite a prompt for the Anima (Qwen3-encoder) DiT — hybrid prose + tags, no
+/// quality block.
+pub const SYS_FAMILY_TO_ANIMA: &str = "\
+You rewrite an anime image prompt for the Anima model, whose Qwen3 text encoder reads a hybrid \
+of natural language plus booru tags. Remove any Pony score_ tags and any Illustrious/NoobAI \
+quality tags (masterpiece, best quality, newest, absurdres, highres); do not add any quality \
+block. Keep the character, subject, and content tags. Begin with one short natural-language \
+sentence describing the scene, then the kept content as comma-separated tags. Output only the \
+rewritten prompt.";
+
 /// Which rewrite the model should perform; maps to a system prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RewriteKind {
@@ -39,6 +49,7 @@ pub enum RewriteKind {
     ProseToTags,
     ToPony,
     ToIllustrious,
+    ToAnima,
 }
 
 impl RewriteKind {
@@ -49,6 +60,7 @@ impl RewriteKind {
             RewriteKind::ProseToTags => SYS_PROSE_TO_TAGS,
             RewriteKind::ToPony => SYS_FAMILY_TO_PONY,
             RewriteKind::ToIllustrious => SYS_FAMILY_TO_ILLUSTRIOUS,
+            RewriteKind::ToAnima => SYS_FAMILY_TO_ANIMA,
         }
     }
 
@@ -59,6 +71,7 @@ impl RewriteKind {
             RewriteKind::ProseToTags => "To tags",
             RewriteKind::ToPony => "To Pony",
             RewriteKind::ToIllustrious => "To Illustrious",
+            RewriteKind::ToAnima => "To Anima",
         }
     }
 }
@@ -150,10 +163,27 @@ mod tests {
         assert_eq!(RewriteKind::ProseToTags.system(), SYS_PROSE_TO_TAGS);
         assert_eq!(RewriteKind::ToPony.system(), SYS_FAMILY_TO_PONY);
         assert_eq!(RewriteKind::ToIllustrious.system(), SYS_FAMILY_TO_ILLUSTRIOUS);
+        assert_eq!(RewriteKind::ToAnima.system(), SYS_FAMILY_TO_ANIMA);
         // Each system prompt is real guidance, not a placeholder.
-        for k in [RewriteKind::TagsToVideo, RewriteKind::ProseToTags, RewriteKind::ToPony] {
+        for k in [
+            RewriteKind::TagsToVideo,
+            RewriteKind::ProseToTags,
+            RewriteKind::ToPony,
+            RewriteKind::ToAnima,
+        ] {
             assert!(k.system().len() > 40);
         }
+    }
+
+    #[test]
+    fn anima_prompt_avoids_quality_blocks_and_asks_for_hybrid() {
+        let sys = RewriteKind::ToAnima.system();
+        assert_eq!(RewriteKind::ToAnima.label(), "To Anima");
+        // No score_/masterpiece quality block; leads with natural language then tags.
+        assert!(!sys.contains("score_9"));
+        assert!(sys.contains("do not add any quality block"));
+        assert!(sys.contains("natural-language"));
+        assert!(sys.contains("comma-separated tags"));
     }
 
     #[test]

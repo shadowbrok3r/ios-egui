@@ -894,6 +894,9 @@ struct ComfyApp {
     /// Settings: selected pack subdir name under the app external files dir.
     #[cfg(feature = "local-npu")]
     local_pack: String,
+    /// Settings: route Create generation to the server (Server model pick) while the stack stays on.
+    #[cfg(feature = "local-npu")]
+    local_use_server: bool,
     /// Cached external-files-dir scan; refreshed on demand from Settings.
     #[cfg(feature = "local-npu")]
     local_packs: Vec<crate::local_engine::PackEntry>,
@@ -1255,6 +1258,8 @@ impl ComfyApp {
             local_backend: LocalBackend::default(),
             #[cfg(feature = "local-npu")]
             local_pack: String::new(),
+            #[cfg(feature = "local-npu")]
+            local_use_server: false,
             #[cfg(feature = "local-npu")]
             local_packs: Vec::new(),
             #[cfg(feature = "local-npu")]
@@ -2109,7 +2114,7 @@ impl ComfyApp {
     /// Whether a Create-tab generation can be queued right now.
     fn can_queue_create(&self) -> Result<(), &'static str> {
         #[cfg(feature = "local-npu")]
-        if self.local_npu {
+        if self.route_local_gen() {
             if self.params.mode != Mode::Txt2Img {
                 return Err("Local NPU is txt2img only for now");
             }
@@ -2218,7 +2223,7 @@ impl ComfyApp {
         }
 
         #[cfg(feature = "local-npu")]
-        if self.local_npu {
+        if self.route_local_gen() {
             self.start_local_npu_generation(host);
             return;
         }
@@ -3259,6 +3264,10 @@ impl ComfyApp {
             local_pack: self.local_pack.clone(),
             #[cfg(not(feature = "local-npu"))]
             local_pack: String::new(),
+            #[cfg(feature = "local-npu")]
+            local_use_server: self.local_use_server,
+            #[cfg(not(feature = "local-npu"))]
+            local_use_server: false,
             prompt_history: self.prompt_history.clone(),
             character_denied: self.character_denied.clone(),
             character_suggestions: self.character_suggestions.clone(),
@@ -3327,6 +3336,7 @@ impl ComfyApp {
             self.auto_tag = saved.auto_tag;
             self.local_backend = saved.local_backend;
             self.local_pack = saved.local_pack;
+            self.local_use_server = saved.local_use_server;
         }
         if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
             self.restore_workflow = Some((saved.workflow_name, json));
@@ -3709,14 +3719,17 @@ impl ComfyApp {
                 ui.add_space(12.0);
                 ui.heading("Local NPU");
                 ui.group(|ui| {
-                    ui.checkbox(&mut self.local_npu, "Local NPU (experimental)");
+                    ui.checkbox(&mut self.local_npu, "Local NPU features (experimental)");
                     ui.weak(
-                        "Queue on Create runs on-device HTP instead of the server. SD1.5 packs are \
-                         512² (unet.bin / vae_decoder.bin / tokenizer.json / clip.safetensors); \
-                         Anima packs are 1024² and carry an ANIMA marker file.",
+                        "Enables the on-device stack: auto-tag, CLIP embeds, Read tags and Rewrite. \
+                         Create generation runs on-device only when a local pack is the chosen \
+                         model; pick 'Server model' to generate on the server with these features \
+                         still on. SD1.5 packs are 512² (unet.bin / vae_decoder.bin / \
+                         tokenizer.json / clip.safetensors); Anima packs are 1024² with an ANIMA \
+                         marker file.",
                     );
                     ui.add_space(6.0);
-                    ui.weak("Pick the on-device model, test it, or import a pack in Create -> Models.");
+                    ui.weak("Pick the Create model (a pack or Server model), test it, or import a pack in Create -> Models.");
                     ui.add_space(6.0);
                     ui.checkbox(&mut self.auto_tag, "Auto-tag gallery (NPU)");
                     ui.weak(
@@ -4628,7 +4641,7 @@ impl ComfyApp {
         let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
         let enhance_label = if app_n > 0 { format!(" · +{app_n} enhance") } else { String::new() };
         #[cfg(feature = "local-npu")]
-        let local_badge = if self.local_npu {
+        let local_badge = if self.route_local_gen() {
             format!(" · Local · {}", self.local_backend.label())
         } else {
             String::new()
@@ -4640,7 +4653,7 @@ impl ComfyApp {
             &format!("{ckpt_label} · {preset_label}{enhance_label}{local_badge}"),
         ));
         #[cfg(feature = "local-npu")]
-        if self.local_npu {
+        if self.route_local_gen() {
             self.ensure_local_packs(host, false);
             let pack = self.selected_pack().map(|p| p.name.clone());
             let line = match (&pack, self.local_backend) {
@@ -5335,23 +5348,33 @@ impl ComfyApp {
         self.ensure_local_packs(host, false);
         let warn = egui::Color32::from_rgb(230, 180, 120);
         let packs = self.local_packs.clone();
+        let use_server = self.local_use_server;
         let mut pick: Option<(String, LocalBackend)> = None;
+        let mut server_pick = false;
         let mut rescan = false;
         let mut test: Option<std::path::PathBuf> = None;
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.strong("On this phone");
+                ui.strong("Create model");
                 if ui.small_button(icons::REFRESH).on_hover_text("Rescan the app files dir").clicked() {
                     rescan = true;
                 }
             });
-            ui.weak("These run on the NPU. The pack supplies the model, so the server list below is unused.");
+            ui.weak("A pack runs on the NPU; 'Server model' sends generation to the server while the NPU features stay on.");
             ui.add_space(4.0);
+            let srv_label = if use_server {
+                format!("{} Server model", icons::CHECK)
+            } else {
+                "     Server model".to_string()
+            };
+            if ui.selectable_label(use_server, sanitize_ui_text(ui, &srv_label)).clicked() {
+                server_pick = true;
+            }
             if packs.is_empty() {
                 ui.colored_label(warn, "No packs installed yet - import one below.");
             }
             for p in &packs {
-                let on = p.name == self.local_pack && p.backend == self.local_backend;
+                let on = !use_server && p.name == self.local_pack && p.backend == self.local_backend;
                 let label = if on {
                     format!("{} {}", icons::CHECK, p.label())
                 } else {
@@ -5361,7 +5384,7 @@ impl ComfyApp {
                     pick = Some((p.name.clone(), p.backend));
                 }
             }
-            if let Some(sel) = self.selected_pack().cloned() {
+            if !use_server && let Some(sel) = self.selected_pack().cloned() {
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     let can_test = sel.backend == LocalBackend::Anima && !self.d3_running;
@@ -5391,14 +5414,25 @@ impl ComfyApp {
         });
         self.local_import_ui(ui, host, None);
         ui.add_space(6.0);
-        ui.weak("Server models (not used while Local NPU is on)");
+        let eff_server = if server_pick { true } else if pick.is_some() { false } else { use_server };
+        ui.weak(if eff_server {
+            "Server models (used — 'Server model' selected above)"
+        } else {
+            "Server models (not used — a local pack is selected above)"
+        });
         ui.add_space(2.0);
         if rescan {
             self.ensure_local_packs(host, true);
         }
+        if server_pick && !self.local_use_server {
+            self.local_use_server = true;
+            crate::local_engine::drop_cache();
+            self.log.info("local-npu: Create model -> server (NPU features stay on)");
+        }
         if let Some((name, backend)) = pick
-            && (name != self.local_pack || backend != self.local_backend)
+            && (self.local_use_server || name != self.local_pack || backend != self.local_backend)
         {
+            self.local_use_server = false;
             self.local_pack = name;
             self.local_backend = backend;
             crate::local_engine::drop_cache();
@@ -6281,7 +6315,7 @@ impl ComfyApp {
     /// Re-seed sampler / steps / cfg / size after a reset from the current model's recommendation.
     #[cfg(feature = "local-npu")]
     fn seed_reset_recommendation(&mut self) {
-        if self.local_npu {
+        if self.route_local_gen() {
             if let Some(entry) = self.selected_pack().cloned() {
                 let d = crate::local_engine::local_defaults(&entry);
                 self.params.width = d.width;
@@ -13456,10 +13490,16 @@ impl ComfyApp {
         crate::local_engine::pick_pack(&self.local_packs, &self.local_pack, self.local_backend)
     }
 
+    /// True when Create generation runs on the NPU rather than the server (stack on, local model).
+    #[cfg(feature = "local-npu")]
+    fn route_local_gen(&self) -> bool {
+        crate::types::routes_local_generation(self.local_npu, self.local_use_server)
+    }
+
     /// True when the Create tab should present the Anima pipeline (fixed size, euler, txt2img).
     #[cfg(feature = "local-npu")]
     fn anima_active(&self) -> bool {
-        self.local_npu && self.local_backend == LocalBackend::Anima
+        self.route_local_gen() && self.local_backend == LocalBackend::Anima
     }
 
     #[cfg(not(feature = "local-npu"))]
@@ -13592,6 +13632,10 @@ impl ComfyApp {
             }
             if ui.button(RewriteKind::ToIllustrious.label()).clicked() {
                 self.start_rewrite(ui.ctx(), host, RewriteKind::ToIllustrious);
+                ui.close();
+            }
+            if ui.button(RewriteKind::ToAnima.label()).clicked() {
+                self.start_rewrite(ui.ctx(), host, RewriteKind::ToAnima);
                 ui.close();
             }
         });

@@ -1547,6 +1547,9 @@ pub struct Settings {
     /// Selected pack subdir under the app external files dir (empty = first pack of `local_backend`).
     #[serde(default)]
     pub local_pack: String,
+    /// Route Create generation to the server even while the Local NPU stack is on (Server model pick).
+    #[serde(default)]
+    pub local_use_server: bool,
     /// Container-side path of ComfyUI's output dir, used to build VHS_LoadVideoPath finish paths.
     #[serde(default = "default_server_output_root")]
     pub server_output_root: String,
@@ -1563,6 +1566,13 @@ pub struct Settings {
 
 pub fn default_server_output_root() -> String {
     "/data/output/".into()
+}
+
+/// Create generation routes to the local NPU only when the stack is on and a local model is the
+/// chosen one; picking "Server model" (`use_server_model`) keeps the NPU features but sends the
+/// job to the server.
+pub fn routes_local_generation(local_npu: bool, use_server_model: bool) -> bool {
+    local_npu && !use_server_model
 }
 
 /// One album from `GET /gallery/api/albums`. Albums are per-account (namespaced by the credential),
@@ -1710,6 +1720,38 @@ mod tests {
         assert!(s.local_npu);
         assert_eq!(s.local_backend, LocalBackend::Sd15);
         assert!(s.local_pack.is_empty());
+    }
+
+    /// Older settings (no `local_use_server`) with the NPU on still route locally.
+    #[test]
+    fn settings_without_use_server_still_route_local() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params, "local_npu": true});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(!s.local_use_server);
+        assert!(routes_local_generation(s.local_npu, s.local_use_server));
+    }
+
+    #[test]
+    fn create_routes_local_only_when_npu_on_and_a_local_model_chosen() {
+        assert!(routes_local_generation(true, false));
+        // Server model picked: NPU on but generation goes to the server.
+        assert!(!routes_local_generation(true, true));
+        // NPU off: always server.
+        assert!(!routes_local_generation(false, false));
+        assert!(!routes_local_generation(false, true));
+    }
+
+    #[test]
+    fn settings_round_trip_the_server_model_pick() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({
+            "server_url": "", "params": params, "local_npu": true, "local_use_server": true,
+        });
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(s.local_use_server);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.local_use_server);
     }
 
     /// Settings written before the finish-pass output root existed default it to `/data/output/`.
