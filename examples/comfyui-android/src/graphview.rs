@@ -316,6 +316,13 @@ impl GraphView {
                 // Prefer real measures; after a few FitAll frames, arrange with what we have so a
                 // never-drawn node cannot stall the queue forever.
                 if ready || self.arrange_wait >= 3 {
+                    let measured = ids.iter().filter(|id| self.sizes.contains_key(id)).count();
+                    log::info!(
+                        "graphview: queued arrange firing ({} nodes, {measured} measured, wait={}, locked={})",
+                        ids.len(),
+                        self.arrange_wait,
+                        self.locked
+                    );
                     self.arrange_now(&mut g.snarl);
                 } else {
                     self.cmd = Some(ViewCmd::FitAll);
