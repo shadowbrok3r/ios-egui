@@ -1243,6 +1243,7 @@ pub enum GallerySort {
     Largest,
     Smallest,
     Name,
+    Score,
 }
 
 impl GallerySort {
@@ -1253,6 +1254,8 @@ impl GallerySort {
             Self::Largest => "large",
             Self::Smallest => "small",
             Self::Name => "name",
+            // Aesthetic score is client-side data; list newest and reorder locally.
+            Self::Score => "new",
         }
     }
 
@@ -1263,11 +1266,12 @@ impl GallerySort {
             Self::Largest => "Largest",
             Self::Smallest => "Smallest",
             Self::Name => "Name",
+            Self::Score => "Score",
         }
     }
 
     pub const ALL: &'static [Self] =
-        &[Self::Newest, Self::Oldest, Self::Largest, Self::Smallest, Self::Name];
+        &[Self::Newest, Self::Oldest, Self::Largest, Self::Smallest, Self::Name, Self::Score];
 }
 
 /// What the gallery's collapsing headers bucket by. The server only orders rows to match; the

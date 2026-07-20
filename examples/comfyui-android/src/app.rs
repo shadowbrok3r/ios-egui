@@ -10547,6 +10547,18 @@ impl ComfyApp {
                 .map(|(i, _)| i)
                 .collect()
         };
+        let mut visible = visible;
+        // Aesthetic order: indexed scores descending, unscored after, stable within ties.
+        if self.gallery_view.sort == GallerySort::Score && self.similar_filter.is_none() {
+            let score_of =
+                |i: usize| self.gallery.get(i).and_then(|it| self.clip_index.score(&it.key()));
+            visible.sort_by(|&a, &b| match (score_of(a), score_of(b)) {
+                (Some(x), Some(y)) => y.total_cmp(&x),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            });
+        }
         if self.similar_filter.is_some() {
             ui.horizontal(|ui| {
                 ui.label(format!("{} Similar images", icons::SEARCH));
