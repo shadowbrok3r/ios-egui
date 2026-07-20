@@ -14,12 +14,12 @@ use rucomfyui::workflow::WorkflowNodeId;
 use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
 
 use crate::apps::{AppDef, AppSet, KnobTy, Status};
-use crate::engine::{Engine, GenCtx, Msg};
+use crate::engine::{Engine, GenCtx, Msg, QueueJob};
 use crate::gallery::{self, ImageMeta, RemixDiffRow, RemixField, ThumbCache};
 use crate::graphview::{self, GraphView, LongPress, LoraPick, elide, elide_width, sanitize_ui_text};
 use crate::icons;
 use crate::mask;
-use crate::{lint, tags};
+use crate::{cooc, lint, tags};
 use crate::logger::{self, Logger};
 use crate::player::Player;
 use crate::schema::{self, SchemaSet};
@@ -30,8 +30,8 @@ use crate::types::{
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, Img2ImgSource, LoraCatalog, LoraPack, Mode,
-    ModelKind, Params, SamplerPack, Settings, append_negatives, checkpoint_family, fallback_vec,
-    file_basename, merge_triggers, strip_injected,
+    ModelKind, Params, PromptHist, SamplerPack, Settings, append_negatives, checkpoint_family,
+    fallback_vec, file_basename, merge_triggers, push_prompt_hist, strip_injected,
 };
 #[cfg(feature = "local-npu")]
 use crate::types::LocalBackend;
@@ -40,6 +40,8 @@ use crate::types::LocalBackend;
 const GALLERY_LOAD_ALL_CAP: u64 = 5000;
 /// comfy-gate clamps `/gallery/api/list` `limit` at this.
 const GALLERY_PAGE_MAX: u64 = 500;
+/// Window for the second Create Reset tap to confirm.
+const RESET_CONFIRM_SECS: f64 = 4.0;
 
 enum Conn {
     Disconnected,
@@ -399,6 +401,13 @@ impl GraphDoc {
     }
 }
 
+/// A prompt this app submitted, tracked for the queue sheet's "Yours" label and targeted cancel.
+struct MyPrompt {
+    id: String,
+    label: String,
+    added: f64,
+}
+
 struct ComfyApp {
     engine: Option<Engine>,
     loaded: bool,
@@ -481,6 +490,16 @@ struct ComfyApp {
     queue_remaining: u32,
     /// Last time we polled `GET /queue`.
     last_queue_poll: f64,
+    /// Latest per-job `GET /queue` snapshot for the queue sheet + targeted cancel.
+    queue_jobs: (Vec<QueueJob>, Vec<QueueJob>),
+    /// Prompts this app submitted (id, short label, added time) for "Yours" rows + our-pending cancel.
+    my_prompts: Vec<MyPrompt>,
+    /// Job labels awaiting a server prompt id, paired in submit order.
+    pending_job_labels: std::collections::VecDeque<String>,
+    /// The pending-jobs queue sheet is open.
+    queue_sheet_open: bool,
+    /// Two-tap arm state for the sheet's "Clear pending" button.
+    queue_clear_arm: bool,
 
     preview: Option<egui::TextureHandle>,
     /// Latest Create result (also the last entry in [`Self::results`]) — img2img / Save default.
@@ -494,6 +513,8 @@ struct ComfyApp {
     result_seq: u64,
     save_counter: u32,
     note: String,
+    /// First Reset tap arms the confirm; a second within `RESET_CONFIRM_SECS` runs it.
+    reset_armed_at: Option<f64>,
 
     /// Open workflow editor tabs (created on connect / when loading graphs).
     graph_tabs: Vec<GraphDoc>,
@@ -624,6 +645,10 @@ struct ComfyApp {
     picked_input: Option<PickedInput>,
     /// Grid to change the device img2img photo is expanded inline.
     picked_input_grid_open: bool,
+    /// Server-gallery picker sheet (choose an existing gallery image as the input) is open.
+    gallery_pick_open: bool,
+    /// Awaiting full bytes for a gallery-picked input: `(item key, filename)`.
+    gallery_pick_pending: Option<(String, String)>,
     /// Full-screen finger-paint inpainting session (session-only, never persisted).
     inpaint: Option<InpaintState>,
     /// A Remix tap is waiting on the viewer's workflow meta before opening the diff sheet.
@@ -675,12 +700,26 @@ struct ComfyApp {
     prompt_chips: bool,
     /// Negative prompt shown as editable chips (session-only).
     neg_prompt_chips: bool,
+    /// Recorded Create-tab prompt pairs for the history scrubber (newest last, capped; persisted).
+    prompt_history: Vec<PromptHist>,
+    /// Live draft stashed at the newest slider slot while scrubbing (session-only).
+    hist_stash: Option<PromptHist>,
+    /// Current 1-based scrubber slider position while `hist_stash` is set.
+    hist_slider: usize,
+    /// Prompt pair last written by a scrub, to detect a manual edit that detaches the scrubber.
+    hist_applied: Option<(String, String)>,
     /// Bundled tag dictionary parsed and ready to query off-thread.
     tag_dict_warm: bool,
     /// Completion signal for the background tag-dictionary warmup.
     tag_dict_warming: Option<std::sync::mpsc::Receiver<()>>,
     /// Server tag-dictionary override; used ahead of the bundled dictionary when present.
     tag_dict_override: Option<Arc<tags::TagDict>>,
+    /// Personal tag co-occurrence model learned from queued positive prompts.
+    cooc: cooc::CoocModel,
+    /// The co-occurrence model finished loading (or found no file) off-thread.
+    cooc_loaded: bool,
+    /// Delivery channel for the background co-occurrence load.
+    cooc_loading: Option<std::sync::mpsc::Receiver<cooc::CoocModel>>,
     /// Cached prompt lint issues plus the fingerprint they were computed from.
     lint_issues: Vec<lint::LintIssue>,
     lint_fp: u64,
@@ -716,6 +755,17 @@ struct ComfyApp {
     d3_last: Option<String>,
     #[cfg(feature = "local-npu")]
     d3_ok: Option<bool>,
+    /// WD14 "Read tags" worker result (ranked tags or an error string).
+    #[cfg(feature = "local-npu")]
+    wd14_rx: Option<std::sync::mpsc::Receiver<Result<local_wd14::TagResult, String>>>,
+    #[cfg(feature = "local-npu")]
+    wd14_running: bool,
+    /// The ranked-tags sheet shown over the gallery once a tag read finishes.
+    #[cfg(feature = "local-npu")]
+    wd14_sheet: Option<local_wd14::TagResult>,
+    /// Cached WD14 tagger pack dir under the app external files dir, if one is present.
+    #[cfg(feature = "local-npu")]
+    wd14_pack: Option<std::path::PathBuf>,
     /// Settings: route Create Queue to on-device HTP instead of the ComfyUI server.
     #[cfg(feature = "local-npu")]
     local_npu: bool,
@@ -855,6 +905,11 @@ impl ComfyApp {
             status: String::new(),
             queue_remaining: 0,
             last_queue_poll: 0.0,
+            queue_jobs: (Vec::new(), Vec::new()),
+            my_prompts: Vec::new(),
+            pending_job_labels: std::collections::VecDeque::new(),
+            queue_sheet_open: false,
+            queue_clear_arm: false,
             preview: None,
             result: None,
             result_bytes: None,
@@ -863,6 +918,7 @@ impl ComfyApp {
             result_seq: 0,
             save_counter: 0,
             note: String::new(),
+            reset_armed_at: None,
             graph_tabs: Vec::new(),
             active_graph: 0,
             next_graph_id: 1,
@@ -942,6 +998,8 @@ impl ComfyApp {
             img2img_url_pending_at: 0.0,
             picked_input: None,
             picked_input_grid_open: false,
+            gallery_pick_open: false,
+            gallery_pick_pending: None,
             inpaint: None,
             viewer_remix_pending: false,
             remix_sheet: None,
@@ -968,9 +1026,16 @@ impl ComfyApp {
             create_companions_open: true,
             prompt_chips: false,
             neg_prompt_chips: false,
+            prompt_history: Vec::new(),
+            hist_stash: None,
+            hist_slider: 0,
+            hist_applied: None,
             tag_dict_warm: false,
             tag_dict_warming: None,
             tag_dict_override: None,
+            cooc: cooc::CoocModel::default(),
+            cooc_loaded: false,
+            cooc_loading: None,
             lint_issues: Vec::new(),
             lint_fp: 0,
             #[cfg(feature = "local-npu")]
@@ -997,6 +1062,14 @@ impl ComfyApp {
             d3_last: None,
             #[cfg(feature = "local-npu")]
             d3_ok: None,
+            #[cfg(feature = "local-npu")]
+            wd14_rx: None,
+            #[cfg(feature = "local-npu")]
+            wd14_running: false,
+            #[cfg(feature = "local-npu")]
+            wd14_sheet: None,
+            #[cfg(feature = "local-npu")]
+            wd14_pack: None,
             #[cfg(feature = "local-npu")]
             local_npu: false,
             #[cfg(feature = "local-npu")]
@@ -1419,6 +1492,22 @@ impl ComfyApp {
             }
             Msg::EnhanceNote(note) => self.enhance_note = note,
             Msg::Queued => self.status = "Queued".into(),
+            Msg::PromptId(id) => {
+                let label = self.pending_job_labels.pop_front().unwrap_or_else(|| "Create".into());
+                let added = ctx.input(|i| i.time);
+                self.my_prompts.push(MyPrompt { id, label, added });
+            }
+            Msg::QueueJobs { running, pending } => {
+                let now = ctx.input(|i| i.time);
+                let live: HashSet<&str> = running
+                    .iter()
+                    .chain(pending.iter())
+                    .map(|j| j.prompt_id.as_str())
+                    .collect();
+                // Drop finished prompts, keeping just-submitted ids not yet in a snapshot.
+                self.my_prompts.retain(|p| live.contains(p.id.as_str()) || now - p.added < 6.0);
+                self.queue_jobs = (running, pending);
+            }
             Msg::Progress { value, max } => {
                 self.progress = (value, max);
                 self.status = format!("Sampling {value}/{max}");
@@ -1522,7 +1611,13 @@ impl ComfyApp {
                 self.executing = None;
                 self.preview = None;
                 self.finish_pending = false;
-                self.status = "Cancelled".into();
+                self.my_prompts.clear();
+                self.pending_job_labels.clear();
+                self.status = if matches!(self.conn, Conn::Connected) {
+                    "Cancelled — server interrupted".into()
+                } else {
+                    "Cancelled".into()
+                };
             }
             Msg::GenError(e) => {
                 self.jobs_left = self.jobs_left.saturating_sub(1);
@@ -1640,7 +1735,13 @@ impl ComfyApp {
                 if w > 0 {
                     self.thumb_aspects.insert(key.clone(), h as f32 / w as f32);
                 }
-                if let Some(v) = &mut self.viewer
+                if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
+                    let name = self.gallery_pick_pending.take().map(|(_, n)| n).unwrap_or_default();
+                    self.set_picked_input(ctx, name, bytes);
+                    self.params.img2img_source = Img2ImgSource::Picked;
+                    self.note = "Gallery image set as input".into();
+                    host.haptic(Haptic::Light);
+                } else if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
                     v.tex = Some(ctx.load_texture(&key, image, egui::TextureOptions::LINEAR));
@@ -1823,8 +1924,17 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         }
+        // Record the queued prompt pair; the dedupe collapses a variant/neighbor loop to one entry.
+        push_prompt_hist(
+            &mut self.prompt_history,
+            PromptHist { positive: self.params.positive.clone(), negative: self.params.negative.clone() },
+        );
         if self.params.randomize_seed {
             self.params.seed = random_seed();
+        }
+        // Record once per user queue action: variant/neighbor loops re-enter with running already set.
+        if !self.running {
+            self.observe_prompt_cooc(host);
         }
 
         #[cfg(feature = "local-npu")]
@@ -1886,6 +1996,11 @@ impl ComfyApp {
                 .and_then(|id| self.graph_tabs.iter().find(|d| d.id == id))
                 .map(|doc| doc.view.export_ui(&doc.graph, schemas, &doc.bypassed))
         });
+        let label = {
+            let p = self.params.positive.trim();
+            if p.is_empty() { "Create".to_string() } else { elide(p, 28) }
+        };
+        self.pending_job_labels.push_back(label);
         self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow);
         host.haptic(Haptic::Medium);
     }
@@ -2011,6 +2126,7 @@ impl ComfyApp {
             "Queued".into()
         };
         self.graph_status.clear();
+        self.pending_job_labels.push_back("Graph".into());
         self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json));
         host.haptic(Haptic::Medium);
     }
@@ -2816,6 +2932,7 @@ impl ComfyApp {
             local_pack: self.local_pack.clone(),
             #[cfg(not(feature = "local-npu"))]
             local_pack: String::new(),
+            prompt_history: self.prompt_history.clone(),
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -2886,6 +3003,7 @@ impl ComfyApp {
             self.confirm_gallery_delete = saved.confirm_gallery_delete;
             self.create_setup_open = saved.create_setup_open;
             self.create_companions_open = saved.create_companions_open;
+            self.prompt_history = saved.prompt_history;
             #[cfg(feature = "local-npu")]
             {
                 self.local_npu = saved.local_npu;
@@ -3350,6 +3468,92 @@ impl ComfyApp {
         }
     }
 
+    /// On-disk path of the personal co-occurrence model.
+    fn cooc_path(host: &Host) -> Option<String> {
+        host.documents_dir().map(|d| format!("{d}/comfyui/cooc.json"))
+    }
+
+    /// Load the co-occurrence model once on a background thread; empty on absence or parse failure.
+    fn ensure_cooc_warm(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.cooc_loaded {
+            return;
+        }
+        if let Some(rx) = &self.cooc_loading {
+            match rx.try_recv() {
+                Ok(model) => {
+                    self.cooc = model;
+                    self.cooc_loaded = true;
+                    self.cooc_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.cooc_loaded = true;
+                    self.cooc_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            }
+        } else {
+            let path = Self::cooc_path(host);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let model = path
+                    .and_then(|p| std::fs::read_to_string(&p).ok())
+                    .and_then(|t| serde_json::from_str::<cooc::CoocModel>(&t).ok())
+                    .unwrap_or_default();
+                let _ = tx.send(model);
+            });
+            self.cooc_loading = Some(rx);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Persist the co-occurrence model (queue-time only; small file).
+    fn save_cooc(&self, host: &Host) {
+        let Some(path) = Self::cooc_path(host) else { return };
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string(&self.cooc) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+
+    /// Learn the current positive prompt's tags into the co-occurrence model, then persist.
+    fn observe_prompt_cooc(&mut self, host: &Host) {
+        if !self.cooc_loaded {
+            return;
+        }
+        let tags: Vec<String> =
+            tags::parse_chips(&self.params.positive).into_iter().map(|c| c.tag).collect();
+        if self.cooc.observe(&tags) {
+            self.save_cooc(host);
+        }
+    }
+
+    /// Dict count + category for a folded tag, for styling co-oc suggestion buttons like prefix ones.
+    fn dict_lookup_meta(&self, tag: &str) -> (u32, u8) {
+        let entry = match &self.tag_dict_override {
+            Some(d) => d.lookup(tag),
+            None if self.tag_dict_warm => tags::TagDict::bundled().lookup(tag),
+            None => None,
+        };
+        entry.map(|e| (e.count, e.category)).unwrap_or((0, 0))
+    }
+
+    /// Next-tag co-oc suggestions shaped like [`tag_suggestions`] for an empty cursor token.
+    fn cooc_suggestions(&self, present: &[String], limit: usize) -> Vec<(String, u32, u8)> {
+        if !self.cooc_loaded {
+            return Vec::new();
+        }
+        self.cooc
+            .suggest(present, limit)
+            .into_iter()
+            .map(|(name, _)| {
+                let (count, cat) = self.dict_lookup_meta(&name);
+                (name, count, cat)
+            })
+            .collect()
+    }
+
     /// Prefix suggestions as owned `(insert_text, count, category)` tuples; override first, else bundled.
     fn tag_suggestions(&self, prefix: &str, limit: usize) -> Vec<(String, u32, u8)> {
         let entries = match &self.tag_dict_override {
@@ -3401,9 +3605,74 @@ impl ComfyApp {
         }
     }
 
-    /// Positive prompt: label + chip toggle, then the chip editor or text field.
+    /// Positive prompt: label + chip toggle, then the chip editor or text field, then the scrubber.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui) {
         self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
+        self.prompt_history_ui(ui);
+    }
+
+    /// Prompt-history scrubber: a compact row that slides `params.positive`/`negative` back through
+    /// recorded generations. The live draft is stashed as the newest slot, so the far end restores
+    /// it; a manual edit detaches. Hidden while history is empty.
+    fn prompt_history_ui(&mut self, ui: &mut egui::Ui) {
+        let n = self.prompt_history.len();
+        if n == 0 {
+            self.hist_stash = None;
+            self.hist_applied = None;
+            return;
+        }
+        // A manual edit to either field while scrubbing detaches: drop the stash, snap to live.
+        let edited = self
+            .hist_applied
+            .as_ref()
+            .is_some_and(|(p, neg)| *p != self.params.positive || *neg != self.params.negative);
+        if self.hist_stash.is_some() && edited {
+            self.hist_stash = None;
+            self.hist_applied = None;
+        }
+        let total = n + 1;
+        let mut val = if self.hist_stash.is_some() { self.hist_slider.clamp(1, total) } else { total };
+        let before = val;
+        ui.horizontal(|ui| {
+            ui.label("Hist");
+            ui.spacing_mut().slider_width = (ui.available_width() - 52.0).max(80.0);
+            ui.add(egui::Slider::new(&mut val, 1..=total).show_value(false));
+            ui.label(format!("{val}/{total}"));
+        });
+        if val != before {
+            self.scrub_to(ui.ctx(), val, total);
+        }
+    }
+
+    /// Move the scrubber to slider position `val` (1..=`total`), writing that slot's prompt pair.
+    fn scrub_to(&mut self, ctx: &egui::Context, val: usize, total: usize) {
+        // First move away from live stashes the current draft into the newest slot.
+        if self.hist_stash.is_none() {
+            self.hist_stash = Some(PromptHist {
+                positive: self.params.positive.clone(),
+                negative: self.params.negative.clone(),
+            });
+        }
+        self.hist_slider = val;
+        let entry = if val >= total {
+            self.hist_stash.clone().unwrap_or_default()
+        } else {
+            self.prompt_history[val - 1].clone()
+        };
+        // Plain field assignment so the chip view and autocomplete re-read the new text.
+        self.params.positive = entry.positive.clone();
+        self.params.negative = entry.negative.clone();
+        self.hist_applied = Some((entry.positive, entry.negative));
+        // Drop focus so a live caret in a prompt field doesn't fight the replaced text.
+        ctx.memory_mut(|m| {
+            m.surrender_focus(PromptField::Positive.edit_id());
+            m.surrender_focus(PromptField::Negative.edit_id());
+        });
+        // Landing back on the live slot detaches cleanly.
+        if val >= total {
+            self.hist_stash = None;
+            self.hist_applied = None;
+        }
     }
 
     /// Negative prompt: label + chip toggle, then the chip editor or text field.
@@ -3450,10 +3719,22 @@ impl ComfyApp {
         let cursor_byte =
             text.char_indices().nth(cursor_char).map(|(b, _)| b).unwrap_or(text.len());
         let (range, tok) = tags::token_at(&text, cursor_byte);
-        if tok.chars().count() < 2 {
-            return;
-        }
-        let sugg = self.tag_suggestions(tok, 8);
+        // Co-oc runs on the positive field only; present = the field's already-typed tags.
+        let present: Vec<String> = if field == PromptField::Positive {
+            tags::parse_chips(&text).into_iter().map(|c| c.tag).collect()
+        } else {
+            Vec::new()
+        };
+        let sugg = if tok.chars().count() < 2 {
+            // Empty cursor token: co-oc next-tag suggestions from the present set.
+            self.cooc_suggestions(&present, 8)
+        } else {
+            let mut m = self.tag_suggestions(tok, 8);
+            if field == PromptField::Positive {
+                cooc::blend_rank(&mut m, |name| self.cooc.rerank_boost(&present, name));
+            }
+            m
+        };
         if sugg.is_empty() {
             return;
         }
@@ -3646,6 +3927,7 @@ impl ComfyApp {
 
     fn create_main_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.ensure_tag_dict_warm(ui.ctx());
+        self.ensure_cooc_warm(ui.ctx(), host);
         let model_file = self.params.model_file().to_string();
         let ckpt_label = if model_file.is_empty() {
             "no model".to_string()
@@ -3714,6 +3996,9 @@ impl ComfyApp {
             if show_video {
                 ui.selectable_value(&mut self.params.mode, Mode::Video, "Video");
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.reset_button(ui, host);
+            });
         });
         // Anima has no img2img, but its checkpoint is unrelated to Wan video.
         if anima && self.params.mode == Mode::Img2Img {
@@ -3755,7 +4040,10 @@ impl ComfyApp {
                 (false, true, false) => match self.params.img2img_source {
                     Img2ImgSource::CurrentOutput => "Image source · Current result".into(),
                     Img2ImgSource::Url => "Image source · From URL".into(),
-                    Img2ImgSource::Picked => "Image source · Device photo".into(),
+                    Img2ImgSource::Picked => match self.picked_input.as_ref() {
+                        Some(p) => format!("Image source · {}", elide(&p.name, 20)),
+                        None => "Image source · Photo".into(),
+                    },
                 },
                 (false, false, _) => String::new(),
             };
@@ -3842,6 +4130,9 @@ impl ComfyApp {
                                 Img2ImgSource::Picked,
                                 "Device photo",
                             );
+                            if ui.selectable_label(false, "From gallery").clicked() {
+                                self.gallery_pick_open = true;
+                            }
                         });
                         // Leaving Picked drops the masked photo it applied to.
                         if prev_src == Img2ImgSource::Picked
@@ -4053,6 +4344,10 @@ impl ComfyApp {
                     self.params.img2img_source = src;
                     self.params.video.video_t2v = false;
                 }
+            }
+            if ui.selectable_label(false, "From gallery").clicked() {
+                self.params.video.video_t2v = false;
+                self.gallery_pick_open = true;
             }
         });
         if self.params.video.video_t2v {
@@ -4792,15 +5087,34 @@ impl ComfyApp {
 
         ui.add_space(6.0);
         ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Checkpoint:");
-            let shown = if draft.card.checkpoint.trim().is_empty() {
-                "none".to_string()
-            } else {
-                file_basename(&draft.card.checkpoint).to_string()
-            };
-            ui.weak(elide(&sanitize_ui_text(ui, &shown), 28));
-        });
+        ui.label("Preferred model");
+        let cur_label = if draft.card.checkpoint.trim().is_empty() {
+            "none".to_string()
+        } else {
+            elide(&sanitize_ui_text(ui, file_basename(&draft.card.checkpoint)), 32)
+        };
+        egui::ComboBox::from_id_salt("char_model")
+            .selected_text(cur_label)
+            .width(w)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut draft.card.checkpoint, String::new(), "none");
+                let target = &mut draft.card.checkpoint;
+                let mut row = |ui: &mut egui::Ui, file: &str| {
+                    let base = elide(&sanitize_ui_text(ui, file_basename(file)), 44);
+                    ui.selectable_value(target, file.to_string(), base)
+                        .on_hover_text(sanitize_ui_text(ui, file));
+                };
+                for f in self.checkpoints.iter().take(300) {
+                    row(ui, f);
+                }
+                if !self.unets.is_empty() {
+                    ui.separator();
+                    ui.weak("Diffusion");
+                    for f in self.unets.iter().take(300) {
+                        row(ui, f);
+                    }
+                }
+            });
         ui.horizontal(|ui| {
             if ui
                 .small_button("Use current model")
@@ -4911,39 +5225,109 @@ impl ComfyApp {
             ModelKind::Checkpoint => self.params.checkpoint = file.to_string(),
             ModelKind::Diffusion => self.params.unet_name = file.to_string(),
         }
-        if let Some(rec) = self
-            .checkpoint_catalog
-            .entry(file)
-            .and_then(|e| e.recommended.as_ref())
-            .cloned()
-        {
-            if let Some(v) = rec.steps {
-                self.params.steps = v;
-            }
-            if let Some(v) = rec.cfg {
-                self.params.cfg = v;
-            }
-            if let Some(v) = rec.width {
-                self.params.width = v;
-            }
-            if let Some(v) = rec.height {
-                self.params.height = v;
-            }
-            if let Some(name) = rec.sampler.as_ref().and_then(|s| match_sampler_name(s, &self.samplers))
-            {
-                self.params.sampler = name;
-            }
-            if let Some(name) =
-                rec.scheduler.as_ref().and_then(|s| match_sampler_name(s, &self.schedulers))
-            {
-                self.params.scheduler = name;
-            }
-        }
+        self.apply_recommended_settings(file);
         if kind == ModelKind::Diffusion {
             self.resolve_companions(Companions::Seed);
         }
         self.selected_preset.clear();
         self.touch_checkpoint_recent(file);
+    }
+
+    /// Overwrite sampler / steps / cfg / size from `file`'s catalog recommendation, where present.
+    fn apply_recommended_settings(&mut self, file: &str) {
+        let Some(rec) = self
+            .checkpoint_catalog
+            .entry(file)
+            .and_then(|e| e.recommended.as_ref())
+            .cloned()
+        else {
+            return;
+        };
+        if let Some(v) = rec.steps {
+            self.params.steps = v;
+        }
+        if let Some(v) = rec.cfg {
+            self.params.cfg = v;
+        }
+        if let Some(v) = rec.width {
+            self.params.width = v;
+        }
+        if let Some(v) = rec.height {
+            self.params.height = v;
+        }
+        if let Some(name) = rec.sampler.as_ref().and_then(|s| match_sampler_name(s, &self.samplers)) {
+            self.params.sampler = name;
+        }
+        if let Some(name) =
+            rec.scheduler.as_ref().and_then(|s| match_sampler_name(s, &self.schedulers))
+        {
+            self.params.scheduler = name;
+        }
+    }
+
+    /// Remove the active character, clear all Create-tab creative state, then re-seed the current
+    /// model's recommended settings (or the selected local pack's defaults).
+    fn reset_create(&mut self, host: &Host) {
+        self.remove_active_character();
+        self.params.reset_creative();
+        self.picked_input = None;
+        self.picked_input_grid_open = false;
+        self.inpaint = None;
+        self.img2img_url_tex = None;
+        self.img2img_url_key.clear();
+        self.img2img_url_req.clear();
+        self.img2img_url_err.clear();
+        self.img2img_url_loading = false;
+        self.selected_preset.clear();
+        self.seed_reset_recommendation();
+        self.note = "Reset to model defaults".into();
+        host.haptic(Haptic::Warning);
+    }
+
+    /// Re-seed sampler / steps / cfg / size after a reset from the current model's recommendation.
+    #[cfg(feature = "local-npu")]
+    fn seed_reset_recommendation(&mut self) {
+        if self.local_npu {
+            if let Some(entry) = self.selected_pack().cloned() {
+                let d = crate::local_engine::local_defaults(&entry);
+                self.params.width = d.width;
+                self.params.height = d.height;
+                self.params.steps = d.steps;
+                self.params.cfg = d.cfg;
+                self.params.scheduler = d.scheduler;
+            }
+            return;
+        }
+        let file = self.params.model_file().to_string();
+        self.apply_recommended_settings(&file);
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn seed_reset_recommendation(&mut self) {
+        let file = self.params.model_file().to_string();
+        self.apply_recommended_settings(&file);
+    }
+
+    /// Two-tap Reset: first tap arms ("Sure?"), a second within the window clears Create.
+    fn reset_button(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let now = ui.input(|i| i.time);
+        let armed = self.reset_armed_at.map(|t| now - t < RESET_CONFIRM_SECS).unwrap_or(false);
+        if !armed {
+            self.reset_armed_at = None;
+        }
+        let resp = ui.small_button(if armed { "Sure?" } else { "Reset" });
+        if armed {
+            ui.ctx().request_repaint_after(Duration::from_secs_f64(RESET_CONFIRM_SECS));
+        }
+        if resp.clicked() {
+            if armed {
+                self.reset_armed_at = None;
+                self.reset_create(host);
+            } else {
+                self.reset_armed_at = Some(now);
+                host.haptic(Haptic::Light);
+            }
+        }
     }
 
     /// Push `file` to the front of the MRU list (deduped, capped).
@@ -6693,6 +7077,7 @@ impl ComfyApp {
             })
             .flatten();
         let schemas = self.schemas.clone().unwrap_or_default();
+        self.pending_job_labels.push_back("Video finish".into());
         self.engine.as_mut().unwrap().run_finish(
             sheet.video_path.clone(),
             reference,
@@ -6824,6 +7209,129 @@ impl ComfyApp {
                     self.remix_sheet = None;
                 }
             }
+        }
+    }
+
+    /// Pending-jobs queue sheet: the running job (marked) then pending jobs in order, each with a
+    /// Cancel, plus a two-tap "Clear pending" footer. Reads the latest `GET /queue` snapshot, which
+    /// the poll refreshes while the sheet is open.
+    fn queue_sheet_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if !self.queue_sheet_open {
+            return;
+        }
+        enum QAct {
+            Interrupt,
+            Delete(String),
+            Clear,
+        }
+        let mut open = true;
+        let mut act: Option<QAct> = None;
+        let mut clear_arm = self.queue_clear_arm;
+        let (running, pending) = &self.queue_jobs;
+        let labels: HashMap<&str, &str> =
+            self.my_prompts.iter().map(|p| (p.id.as_str(), p.label.as_str())).collect();
+        let row_label = |job: &QueueJob| -> String {
+            match labels.get(job.prompt_id.as_str()) {
+                Some(l) => format!("Yours · {l}"),
+                None => job.prompt_id.chars().take(8).collect(),
+            }
+        };
+        let total = running.len() + pending.len();
+        let mut close = false;
+        let max_h = (ctx.content_rect().height() * 0.5).clamp(160.0, 360.0);
+        centered(egui::Window::new(format!("{} Queue", icons::RUN)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                if total == 0 {
+                    ui.weak("The server queue is empty.");
+                } else {
+                    ui.weak(format!("{total} job(s) on the server."));
+                    ui.add_space(4.0);
+                    crate::theme::scroll_vertical().show(ui, |ui| {
+                        ui.set_max_height(max_h);
+                        ui.set_min_width(320.0);
+                        let mut pos = 0usize;
+                        for job in running {
+                            pos += 1;
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("{pos}."));
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(120, 200, 140),
+                                    "Running",
+                                );
+                                ui.label(elide(&row_label(job), 32));
+                                if ui.small_button("Cancel").clicked() {
+                                    act = Some(QAct::Interrupt);
+                                }
+                            });
+                        }
+                        for job in pending {
+                            pos += 1;
+                            ui.horizontal(|ui| {
+                                ui.strong(format!("{pos}."));
+                                ui.label(elide(&row_label(job), 40));
+                                if ui.small_button("Cancel").clicked() {
+                                    act = Some(QAct::Delete(job.prompt_id.clone()));
+                                }
+                            });
+                        }
+                    });
+                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let txt = if clear_arm { "Sure? Clear pending" } else { "Clear pending" };
+                    if ui
+                        .add_enabled(
+                            !pending.is_empty(),
+                            egui::Button::new(format!("{} {txt}", icons::TRASH)),
+                        )
+                        .clicked()
+                    {
+                        if clear_arm {
+                            act = Some(QAct::Clear);
+                            clear_arm = false;
+                        } else {
+                            clear_arm = true;
+                        }
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        self.queue_clear_arm = clear_arm;
+        if !open || close {
+            self.queue_sheet_open = false;
+            self.queue_clear_arm = false;
+        }
+        match act {
+            Some(QAct::Interrupt) => {
+                if let Some(e) = self.engine.as_ref() {
+                    e.interrupt();
+                }
+                self.status = "Interrupted the running job".into();
+                host.haptic(Haptic::Warning);
+                self.last_queue_poll = 0.0;
+            }
+            Some(QAct::Delete(id)) => {
+                if let Some(e) = self.engine.as_ref() {
+                    e.queue_delete(vec![id]);
+                }
+                host.haptic(Haptic::Light);
+                self.last_queue_poll = 0.0;
+            }
+            Some(QAct::Clear) => {
+                if let Some(e) = self.engine.as_ref() {
+                    e.queue_clear();
+                }
+                self.status = "Cleared the pending queue".into();
+                host.haptic(Haptic::Warning);
+                self.last_queue_poll = 0.0;
+            }
+            None => {}
         }
     }
 
@@ -7238,6 +7746,25 @@ impl ComfyApp {
         self.create_fab(ui.ctx(), host, pane);
     }
 
+    /// Cancel the active generation: abort local awaiters, `POST /interrupt` the running server
+    /// prompt, and `POST /queue` delete our still-pending server jobs.
+    fn cancel_generation(&mut self, host: &Host) {
+        let ours: HashSet<&str> = self.my_prompts.iter().map(|p| p.id.as_str()).collect();
+        let pending_ours: Vec<String> = self
+            .queue_jobs
+            .1
+            .iter()
+            .filter(|j| ours.contains(j.prompt_id.as_str()))
+            .map(|j| j.prompt_id.clone())
+            .collect();
+        if let Some(engine) = self.engine.as_mut() {
+            engine.cancel();
+            engine.interrupt();
+            engine.queue_delete(pending_ours);
+            host.haptic(Haptic::Warning);
+        }
+    }
+
     /// Queue FAB (+ Cancel while running) shared by Create and Graph (bottom-right stack).
     fn queue_fab(&mut self, ctx: &egui::Context, host: &Host, pane: egui::Rect, kind: QueueFabKind) {
         if !pane.is_finite() || pane.width() < 80.0 {
@@ -7330,10 +7857,7 @@ impl ComfyApp {
         }
 
         if cancel_clicked {
-            if let Some(engine) = self.engine.as_mut() {
-                engine.cancel();
-                host.haptic(Haptic::Warning);
-            }
+            self.cancel_generation(host);
             return;
         }
         if queue_clicked {
@@ -9182,6 +9706,9 @@ impl ComfyApp {
 
     fn gallery_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         let connected = matches!(self.conn, Conn::Connected);
+        // A finished WD14 read floats over the gallery, viewer open or not.
+        #[cfg(feature = "local-npu")]
+        self.wd14_sheet_window(ui.ctx(), host);
         if self.viewer.is_some() {
             self.gallery_viewer(ui, host);
             self.remix_sheet_window(ui.ctx(), host);
@@ -9867,6 +10394,144 @@ impl ComfyApp {
         open
     }
 
+    /// Centered picker over the server gallery's image items; a tap fetches full bytes and sets
+    /// them as the img2img / video start input. Reuses the Gallery tab's listing + thumb cache.
+    fn gallery_pick_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if !self.gallery_pick_open {
+            return;
+        }
+        let connected = matches!(self.conn, Conn::Connected);
+        let mut open = true;
+        let mut pick: Option<usize> = None;
+        let mut refresh = false;
+        centered(egui::Window::new(format!("{} From gallery", icons::GALLERY)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_size([360.0, 460.0])
+            .show(ctx, |ui| {
+                if !connected {
+                    ui.add_space(12.0);
+                    ui.weak("Connect to a server to browse its gallery.");
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button(format!("{} Refresh", icons::REFRESH)).clicked() {
+                        refresh = true;
+                    }
+                    if self.gallery_loading {
+                        ui.spinner();
+                    }
+                    if self.gallery_pick_pending.is_some() {
+                        ui.spinner();
+                        ui.weak("loading image…");
+                    }
+                });
+                if !self.gallery_status.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 160, 120),
+                        elide(&self.gallery_status, 120),
+                    );
+                }
+                ui.separator();
+                let images: Vec<usize> = self
+                    .gallery
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| !it.is_video)
+                    .map(|(i, _)| i)
+                    .collect();
+                if images.is_empty() {
+                    ui.add_space(16.0);
+                    ui.vertical_centered(|ui| {
+                        if self.gallery_loading {
+                            ui.spinner();
+                        } else {
+                            ui.weak("No gallery images yet.");
+                        }
+                    });
+                    return;
+                }
+                crate::theme::scroll_vertical()
+                    .id_salt("gallery_pick_grid")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        pick = self.gallery_pick_grid(ui, &images);
+                        ui.add_space(8.0);
+                    });
+            });
+        // Load the listing if the Gallery tab hasn't already fetched it.
+        if connected && self.gallery.is_empty() && self.gallery_total == 0 && !self.gallery_loading {
+            self.gallery_loading = true;
+            self.engine.as_ref().unwrap().gallery_list(
+                self.gallery_gen,
+                0,
+                self.gallery_page_size(),
+                &self.gallery_q,
+                &self.gallery_view,
+            );
+        }
+        if refresh && connected {
+            self.refresh_gallery();
+        }
+        if let Some(idx) = pick {
+            self.pick_gallery_input(idx, host);
+        }
+        if !open {
+            self.gallery_pick_open = false;
+        }
+    }
+
+    /// Thumbnail grid for the gallery picker; returns the tapped listing index.
+    fn gallery_pick_grid(&mut self, ui: &mut egui::Ui, indices: &[usize]) -> Option<usize> {
+        let (cols, tile) = Self::picker_grid_dims(ui);
+        let size = 320u32;
+        let mut pick = None;
+        for row in indices.chunks(cols) {
+            ui.horizontal(|ui| {
+                for &idx in row {
+                    let (thumb_key, subfolder, filename) = {
+                        let Some(item) = self.gallery.get(idx) else { continue };
+                        (item.thumb_key(size), item.subfolder.clone(), item.filename.clone())
+                    };
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
+                    if !ui.is_rect_visible(rect) {
+                        continue;
+                    }
+                    let clicked = match self.thumbs.get(&thumb_key) {
+                        Some(tex) => {
+                            let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                .fit_to_exact_size(egui::vec2(tile, tile))
+                                .sense(egui::Sense::click());
+                            ui.put(rect, img).clicked()
+                        }
+                        None => {
+                            if self.thumbs.claim(&thumb_key) {
+                                self.engine.as_ref().unwrap().fetch_thumb(subfolder, filename, size);
+                            }
+                            ui.put(rect, egui::Button::new(elide(&thumb_key, 12)).wrap()).clicked()
+                        }
+                    };
+                    if clicked {
+                        pick = Some(idx);
+                    }
+                }
+            });
+        }
+        pick
+    }
+
+    /// Fetch the tapped gallery image's full bytes; the result lands as the picked input.
+    fn pick_gallery_input(&mut self, idx: usize, host: &Host) {
+        let Some(item) = self.gallery.get(idx).cloned() else { return };
+        let cache_dir = host.documents_dir();
+        self.gallery_pick_pending = Some((item.key(), item.filename.clone()));
+        self.engine.as_ref().unwrap().fetch_full(item.subfolder, item.filename, cache_dir);
+        self.gallery_pick_open = false;
+        self.note = "Loading gallery image…".into();
+        host.haptic(Haptic::Light);
+    }
+
     fn open_viewer(&mut self, idx: usize, host: &Host) {
         let Some(item) = self.gallery.get(idx).cloned() else { return };
         // Any previous item's playback ends here (drop stops the decode thread).
@@ -9971,10 +10636,14 @@ impl ComfyApp {
             AlbumCreate,
             Delete,
             Show(usize),
+            #[cfg(feature = "local-npu")]
+            ReadTags,
         }
         let mut act: Option<Act> = None;
         // Video-only finish button availability; a reason disables it via hover.
         let finish_disabled = self.finish_disabled_reason();
+        #[cfg(feature = "local-npu")]
+        self.ensure_local_packs(host, false);
         // Android system Back / Esc returns to the gallery list.
         if ui.ctx().input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
@@ -10093,6 +10762,10 @@ impl ComfyApp {
             let albums_known = v.albums.is_some();
             // Remix once the scraped meta is non-empty, or while it is still loading (deferred).
             let can_remix = v.meta.as_ref().is_some_and(|m| !m.is_empty()) || v.meta_loading;
+            // WD14 Read tags: a still image with loaded bytes, a pack present, no read in flight.
+            #[cfg(feature = "local-npu")]
+            let can_read_tags =
+                !v.item.is_video && v.bytes.is_some() && self.wd14_pack.is_some() && !self.wd14_running;
             let mut remix_held = false;
             egui::Panel::bottom("viewer-actions").show(ui, |ui| {
                 const BTN_H: f32 = 36.0;
@@ -10172,6 +10845,18 @@ impl ComfyApp {
                         .clicked()
                     {
                         act = Some(Act::UseAsInput);
+                    }
+                    #[cfg(feature = "local-npu")]
+                    if ui
+                        .add_enabled(
+                            can_read_tags,
+                            egui::Button::new(format!("{} Read tags", icons::SEARCH))
+                                .min_size(egui::vec2(0.0, BTN_H)),
+                        )
+                        .on_hover_text("Tag this image on the NPU (WD14 danbooru tagger)")
+                        .clicked()
+                    {
+                        act = Some(Act::ReadTags);
                     }
                     if ui
                         .add_enabled(
@@ -10429,6 +11114,12 @@ impl ComfyApp {
                     self.params.input_url = url;
                     self.tab = Tab::Generate;
                     self.note = "Gallery image set as img2img input".into();
+                }
+            }
+            #[cfg(feature = "local-npu")]
+            Some(Act::ReadTags) => {
+                if let Some(bytes) = self.viewer.as_ref().and_then(|v| v.bytes.clone()) {
+                    self.start_wd14(ui.ctx(), host, bytes);
                 }
             }
             Some(Act::Inpaint) => {
@@ -10850,14 +11541,19 @@ impl ComfyApp {
             return;
         }
         self.local_packs_scanned = true;
-        self.local_packs = match self.external_files_dir(host) {
-            Some(root) => crate::local_engine::scan_packs(std::path::Path::new(&root)),
+        let root = self.external_files_dir(host);
+        self.local_packs = match &root {
+            Some(root) => crate::local_engine::scan_packs(std::path::Path::new(root)),
             None => Vec::new(),
         };
+        self.wd14_pack = root
+            .as_deref()
+            .and_then(|root| crate::local_engine::find_wd14_pack(std::path::Path::new(root)));
         self.log.info(format!(
-            "local-npu: {} pack(s) found: {}",
+            "local-npu: {} pack(s) found: {}; wd14 pack: {}",
             self.local_packs.len(),
-            self.local_packs.iter().map(|p| p.label()).collect::<Vec<_>>().join(", ")
+            self.local_packs.iter().map(|p| p.label()).collect::<Vec<_>>().join(", "),
+            self.wd14_pack.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into())
         ));
     }
 
@@ -11011,6 +11707,147 @@ impl ComfyApp {
                 self.d3_running = false;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Spawn the WD14 tagger on a worker thread; the ranked-tags result returns via the channel.
+    #[cfg(feature = "local-npu")]
+    fn start_wd14(&mut self, ctx: &egui::Context, host: &Host, bytes: Vec<u8>) {
+        let Some(lib_dir) = host.native_lib_dir() else {
+            self.gallery_status = "Read tags: nativeLibraryDir unavailable".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let Some(pack_dir) = self.wd14_pack.clone() else {
+            self.gallery_status =
+                "Read tags: no wd14 pack — push one to the app files dir, then Refresh in Settings".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.wd14_rx = Some(rx);
+        self.wd14_running = true;
+        self.gallery_status = "Reading tags on NPU…".into();
+        self.log.info(format!("local-wd14: tagging (libs={lib_dir}, pack={})", pack_dir.display()));
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::local_engine::read_tags(std::path::PathBuf::from(lib_dir), pack_dir, bytes);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        host.haptic(Haptic::Medium);
+    }
+
+    /// Drain a finished tag read into the sheet, or surface the error as a status note.
+    #[cfg(feature = "local-npu")]
+    fn poll_wd14(&mut self) {
+        let Some(rx) = self.wd14_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.wd14_rx = None;
+                self.wd14_running = false;
+                if result.general.is_empty() && result.character.is_empty() {
+                    self.gallery_status = "Read tags: nothing above threshold".into();
+                } else {
+                    self.gallery_status.clear();
+                    self.wd14_sheet = Some(result);
+                }
+            }
+            Ok(Err(e)) => {
+                self.wd14_rx = None;
+                self.wd14_running = false;
+                self.log.error(format!("local-wd14: {e}"));
+                self.gallery_status = format!("Read tags failed: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.wd14_rx = None;
+                self.wd14_running = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// The ranked-tags sheet: tap a chip to append it to the positive prompt, or Add top 10.
+    #[cfg(feature = "local-npu")]
+    fn wd14_sheet_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.wd14_sheet.is_none() {
+            return;
+        }
+        enum WAct {
+            Add(String),
+            AddTop(usize),
+            Close,
+        }
+        let mut open = true;
+        let mut act: Option<WAct> = None;
+        let result = self.wd14_sheet.clone().unwrap();
+        let max_h = (ctx.content_rect().height() * 0.5).clamp(160.0, 380.0);
+        centered(egui::Window::new(format!("{} Tags", icons::SEARCH)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                if let Some(r) = &result.rating {
+                    ui.weak(format!("Rating: {}  {}%", r.insert_text(), r.percent()));
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} general tags", result.general.len()));
+                    if ui.button(format!("{} Add top 10", icons::ADD)).clicked() {
+                        act = Some(WAct::AddTop(10));
+                    }
+                });
+                ui.weak("Tap a tag to add it to the prompt.");
+                ui.add_space(4.0);
+                crate::theme::scroll_vertical().show(ui, |ui| {
+                    ui.set_max_height(max_h);
+                    ui.set_min_width(320.0);
+                    if !result.character.is_empty() {
+                        ui.strong("Character");
+                        ui.horizontal_wrapped(|ui| {
+                            for t in &result.character {
+                                let label = format!("{}  {}%", t.insert_text(), t.percent());
+                                if ui.button(label).clicked() {
+                                    act = Some(WAct::Add(t.insert_text()));
+                                }
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.strong("General");
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        for t in &result.general {
+                            let label = format!("{}  {}%", t.insert_text(), t.percent());
+                            if ui.button(label).clicked() {
+                                act = Some(WAct::Add(t.insert_text()));
+                            }
+                        }
+                    });
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    act = Some(WAct::Close);
+                }
+            });
+        match act {
+            Some(WAct::Add(tag)) => {
+                self.params.positive = tags::push_chip(&self.params.positive, &tag);
+                host.haptic(Haptic::Light);
+            }
+            Some(WAct::AddTop(n)) => {
+                for tag in result.top_general(n) {
+                    self.params.positive = tags::push_chip(&self.params.positive, &tag);
+                }
+                host.haptic(Haptic::Light);
+                self.wd14_sheet = None;
+            }
+            Some(WAct::Close) => self.wd14_sheet = None,
+            None => {
+                if !open {
+                    self.wd14_sheet = None;
+                }
+            }
         }
     }
 
@@ -11221,6 +12058,8 @@ impl EguiApp for ComfyApp {
         self.poll_d2_text2img();
         #[cfg(feature = "local-npu")]
         self.poll_d3_anima();
+        #[cfg(feature = "local-npu")]
+        self.poll_wd14();
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
         if self.log_lines.len() > logger::MAX_LINES {
             let excess = self.log_lines.len() - logger::MAX_LINES;
@@ -11256,6 +12095,7 @@ impl EguiApp for ComfyApp {
                 .show(ui, |ui| self.graph_tab(ui, host));
             self.app_picker_window(ui.ctx(), host);
             self.publish_window(ui.ctx(), host);
+            self.queue_sheet_window(ui.ctx(), host);
             if self.running || self.queue_remaining > 0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
             }
@@ -11297,12 +12137,19 @@ impl EguiApp for ComfyApp {
                 } else {
                     (0.0, elide(&self.status, 48))
                 };
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .desired_height(14.0)
-                        .text(format!("{:.0}%  {label}", frac * 100.0))
-                        .animate(true),
-                );
+                let bar = ui
+                    .add(
+                        egui::ProgressBar::new(frac)
+                            .desired_height(14.0)
+                            .text(format!("{:.0}%  {label}", frac * 100.0))
+                            .animate(true),
+                    )
+                    .interact(egui::Sense::click())
+                    .on_hover_text("Tap to see the queue");
+                if bar.clicked() {
+                    self.queue_sheet_open = true;
+                    self.queue_clear_arm = false;
+                }
                 ui.add_space(2.0);
             }
             self.nav_bar(ui);
@@ -11320,17 +12167,21 @@ impl EguiApp for ComfyApp {
 
         self.app_picker_window(ui.ctx(), host);
         self.publish_window(ui.ctx(), host);
+        self.gallery_pick_window(ui.ctx(), host);
+        self.queue_sheet_window(ui.ctx(), host);
 
-        // Keep the server-wide queue in view even when jobs were started on the website.
+        // Keep the server-wide queue in view even when jobs were started on the website. Poll faster
+        // while the queue sheet is open so per-row actions reflect quickly.
         if matches!(self.conn, Conn::Connected) {
             let now = ui.ctx().input(|i| i.time);
-            if now - self.last_queue_poll > 2.5 {
+            let interval = if self.queue_sheet_open { 1.0 } else { 2.5 };
+            if now - self.last_queue_poll > interval {
                 self.last_queue_poll = now;
                 self.engine.as_ref().unwrap().poll_queue();
             }
         }
 
-        if self.running || self.queue_remaining > 0 {
+        if self.running || self.queue_remaining > 0 || self.queue_sheet_open {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
     }

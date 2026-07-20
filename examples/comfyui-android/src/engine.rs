@@ -36,6 +36,13 @@ pub struct GenCtx {
     pub schemas: Arc<SchemaSet>,
 }
 
+/// One `GET /queue` entry (`queue_running` / `queue_pending`): the server's run number and prompt id.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueueJob {
+    pub number: i64,
+    pub prompt_id: String,
+}
+
 /// Every option list the Create tab's pickers offer, read off `/object_info` on connect.
 #[derive(Clone, Default)]
 pub struct ModelLists {
@@ -61,10 +68,14 @@ pub enum Msg {
     /// Enhance-chain steps that were skipped or inputs dropped while building the prompt.
     EnhanceNote(String),
     Queued,
+    /// The server assigned this prompt id to a job we submitted (server transport only).
+    PromptId(String),
     Progress { value: u32, max: u32 },
     Status(String),
     /// Server-wide queue depth from the WS `status` broadcast (includes jobs from other clients).
     QueueRemaining(u32),
+    /// Per-job `GET /queue` snapshot: running + pending jobs in server order.
+    QueueJobs { running: Vec<QueueJob>, pending: Vec<QueueJob> },
     Preview(egui::ColorImage),
     Result { image: egui::ColorImage, bytes: Vec<u8> },
     /// A node started executing (`None` = prompt finished). WebSocket transport only today.
@@ -429,11 +440,55 @@ impl Engine {
             let Ok(resp) = http.get(url).send().await else { return };
             let Ok(body) = resp.text().await else { return };
             let Ok(v) = serde_json::from_str::<Value>(&body) else { return };
-            let running = v.get("queue_running").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
-            let pending = v.get("queue_pending").and_then(Value::as_array).map(|a| a.len()).unwrap_or(0);
-            let remaining = (running + pending) as u32;
+            let (running, pending) = parse_queue(&v);
+            let remaining = (running.len() + pending.len()) as u32;
             let _ = tx.send(Msg::QueueRemaining(remaining));
+            let _ = tx.send(Msg::QueueJobs { running, pending });
             ctx.request_repaint();
+        });
+    }
+
+    /// Interrupt the currently-executing prompt on the server (`POST /interrupt`, no body).
+    pub fn interrupt(&self) {
+        let Some((http, url)) = self.authed_url("/interrupt", &[]) else { return };
+        let log = self.log.clone();
+        self.rt.spawn(async move {
+            log.info("POST /interrupt");
+            match http.post(url).send().await {
+                Ok(r) => log.info(format!("-> {}", r.status())),
+                Err(e) => log.warn(format!("interrupt failed: {e}")),
+            }
+        });
+    }
+
+    /// Remove pending jobs from the server queue by prompt id (`POST /queue {"delete":[...]}`).
+    pub fn queue_delete(&self, ids: Vec<String>) {
+        if ids.is_empty() {
+            return;
+        }
+        let Some((http, url)) = self.authed_url("/queue", &[]) else { return };
+        let log = self.log.clone();
+        let body = serde_json::json!({ "delete": ids });
+        self.rt.spawn(async move {
+            log.info(format!("POST /queue {body}"));
+            match http.post(url).json(&body).send().await {
+                Ok(r) => log.info(format!("-> {}", r.status())),
+                Err(e) => log.warn(format!("queue delete failed: {e}")),
+            }
+        });
+    }
+
+    /// Clear every pending job from the server queue (`POST /queue {"clear":true}`).
+    pub fn queue_clear(&self) {
+        let Some((http, url)) = self.authed_url("/queue", &[]) else { return };
+        let log = self.log.clone();
+        let body = serde_json::json!({ "clear": true });
+        self.rt.spawn(async move {
+            log.info("POST /queue clear");
+            match http.post(url).json(&body).send().await {
+                Ok(r) => log.info(format!("-> {}", r.status())),
+                Err(e) => log.warn(format!("queue clear failed: {e}")),
+            }
         });
     }
 
@@ -1544,6 +1599,7 @@ async fn stream_execution(
             }
         };
         *current_prompt.lock().unwrap() = Some(prompt_id.clone());
+        send!(Msg::PromptId(prompt_id.clone()));
         send!(Msg::Queued);
         let outcome = reconcile_from_history(&client, &prompt_id, &tx, &ctx, &log).await;
         *current_prompt.lock().unwrap() = None;
@@ -1565,6 +1621,7 @@ async fn stream_execution(
     let prompt_id = execution.prompt_id().to_string();
     log.info(format!("queued prompt {prompt_id}"));
     *current_prompt.lock().unwrap() = Some(prompt_id.clone());
+    send!(Msg::PromptId(prompt_id.clone()));
     send!(Msg::Queued);
 
     let mut outcome = None;
@@ -1957,6 +2014,29 @@ fn auth_headers(api_key: &str, session: &str) -> reqwest::header::HeaderMap {
     headers
 }
 
+/// Parse a `GET /queue` body into `(running, pending)` job lists, tolerating missing/extra fields.
+fn parse_queue(v: &Value) -> (Vec<QueueJob>, Vec<QueueJob>) {
+    (parse_queue_array(v.get("queue_running")), parse_queue_array(v.get("queue_pending")))
+}
+
+/// Map a `queue_running`/`queue_pending` array to jobs; a non-array is an empty list.
+fn parse_queue_array(v: Option<&Value>) -> Vec<QueueJob> {
+    v.and_then(Value::as_array)
+        .map(|items| items.iter().map(parse_queue_entry).collect())
+        .unwrap_or_default()
+}
+
+/// One queue entry: `[number, prompt_id, graph, ...]`. A malformed entry degrades to an unknown row.
+fn parse_queue_entry(e: &Value) -> QueueJob {
+    let number = e
+        .get(0)
+        .and_then(|n| n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)))
+        .unwrap_or(0);
+    let prompt_id =
+        e.get(1).and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| "?".into());
+    QueueJob { number, prompt_id }
+}
+
 /// comfy-gate's session cookie name.
 const SESSION_COOKIE: &str = "cg_session";
 
@@ -2068,6 +2148,41 @@ mod tests {
     #[test]
     fn session_cookie_match_is_exact() {
         assert_eq!(session_from_set_cookie(["xcg_session=nope; Path=/"].into_iter()), None);
+    }
+
+    /// A realistic `/queue` body: one running job, two pending, and a malformed entry that must
+    /// degrade to an unknown row rather than fail the whole parse.
+    #[test]
+    fn parse_queue_reads_running_pending_and_tolerates_junk() {
+        let body = serde_json::json!({
+            "queue_running": [
+                [7, "run-aaaa", {"3": {"class_type": "KSampler"}}]
+            ],
+            "queue_pending": [
+                [8, "pend-bbbb", {"nodes": []}],
+                [9.0, "pend-cccc"],
+                {"oops": "not an array"}
+            ]
+        });
+        let (running, pending) = parse_queue(&body);
+        assert_eq!(running, vec![QueueJob { number: 7, prompt_id: "run-aaaa".into() }]);
+        assert_eq!(
+            pending,
+            vec![
+                QueueJob { number: 8, prompt_id: "pend-bbbb".into() },
+                QueueJob { number: 9, prompt_id: "pend-cccc".into() },
+                QueueJob { number: 0, prompt_id: "?".into() },
+            ]
+        );
+    }
+
+    /// Missing arrays, a non-object body, and empty queues all parse to empty lists, never a panic.
+    #[test]
+    fn parse_queue_tolerates_missing_and_malformed_shapes() {
+        assert_eq!(parse_queue(&serde_json::json!({})), (vec![], vec![]));
+        assert_eq!(parse_queue(&serde_json::json!("nonsense")), (vec![], vec![]));
+        let only_running = serde_json::json!({ "queue_running": [], "queue_pending": [] });
+        assert_eq!(parse_queue(&only_running), (vec![], vec![]));
     }
 
     #[test]

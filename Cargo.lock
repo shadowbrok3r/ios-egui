@@ -1265,6 +1265,7 @@ dependencies = [
  "image",
  "local-anima",
  "local-sd",
+ "local-wd14",
  "log",
  "reqwest",
  "rucomfyui",
@@ -3861,6 +3862,17 @@ dependencies = [
  "rand_distr 0.6.0",
  "thiserror 2.0.19",
  "tokenizers",
+]
+
+[[package]]
+name = "local-wd14"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "log",
+ "memmap2",
+ "qnn-rs",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

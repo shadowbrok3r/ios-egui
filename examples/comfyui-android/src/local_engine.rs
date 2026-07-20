@@ -71,6 +71,42 @@ pub fn scan_packs(root: &Path) -> Vec<PackEntry> {
     out
 }
 
+/// Create-tab settings a local pack recommends: fixed latent size plus sampler defaults.
+pub struct LocalDefaults {
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    pub cfg: f32,
+    pub scheduler: String,
+}
+
+/// Recommended defaults for `entry`: Anima reads its `config.json`, SD1.5 is fixed 512² at the
+/// `local_sd` pipeline defaults.
+pub fn local_defaults(entry: &PackEntry) -> LocalDefaults {
+    match entry.backend {
+        LocalBackend::Anima => {
+            let c = AnimaPack::open(&entry.dir).map(|p| p.config().clone()).unwrap_or_default();
+            LocalDefaults {
+                width: c.default_width as u32,
+                height: c.default_height as u32,
+                steps: c.default_steps as u32,
+                cfg: c.default_cfg,
+                scheduler: c.default_scheduler,
+            }
+        }
+        LocalBackend::Sd15 => {
+            let d = Text2ImgParams::default();
+            LocalDefaults {
+                width: 512,
+                height: 512,
+                steps: d.steps as u32,
+                cfg: d.guidance_scale,
+                scheduler: "normal".into(),
+            }
+        }
+    }
+}
+
 /// The `backend` pack called `name`, else the first pack of `backend`. Never crosses backends.
 pub fn pick_pack<'a>(packs: &'a [PackEntry], name: &str, backend: LocalBackend) -> Option<&'a PackEntry> {
     packs
@@ -592,6 +628,49 @@ fn anima_smoke_inner(
     Ok(())
 }
 
+/// The first subdirectory under `root` carrying the WD14 tagger marker, if any. WD14 packs coexist
+/// with SD1.5/Anima generate packs (a different kind), so this scans independently of `classify_pack`.
+pub fn find_wd14_pack(root: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| d.is_dir())
+        .find(|d| local_wd14::Wd14Pack::is_wd14_pack(d))
+}
+
+/// Run the WD14 tagger on encoded image bytes; blocking, ranked tags or an error string. Serialized
+/// with generation (one HTP session at a time) and drops any resident SD/Anima cache first.
+pub fn read_tags(
+    lib_dir: PathBuf,
+    pack_dir: PathBuf,
+    image: Vec<u8>,
+) -> Result<local_wd14::TagResult, String> {
+    let _gate = run_lock().lock();
+    drop_cache();
+    let t = Instant::now();
+    local_wd14::prepare_htp_env(&lib_dir);
+    let pack = local_wd14::Wd14Pack::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
+    let system = local_wd14::QnnSystem::load(lib_dir.join("libQnnSystem.so"))
+        .map_err(|e| format!("QnnSystem: {e}"))?;
+    let backend =
+        local_wd14::Backend::load(lib_dir.join("libQnnHtp.so")).map_err(|e| format!("Backend: {e}"))?;
+    let session = local_wd14::Session::new(&backend).map_err(|e| format!("session: {e}"))?;
+    if let Err(e) = session.set_htp_performance_mode() {
+        log::warn!("local-wd14: performance mode unavailable: {e}");
+    }
+    let result =
+        local_wd14::tag_bytes(&pack, &session, &system, &image, &local_wd14::Wd14Params::default())
+            .map_err(|e| format!("tag: {e}"))?;
+    log::info!(
+        "local-wd14: {} general, {} character in {:.2}s",
+        result.general.len(),
+        result.character.len(),
+        t.elapsed().as_secs_f32()
+    );
+    Ok(result)
+}
+
 /// `WxH mean=… min=… max=…` — a flat/black decode shows up as min == max.
 fn image_stats(image: &local_anima::Image) -> String {
     let n = image.rgb.len().max(1);
@@ -653,6 +732,20 @@ mod tests {
     #[test]
     fn scan_of_a_missing_root_is_empty() {
         assert!(scan_packs(Path::new("/nope/does/not/exist")).is_empty());
+    }
+
+    #[test]
+    fn finds_the_wd14_pack_alongside_generate_packs() {
+        let root = tmp("comfyui-packs-wd14");
+        let wd = root.join("wd14");
+        std::fs::create_dir_all(&wd).unwrap();
+        std::fs::write(wd.join("WD14"), b"").unwrap();
+        let sd = root.join("qnn");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(sd.join("unet.bin"), b"x").unwrap();
+        assert_eq!(find_wd14_pack(&root), Some(wd));
+        assert!(find_wd14_pack(Path::new("/nope/does/not/exist")).is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -296,6 +296,32 @@ impl Default for Params {
 }
 
 impl Params {
+    /// Reset creative state (prompts, LoRAs, enhance chain, video, mode, seed) to defaults,
+    /// keeping the selected model and its companions.
+    pub fn reset_creative(&mut self) {
+        let d = Params::default();
+        self.positive = d.positive;
+        self.negative = d.negative;
+        self.lora_triggers = d.lora_triggers;
+        self.steps = d.steps;
+        self.cfg = d.cfg;
+        self.width = d.width;
+        self.height = d.height;
+        self.batch_size = d.batch_size;
+        self.sampler = d.sampler;
+        self.scheduler = d.scheduler;
+        self.seed = d.seed;
+        self.randomize_seed = d.randomize_seed;
+        self.denoise = d.denoise;
+        self.mode = d.mode;
+        self.img2img_source = d.img2img_source;
+        self.inpaint_mask = d.inpaint_mask;
+        self.input_url = d.input_url;
+        self.loras = d.loras;
+        self.apps = d.apps;
+        self.video = d.video;
+    }
+
     /// Positive CLIP text: LoRA triggers (if any) then the subject prompt.
     pub fn combined_positive(&self) -> String {
         let triggers = self.lora_triggers.trim().trim_end_matches(',').trim();
@@ -598,6 +624,31 @@ impl CharacterPack {
 pub struct CreatePreset {
     pub name: String,
     pub params: Params,
+}
+
+/// One recorded Create-tab prompt pair for the history scrubber.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptHist {
+    #[serde(default)]
+    pub positive: String,
+    #[serde(default)]
+    pub negative: String,
+}
+
+/// Newest-last cap on [`Settings::prompt_history`].
+pub const PROMPT_HISTORY_CAP: usize = 60;
+
+/// Append `entry` as the newest history item, skipping an exact repeat of the current newest
+/// and evicting the oldest past [`PROMPT_HISTORY_CAP`].
+pub fn push_prompt_hist(hist: &mut Vec<PromptHist>, entry: PromptHist) {
+    if hist.last() == Some(&entry) {
+        return;
+    }
+    hist.push(entry);
+    let overflow = hist.len().saturating_sub(PROMPT_HISTORY_CAP);
+    if overflow > 0 {
+        hist.drain(..overflow);
+    }
 }
 
 /// Server-published checkpoint catalog (`GET /checkpoint-catalog.json`).
@@ -1451,6 +1502,9 @@ pub struct Settings {
     /// Container-side path of ComfyUI's output dir, used to build VHS_LoadVideoPath finish paths.
     #[serde(default = "default_server_output_root")]
     pub server_output_root: String,
+    /// Recorded Create-tab prompt pairs for the history scrubber (newest last, capped).
+    #[serde(default)]
+    pub prompt_history: Vec<PromptHist>,
 }
 
 pub fn default_server_output_root() -> String {
@@ -1628,6 +1682,52 @@ mod tests {
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.local_backend, LocalBackend::Anima);
         assert_eq!(back.local_pack, "anima_nova");
+    }
+
+    fn ph(p: &str, n: &str) -> PromptHist {
+        PromptHist { positive: p.into(), negative: n.into() }
+    }
+
+    #[test]
+    fn push_prompt_hist_skips_repeat_of_newest() {
+        let mut h = vec![ph("a", "x")];
+        push_prompt_hist(&mut h, ph("a", "x"));
+        assert_eq!(h, vec![ph("a", "x")]);
+        // A differing negative is not a repeat.
+        push_prompt_hist(&mut h, ph("a", "y"));
+        assert_eq!(h.len(), 2);
+        // Repeating an older-but-not-newest entry still appends.
+        push_prompt_hist(&mut h, ph("a", "x"));
+        assert_eq!(h, vec![ph("a", "x"), ph("a", "y"), ph("a", "x")]);
+    }
+
+    #[test]
+    fn push_prompt_hist_keeps_newest_last() {
+        let mut h = Vec::new();
+        for i in 0..3 {
+            push_prompt_hist(&mut h, ph(&i.to_string(), ""));
+        }
+        assert_eq!(h.last(), Some(&ph("2", "")));
+        assert_eq!(h.first(), Some(&ph("0", "")));
+    }
+
+    #[test]
+    fn push_prompt_hist_evicts_oldest_past_cap() {
+        let mut h = Vec::new();
+        for i in 0..(PROMPT_HISTORY_CAP + 10) {
+            push_prompt_hist(&mut h, ph(&i.to_string(), ""));
+        }
+        assert_eq!(h.len(), PROMPT_HISTORY_CAP);
+        assert_eq!(h.first(), Some(&ph("10", "")));
+        assert_eq!(h.last(), Some(&ph(&(PROMPT_HISTORY_CAP + 9).to_string(), "")));
+    }
+
+    #[test]
+    fn settings_without_prompt_history_default_empty() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(s.prompt_history.is_empty());
     }
 
     #[test]
@@ -1902,6 +2002,59 @@ mod tests {
         assert_eq!(p.loras.len(), 2);
         p.remove_character(&applied);
         assert_eq!(serde_json::to_string(&p).unwrap(), before, "remove must restore Params exactly");
+    }
+
+    #[test]
+    fn reset_creative_clears_creative_state_but_keeps_the_model() {
+        let mut p = Params {
+            checkpoint: "novaAnime.safetensors".into(),
+            positive: "a girl, outdoors".into(),
+            lora_triggers: "masterpiece".into(),
+            loras: vec![card_lora("base.safetensors", 1.0)],
+            apps: vec![AppStep {
+                app: "face.detailer".into(),
+                enabled: true,
+                version: 0,
+                values: Default::default(),
+            }],
+            mode: Mode::Img2Img,
+            randomize_seed: false,
+            steps: 40,
+            ..Default::default()
+        };
+        p.video.length = 33;
+        p.reset_creative();
+        assert!(p.positive.is_empty());
+        assert!(p.lora_triggers.is_empty());
+        assert!(p.loras.is_empty());
+        assert!(p.apps.is_empty());
+        assert_eq!(p.mode, Mode::Txt2Img);
+        assert!(p.randomize_seed);
+        assert_eq!(p.steps, Params::default().steps);
+        assert_eq!(p.video.length, VideoParams::default().length);
+        // The selected model survives the reset.
+        assert_eq!(p.checkpoint, "novaAnime.safetensors");
+    }
+
+    #[test]
+    fn resetting_after_applying_a_character_matches_a_fresh_default() {
+        let mut p = Params { checkpoint: "novaAnime.safetensors".into(), ..Default::default() };
+        let card = CharacterCard {
+            name: "Mia".into(),
+            identity: "silver hair, red eyes".into(),
+            triggers: "miachar".into(),
+            negatives: "bad anatomy".into(),
+            loras: vec![card_lora("mia.safetensors", 0.8)],
+            ..Default::default()
+        };
+        let _ = p.apply_character(&card, |_| ("mia trigger".into(), "extra fingers".into()));
+        p.reset_creative();
+        let fresh = Params { checkpoint: "novaAnime.safetensors".into(), ..Default::default() };
+        assert_eq!(
+            serde_json::to_string(&p).unwrap(),
+            serde_json::to_string(&fresh).unwrap(),
+            "reset must leave no trace of the applied character"
+        );
     }
 
     #[test]

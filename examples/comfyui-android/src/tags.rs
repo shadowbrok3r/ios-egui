@@ -26,7 +26,7 @@ pub struct TagDict {
 }
 
 /// Comparison/lookup key: trimmed, ASCII-lowercased, underscores folded to spaces.
-fn fold(s: &str) -> String {
+pub(crate) fn fold(s: &str) -> String {
     s.trim().to_ascii_lowercase().replace('_', " ")
 }
 
@@ -172,6 +172,20 @@ impl TagDict {
         }
         let lo = self.entries.partition_point(|e| fold(&e.name) < q);
         self.entries.get(lo).filter(|e| fold(&e.name) == q).map(|e| e.category)
+    }
+
+    /// The entry whose folded name equals `tag` (aliases resolve to canonical), if any.
+    pub fn lookup(&self, tag: &str) -> Option<&TagEntry> {
+        let q = fold(tag);
+        if q.is_empty() {
+            return None;
+        }
+        let lo = self.entries.partition_point(|e| fold(&e.name) < q);
+        let e = self.entries.get(lo).filter(|e| fold(&e.name) == q)?;
+        Some(match e.canonical {
+            Some(ci) => &self.entries[ci as usize],
+            None => e,
+        })
     }
 }
 
