@@ -309,7 +309,7 @@ def main() -> None:
             print(f"    {f:10} {p.stat().st_size} bytes")
         print(
             "\nPush next to the anima/sd pack dirs on the device, e.g.:\n"
-            "  adb push %s /sdcard/Android/data/com.example.comfyui/files/wd14" % args.out
+            "  adb push %s /storage/emulated/0/ComfyUI/wd14" % args.out
         )
 
 
