@@ -762,6 +762,10 @@ struct ComfyApp {
     similar_filter: Option<(String, Vec<String>)>,
     /// Gallery client-side tag search box (session-only).
     tag_q: String,
+    /// Filter box inside the all-tags browser menu (session-only).
+    tag_browse_q: String,
+    /// 0 = all, 1 = indexed only, 2 = unindexed only (session-only).
+    index_filter: u8,
     /// Active facet-chip tag filters, AND-combined with the search box (session-only).
     tag_facets: Vec<String>,
 
@@ -1112,6 +1116,8 @@ impl ComfyApp {
             tag_index_loading: None,
             #[cfg(feature = "local-npu")]
             tag_index_dirty: 0,
+            tag_browse_q: String::new(),
+            index_filter: 0,
             clip_index: clip_index::ClipIndex::default(),
             clip_index_loaded: false,
             clip_index_loading: None,
@@ -10584,9 +10590,10 @@ impl ComfyApp {
         }
         ui.horizontal(|ui| {
             let rating_w = 88.0;
+            let tags_w = 58.0;
             let clear = !self.tag_q.is_empty() || !self.tag_facets.is_empty();
             let clear_w = if clear { 34.0 } else { 0.0 };
-            let box_w = (ui.available_width() - rating_w - clear_w - 12.0).max(72.0);
+            let box_w = (ui.available_width() - rating_w - tags_w - clear_w - 16.0).max(72.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.tag_q)
                     .hint_text(format!("{} tags", icons::SEARCH))
@@ -10597,12 +10604,38 @@ impl ComfyApp {
                 RatingFilter::Safe => "Safe".to_string(),
                 RatingFilter::Nsfw => "NSFW".to_string(),
             };
+            ui.menu_button("Tags", |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tag_browse_q)
+                        .hint_text("filter tags")
+                        .desired_width(180.0),
+                );
+                let keys: Vec<String> = self.gallery.iter().map(|it| it.key()).collect();
+                let all = self.tag_index.top_tags(&keys, 400);
+                let q = self.tag_browse_q.trim().to_lowercase();
+                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                    for (tag, n) in all.iter().filter(|(t, _)| q.is_empty() || t.contains(&q)) {
+                        let on = self.tag_facets.contains(tag);
+                        if ui.selectable_label(on, format!("{tag}  ({n})")).clicked() {
+                            if on {
+                                self.tag_facets.retain(|f| f != tag);
+                            } else {
+                                self.tag_facets.push(tag.clone());
+                            }
+                        }
+                    }
+                });
+            });
             ui.menu_button(rating_label, |ui| {
                 for r in RatingFilter::ALL {
                     ui.selectable_value(&mut self.gallery_view.rating, *r, r.label());
                 }
                 ui.separator();
                 ui.weak("Unindexed images count as Safe.");
+                ui.separator();
+                ui.selectable_value(&mut self.index_filter, 0, "Indexed + not");
+                ui.selectable_value(&mut self.index_filter, 1, "Indexed only");
+                ui.selectable_value(&mut self.index_filter, 2, "Unindexed only");
             });
             if clear && ui.button(icons::CLOSE).on_hover_text("Clear tag filters").clicked() {
                 self.tag_q.clear();
@@ -10759,6 +10792,11 @@ impl ComfyApp {
                     (tag_q.is_empty() || self.tag_index.matches(&key, &tag_q))
                         && self.tag_facets.iter().all(|f| self.tag_index.matches(&key, f))
                         && rating.matches(self.tag_index.is_nsfw(&key))
+                        && match self.index_filter {
+                            1 => self.tag_index.contains(&key),
+                            2 => !self.tag_index.contains(&key),
+                            _ => true,
+                        }
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -11344,6 +11382,11 @@ impl ComfyApp {
                     // recognizable even as a blank tile.
                     if is_video {
                         video_badge(ui, rect);
+                    }
+                    // Tiny corner dot marks tag-indexed images.
+                    if self.tag_index.contains(&item_key) {
+                        let c = rect.right_top() + egui::vec2(-7.0, 7.0);
+                        ui.painter().circle_filled(c, 3.0, egui::Color32::from_rgb(120, 220, 140));
                     }
                     if select_mode {
                         selection_overlay(ui, rect, selected);
@@ -12447,11 +12490,12 @@ impl ComfyApp {
         });
 
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+        // Newest first: row 0 is the latest line, so long sessions need no scrolling.
+        let total = self.log_lines.len();
         crate::theme::scroll_both()
             .auto_shrink([false, false])
-            .stick_to_bottom(true)
-            .show_rows(ui, row_h, self.log_lines.len(), |ui, range| {
-                for line in &self.log_lines[range] {
+            .show_rows(ui, row_h, total, |ui, range| {
+                for line in range.map(|i| &self.log_lines[total - 1 - i]) {
                     let color = match line.level {
                         logger::Level::Info => ui.visuals().text_color(),
                         logger::Level::Warn => egui::Color32::from_rgb(230, 200, 120),
