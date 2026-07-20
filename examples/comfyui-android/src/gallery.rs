@@ -836,16 +836,20 @@ pub fn group_selected(
 /// The list API returns no prompt text per item, so identity-tag matching is not possible here;
 /// LoRA-name matching is the robust signal available before opening a viewer.
 fn character_label(item: &GalleryItem, characters: &[CharacterCard]) -> String {
-    for c in characters {
-        let hit = c.loras.iter().any(|l| {
-            let base = file_basename(&l.file);
-            !base.is_empty() && item.models.iter().any(|m| file_basename(m).eq_ignore_ascii_case(base))
-        });
-        if hit {
-            return c.name.clone();
-        }
-    }
-    "No character".to_string()
+    characters
+        .iter()
+        .find(|c| item_matches_character(item, c))
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "No character".to_string())
+}
+
+/// Whether `item`'s graph referenced any of `card`'s LoRAs (case-insensitive basename match against
+/// `item.models`). The signal the Character grouping and centroid-seeding both rely on.
+pub fn item_matches_character(item: &GalleryItem, card: &CharacterCard) -> bool {
+    card.loras.iter().any(|l| {
+        let base = file_basename(&l.file);
+        !base.is_empty() && item.models.iter().any(|m| file_basename(m).eq_ignore_ascii_case(base))
+    })
 }
 
 /// Decoded thumbnails, evicted oldest-first against a memory budget.

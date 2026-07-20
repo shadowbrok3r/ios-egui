@@ -501,6 +501,12 @@ pub struct CharacterCard {
     /// Face-detailer wildcard prompt, piped into the `face.detailer` app when enabled.
     #[serde(default)]
     pub face_prompt: String,
+    /// Gallery item key (`subfolder/filename`) of the card's profile picture; empty = none.
+    #[serde(default)]
+    pub portrait_key: String,
+    /// Server album id collecting this character's matched images; 0 = none yet.
+    #[serde(default)]
+    pub album_id: i64,
 }
 
 /// Exactly what applying a [`CharacterCard`] changed, so removal reverses it token-for-token.
@@ -1547,6 +1553,12 @@ pub struct Settings {
     /// Recorded Create-tab prompt pairs for the history scrubber (newest last, capped).
     #[serde(default)]
     pub prompt_history: Vec<PromptHist>,
+    /// Per-character denied gallery keys, keyed by card name, so a denied match never resurfaces.
+    #[serde(default)]
+    pub character_denied: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-character pending match suggestions awaiting review, keyed by card name (capped).
+    #[serde(default)]
+    pub character_suggestions: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 pub fn default_server_output_root() -> String {
@@ -2001,6 +2013,8 @@ mod tests {
             checkpoint: "novaAnime.safetensors".into(),
             switch_checkpoint: true,
             face_prompt: "close-up of Mia's face".into(),
+            portrait_key: "user_x/Mia/portrait.png".into(),
+            album_id: 7,
         };
         let json = CharacterPack { card: card.clone() }.to_clipboard_json();
         let back = CharacterPack::from_clipboard_json(&json).expect("valid pack");
@@ -2011,6 +2025,38 @@ mod tests {
         // A nameless card is not a shareable pack.
         let nameless = CharacterPack { card: CharacterCard::default() };
         assert!(CharacterPack::from_clipboard_json(&nameless.to_clipboard_json()).is_none());
+    }
+
+    /// Cards written before the profile / album fields existed still load, with empty defaults.
+    #[test]
+    fn character_card_without_portrait_or_album_loads_with_defaults() {
+        let old = r#"{"name": "Mia", "identity": "1girl, silver hair"}"#;
+        let card: CharacterCard = serde_json::from_str(old).expect("old card must deserialize");
+        assert_eq!(card.name, "Mia");
+        assert!(card.portrait_key.is_empty());
+        assert_eq!(card.album_id, 0);
+        // The new fields round-trip once set.
+        let card = CharacterCard { portrait_key: "u/p.png".into(), album_id: 3, ..card };
+        let back: CharacterCard =
+            serde_json::from_str(&serde_json::to_string(&card).unwrap()).unwrap();
+        assert_eq!(back.portrait_key, "u/p.png");
+        assert_eq!(back.album_id, 3);
+    }
+
+    /// Settings written before the character denied / suggestions maps existed still load empty.
+    #[test]
+    fn settings_without_character_maps_load_empty() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(s.character_denied.is_empty());
+        assert!(s.character_suggestions.is_empty());
+        let mut s = s;
+        s.character_denied.insert("Mia".into(), vec!["u/a.png".into()]);
+        s.character_suggestions.insert("Mia".into(), vec!["u/b.png".into()]);
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.character_denied["Mia"], vec!["u/a.png".to_string()]);
+        assert_eq!(back.character_suggestions["Mia"], vec!["u/b.png".to_string()]);
     }
 
     #[test]

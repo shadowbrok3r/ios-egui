@@ -197,9 +197,18 @@ struct Viewer {
     meta_loading: bool,
 }
 
-/// A grade-pass swipe session over a burst's recent results.
+/// Minimum cosine similarity for a "Find images" character match (tunable).
+const CHARACTER_MATCH_COS: f32 = 0.55;
+/// Higher bar for an unprompted auto-suggestion when a freshly indexed image scores against a card.
+#[cfg(feature = "local-npu")]
+const CHARACTER_SUGGEST_COS: f32 = 0.62;
+/// Cap on a character's pending-suggestions list.
+#[cfg(feature = "local-npu")]
+const CHARACTER_SUGGEST_CAP: usize = 200;
+
+/// A swipe session over a deck of gallery keys, shared by the grade pass and character review.
 struct Triage {
-    /// Gallery keys in deck order (aesthetic score descending when scored, else newest first).
+    /// Gallery keys in deck order (grade: score/mtime descending; review: cosine descending).
     deck: Vec<String>,
     /// Index of the current undecided card.
     pos: usize,
@@ -207,15 +216,26 @@ struct Triage {
     trashed: usize,
     /// Keys swiped right, batch album-added on commit.
     keep: Vec<String>,
-    /// Keys swiped left, batch soft-deleted on commit.
+    /// Keys swiped left (grade: trashed; review: denied), batched on commit.
     trash: Vec<String>,
-    /// Album kept cards join on commit; `None` leaves them in the gallery only.
+    /// Grade-mode album kept cards join on commit; `None` leaves them in the gallery only.
     album: Option<i64>,
     /// Last recorded decision, for one-step Undo.
     last: Option<TriagePick>,
+    /// What the deck's swipes mean and where the batch lands.
+    mode: TriageMode,
 }
 
-/// A triage card outcome: swipe right keeps, left trashes, up reuses as img2img input.
+/// What a [`Triage`] deck is grading and where committed decisions go.
+#[derive(Clone)]
+enum TriageMode {
+    /// Grade pass over a burst: right keeps (optional album), left trashes (soft-delete), up reuses.
+    Grade,
+    /// Character review: right accepts into the card's album, left denies (remembered), up skips.
+    Character { card: String },
+}
+
+/// A triage card outcome: swipe right keeps/accepts, left trashes/denies, up reuses or skips.
 #[derive(Clone, Copy)]
 enum TriagePick {
     Keep,
@@ -496,6 +516,15 @@ struct ComfyApp {
     active_character: Option<AppliedCharacter>,
     /// Open card editor, or `None` when showing the card list.
     character_draft: Option<CharacterDraft>,
+    /// Per-character denied gallery keys (persisted), keyed by card name; never re-surfaced.
+    character_denied: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-character pending match suggestions (persisted, capped), keyed by card name.
+    character_suggestions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Session cache of per-character CLIP centroids for the suggest hot loop; cleared on change.
+    character_centroids: HashMap<String, Vec<f32>>,
+    /// After creating a character's collection album, stamp its id onto the card and add these
+    /// items: `(card name, album name, items)`.
+    char_album_pending: Option<(String, String, Vec<(String, String)>)>,
     /// Builtin enhance apps plus any under `{documents}/comfyui/apps`.
     apps: Arc<AppSet>,
     /// Where a picked app goes: the Create chain, or the canvas at a graph position.
@@ -997,6 +1026,10 @@ impl ComfyApp {
             characters: Vec::new(),
             active_character: None,
             character_draft: None,
+            character_denied: std::collections::BTreeMap::new(),
+            character_suggestions: std::collections::BTreeMap::new(),
+            character_centroids: HashMap::new(),
+            char_album_pending: None,
             apps: Arc::new(AppSet::builtin()),
             app_picker: None,
             app_filter: String::new(),
@@ -1448,6 +1481,19 @@ impl ComfyApp {
                         self.select_mode = false;
                     } else {
                         self.album_pending_add = Some((name, items));
+                    }
+                }
+                // Finish creating a character's collection album: stamp its id onto the card, add.
+                if let Some((card, album_name, items)) = self.char_album_pending.take() {
+                    if let Some(id) = self.albums.iter().find(|a| a.name == album_name).map(|a| a.id) {
+                        if let Some(c) = self.characters.iter_mut().find(|c| c.name == card) {
+                            c.album_id = id;
+                        }
+                        if !items.is_empty() {
+                            self.engine.as_ref().unwrap().album_add(id, items);
+                        }
+                    } else {
+                        self.char_album_pending = Some((card, album_name, items));
                     }
                 }
             }
@@ -3214,6 +3260,8 @@ impl ComfyApp {
             #[cfg(not(feature = "local-npu"))]
             local_pack: String::new(),
             prompt_history: self.prompt_history.clone(),
+            character_denied: self.character_denied.clone(),
+            character_suggestions: self.character_suggestions.clone(),
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -3263,6 +3311,9 @@ impl ComfyApp {
         self.selected_preset = saved.selected_preset;
         self.characters = saved.characters;
         self.active_character = saved.active_character;
+        self.character_denied = saved.character_denied;
+        self.character_suggestions = saved.character_suggestions;
+        self.character_centroids.clear();
         self.checkpoint_sort = saved.checkpoint_sort;
         self.checkpoint_favorites = saved.checkpoint_favorites;
         self.checkpoint_recent = saved.checkpoint_recent;
@@ -5850,6 +5901,8 @@ impl ComfyApp {
             Edit(usize),
             Share(usize),
             Delete(String),
+            Find(usize),
+            Suggestions(usize),
         }
         let active = self.active_character.as_ref().map(|a| a.name.clone());
         let mut act: Option<Act> = None;
@@ -5860,9 +5913,15 @@ impl ComfyApp {
             } else {
                 elide(&card.name, 30)
             };
+            let suggested = self.character_suggestions.get(&card.name).map(|s| s.len()).unwrap_or(0);
             ui.group(|ui| {
                 ui.set_max_width(list_w - 8.0);
                 ui.horizontal(|ui| {
+                    // Profile square on the left; falls back to no square when unset.
+                    if !card.portrait_key.is_empty() {
+                        self.portrait_thumb(ui, &card.portrait_key, 38.0);
+                        ui.add_space(4.0);
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if is_active {
                             if ui.small_button("Remove").clicked() {
@@ -5876,6 +5935,23 @@ impl ComfyApp {
                         let title = elide_width(ui, &sanitize_ui_text(ui, &header), max_w);
                         ui.strong(title);
                     });
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(format!("{} Find images", icons::SEARCH))
+                        .on_hover_text("Rank gallery images by CLIP similarity, then review them")
+                        .clicked()
+                    {
+                        act = Some(Act::Find(i));
+                    }
+                    if suggested > 0
+                        && ui
+                            .small_button(format!("{} {suggested} suggested", icons::STAR))
+                            .on_hover_text("Review images auto-matched to this character")
+                            .clicked()
+                    {
+                        act = Some(Act::Suggestions(i));
+                    }
                 });
                 egui::CollapsingHeader::new("Details")
                     .id_salt(("character_row", card.name.as_str()))
@@ -5928,7 +6004,25 @@ impl ComfyApp {
                     self.remove_active_character();
                 }
                 self.characters.retain(|c| c.name != name);
+                self.character_denied.remove(&name);
+                self.character_suggestions.remove(&name);
+                self.character_centroids.remove(&name);
                 host.haptic(Haptic::Warning);
+            }
+            Some(Act::Find(i)) => {
+                if let Some(card) = self.characters.get(i).cloned() {
+                    self.find_character_images(card, host);
+                }
+            }
+            Some(Act::Suggestions(i)) => {
+                if let Some(card) = self.characters.get(i).cloned() {
+                    let keys = self.character_suggestions.get(&card.name).cloned().unwrap_or_default();
+                    if keys.is_empty() {
+                        self.status = "No suggestions to review".into();
+                    } else {
+                        self.open_character_review(card.name, keys, host);
+                    }
+                }
             }
             None => {}
         }
@@ -6091,8 +6185,12 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         };
+        // Profile picture and album id reference the sharer's account; drop them on import.
+        let mut card = pack.card;
+        card.portrait_key.clear();
+        card.album_id = 0;
         // Open the imported card in the editor for review before saving.
-        self.character_draft = Some(CharacterDraft { editing: None, card: pack.card });
+        self.character_draft = Some(CharacterDraft { editing: None, card });
         self.status = "Character imported — review and save".into();
         host.haptic(Haptic::Light);
     }
@@ -8397,6 +8495,13 @@ impl ComfyApp {
         };
         if let Some(old) = editing.as_ref().filter(|o| *o != &card.name) {
             self.characters.retain(|c| &c.name != old);
+            // Carry the denied / suggestion history across the rename.
+            if let Some(v) = self.character_denied.remove(old) {
+                self.character_denied.insert(card.name.clone(), v);
+            }
+            if let Some(v) = self.character_suggestions.remove(old) {
+                self.character_suggestions.insert(card.name.clone(), v);
+            }
         }
         if let Some(slot) = self.characters.iter_mut().find(|c| c.name == card.name) {
             *slot = card.clone();
@@ -8404,6 +8509,8 @@ impl ComfyApp {
             self.characters.push(card.clone());
             self.characters.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         }
+        // Seeds may have changed (LoRAs / portrait), so drop the cached centroids.
+        self.character_centroids.clear();
         if reapply {
             self.remove_active_character();
             if let Some(i) = self.characters.iter().position(|c| c.name == card.name) {
@@ -8431,6 +8538,177 @@ impl ComfyApp {
         let checkpoint =
             meta.unet.clone().or_else(|| meta.models.first().cloned()).unwrap_or_default();
         CharacterCard { identity, loras, checkpoint, ..Default::default() }
+    }
+
+    /// A small square gallery thumbnail for `key` at `edge` px, fetched on demand and served from
+    /// the same thumb cache the gallery tiles use.
+    fn portrait_thumb(&mut self, ui: &mut egui::Ui, key: &str, edge: f32) {
+        let size = 96u32;
+        let thumb_key = format!("{key}#{size}");
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
+        match self.thumbs.get(&thumb_key) {
+            Some(tex) => {
+                let sized = egui::load::SizedTexture::from_handle(tex);
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.add(
+                            egui::Image::new(sized).max_size(rect.size()).maintain_aspect_ratio(true),
+                        );
+                    });
+                });
+            }
+            None => {
+                if self.thumbs.claim(&thumb_key)
+                    && let Some((sub, file)) = key.rsplit_once('/')
+                {
+                    self.engine.as_ref().unwrap().fetch_thumb(sub.to_string(), file.to_string(), size);
+                }
+                ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+            }
+        }
+    }
+
+    /// Confirmed-set keys for a character's CLIP centroid, strongest signal first: members of the
+    /// card's album while that album is the loaded view, else LoRA-name matches (the Character
+    /// grouping rule), always folding in the portrait. Only keys with an embedding actually count.
+    fn character_seed_keys(&self, card: &CharacterCard) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        // Album membership lives server-side, so it's only known while the gallery is filtered to it.
+        if card.album_id != 0 && self.gallery_view.album == Some(card.album_id) {
+            for it in self.gallery.iter().filter(|it| !it.is_video) {
+                if seen.insert(it.key()) {
+                    keys.push(it.key());
+                }
+            }
+        }
+        if keys.is_empty() {
+            for it in self.gallery.iter().filter(|it| !it.is_video) {
+                if crate::gallery::item_matches_character(it, card) && seen.insert(it.key()) {
+                    keys.push(it.key());
+                }
+            }
+        }
+        if !card.portrait_key.is_empty() && seen.insert(card.portrait_key.clone()) {
+            keys.push(card.portrait_key.clone());
+        }
+        keys
+    }
+
+    /// Rank gallery images by CLIP similarity to the character and open the review deck over them.
+    fn find_character_images(&mut self, card: CharacterCard, host: &Host) {
+        self.character_centroids.remove(&card.name);
+        let seeds = self.character_seed_keys(&card);
+        let Some(centroid) = clip_index::character_centroid(&seeds, &self.clip_index) else {
+            self.status = "No indexed images for this character yet — index the gallery first".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let mut exclude: HashSet<String> = seeds.into_iter().collect();
+        if let Some(d) = self.character_denied.get(&card.name) {
+            exclude.extend(d.iter().cloned());
+        }
+        let ranked =
+            clip_index::rank_candidates(&centroid, &self.clip_index, &exclude, CHARACTER_MATCH_COS);
+        if ranked.is_empty() {
+            self.status = "No new matches found".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let keys: Vec<String> = ranked.into_iter().map(|(k, _)| k).collect();
+        self.open_character_review(card.name, keys, host);
+    }
+
+    /// Enter the shared swipe deck in character-review mode over `keys` (already ranked best-first),
+    /// keeping only those still present as still images in the loaded gallery.
+    fn open_character_review(&mut self, card_name: String, keys: Vec<String>, host: &Host) {
+        let present: HashSet<String> =
+            self.gallery.iter().filter(|it| !it.is_video).map(|it| it.key()).collect();
+        let deck: Vec<String> = keys.into_iter().filter(|k| present.contains(k)).collect();
+        if deck.is_empty() {
+            self.status = "Matched images aren't in the loaded gallery — load more first".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        self.tab = Tab::Gallery;
+        self.viewer = None;
+        self.triage_swipe_origin = None;
+        self.triage = Some(Triage {
+            deck,
+            pos: 0,
+            kept: 0,
+            trashed: 0,
+            keep: Vec::new(),
+            trash: Vec::new(),
+            album: None,
+            last: None,
+            mode: TriageMode::Character { card: card_name },
+        });
+        host.haptic(Haptic::Light);
+    }
+
+    /// Add accepted images to the character's collection album, creating it (named after the card)
+    /// on first use and stamping its id back onto the card.
+    fn add_to_character_album(&mut self, card_name: &str, items: Vec<(String, String)>) {
+        let album_id =
+            self.characters.iter().find(|c| c.name == card_name).map(|c| c.album_id).unwrap_or(0);
+        if album_id != 0 {
+            self.engine.as_ref().unwrap().album_add(album_id, items);
+        } else {
+            let album_name = card_name.to_string();
+            self.engine.as_ref().unwrap().album_create(album_name.clone());
+            self.char_album_pending = Some((card_name.to_string(), album_name, items));
+        }
+        // The assembled album is the training set a LoRA-trainer workflow would consume; queueing
+        // that is out of scope here (the server's trainer node inventory is unknown).
+    }
+
+    /// A character's cached CLIP centroid, computed from its seeds on a cache miss.
+    #[cfg(feature = "local-npu")]
+    fn character_centroid_cached(&mut self, card: &CharacterCard) -> Option<Vec<f32>> {
+        if !self.character_centroids.contains_key(&card.name) {
+            let keys = self.character_seed_keys(card);
+            let cen = clip_index::character_centroid(&keys, &self.clip_index).unwrap_or_default();
+            self.character_centroids.insert(card.name.clone(), cen);
+        }
+        self.character_centroids.get(&card.name).filter(|c| !c.is_empty()).cloned()
+    }
+
+    /// Score a freshly indexed image against every character; record high-confidence hits as pending
+    /// suggestions (never a silent move — the user reviews them). Denied, seed, and already-pending
+    /// keys are skipped.
+    #[cfg(feature = "local-npu")]
+    fn suggest_for_new_key(&mut self, key: &str) {
+        if self.characters.is_empty() {
+            return;
+        }
+        let matched_item = self.gallery.iter().find(|it| it.key() == key).cloned();
+        for card in self.characters.clone() {
+            if card.portrait_key == key {
+                continue;
+            }
+            if self.character_denied.get(&card.name).is_some_and(|d| d.iter().any(|k| k == key)) {
+                continue;
+            }
+            if self.character_suggestions.get(&card.name).is_some_and(|s| s.iter().any(|k| k == key)) {
+                continue;
+            }
+            // A LoRA-name match is already a confirmed seed — no need to suggest it.
+            if matched_item.as_ref().is_some_and(|it| crate::gallery::item_matches_character(it, &card))
+            {
+                continue;
+            }
+            let Some(cen) = self.character_centroid_cached(&card) else { continue };
+            let Some(cos) = self.clip_index.cosine_to(key, &cen) else { continue };
+            if cos >= CHARACTER_SUGGEST_COS {
+                let sug = self.character_suggestions.entry(card.name.clone()).or_default();
+                sug.push(key.to_string());
+                let overflow = sug.len().saturating_sub(CHARACTER_SUGGEST_CAP);
+                if overflow > 0 {
+                    sug.drain(..overflow);
+                }
+            }
+        }
     }
 
     fn output(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -10399,6 +10677,8 @@ impl ComfyApp {
         self.gallery_total = 0;
         self.gallery_loading = true;
         self.gallery_status.clear();
+        // Seeds are drawn from the gallery listing, so a new query invalidates cached centroids.
+        self.character_centroids.clear();
         // Forget in-flight thumb requests so earlier failures get retried.
         self.thumbs.reset_pending();
         // Supersede any in-flight pages of the previous query (auto-load chains overlap).
@@ -11784,6 +12064,7 @@ impl ComfyApp {
             trash: Vec::new(),
             album: None,
             last: None,
+            mode: TriageMode::Grade,
         });
         host.haptic(Haptic::Light);
     }
@@ -11797,52 +12078,92 @@ impl ComfyApp {
             .collect()
     }
 
-    /// Flush the batched decisions: soft-delete left-swipes, album-add kept, drop decided keys.
+    /// Flush the batched decisions. Grade: soft-delete left-swipes, album-add kept, drop triaged
+    /// keys. Character: accept into the card's album, remember denials, clear reviewed suggestions.
     fn commit_triage(&mut self, host: &Host) {
         let Some(t) = self.triage.take() else { return };
         self.triage_swipe_origin = None;
-        let decided: HashSet<String> = t.deck[..t.pos.min(t.deck.len())].iter().cloned().collect();
-        self.untriaged.retain(|k| !decided.contains(k));
-        if let Some(id) = t.album {
-            let items = self.items_for_keys(&t.keep);
-            if !items.is_empty() {
-                self.engine.as_ref().unwrap().album_add(id, items);
+        match &t.mode {
+            TriageMode::Grade => {
+                let decided: HashSet<String> =
+                    t.deck[..t.pos.min(t.deck.len())].iter().cloned().collect();
+                self.untriaged.retain(|k| !decided.contains(k));
+                if let Some(id) = t.album {
+                    let items = self.items_for_keys(&t.keep);
+                    if !items.is_empty() {
+                        self.engine.as_ref().unwrap().album_add(id, items);
+                    }
+                }
+                if !t.trash.is_empty() {
+                    let items = self.items_for_keys(&t.trash);
+                    if !items.is_empty() {
+                        let n = items.len();
+                        self.engine.as_ref().unwrap().delete_images(items);
+                        self.gallery_status = format!("Triage: moved {n} to trash");
+                        host.haptic(Haptic::Warning);
+                    }
+                }
             }
-        }
-        if !t.trash.is_empty() {
-            let items = self.items_for_keys(&t.trash);
-            if !items.is_empty() {
-                let n = items.len();
-                self.engine.as_ref().unwrap().delete_images(items);
-                self.gallery_status = format!("Triage: moved {n} to trash");
-                host.haptic(Haptic::Warning);
+            TriageMode::Character { card } => {
+                let card_name = card.clone();
+                let items = self.items_for_keys(&t.keep);
+                if !items.is_empty() {
+                    self.add_to_character_album(&card_name, items);
+                }
+                if !t.trash.is_empty() {
+                    let denied = self.character_denied.entry(card_name.clone()).or_default();
+                    for k in &t.trash {
+                        if !denied.contains(k) {
+                            denied.push(k.clone());
+                        }
+                    }
+                }
+                if let Some(sug) = self.character_suggestions.get_mut(&card_name) {
+                    let decided: HashSet<&String> = t.keep.iter().chain(&t.trash).collect();
+                    sug.retain(|k| !decided.contains(k));
+                }
+                self.character_centroids.remove(&card_name);
+                self.gallery_status =
+                    format!("Review: accepted {}, denied {}", t.keep.len(), t.trash.len());
+                host.haptic(Haptic::Success);
             }
         }
     }
 
-    /// Record a card decision and advance; swipe-up loads the image as input and closes the deck.
+    /// Record a card decision and advance. Grade swipe-up loads the image as input and closes the
+    /// deck; character swipe-up is a skip (decide later).
     fn triage_pick(&mut self, pick: TriagePick, host: &Host) {
-        let key = {
+        let (key, char_skip) = {
             let Some(t) = self.triage.as_mut() else { return };
             let Some(key) = t.deck.get(t.pos).cloned() else { return };
+            let char_mode = matches!(t.mode, TriageMode::Character { .. });
+            let mut char_skip = false;
             match pick {
                 TriagePick::Keep => {
                     t.keep.push(key.clone());
                     t.kept += 1;
+                    t.pos += 1;
+                    t.last = Some(pick);
                 }
                 TriagePick::Trash => {
                     t.trash.push(key.clone());
                     t.trashed += 1;
+                    t.pos += 1;
+                    t.last = Some(pick);
                 }
-                TriagePick::Input => {}
+                TriagePick::Input => {
+                    t.pos += 1;
+                    // A skip isn't a keep/trash, so it isn't an undoable step.
+                    t.last = if char_mode { None } else { Some(pick) };
+                    char_skip = char_mode;
+                }
             }
-            t.pos += 1;
-            t.last = Some(pick);
-            key
+            (key, char_skip)
         };
         match pick {
             TriagePick::Keep => host.haptic(Haptic::Light),
             TriagePick::Trash => host.haptic(Haptic::Warning),
+            TriagePick::Input if char_skip => host.haptic(Haptic::Light),
             TriagePick::Input => {
                 self.use_key_as_input(&key, host);
                 self.commit_triage(host);
@@ -11919,7 +12240,8 @@ impl ComfyApp {
         None
     }
 
-    /// Fullscreen grade-pass deck: swipe/tap to keep, trash, or reuse; batch committed on exit.
+    /// Fullscreen swipe deck: grade pass (keep/trash/reuse) or character review (accept/deny/skip);
+    /// batch committed on exit.
     fn triage_view(&mut self, ui: &mut egui::Ui, host: &Host) {
         if ui.ctx().input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
@@ -11936,14 +12258,21 @@ impl ComfyApp {
             Done,
         }
         let mut act: Option<TA> = None;
-        let (total, pos, kept, trashed, album, cur_key) = {
+        let (total, pos, kept, trashed, album, cur_key, review) = {
             let t = self.triage.as_ref().unwrap();
-            (t.deck.len(), t.pos, t.kept, t.trashed, t.album, t.deck.get(t.pos).cloned())
+            let review = match &t.mode {
+                TriageMode::Grade => None,
+                TriageMode::Character { card } => Some(card.clone()),
+            };
+            (t.deck.len(), t.pos, t.kept, t.trashed, t.album, t.deck.get(t.pos).cloned(), review)
         };
         let left = total.saturating_sub(pos);
 
         ui.horizontal(|ui| {
-            ui.strong(format!("{} Grade pass", icons::STAR));
+            match &review {
+                Some(card) => ui.strong(format!("{} Review: {}", icons::STAR, elide(card, 22))),
+                None => ui.strong(format!("{} Grade pass", icons::STAR)),
+            };
             ui.separator();
             if pos < total {
                 ui.weak(format!("{}/{}", pos + 1, total));
@@ -11954,7 +12283,11 @@ impl ComfyApp {
                 }
                 ui.separator();
             }
-            ui.weak(format!("Kept {kept} · Trashed {trashed} · {left} left"));
+            if review.is_some() {
+                ui.weak(format!("Accepted {kept} · Denied {trashed} · {left} left"));
+            } else {
+                ui.weak(format!("Kept {kept} · Trashed {trashed} · {left} left"));
+            }
         });
         ui.separator();
 
@@ -11964,20 +12297,37 @@ impl ComfyApp {
             const GAP: f32 = 4.0;
             ui.add_space(2.0);
             if cur_key.is_some() {
+                let (left_lbl, left_hint, mid_lbl, mid_hint, right_lbl) = if review.is_some() {
+                    (
+                        format!("{} Deny", icons::CLOSE),
+                        "Swipe left — never suggest again",
+                        format!("{} Skip", icons::REDO),
+                        "Swipe up — decide later",
+                        format!("{} Accept", icons::CHECK),
+                    )
+                } else {
+                    (
+                        format!("{} Trash", icons::TRASH),
+                        "Swipe left",
+                        format!("{} Input", icons::IMAGE),
+                        "Swipe up — use as img2img input",
+                        format!("{} Keep", icons::CHECK),
+                    )
+                };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP;
                     let w = ((ui.available_width() - GAP * 3.0) / 4.0).max(40.0);
                     let size = egui::vec2(w, BTN_H);
                     if ui
-                        .add_sized(size, egui::Button::new(format!("{} Trash", icons::TRASH)))
-                        .on_hover_text("Swipe left")
+                        .add_sized(size, egui::Button::new(left_lbl))
+                        .on_hover_text(left_hint)
                         .clicked()
                     {
                         act = Some(TA::Pick(TriagePick::Trash));
                     }
                     if ui
-                        .add_sized(size, egui::Button::new(format!("{} Input", icons::IMAGE)))
-                        .on_hover_text("Swipe up — use as img2img input")
+                        .add_sized(size, egui::Button::new(mid_lbl))
+                        .on_hover_text(mid_hint)
                         .clicked()
                     {
                         act = Some(TA::Pick(TriagePick::Input));
@@ -11990,32 +12340,47 @@ impl ComfyApp {
                         act = Some(TA::Undo);
                     }
                     if ui
-                        .add_sized(size, egui::Button::new(format!("{} Keep", icons::CHECK)))
+                        .add_sized(size, egui::Button::new(right_lbl))
                         .on_hover_text("Swipe right")
                         .clicked()
                     {
                         act = Some(TA::Pick(TriagePick::Keep));
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.weak(format!("{} Keep to", icons::ALBUM));
-                    let label = album
-                        .and_then(|id| self.albums.iter().find(|a| a.id == id))
-                        .map(|a| elide(&a.name, 20))
-                        .unwrap_or_else(|| "gallery only".into());
-                    up_menu(ui, label, |ui| {
-                        if ui.selectable_label(album.is_none(), "Gallery only").clicked() {
-                            act = Some(TA::SetAlbum(None));
-                            ui.close();
-                        }
-                        for a in &self.albums {
-                            if ui.selectable_label(album == Some(a.id), elide(&a.name, 28)).clicked() {
-                                act = Some(TA::SetAlbum(Some(a.id)));
-                                ui.close();
-                            }
-                        }
-                    });
-                });
+                match &review {
+                    // Character mode: accepted images join the card's album (created on demand).
+                    Some(card) => {
+                        ui.weak(format!(
+                            "{} Accept adds to the {} album",
+                            icons::ALBUM,
+                            elide(card, 20)
+                        ));
+                    }
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.weak(format!("{} Keep to", icons::ALBUM));
+                            let label = album
+                                .and_then(|id| self.albums.iter().find(|a| a.id == id))
+                                .map(|a| elide(&a.name, 20))
+                                .unwrap_or_else(|| "gallery only".into());
+                            up_menu(ui, label, |ui| {
+                                if ui.selectable_label(album.is_none(), "Gallery only").clicked() {
+                                    act = Some(TA::SetAlbum(None));
+                                    ui.close();
+                                }
+                                for a in &self.albums {
+                                    if ui
+                                        .selectable_label(album == Some(a.id), elide(&a.name, 28))
+                                        .clicked()
+                                    {
+                                        act = Some(TA::SetAlbum(Some(a.id)));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        });
+                    }
+                }
             } else {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP;
@@ -12084,8 +12449,13 @@ impl ComfyApp {
         } else {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
-                ui.label(format!("All {total} triaged — kept {kept}, trashed {trashed}."));
-                ui.weak("Trashed images go to the server trash on Done.");
+                if review.is_some() {
+                    ui.label(format!("All {total} reviewed — accepted {kept}, denied {trashed}."));
+                    ui.weak("Accepted images join the album; denied never resurface.");
+                } else {
+                    ui.label(format!("All {total} triaged — kept {kept}, trashed {trashed}."));
+                    ui.weak("Trashed images go to the server trash on Done.");
+                }
             });
         }
 
@@ -12125,6 +12495,7 @@ impl ComfyApp {
             AlbumAdd(i64),
             AlbumRemove(i64),
             AlbumCreate,
+            SetPortrait(String),
             Delete,
             Show(usize),
             #[cfg(feature = "local-npu")]
@@ -12319,6 +12690,27 @@ impl ComfyApp {
                             act = Some(Act::SaveCharacter);
                             ui.close();
                         }
+                        // Set this image as a character's profile picture.
+                        if self.characters.is_empty() {
+                            ui.add_enabled(false, egui::Button::new(format!("{} Set as profile", icons::USER)))
+                                .on_hover_text("Create a character card first");
+                        } else {
+                            let active = self.active_character.as_ref().map(|a| a.name.clone());
+                            ui.menu_button(format!("{} Set as profile", icons::USER), |ui| {
+                                for c in &self.characters {
+                                    let is_active = active.as_deref() == Some(c.name.as_str());
+                                    let label = if is_active {
+                                        format!("{} {}", icons::CHECK, elide(&c.name, 26))
+                                    } else {
+                                        elide(&c.name, 30)
+                                    };
+                                    if ui.button(label).clicked() {
+                                        act = Some(Act::SetPortrait(c.name.clone()));
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
                         if ui.button(format!("{} Use as img2img input", icons::IMAGE)).clicked() {
                             act = Some(Act::UseAsInput);
                             ui.close();
@@ -12505,6 +12897,16 @@ impl ComfyApp {
                 self.album_new_name.clear();
                 self.album_create_draft =
                     Some(vec![(v.item.subfolder.clone(), v.item.filename.clone())]);
+            }
+            Some(Act::SetPortrait(name)) => {
+                let key = self.viewer.as_ref().map(|v| v.item.key());
+                if let (Some(key), Some(c)) =
+                    (key, self.characters.iter_mut().find(|c| c.name == name))
+                {
+                    c.portrait_key = key;
+                    self.gallery_status = format!("Profile set for {}", elide(&name, 24));
+                    host.haptic(Haptic::Light);
+                }
             }
             Some(Act::Delete) => {
                 self.remember_viewer_neighbor_after_delete();
@@ -13502,8 +13904,10 @@ impl ComfyApp {
         match rx.try_recv() {
             Ok((key, Ok((emb, score)))) => {
                 self.clipemb_rx = None;
-                self.clip_index.insert(key, emb, score);
+                self.clip_index.insert(key.clone(), emb, score);
                 self.clip_index_dirty += 1;
+                // A newly indexed image may match a character — record high-confidence suggestions.
+                self.suggest_for_new_key(&key);
                 if self.clip_index_dirty >= Self::AUTOTAG_SAVE_EVERY {
                     self.save_clip_index(host);
                 }
