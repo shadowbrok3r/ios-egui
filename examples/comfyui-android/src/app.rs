@@ -825,6 +825,14 @@ struct ComfyApp {
     clipemb_rx: Option<std::sync::mpsc::Receiver<(String, Result<(Vec<f32>, Option<f32>), String>)>>,
     #[cfg(feature = "local-npu")]
     clipemb_failed: HashSet<String>,
+    /// Semantic-search query box in the Tags menu (session-only).
+    #[cfg(feature = "local-npu")]
+    clip_text_q: String,
+    /// Text-embedding worker result (the L2-normalized query embedding or an error string).
+    #[cfg(feature = "local-npu")]
+    clip_search_rx: Option<std::sync::mpsc::Receiver<Result<Vec<f32>, String>>>,
+    #[cfg(feature = "local-npu")]
+    clip_search_running: bool,
     /// Similarity view: source key + ordered similar keys; overrides the gallery filters while set.
     similar_filter: Option<(String, Vec<String>)>,
     /// The gallery grid's visible viewport this frame; gates pull-to-refresh and tile hits.
@@ -1214,6 +1222,12 @@ impl ComfyApp {
             clipemb_rx: None,
             #[cfg(feature = "local-npu")]
             clipemb_failed: HashSet::new(),
+            #[cfg(feature = "local-npu")]
+            clip_text_q: String::new(),
+            #[cfg(feature = "local-npu")]
+            clip_search_rx: None,
+            #[cfg(feature = "local-npu")]
+            clip_search_running: false,
             similar_filter: None,
             tag_q: String::new(),
             tag_facets: Vec::new(),
@@ -10765,7 +10779,7 @@ impl ComfyApp {
             || self.gallery_view.media != GalleryMedia::All
     }
 
-    fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool) -> bool {
+    fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool, host: &Host) -> bool {
         let mut changed = false;
         // One row: search + refresh + View (rightmost). Filters live in View submenus.
         ui.horizontal(|ui| {
@@ -10789,7 +10803,7 @@ impl ComfyApp {
                 changed = true;
             }
 
-            up_menu_sized(ui, "Tags".to_string(), egui::vec2(56.0, 28.0), |ui| self.tags_menu_ui(ui));
+            up_menu_sized(ui, "Tags".to_string(), egui::vec2(56.0, 28.0), |ui| self.tags_menu_ui(ui, host));
 
             up_menu_sized(ui, format!("{} View", icons::GALLERY), egui::vec2(68.0, 28.0), |ui| {
                 if ui
@@ -11008,7 +11022,11 @@ impl ComfyApp {
     /// Compact client-side tag filter row: search box, rating selector, and facet chips over the
     /// currently visible items. All filtering is local (auto-tag index); nothing re-queries.
     /// The all-tags browser: search box over every indexed tag with counts, tap to toggle a facet.
-    fn tags_menu_ui(&mut self, ui: &mut egui::Ui) {
+    fn tags_menu_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
+        #[cfg(feature = "local-npu")]
+        self.semantic_search_ui(ui, host);
+        #[cfg(not(feature = "local-npu"))]
+        let _ = host;
         ui.add(
             egui::TextEdit::singleline(&mut self.tag_browse_q)
                 .hint_text("filter tags")
@@ -11029,6 +11047,107 @@ impl ComfyApp {
                 }
             }
         });
+    }
+
+    /// Typed semantic search at the top of the Tags menu: embed the query on the NPU text tower and
+    /// rank the CLIP index by cosine. Shows one dim line when the pack files or index are missing.
+    #[cfg(feature = "local-npu")]
+    fn semantic_search_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let has_text = self.clip_pack.as_ref().is_some_and(|d| {
+            d.join(local_clip::TEXT_MODEL_FILE).is_file() && d.join(local_clip::TOKENIZER_FILE).is_file()
+        });
+        if has_text && self.clip_index.len() > 0 {
+            ui.label(format!("{} Semantic search", icons::SEARCH));
+            if self.clip_search_running {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.label("Embedding query…");
+                });
+            } else {
+                let mut submit = false;
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.clip_text_q)
+                            .hint_text("describe an image")
+                            .desired_width(150.0),
+                    );
+                    submit = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    submit |= ui.button("Search").clicked();
+                });
+                if submit {
+                    let q = self.clip_text_q.trim().to_string();
+                    if !q.is_empty() {
+                        self.start_clip_search(ui.ctx(), host, q);
+                        ui.close();
+                    }
+                }
+            }
+        } else {
+            let msg = if !has_text {
+                "Semantic search needs text_model.bin + tokenizer.json in the CLIP pack"
+            } else {
+                "Semantic search: waiting for images to be indexed"
+            };
+            ui.weak(msg);
+        }
+        ui.separator();
+    }
+
+    /// Spawn the CLIP text-embedding worker; the L2-normalized query embedding returns via the
+    /// channel and `poll_clip_search` ranks the index into the similarity view.
+    #[cfg(feature = "local-npu")]
+    fn start_clip_search(&mut self, ctx: &egui::Context, host: &Host, query: String) {
+        let (Some(lib_dir), Some(pack_dir)) = (host.native_lib_dir(), self.clip_pack.clone()) else {
+            self.status = "Semantic search: no NPU libs or CLIP pack".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.clip_search_rx = Some(rx);
+        self.clip_search_running = true;
+        self.status = format!("Searching \"{}\"…", elide(&query, 32));
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::local_engine::embed_clip_text(std::path::PathBuf::from(lib_dir), pack_dir, query);
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+        host.haptic(Haptic::Medium);
+    }
+
+    /// Drain a finished query embedding: rank the index by cosine into the similarity view, or note.
+    #[cfg(feature = "local-npu")]
+    fn poll_clip_search(&mut self) {
+        let Some(rx) = self.clip_search_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok(emb)) => {
+                self.clip_search_rx = None;
+                self.clip_search_running = false;
+                let exclude = HashSet::new();
+                let ranked = clip_index::rank_candidates(&emb, &self.clip_index, &exclude, 0.15);
+                let n = ranked.len().min(200);
+                let keys: Vec<String> = ranked.into_iter().take(200).map(|(k, _)| k).collect();
+                let q = self.clip_text_q.trim().to_string();
+                if keys.is_empty() {
+                    self.status = format!("No matches for \"{}\"", elide(&q, 32));
+                } else {
+                    self.status = format!("{n} matches for \"{}\"", elide(&q, 32));
+                    self.similar_filter = Some((format!("query: {q}"), keys));
+                }
+            }
+            Ok(Err(e)) => {
+                self.clip_search_rx = None;
+                self.clip_search_running = false;
+                self.log.error(format!("clip text search: {e}"));
+                self.status = format!("Semantic search failed: {e}");
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.clip_search_rx = None;
+                self.clip_search_running = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
     }
 
     fn gallery_tag_bar(&mut self, ui: &mut egui::Ui, facets: &[(String, usize)]) {
@@ -11177,7 +11296,7 @@ impl ComfyApp {
             if self.select_mode {
                 self.selection_bar(ui, host);
             } else {
-                refresh = self.gallery_controls(ui, connected);
+                refresh = self.gallery_controls(ui, connected, host);
             }
             ui.add_space(2.0);
         });
@@ -14069,6 +14188,8 @@ impl EguiApp for ComfyApp {
         self.poll_wd14();
         #[cfg(feature = "local-npu")]
         self.poll_rewrite();
+        #[cfg(feature = "local-npu")]
+        self.poll_clip_search();
         self.ensure_tag_index_warm(ui.ctx(), host);
         self.ensure_clip_index_warm(ui.ctx(), host);
         #[cfg(feature = "local-npu")]

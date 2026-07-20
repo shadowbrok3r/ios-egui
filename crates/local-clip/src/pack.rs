@@ -14,6 +14,12 @@ pub const REQUIRED: [&str; 2] = [MARKER, "model.bin"];
 /// The optional aesthetic head file inside a pack.
 pub const AESTHETIC_FILE: &str = "aesthetic.bin";
 
+/// The optional text-tower context binary inside a pack (enables typed semantic search).
+pub const TEXT_MODEL_FILE: &str = "text_model.bin";
+
+/// The optional tokenizer file inside a pack, paired with `text_model.bin`.
+pub const TOKENIZER_FILE: &str = "tokenizer.json";
+
 /// LAION aesthetic linear head: `score = dot(weights, emb) + bias` on the L2-normalized embedding.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AestheticHead {
@@ -82,6 +88,19 @@ impl ClipPack {
     /// True when the pack ships an aesthetic head.
     pub fn has_aesthetic(&self) -> bool {
         self.path(AESTHETIC_FILE).exists()
+    }
+
+    pub fn text_model(&self) -> PathBuf {
+        self.path(TEXT_MODEL_FILE)
+    }
+
+    pub fn tokenizer_json(&self) -> PathBuf {
+        self.path(TOKENIZER_FILE)
+    }
+
+    /// True when the pack ships the text tower and its tokenizer (typed semantic search).
+    pub fn has_text(&self) -> bool {
+        self.path(TEXT_MODEL_FILE).exists() && self.path(TOKENIZER_FILE).exists()
     }
 
     /// Parse the aesthetic head if present, `None` otherwise.

@@ -817,6 +817,32 @@ pub fn embed_clip(
     Ok((emb, score))
 }
 
+/// Embed a text query with the CLIP text tower; blocking, L2-normalized 512-d embedding for cosine
+/// ranking against the image index. Serialized with generation like `embed_clip`.
+pub fn embed_clip_text(
+    lib_dir: PathBuf,
+    pack_dir: PathBuf,
+    query: String,
+) -> Result<Vec<f32>, String> {
+    let _gate = run_lock().lock();
+    drop_generation_caches();
+    let t = Instant::now();
+    let pack = local_clip::ClipPack::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
+    if !pack.has_text() {
+        return Err("pack has no text_model.bin + tokenizer.json".into());
+    }
+    let slot = warm_util_cache(&lib_dir)?;
+    let cache = slot.as_ref().ok_or("util cache empty after load")?;
+    let session = local_clip::Session::new(&cache.backend).map_err(|e| format!("session: {e}"))?;
+    if let Err(e) = session.set_htp_performance_mode() {
+        log::warn!("local-clip: performance mode unavailable: {e}");
+    }
+    let emb = local_clip::embed_text(&pack, &session, &cache.system, &query)
+        .map_err(|e| format!("embed: {e}"))?;
+    log::info!("local-clip: text query -> {}-d in {:.2}s", emb.len(), t.elapsed().as_secs_f32());
+    Ok(emb)
+}
+
 /// Run the WD14 tagger on encoded image bytes; blocking, ranked tags or an error string. Serialized
 /// with generation (one HTP session at a time) and drops any resident SD/Anima cache first.
 pub fn read_tags(

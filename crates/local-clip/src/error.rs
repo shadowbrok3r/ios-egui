@@ -28,6 +28,9 @@ pub enum Error {
     #[error("model graph has no {0} tensors")]
     NoTensors(&'static str),
 
+    #[error("tokenizer: {0}")]
+    Tokenizer(String),
+
     #[error("{0}")]
     Msg(String),
 }

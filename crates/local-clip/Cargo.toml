@@ -12,3 +12,4 @@ log = { workspace = true }
 memmap2 = "0.9"
 qnn-rs = { path = "../qnn-rs" }
 thiserror = "2.0.19"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }

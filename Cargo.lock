@@ -3877,6 +3877,7 @@ dependencies = [
  "memmap2",
  "qnn-rs",
  "thiserror 2.0.19",
+ "tokenizers",
 ]
 
 [[package]]

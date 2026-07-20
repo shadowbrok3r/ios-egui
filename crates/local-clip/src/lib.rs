@@ -29,9 +29,11 @@ mod error;
 pub mod embed;
 pub mod img;
 pub mod pack;
+pub mod text;
 
 pub use embed::{aesthetic_score, cosine, embed, embed_bytes, embed_image, l2_normalize};
 pub use error::{Error, Result};
 pub use img::{center_crop_offset, fit_shortest, normalize_nchw, preprocess, CLIP_MEAN, CLIP_STD, INPUT_SIZE};
-pub use pack::{parse_aesthetic, AestheticHead, ClipPack, AESTHETIC_FILE, MARKER};
+pub use pack::{parse_aesthetic, AestheticHead, ClipPack, AESTHETIC_FILE, MARKER, TEXT_MODEL_FILE, TOKENIZER_FILE};
+pub use text::{build_inputs, embed_text, encode_query, BOS, CONTEXT_LEN, EOS};
 pub use qnn_rs::{prepare_htp_env, Backend, Context as QnnContext, ContextOpts, QnnSystem, Session};

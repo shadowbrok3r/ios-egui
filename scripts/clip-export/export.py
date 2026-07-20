@@ -9,6 +9,13 @@ Pipeline (each stage skippable with --from):
   4. context         qnn-context-binary-generator  model.dlc + HTP -> context .bin
   5. pack            assemble <out>/ : CLIPV marker, model.bin, optional aesthetic.bin
 
+With --text the SAME stages also build the CLIP text tower into the same pack dir:
+onnx/text_model.onnx + tokenizer.json are fetched, input_ids/attention_mask are pinned to
+[1,77] (int64 -> int32 externally so the QAIRT converter and qnn-rs I32 path both accept
+them), the graph is trimmed to text_embeds [1,512], converted to clip_text.dlc, and its
+context binary is copied to text_model.bin next to tokenizer.json. Typed semantic search on
+device needs both text_model.bin and tokenizer.json.
+
 This script is meant to run ON THE MACHINE WHERE THE QAIRT/QNN SDK LIVES. It never
 runs the SDK tools itself here unless they are present; each SDK stage checks its tool and
 fails with a clear message otherwise.
@@ -47,9 +54,14 @@ from pathlib import Path
 HF_HOST = "https://huggingface.co"
 DEFAULT_REPO = "Xenova/clip-vit-base-patch32"
 VISION_REMOTE = "onnx/vision_model.onnx"
+TEXT_REMOTE = "onnx/text_model.onnx"
+TOKENIZER_REMOTE = "tokenizer.json"
 INPUT_SIZE = 224
 EMBED_DIM = 512
 EMBED_OUTPUT = "image_embeds"
+TEXT_EMBED_OUTPUT = "text_embeds"
+CONTEXT_LEN = 77
+TEXT_NAME = "clip_text"
 AESTHETIC_PTH = "sa_0_4_vit_b_32_linear.pth"
 AESTHETIC_URL = f"https://raw.githubusercontent.com/LAION-AI/aesthetic-predictor/main/{AESTHETIC_PTH}"
 STAGES = ["download", "shape", "convert", "lib", "context", "pack"]
@@ -150,17 +162,17 @@ def download(repo: str, work: Path, want_aesthetic: bool) -> Path:
     return onnx
 
 
-def pick_embedding_output(model) -> str:
+def pick_embedding_output(model, want: str = EMBED_OUTPUT) -> str:
     outs = list(model.graph.output)
     for o in outs:
-        if o.name == EMBED_OUTPUT:
+        if o.name == want:
             return o.name
     # Fallback: the rank-2 [1, N] pooled/projected embedding.
     for o in outs:
         if len(o.type.tensor_type.shape.dim) == 2:
-            print(f"warn: no '{EMBED_OUTPUT}' output; using rank-2 output '{o.name}'", file=sys.stderr)
+            print(f"warn: no '{want}' output; using rank-2 output '{o.name}'", file=sys.stderr)
             return o.name
-    print(f"warn: no image_embeds / rank-2 output; using first output '{outs[0].name}'", file=sys.stderr)
+    print(f"warn: no {want} / rank-2 output; using first output '{outs[0].name}'", file=sys.stderr)
     return outs[0].name
 
 
@@ -198,6 +210,99 @@ def fix_shape(onnx_in: Path, onnx_out: Path) -> None:
         import onnx.utils  # type: ignore
         note(f"trimming outputs {out_names} -> ['{emb}']")
         onnx.utils.extract_model(str(onnx_out), str(onnx_out), [inp.name], [emb])
+
+
+def cast_int64_inputs_to_int32(model) -> None:
+    # QAIRT chokes on int64 graph inputs; declare each int64 input as int32 and prepend a
+    # Cast(int32->int64) whose output reuses the original input name, so consumers are unchanged.
+    from onnx import TensorProto, helper  # type: ignore
+
+    g = model.graph
+    casts, new_inputs = [], []
+    for inp in list(g.input):
+        tt = inp.type.tensor_type
+        if tt.elem_type != TensorProto.INT64:
+            new_inputs.append(inp)
+            continue
+        dims = [d.dim_value for d in tt.shape.dim]
+        new_inputs.append(helper.make_tensor_value_info(inp.name + "_i32", TensorProto.INT32, dims))
+        casts.append(helper.make_node("Cast", [inp.name + "_i32"], [inp.name],
+                                      to=TensorProto.INT64, name=f"cast_{inp.name}_to_i64"))
+        note(f"text input '{inp.name}' int64 -> int32 (external), Cast to int64 inside")
+    if not casts:
+        return
+    del g.input[:]
+    g.input.extend(new_inputs)
+    nodes = list(g.node)
+    del g.node[:]
+    g.node.extend(casts + nodes)
+
+
+def fix_text_shape(onnx_in: Path, onnx_out: Path) -> None:
+    try:
+        import onnx  # type: ignore
+    except ImportError:
+        die("python 'onnx' package required for the shape stage (pip install onnx)")
+    model = onnx.load(str(onnx_in))
+    for inp in model.graph.input:
+        dims = inp.type.tensor_type.shape.dim
+        if len(dims) != 2:
+            print(f"warn: text input '{inp.name}' rank {len(dims)} != 2 (expected [batch, seq])", file=sys.stderr)
+            continue
+        dims[0].ClearField("dim_param")
+        dims[0].dim_value = 1
+        dims[1].ClearField("dim_param")
+        dims[1].dim_value = CONTEXT_LEN
+        note(f"text input '{inp.name}' fixed to [1, {CONTEXT_LEN}]")
+    cast_int64_inputs_to_int32(model)
+    emb = pick_embedding_output(model, TEXT_EMBED_OUTPUT)
+    out_names = [o.name for o in model.graph.output]
+    in_names = [i.name for i in model.graph.input]
+    note(f"text embedding output '{emb}' (all outputs: {out_names})")
+    onnx.save(model, str(onnx_out))
+    if len(out_names) > 1:
+        import onnx.utils  # type: ignore
+        note(f"trimming outputs {out_names} -> ['{emb}']")
+        onnx.utils.extract_model(str(onnx_out), str(onnx_out), in_names, [emb])
+
+
+def gen_context_binary(sdk: Path, out_dir: Path, name: str, dlc: Path, args) -> Path:
+    # DLC + HTP -> offline context binary; out_dir is per-tower so the *.bin fallback can't collide.
+    htp_backend = sdk / "lib" / "x86_64-linux-clang" / "libQnnHtp.so"
+    if not htp_backend.exists():
+        die(f"missing HTP backend {htp_backend}")
+    gen = sdk_tool(sdk, "qnn-context-binary-generator")
+    htp_cfg = out_dir / f"htp_{args.dsp_arch}.json"
+    htp_cfg.write_text(
+        '{\n'
+        f'  "graphs": [{{"graph_names": ["{name}"], "vtcm_mb": {args.vtcm_mb}, "fp16_relaxed_precision": 1, "O": 3.0}}],\n'
+        f'  "devices": [{{"dsp_arch": "{args.dsp_arch}", "cores": [{{"core_id": 0, "perf_profile": "burst", "rpc_control_latency": 100}}]}}]\n'
+        '}\n'
+    )
+    dlc_loader = sdk / "lib" / "x86_64-linux-clang" / "libQnnModelDlc.so"
+    if not dlc_loader.exists():
+        die(f"missing {dlc_loader}")
+    ctx_bin = out_dir / f"{name}_ctx.bin"
+    gen_args = ["--model", str(dlc_loader), "--dlc_path", str(dlc),
+                "--backend", str(htp_backend), "--binary_file", str(ctx_bin),
+                "--output_dir", str(out_dir), "--htp_socs", args.soc, "--vtcm_override", args.vtcm_mb]
+    ext_so = sdk / "lib" / "x86_64-linux-clang" / "libQnnHtpNetRunExtensions.so"
+    if ext_so.exists():
+        backend_cfg = out_dir / "backend_extensions.json"
+        backend_cfg.write_text(
+            '{"backend_extensions": {"shared_library_path": "%s", "config_file_path": "%s"}}\n'
+            % (ext_so, htp_cfg)
+        )
+        gen_args += ["--config_file", str(backend_cfg)]
+    else:
+        print(f"warn: no {ext_so} — generating with --htp_socs only", file=sys.stderr)
+    run_native_tool(gen, gen_args, sdk)
+    if not ctx_bin.exists():
+        found = [p for p in out_dir.rglob("*.bin")]
+        if not found:
+            die(f"context binary not produced under {out_dir}")
+        ctx_bin = found[0]
+    return ctx_bin
 
 
 def build_aesthetic(work: Path, out_bin: Path) -> None:
@@ -240,6 +345,7 @@ def main() -> None:
     ap.add_argument("--soc", default="sm8550", help="offline-cache SoC model (default sm8550 = V73)")
     ap.add_argument("--vtcm-mb", default="8", help="VTCM budget MB (default 8)")
     ap.add_argument("--aesthetic", action="store_true", help="also build aesthetic.bin from the LAION .pth (needs torch)")
+    ap.add_argument("--text", action="store_true", help="also build the text tower (text_model.bin + tokenizer.json) for typed semantic search")
     ap.add_argument("--convert-arg", action="append", default=[], help="extra token passed through to qairt-converter (repeatable), e.g. for --desired_input_layout if it complains about NCHW")
     ap.add_argument("--from", dest="from_stage", default="download", choices=STAGES, help="skip earlier stages")
     args = ap.parse_args()
@@ -248,11 +354,21 @@ def main() -> None:
     work.mkdir(parents=True, exist_ok=True)
     onnx_raw = work / "model.onnx"
     onnx_static = work / "model_static.onnx"
+    text_onnx_raw = work / "text_model.onnx"
+    text_onnx_static = work / "text_static.onnx"
+    text_dlc = work / f"{TEXT_NAME}.dlc"
+    text_ctx_dir = work / "text_ctx"
+    tokenizer_src = work / "tokenizer.json"
 
     if stage_ge("download", args.from_stage):
         onnx_raw = download(args.repo, work, args.aesthetic)
+        if args.text:
+            fetch(text_onnx_raw, args.repo, TEXT_REMOTE)
+            fetch(tokenizer_src, args.repo, TOKENIZER_REMOTE)
     if stage_ge("shape", args.from_stage):
         fix_shape(onnx_raw, onnx_static)
+        if args.text:
+            fix_text_shape(text_onnx_raw, text_onnx_static)
 
     # Stages 2-4 need the SDK; resolve it lazily so the download/shape stages work without one.
     need_sdk = any(stage_ge(s, args.from_stage) for s in ("convert", "lib", "context"))
@@ -281,6 +397,12 @@ def main() -> None:
         run_py_tool(args.python, conv, conv_args, sdk)
         if not model_dlc.exists():
             die(f"converter did not write {model_dlc}")
+        if args.text:
+            text_conv_args = ["--input_network", str(text_onnx_static), "--output_path", str(text_dlc),
+                              "--float_bitwidth", "16", *args.convert_arg]
+            run_py_tool(args.python, sdk_tool(sdk, "qairt-converter"), text_conv_args, sdk)
+            if not text_dlc.exists():
+                die(f"converter did not write {text_dlc}")
 
     if stage_ge("lib", args.from_stage):
         note("lib stage: not needed on the DLC route (context loads via libQnnModelDlc.so)")
@@ -321,6 +443,11 @@ def main() -> None:
                 die(f"context binary not produced under {work}")
             ctx_bin = found[0]
 
+    text_ctx_bin = text_ctx_dir / f"{TEXT_NAME}_ctx.bin"
+    if stage_ge("context", args.from_stage) and args.text:
+        text_ctx_dir.mkdir(parents=True, exist_ok=True)
+        text_ctx_bin = gen_context_binary(sdk, text_ctx_dir, TEXT_NAME, text_dlc, args)
+
     if stage_ge("pack", args.from_stage):
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "CLIPV").write_text("")
@@ -331,6 +458,14 @@ def main() -> None:
         if args.aesthetic:
             build_aesthetic(work, args.out / "aesthetic.bin")
             emitted.append("aesthetic.bin")
+        if args.text:
+            if not text_ctx_bin.exists():
+                die(f"no text context binary at {text_ctx_bin} — run --text through the context stage first")
+            shutil.copyfile(text_ctx_bin, args.out / "text_model.bin")
+            if not (tokenizer_src.exists() and tokenizer_src.stat().st_size > 0):
+                die(f"tokenizer.json missing at {tokenizer_src} — run --text through the download stage first")
+            shutil.copyfile(tokenizer_src, args.out / "tokenizer.json")
+            emitted += ["text_model.bin", "tokenizer.json"]
         note(f"pack ready: {args.out}")
         for f in emitted:
             p = args.out / f

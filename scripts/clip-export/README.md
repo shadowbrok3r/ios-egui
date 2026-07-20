@@ -1,10 +1,11 @@
-# CLIP visual + aesthetic export → `local-clip` HTP pack
+# CLIP visual + aesthetic + text export → `local-clip` HTP pack
 
 `export.py` turns the **CLIP ViT-B/32 visual tower** ONNX into a Qualcomm HTP "pack"
 that the on-device `local-clip` runtime loads for image embeddings and (optionally) a
 LAION aesthetic score. It downloads the model, forces a static input shape, trims the
 graph to the single embedding output, runs the QAIRT/QNN converters, and assembles the
-pack directory.
+pack directory. With `--text` it also builds the **text tower** (`text_model.bin` +
+`tokenizer.json`) into the same pack, which enables typed semantic gallery search.
 
 The script must run **on the machine that has the QAIRT/QNN SDK** (the converters are
 x86-64 host tools). It never runs the SDK here in-repo; each SDK stage checks that its
@@ -20,6 +21,19 @@ tool exists and fails with a clear message otherwise.
   [optimum](https://github.com/huggingface/optimum)
   (`optimum-cli export onnx --model openai/clip-vit-base-patch32 ...`), then point `--repo`
   at a local dir / adjust the fetch. Confirm the projected output is `image_embeds`.
+- Text tower (`--text`): file `onnx/text_model.onnx` (`CLIPTextModelWithProjection`), inputs
+  `input_ids` / `attention_mask` `[1,77]` (int64 in ONNX), output `text_embeds` `[1,512]` (the
+  projected embedding) **and** `last_hidden_state`. The tokenizer is fetched from
+  `tokenizer.json` in the same repo. No torch needed.
+
+### int64 → int32 inputs (text)
+
+The QAIRT converter rejects int64 graph inputs, so the shape stage declares `input_ids` /
+`attention_mask` as **int32** and prepends a `Cast(int32→int64)` whose output reuses the
+original input name (consumers unchanged). On device qnn-rs feeds these two inputs via its
+`TensorIn::I32` path. The graph pools at the first EOS via an internal argmax over
+`input_ids`, so the runtime keeps BOS `49406` first, EOS `49407` last, and pads with the EOS
+id (attention_mask 0) — matching HF CLIP.
 
 ### Output trimming
 
@@ -27,7 +41,8 @@ The Rust runtime reads the graph's **sole** output. When the ONNX emits both
 `image_embeds` and `last_hidden_state`, stage 1 (`shape`) keeps only `image_embeds` via
 `onnx.utils.extract_model`. The pack contract's output is therefore the **512-d projected
 image embedding** (`image_embeds`). If a variant lacks that name, the script falls back to
-the first rank-2 `[1,N]` output and warns.
+the first rank-2 `[1,N]` output and warns. The text tower is trimmed the same way to
+`text_embeds` (same fallback).
 
 ### Aesthetic head (`--aesthetic`)
 
@@ -67,8 +82,12 @@ prediction = amodel(image_features)
 
 ```sh
 <qairt-venv>/bin/python scripts/clip-export/export.py \
-  --out ~/clip --work ~/clip-build --sdk ~/Desktop/QNN/qairt/<ver> --aesthetic
+  --out ~/clip --work ~/clip-build --sdk ~/Desktop/QNN/qairt/<ver> --aesthetic --text
 ```
+
+`--aesthetic` and `--text` are independent add-ons; pass either, both, or neither. `--text`
+runs through the same stages (a separate `clip_text.dlc` + context binary under
+`<work>/text_ctx/`) and appends `text_model.bin` + `tokenizer.json` to the pack.
 
 Defaults target an **older-arch V73** HTP build (`--dsp-arch v73 --soc sm8550`). V73
 context binaries run fine on newer HTP (V81 / S26 Ultra); building for the older arch
@@ -108,18 +127,25 @@ converter complains about layout, pass the SDK's flag through, e.g.:
 <out>/                 e.g. ~/clip
 ├── CLIPV              marker file (empty; identifies the pack)
 ├── model.bin          the HTP context binary (the visual tower graph)
-└── aesthetic.bin      optional; f32 LE [w0..w511, bias]  (only with --aesthetic)
+├── aesthetic.bin      optional; f32 LE [w0..w511, bias]  (only with --aesthetic)
+├── text_model.bin     optional; the HTP context binary (the text tower graph)  (only with --text)
+└── tokenizer.json     optional; CLIP tokenizer paired with text_model.bin       (only with --text)
 ```
 
-Push it next to the existing anima / sd / wd14 packs under the app's external files dir:
+Push it next to the existing anima / sd / wd14 packs. The durable location the app scans is
+`/storage/emulated/0/ComfyUI/clip` (survives uninstall); the app's external files dir works too:
 
 ```sh
+adb push ~/clip /storage/emulated/0/ComfyUI/clip
+# or the app-private files dir:
 adb push ~/clip /sdcard/Android/data/com.example.comfyui/files/clip
 ```
 
-On device the app scans that files dir; a `CLIPV`-marked subdir enables CLIP embeddings
-(and the aesthetic score if `aesthetic.bin` is present). CLIP packs are a distinct pack
-kind, discovered independently of the SD / Anima / WD14 packs.
+On device the app scans those dirs; a `CLIPV`-marked subdir enables CLIP embeddings (and the
+aesthetic score if `aesthetic.bin` is present). Typed **semantic gallery search** additionally
+needs **both** `text_model.bin` and `tokenizer.json` present; without them the Tags menu shows a
+dim line saying so. CLIP packs are a distinct pack kind, discovered independently of the SD /
+Anima / WD14 packs.
 
 ## Preprocessing contract
 
