@@ -278,21 +278,32 @@ pub fn sync_selection_to_ime(start: usize, end: usize, clear_composing: bool) {
 /// Non-collapsed egui selections mirror as a caret at the selection end: pushing a real range
 /// puts the selectable EditText into selection mode, which dismisses the keyboard.
 pub fn sync_caret_to_ime(start: usize, end: usize) {
-    if LAST_PREEDIT.lock().map(|g| !g.is_empty()).unwrap_or(false) {
-        return;
-    }
+    let preedit_len = LAST_PREEDIT.lock().map(|g| g.chars().count()).unwrap_or(0);
     let caret = if start == end { start } else { end } as i32;
-    let stale = match LAST_SYNC.lock() {
+    let (mirror, stale) = match LAST_SYNC.lock() {
         Ok(g) => match g.as_ref() {
             // Not seeded yet — sync_focused_text_edit owns the first push.
             None => return,
-            Some((_, s, e)) => *s != caret || *e != caret,
+            Some((_, s, e)) => (*e, *s != caret || *e != caret),
         },
         Err(_) => return,
     };
-    if stale {
-        sync_selection_to_ime(caret as usize, caret as usize, false);
+    if !stale {
+        return;
     }
+    if preedit_len > 0 {
+        // Composition active: preedit growth moves the caret too, so only a move that lands
+        // clearly outside the composing word is a user tap. Finish the composition in place
+        // first — otherwise the IME re-anchors it and retypes the word at the tap point.
+        if (caret - mirror).unsigned_abs() as usize > preedit_len {
+            if let Ok(mut g) = LAST_PREEDIT.lock() {
+                g.clear();
+            }
+            sync_selection_to_ime(caret as usize, caret as usize, true);
+        }
+        return;
+    }
+    sync_selection_to_ime(caret as usize, caret as usize, false);
 }
 
 /// Drain pending InputConnection events from Kotlin.
