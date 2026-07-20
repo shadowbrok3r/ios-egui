@@ -659,6 +659,53 @@ pub fn find_wd14_pack_many(roots: &[&Path]) -> Option<PathBuf> {
     roots.iter().find_map(|r| find_wd14_pack(r))
 }
 
+fn find_clip_pack(root: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|d| d.is_dir())
+        .find(|d| local_clip::ClipPack::is_clip_pack(d))
+}
+
+/// The first CLIP pack under any of `roots`.
+pub fn find_clip_pack_many(roots: &[&Path]) -> Option<PathBuf> {
+    roots.iter().find_map(|r| find_clip_pack(r))
+}
+
+/// Embed encoded image bytes with the CLIP pack; blocking, L2-normalized embedding plus the
+/// aesthetic score when the pack ships a head. Serialized with generation like `read_tags`.
+pub fn embed_clip(
+    lib_dir: PathBuf,
+    pack_dir: PathBuf,
+    image: Vec<u8>,
+) -> Result<(Vec<f32>, Option<f32>), String> {
+    let _gate = run_lock().lock();
+    drop_cache();
+    let t = Instant::now();
+    local_clip::prepare_htp_env(&lib_dir);
+    let pack = local_clip::ClipPack::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
+    let system = local_clip::QnnSystem::load(lib_dir.join("libQnnSystem.so"))
+        .map_err(|e| format!("QnnSystem: {e}"))?;
+    let backend =
+        local_clip::Backend::load(lib_dir.join("libQnnHtp.so")).map_err(|e| format!("Backend: {e}"))?;
+    let session = local_clip::Session::new(&backend).map_err(|e| format!("session: {e}"))?;
+    if let Err(e) = session.set_htp_performance_mode() {
+        log::warn!("local-clip: performance mode unavailable: {e}");
+    }
+    let emb = local_clip::embed_bytes(&pack, &session, &system, &image)
+        .map_err(|e| format!("embed: {e}"))?;
+    let score = match pack.aesthetic() {
+        Ok(head) => head.map(|h| local_clip::aesthetic_score(&h, &emb)),
+        Err(e) => {
+            log::warn!("local-clip: aesthetic head unreadable: {e}");
+            None
+        }
+    };
+    log::info!("local-clip: {}-d embedding in {:.2}s", emb.len(), t.elapsed().as_secs_f32());
+    Ok((emb, score))
+}
+
 /// Run the WD14 tagger on encoded image bytes; blocking, ranked tags or an error string. Serialized
 /// with generation (one HTP session at a time) and drops any resident SD/Anima cache first.
 pub fn read_tags(

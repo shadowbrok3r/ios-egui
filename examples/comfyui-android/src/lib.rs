@@ -22,6 +22,7 @@ pub mod lint;
 mod logger;
 pub mod mask;
 mod schema;
+mod clip_index;
 mod tag_index;
 pub mod tags;
 mod theme;

@@ -1269,6 +1269,7 @@ dependencies = [
  "futures",
  "image",
  "local-anima",
+ "local-clip",
  "local-sd",
  "local-wd14",
  "log",

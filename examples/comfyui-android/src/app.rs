@@ -23,7 +23,7 @@ use crate::{cooc, lint, tags};
 use crate::logger::{self, Logger};
 use crate::player::Player;
 use crate::schema::{self, SchemaSet};
-use crate::tag_index;
+use crate::{clip_index, tag_index};
 use crate::uiwf;
 use crate::types::{
     ActiveLora, Album, AppPack, AppStep, AppliedCharacter, CHECKPOINT_RECENT_MAX, CharacterCard,
@@ -740,6 +740,22 @@ struct ComfyApp {
     /// New index entries stored since the last save (writes are batched, never per frame).
     #[cfg(feature = "local-npu")]
     tag_index_dirty: usize,
+    /// Persistent CLIP embedding index (gallery key -> embedding + aesthetic score).
+    clip_index: clip_index::ClipIndex,
+    clip_index_loaded: bool,
+    clip_index_loading: Option<std::sync::mpsc::Receiver<clip_index::ClipIndex>>,
+    #[cfg(feature = "local-npu")]
+    clip_index_dirty: usize,
+    #[cfg(feature = "local-npu")]
+    clip_pack: Option<std::path::PathBuf>,
+    #[cfg(feature = "local-npu")]
+    clipemb_pending: Option<String>,
+    #[cfg(feature = "local-npu")]
+    clipemb_rx: Option<std::sync::mpsc::Receiver<(String, Result<(Vec<f32>, Option<f32>), String>)>>,
+    #[cfg(feature = "local-npu")]
+    clipemb_failed: HashSet<String>,
+    /// Similarity view: source key + ordered similar keys; overrides the gallery filters while set.
+    similar_filter: Option<(String, Vec<String>)>,
     /// Gallery client-side tag search box (session-only).
     tag_q: String,
     /// Active facet-chip tag filters, AND-combined with the search box (session-only).
@@ -1069,6 +1085,20 @@ impl ComfyApp {
             tag_index_loading: None,
             #[cfg(feature = "local-npu")]
             tag_index_dirty: 0,
+            clip_index: clip_index::ClipIndex::default(),
+            clip_index_loaded: false,
+            clip_index_loading: None,
+            #[cfg(feature = "local-npu")]
+            clip_index_dirty: 0,
+            #[cfg(feature = "local-npu")]
+            clip_pack: None,
+            #[cfg(feature = "local-npu")]
+            clipemb_pending: None,
+            #[cfg(feature = "local-npu")]
+            clipemb_rx: None,
+            #[cfg(feature = "local-npu")]
+            clipemb_failed: HashSet::new(),
+            similar_filter: None,
             tag_q: String::new(),
             tag_facets: Vec::new(),
             #[cfg(feature = "local-npu")]
@@ -1772,6 +1802,10 @@ impl ComfyApp {
                 let for_pump = self.autotag_pending.as_deref() == Some(key.as_str());
                 #[cfg(not(feature = "local-npu"))]
                 let for_pump = false;
+                #[cfg(feature = "local-npu")]
+                let for_emb = self.clipemb_pending.as_deref() == Some(key.as_str());
+                #[cfg(not(feature = "local-npu"))]
+                let for_emb = false;
                 if for_pump {
                     #[cfg(feature = "local-npu")]
                     {
@@ -1781,6 +1815,15 @@ impl ComfyApp {
                         // pump re-picks this image cheaply once idle.
                         if !self.running && !self.wd14_running {
                             self.autotag_run(ctx, host, key, bytes);
+                        }
+                    }
+                } else if for_emb {
+                    #[cfg(feature = "local-npu")]
+                    {
+                        self.clipemb_pending = None;
+                        // Same defer rule as tags: never contend with a generation or Read-tags.
+                        if !self.running && !self.wd14_running {
+                            self.clipemb_run(ctx, host, key, bytes);
                         }
                     }
                 } else if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
@@ -3895,6 +3938,54 @@ impl ComfyApp {
         if let Ok(json) = serde_json::to_string(&self.tag_index) {
             let _ = std::fs::write(&path, json);
         }
+    }
+
+    fn clip_index_path(host: &Host) -> Option<String> {
+        host.documents_dir().map(|d| format!("{d}/comfyui/clip_index.bin"))
+    }
+
+    /// Load the CLIP embedding index once on a background thread; empty on absence or junk.
+    fn ensure_clip_index_warm(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.clip_index_loaded {
+            return;
+        }
+        if let Some(rx) = &self.clip_index_loading {
+            match rx.try_recv() {
+                Ok(index) => {
+                    self.clip_index = index;
+                    self.clip_index_loaded = true;
+                    self.clip_index_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.clip_index_loaded = true;
+                    self.clip_index_loading = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
+            }
+        } else {
+            let path = Self::clip_index_path(host);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let index = path
+                    .and_then(|p| std::fs::read(&p).ok())
+                    .map(|b| clip_index::ClipIndex::from_bytes(&b))
+                    .unwrap_or_default();
+                let _ = tx.send(index);
+            });
+            self.clip_index_loading = Some(rx);
+            ctx.request_repaint();
+        }
+    }
+
+    /// Persist the CLIP embedding index and clear the batched-write counter.
+    #[cfg(feature = "local-npu")]
+    fn save_clip_index(&mut self, host: &Host) {
+        self.clip_index_dirty = 0;
+        let Some(path) = Self::clip_index_path(host) else { return };
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, self.clip_index.to_bytes());
     }
 
     /// Dict count + category for a folded tag, for styling co-oc suggestion buttons like prefix ones.
@@ -10437,30 +10528,46 @@ impl ComfyApp {
         let media = self.gallery_view.media;
         let rating = self.gallery_view.rating;
         let tag_q = self.tag_q.trim().to_string();
-        let visible: Vec<usize> = self
-            .gallery
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| media.matches(it.is_video))
-            .filter(|(_, it)| {
-                let key = it.key();
-                (tag_q.is_empty() || self.tag_index.matches(&key, &tag_q))
-                    && self.tag_facets.iter().all(|f| self.tag_index.matches(&key, f))
-                    && rating.matches(self.tag_index.is_nsfw(&key))
-            })
-            .map(|(i, _)| i)
-            .collect();
+        // A similarity view overrides the filters and keeps the ranked order.
+        let visible: Vec<usize> = if let Some((_, keys)) = &self.similar_filter {
+            let by_key: HashMap<String, usize> =
+                self.gallery.iter().enumerate().map(|(i, it)| (it.key(), i)).collect();
+            keys.iter().filter_map(|k| by_key.get(k).copied()).collect()
+        } else {
+            self.gallery
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| media.matches(it.is_video))
+                .filter(|(_, it)| {
+                    let key = it.key();
+                    (tag_q.is_empty() || self.tag_index.matches(&key, &tag_q))
+                        && self.tag_facets.iter().all(|f| self.tag_index.matches(&key, f))
+                        && rating.matches(self.tag_index.is_nsfw(&key))
+                })
+                .map(|(i, _)| i)
+                .collect()
+        };
+        if self.similar_filter.is_some() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{} Similar images", icons::SEARCH));
+                if ui.small_button("Show all").clicked() {
+                    self.similar_filter = None;
+                }
+            });
+        }
         // Facet chips reflect the currently visible set.
         let facet_keys: Vec<String> =
             visible.iter().filter_map(|&i| self.gallery.get(i).map(|it| it.key())).collect();
         let facets = self.tag_index.top_tags(&facet_keys, 12);
         self.gallery_tag_bar(ui, &facets);
-        let groups = crate::gallery::group_selected(
-            &self.gallery,
-            &visible,
-            self.gallery_view.group,
-            &self.characters,
-        );
+        // Similarity order is the point of that view; grouping would destroy it.
+        let group = if self.similar_filter.is_some() {
+            crate::types::GalleryGroup::None
+        } else {
+            self.gallery_view.group
+        };
+        let groups =
+            crate::gallery::group_selected(&self.gallery, &visible, group, &self.characters);
         let cols = self.gallery_view.columns.clamp(1, 3);
         let mut open: Option<usize> = None;
         let mut load_more = false;
@@ -11261,6 +11368,7 @@ impl ComfyApp {
             Remix,
             RemixInstant,
             SaveCharacter,
+            MoreLike,
             UseAsInput,
             Inpaint,
             Finish,
@@ -11475,6 +11583,14 @@ impl ComfyApp {
                             .clicked()
                         {
                             act = Some(Act::ReadTags);
+                        }
+                        let can_similar = !v.item.is_video && self.clip_index.contains(&v.item.key());
+                        if ui
+                            .add_enabled(can_similar, egui::Button::new(format!("{} More like this", icons::SEARCH)))
+                            .on_hover_text("Gallery images ranked by CLIP similarity (needs the clip pack + indexing)")
+                            .clicked()
+                        {
+                            act = Some(Act::MoreLike);
                             ui.close();
                         }
                         if ui
@@ -11695,6 +11811,19 @@ impl ComfyApp {
                     host.haptic(Haptic::Light);
                 } else {
                     self.gallery_status = "Loading workflow…".into();
+                }
+            }
+            Some(Act::MoreLike) => {
+                if let Some(key) = self.viewer.as_ref().map(|v| v.item.key()) {
+                    let similar: Vec<String> =
+                        self.clip_index.top_similar(&key, 60).into_iter().map(|(k, _)| k).collect();
+                    if similar.is_empty() {
+                        self.gallery_status = "No similar images indexed yet".into();
+                    } else {
+                        self.similar_filter = Some((key, similar));
+                        self.close_viewer();
+                        host.haptic(Haptic::Light);
+                    }
                 }
             }
             Some(Act::UseAsInput) => {
@@ -12160,6 +12289,7 @@ impl ComfyApp {
         roots.push(std::path::Path::new(durable));
         self.local_packs = crate::local_engine::scan_packs_many(&roots);
         self.wd14_pack = crate::local_engine::find_wd14_pack_many(&roots);
+        self.clip_pack = crate::local_engine::find_clip_pack_many(&roots);
         self.log.info(format!(
             "local-npu: {} pack(s) found: {}; wd14 pack: {} (roots: app files + {durable})",
             self.local_packs.len(),
@@ -12437,8 +12567,12 @@ impl ComfyApp {
     /// stops it choosing new work (an in-flight tag holds the run_lock and finishes).
     #[cfg(feature = "local-npu")]
     fn pump_autotag(&mut self, ctx: &egui::Context, host: &Host) {
-        // A fetch or tag is in flight — let it finish; not a pause, so don't flush.
-        if self.autotag_pending.is_some() || self.autotag_rx.is_some() {
+        // A fetch, tag, or embed is in flight — let it finish; not a pause, so don't flush.
+        if self.autotag_pending.is_some()
+            || self.autotag_rx.is_some()
+            || self.clipemb_pending.is_some()
+            || self.clipemb_rx.is_some()
+        {
             return;
         }
         let idle = self.auto_tag
@@ -12469,12 +12603,79 @@ impl ComfyApp {
                 self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
                 ctx.request_repaint();
             }
-            // Paused (preconditions unmet) or nothing left: flush the batched writes once.
+            // Everything tagged (or tagging paused): embed the next un-embedded image, else flush.
             None => {
-                if self.tag_index_dirty > 0 {
-                    self.save_tag_index(host);
+                let next_emb = (idle && self.clip_pack.is_some() && self.clip_index_loaded)
+                    .then(|| {
+                        self.gallery.iter().find_map(|it| {
+                            if it.is_video {
+                                return None;
+                            }
+                            let key = it.key();
+                            if self.clip_index.contains(&key) || self.clipemb_failed.contains(&key) {
+                                return None;
+                            }
+                            Some((key, it.subfolder.clone(), it.filename.clone()))
+                        })
+                    })
+                    .flatten();
+                match next_emb {
+                    Some((key, subfolder, filename)) => {
+                        self.clipemb_pending = Some(key);
+                        let cache_dir = host.documents_dir();
+                        self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
+                        ctx.request_repaint();
+                    }
+                    None => {
+                        if self.tag_index_dirty > 0 {
+                            self.save_tag_index(host);
+                        }
+                        if self.clip_index_dirty > 0 {
+                            self.save_clip_index(host);
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "local-npu")]
+    fn clipemb_run(&mut self, ctx: &egui::Context, host: &Host, key: String, bytes: Vec<u8>) {
+        let (Some(lib_dir), Some(pack_dir)) = (host.native_lib_dir(), self.clip_pack.clone()) else {
+            self.clipemb_failed.insert(key);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.clipemb_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result =
+                crate::local_engine::embed_clip(std::path::PathBuf::from(lib_dir), pack_dir, bytes);
+            let _ = tx.send((key, result));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drain a finished embedding into the index; batch-save and mark failures.
+    #[cfg(feature = "local-npu")]
+    fn poll_clipemb(&mut self, host: &Host) {
+        let Some(rx) = self.clipemb_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok((key, Ok((emb, score)))) => {
+                self.clipemb_rx = None;
+                self.clip_index.insert(key, emb, score);
+                self.clip_index_dirty += 1;
+                if self.clip_index_dirty >= Self::AUTOTAG_SAVE_EVERY {
+                    self.save_clip_index(host);
+                }
+            }
+            Ok((key, Err(e))) => {
+                self.clipemb_rx = None;
+                self.log.warn(format!("clip embed {}: {e}", elide(&key, 48)));
+                self.clipemb_failed.insert(key);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.clipemb_rx = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -12547,9 +12748,11 @@ impl EguiApp for ComfyApp {
         #[cfg(feature = "local-npu")]
         self.poll_wd14();
         self.ensure_tag_index_warm(ui.ctx(), host);
+        self.ensure_clip_index_warm(ui.ctx(), host);
         #[cfg(feature = "local-npu")]
         {
             self.poll_autotag(host);
+            self.poll_clipemb(host);
             self.pump_autotag(ui.ctx(), host);
         }
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
