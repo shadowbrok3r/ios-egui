@@ -686,6 +686,10 @@ struct ComfyApp {
     viewer_after_delete: Option<(String, String)>,
     /// Scroll the Create tab to the result strip after a new image lands.
     create_scroll_bottom: bool,
+    /// Soft keyboard was visible last frame; used to detect the open edge.
+    kb_was_open: bool,
+    /// The soft keyboard opened this frame; scroll the focused field into the shrunk viewport.
+    kb_open_edge: bool,
     /// Long-press-to-paint gesture: (press start time, screen origin, cancelled-as-a-scroll).
     sel_press: Option<(f64, egui::Pos2, bool)>,
     sel_long_fired: bool,
@@ -1143,6 +1147,8 @@ impl ComfyApp {
             delete_confirm: None,
             viewer_after_delete: None,
             create_scroll_bottom: false,
+            kb_was_open: false,
+            kb_open_edge: false,
             sel_press: None,
             sel_long_fired: false,
             sel_painting: false,
@@ -3626,6 +3632,7 @@ impl ComfyApp {
     }
 
     fn settings_server_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        self.scroll_focus_into_view(ui);
         crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             ui.heading(format!("{} Server", icons::LINK));
@@ -8978,6 +8985,18 @@ impl ComfyApp {
         }
     }
 
+    /// When the soft keyboard opens, scroll the focused field into the shrunk viewport.
+    fn scroll_focus_into_view(&self, ui: &egui::Ui) {
+        if !self.kb_open_edge {
+            return;
+        }
+        if let Some(id) = ui.ctx().memory(|m| m.focused())
+            && let Some(resp) = ui.ctx().read_response(id)
+        {
+            resp.scroll_to_me(None);
+        }
+    }
+
     fn generate_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         if self.result_view.is_some() {
             let pane = ui.available_rect_before_wrap();
@@ -8995,6 +9014,7 @@ impl ComfyApp {
         });
 
         let pane = ui.available_rect_before_wrap();
+        self.scroll_focus_into_view(ui);
         crate::theme::scroll_vertical()
             .id_salt("create-main-scroll")
             .auto_shrink([false, false])
@@ -14181,6 +14201,12 @@ impl EguiApp for ComfyApp {
                 self.connect(host);
             }
         }
+
+        // Rising edge of the soft keyboard; the shrunk viewport can drop the focused field below
+        // the fold, so scroll it back into view (egui only auto-scrolls to the cursor on edits).
+        let kb_open = host.keyboard_height() > 1.0;
+        self.kb_open_edge = kb_open && !self.kb_was_open;
+        self.kb_was_open = kb_open;
 
         for m in self.engine.as_ref().unwrap().drain() {
             self.handle(ui.ctx(), host, m);

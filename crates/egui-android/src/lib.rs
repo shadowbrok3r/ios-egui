@@ -48,6 +48,8 @@ struct Adapter {
     ime_synced_focus: Option<egui::Id>,
     /// Force one egui→EditText sync after a text-actions bar edit (paste/cut/select-all).
     ime_force_sync: bool,
+    /// Points subtracted from `screen_rect.max.y` this frame for the soft keyboard.
+    ime_inset_pt: f32,
 }
 
 impl Adapter {
@@ -70,10 +72,6 @@ impl eframe::App for Adapter {
             self.app.on_start(ui.ctx(), &self.host);
         }
         self.frame += 1;
-        // Feed Android WindowInsets (status bar / camera cutout / nav bar) into the host, then
-        // inset the UI so app content isn't drawn under the system bars (Android 15 is edge-to-edge
-        // by default). Apps can still read `host.safe_area_insets()` for finer control.
-        crate::host::update_insets(&self.host, ui.ctx().pixels_per_point());
         // While a tap is on the bar, disable click-away focus surrender so the focused text
         // field (or plugin viewport) still has focus when the queued event lands.
         // Do NOT clear `bar_touch` on pointer-up here: the click is processed on the release
@@ -156,19 +154,16 @@ impl eframe::App for Adapter {
             });
         }
         let insets = self.host.safe_area_insets();
+        // `screen_rect` was shortened by the keyboard in `raw_input_hook`; `rect` is that reduced
+        // area (given to the app), `full_rect` restores full height for the text-actions bar.
         let mut rect = ui.max_rect();
-        rect.min.x += insets.left;
-        rect.min.y += insets.top;
-        rect.max.x -= insets.right;
-        rect.max.y -= insets.bottom;
-        // `full_rect` (system-bar insets only) positions the floating text-actions bar; the app
-        // itself gets a rect shortened by the soft keyboard so bottom-anchored fields and panels
-        // reflow above it instead of hiding underneath.
-        let full_rect = rect;
-        let keyboard = self.host.keyboard_height();
-        if keyboard > 0.0 {
-            let overlap = (keyboard - insets.bottom).max(0.0);
-            rect.max.y = (rect.max.y - overlap).max(rect.min.y + 1.0);
+        let mut full_rect = rect;
+        full_rect.max.y += self.ime_inset_pt;
+        for r in [&mut rect, &mut full_rect] {
+            r.min.x += insets.left;
+            r.min.y += insets.top;
+            r.max.x -= insets.right;
+            r.max.y -= insets.bottom;
         }
         ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
             self.app.update(ui, &self.host);
@@ -316,6 +311,26 @@ impl eframe::App for Adapter {
             self.pin_text_focus(ui.ctx());
         }
         crate::host::drain(&self.host);
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Feed Android WindowInsets (status bar / camera cutout / nav bar / IME) into the host so
+        // `host.safe_area_insets()` and `host.keyboard_height()` track the current frame.
+        crate::host::update_insets(&self.host, ctx.pixels_per_point());
+        // Shrink egui's layout viewport by the keyboard's occlusion (points) so the whole UI —
+        // central panel, ctx-level windows and popups — lays out above the soft keyboard. The GL
+        // surface stays full-size; only `screen_rect` shrinks. `keyboard_height()` is in points.
+        self.ime_inset_pt = 0.0;
+        let inset = (self.host.keyboard_height() - self.host.safe_area_insets().bottom).max(0.0);
+        if inset <= 0.0 {
+            return;
+        }
+        if let Some(rect) = raw_input.screen_rect.as_mut()
+            && inset < rect.height() - 1.0
+        {
+            rect.max.y -= inset;
+            self.ime_inset_pt = inset;
+        }
     }
 }
 
@@ -480,6 +495,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
                 last_ime: None,
                 ime_synced_focus: None,
                 ime_force_sync: false,
+                ime_inset_pt: 0.0,
             }))
         }),
     );
