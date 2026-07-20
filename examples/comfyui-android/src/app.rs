@@ -827,6 +827,8 @@ struct ComfyApp {
     clipemb_failed: HashSet<String>,
     /// Similarity view: source key + ordered similar keys; overrides the gallery filters while set.
     similar_filter: Option<(String, Vec<String>)>,
+    /// The gallery grid's visible viewport this frame; gates pull-to-refresh and tile hits.
+    gallery_grid_clip: egui::Rect,
     /// Gallery client-side tag search box (session-only).
     tag_q: String,
     /// Filter box inside the all-tags browser menu (session-only).
@@ -1196,6 +1198,7 @@ impl ComfyApp {
             tag_index_loading: None,
             #[cfg(feature = "local-npu")]
             tag_index_dirty: 0,
+            gallery_grid_clip: egui::Rect::NOTHING,
             tag_browse_q: String::new(),
             index_filter: 0,
             clip_index: clip_index::ClipIndex::default(),
@@ -10744,7 +10747,8 @@ impl ComfyApp {
         ui.horizontal(|ui| {
             let refresh_w = 40.0;
             let view_w = 72.0;
-            let search_w = (ui.available_width() - refresh_w - view_w - 8.0).max(96.0);
+            let tags_w = 60.0;
+            let search_w = (ui.available_width() - refresh_w - view_w - tags_w - 12.0).max(96.0);
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.gallery_q)
                     .hint_text(format!("{} search", icons::SEARCH))
@@ -10760,6 +10764,8 @@ impl ComfyApp {
             {
                 changed = true;
             }
+
+            up_menu(ui, "Tags".to_string(), |ui| self.tags_menu_ui(ui));
 
             up_menu(ui, format!("{} View", icons::GALLERY), |ui| {
                 if ui
@@ -10803,6 +10809,18 @@ impl ComfyApp {
                             self.gallery_view.groups_open = !self.gallery_view.groups_open;
                         }
                     }
+                });
+
+                ui.menu_button(format!("Rating · {}", self.gallery_view.rating.label()), |ui| {
+                    for r in RatingFilter::ALL {
+                        ui.selectable_value(&mut self.gallery_view.rating, *r, r.label());
+                    }
+                    ui.separator();
+                    ui.weak("Unindexed images count as Safe.");
+                    ui.separator();
+                    ui.selectable_value(&mut self.index_filter, 0, "Indexed + not");
+                    ui.selectable_value(&mut self.index_filter, 1, "Indexed only");
+                    ui.selectable_value(&mut self.index_filter, 2, "Unindexed only");
                 });
 
                 ui.menu_button(format!("Columns · {}", self.gallery_view.columns), |ui| {
@@ -10965,59 +10983,43 @@ impl ComfyApp {
 
     /// Compact client-side tag filter row: search box, rating selector, and facet chips over the
     /// currently visible items. All filtering is local (auto-tag index); nothing re-queries.
+    /// The all-tags browser: search box over every indexed tag with counts, tap to toggle a facet.
+    fn tags_menu_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add(
+            egui::TextEdit::singleline(&mut self.tag_browse_q)
+                .hint_text("filter tags")
+                .desired_width(180.0),
+        );
+        let keys: Vec<String> = self.gallery.iter().map(|it| it.key()).collect();
+        let all = self.tag_index.top_tags(&keys, 400);
+        let q = self.tag_browse_q.trim().to_lowercase();
+        egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+            for (tag, n) in all.iter().filter(|(t, _)| q.is_empty() || t.contains(&q)) {
+                let on = self.tag_facets.contains(tag);
+                if ui.selectable_label(on, format!("{tag}  ({n})")).clicked() {
+                    if on {
+                        self.tag_facets.retain(|f| f != tag);
+                    } else {
+                        self.tag_facets.push(tag.clone());
+                    }
+                }
+            }
+        });
+    }
+
     fn gallery_tag_bar(&mut self, ui: &mut egui::Ui, facets: &[(String, usize)]) {
         if self.tag_index.is_empty() {
             return;
         }
         ui.horizontal(|ui| {
-            let rating_w = 88.0;
-            let tags_w = 58.0;
             let clear = !self.tag_q.is_empty() || !self.tag_facets.is_empty();
             let clear_w = if clear { 34.0 } else { 0.0 };
-            let box_w = (ui.available_width() - rating_w - tags_w - clear_w - 16.0).max(72.0);
+            let box_w = (ui.available_width() - clear_w - 8.0).max(72.0);
             ui.add(
                 egui::TextEdit::singleline(&mut self.tag_q)
                     .hint_text(format!("{} tags", icons::SEARCH))
                     .desired_width(box_w),
             );
-            let rating_label = match self.gallery_view.rating {
-                RatingFilter::All => format!("{} All", icons::STAR),
-                RatingFilter::Safe => "Safe".to_string(),
-                RatingFilter::Nsfw => "NSFW".to_string(),
-            };
-            ui.menu_button("Tags", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.tag_browse_q)
-                        .hint_text("filter tags")
-                        .desired_width(180.0),
-                );
-                let keys: Vec<String> = self.gallery.iter().map(|it| it.key()).collect();
-                let all = self.tag_index.top_tags(&keys, 400);
-                let q = self.tag_browse_q.trim().to_lowercase();
-                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                    for (tag, n) in all.iter().filter(|(t, _)| q.is_empty() || t.contains(&q)) {
-                        let on = self.tag_facets.contains(tag);
-                        if ui.selectable_label(on, format!("{tag}  ({n})")).clicked() {
-                            if on {
-                                self.tag_facets.retain(|f| f != tag);
-                            } else {
-                                self.tag_facets.push(tag.clone());
-                            }
-                        }
-                    }
-                });
-            });
-            ui.menu_button(rating_label, |ui| {
-                for r in RatingFilter::ALL {
-                    ui.selectable_value(&mut self.gallery_view.rating, *r, r.label());
-                }
-                ui.separator();
-                ui.weak("Unindexed images count as Safe.");
-                ui.separator();
-                ui.selectable_value(&mut self.index_filter, 0, "Indexed + not");
-                ui.selectable_value(&mut self.index_filter, 1, "Indexed only");
-                ui.selectable_value(&mut self.index_filter, 2, "Unindexed only");
-            });
             if clear && ui.button(icons::CLOSE).on_hover_text("Clear tag filters").clicked() {
                 self.tag_q.clear();
                 self.tag_facets.clear();
@@ -11333,12 +11335,13 @@ impl ComfyApp {
             return false;
         }
         let at_top = self.gallery_scroll_y <= 1.0;
-        let (pressed, released, down, delta_y) = ui.input(|i| {
+        let (pressed, released, down, delta_y, pos) = ui.input(|i| {
             (
                 i.pointer.any_pressed(),
                 i.pointer.any_released(),
                 i.pointer.any_down(),
                 i.pointer.delta().y,
+                i.pointer.interact_pos(),
             )
         });
 
@@ -11349,7 +11352,10 @@ impl ComfyApp {
         }
 
         if pressed {
-            self.gallery_pull_tracking = at_top;
+            // Only presses starting inside the grid arm the pull — a drag on the tag chip row
+            // or header must never turn into a refresh.
+            let in_grid = pos.is_some_and(|p| self.gallery_grid_clip.contains(p));
+            self.gallery_pull_tracking = at_top && in_grid;
             self.gallery_pull = 0.0;
         }
 
@@ -11733,6 +11739,8 @@ impl ComfyApp {
     /// space. In the grid, tiles stay square so rows line up.
     fn gallery_grid(&mut self, ui: &mut egui::Ui, indices: &[usize], cols: usize) -> Option<usize> {
         let mut open = None;
+        let clip = ui.clip_rect();
+        self.gallery_grid_clip = clip;
         let spacing = ui.spacing().item_spacing.x;
         let avail = ui.available_width();
         let tile = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(48.0);
@@ -11763,7 +11771,8 @@ impl ComfyApp {
                     if !ui.is_rect_visible(rect) {
                         continue;
                     }
-                    self.tile_hits.push((rect, idx));
+                    // Clip to the viewport so a straddling tile can't catch presses under the nav bar.
+                    self.tile_hits.push((rect.intersect(clip), idx));
                     let selected = self.selected.contains(&item_key);
                     let clicked = match self.thumbs.get(&thumb_key) {
                         Some(tex) => {
