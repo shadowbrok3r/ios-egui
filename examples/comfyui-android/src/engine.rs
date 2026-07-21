@@ -1146,23 +1146,33 @@ impl Engine {
     ) {
         let key = format!("{subfolder}/{filename}");
         let thumb_key = format!("{key}#{size}");
-        if let Some(root) = cache_root.as_ref()
-            && let Some(bytes) = crate::gallery::read_full_cache(root, &key)
-            && let Some(image) = decode_thumb(&bytes, size)
-        {
-            let _ = self.tx.send(Msg::Thumb { key: thumb_key, image });
-            self.ctx.request_repaint();
-            return;
-        }
         let size_s = size.to_string();
-        let Some((http, url)) = self.authed_url(
+        // Resolved eagerly (borrows self); the task uses it only on a cache miss.
+        let net = self.authed_url(
             "/gallery/api/thumb",
             &[("subfolder", &subfolder), ("filename", &filename), ("size", &size_s)],
-        ) else {
-            return;
-        };
+        );
         let (tx, ctx, _log) = self.emitters();
         self.rt.spawn(async move {
+            // Cache-hit path off the UI thread: with a fully cached library every claim used to
+            // read + decode a multi-MB PNG synchronously (~13ms per tile — measured as the whole
+            // scroll-time frame cost).
+            if let Some(root) = cache_root {
+                let key2 = key.clone();
+                let cached = tokio::task::spawn_blocking(move || {
+                    crate::gallery::read_full_cache(&root, &key2)
+                        .and_then(|bytes| decode_thumb(&bytes, size))
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(image) = cached {
+                    let _ = tx.send(Msg::Thumb { key: thumb_key, image });
+                    ctx.request_repaint();
+                    return;
+                }
+            }
+            let Some((http, url)) = net else { return };
             if let Ok(bytes) = get_ok_bytes(&http, url).await
                 && let Some(image) = decode(&bytes)
             {

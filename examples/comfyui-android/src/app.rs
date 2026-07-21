@@ -13017,10 +13017,9 @@ impl ComfyApp {
             ui.allocate_space(egui::vec2(avail, first as f32 * row_h - spacing_y));
         }
         // Bound fetch dispatches per frame: a fast scrollbar drag lands on a fresh viewport of
-        // uncached tiles every frame, and firing ~30 fetches per frame both stalls the frame and
-        // downloads screens the user already blew past. Unclaimed tiles retry once scrolling
-        // settles; the remaining tiles of a resting viewport fill within a few frames.
-        let mut claim_budget = 6usize;
+        // uncached tiles every frame, and unbounded claims would decode/download whole screens
+        // the user already blew past. A resting 3-column viewport (~36 tiles) fills in ~3 frames.
+        let mut claim_budget = 12usize;
         for row in indices.chunks(cols).skip(first).take(last - first) {
             ui.horizontal(|ui| {
                 for &idx in row {
