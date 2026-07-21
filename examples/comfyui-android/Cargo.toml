@@ -27,6 +27,8 @@ local-npu = ["dep:local-sd", "dep:local-anima", "dep:local-wd14", "dep:local-cli
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
 egui = "0.35"
+# Thread CPU clock for the frame profiler (already in the workspace tree via qnn-rs).
+libc = "0.2"
 # default-features off drops the websocket transport: rucomfyui can't attach the auth header to its
 # progress ws, so an auth-gated server would reject it anyway — we poll /history instead.
 rucomfyui = { git = "https://github.com/philpax/rucomfyui", default-features = false, features = ["typed_nodes"] }

@@ -123,6 +123,17 @@ fn read(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Cumulative CPU time consumed by the calling thread, in ms. Deltas across a frame separate
+/// "our code was slow" from "the scheduler preempted us" (wall clock can't tell them apart).
+pub fn thread_cpu_ms() -> f32 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: ts is a valid out-pointer for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return 0.0;
+    }
+    ts.tv_sec as f32 * 1000.0 + ts.tv_nsec as f32 / 1e6
+}
+
 /// `(comm, utime+stime)` from a procfs `stat` line. comm sits in parens and may itself contain
 /// parens/spaces, so fields are split after the LAST `)`.
 fn parse_stat_ticks(stat: &str) -> Option<(String, u64)> {
@@ -217,6 +228,20 @@ mod tests {
         assert!(snap.mem_total_mb > 100.0);
         // A 300ms busy-spin spans ≥ 1 USER_HZ tick, so CPU% must be strictly positive.
         assert!(snap.cpu_pct > 0.0, "spun the whole window yet cpu_pct == 0: {snap:?}");
+    }
+
+    /// The thread clock advances with CPU work and never runs backwards.
+    #[test]
+    fn thread_clock_is_monotonic_under_load() {
+        let a = thread_cpu_ms();
+        let mut x = 0u64;
+        for i in 0..3_000_000u64 {
+            x = x.wrapping_add(i * i);
+        }
+        std::hint::black_box(x);
+        let b = thread_cpu_ms();
+        assert!(b >= a, "thread clock went backwards: {a} -> {b}");
+        assert!(b > 0.0);
     }
 
     /// A delta shorter than the guard returns nothing and keeps the anchor.

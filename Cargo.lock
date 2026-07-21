@@ -1268,6 +1268,7 @@ dependencies = [
  "flate2",
  "futures",
  "image",
+ "libc",
  "local-anima",
  "local-clip",
  "local-rewrite",

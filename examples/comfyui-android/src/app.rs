@@ -508,10 +508,12 @@ impl FrameProf {
     fn observe(
         &mut self,
         cpu_ms: f32,
+        thr_ms: f32,
         msgs_ms: f32,
         bg_ms: f32,
         bg_top: (&'static str, f32),
         tab: &str,
+        detail: &str,
         running: bool,
         log: &Logger,
     ) {
@@ -540,8 +542,9 @@ impl FrameProf {
             } else {
                 String::new()
             };
+            let det = if detail.is_empty() { String::new() } else { format!(" [{detail}]") };
             log.warn(format!(
-                "slow frame {cpu_ms:.0}ms on {tab} (msgs {msgs_ms:.0} + bg {bg_ms:.0}{bg_detail} + ui {ui_ms:.0}, running={running})"
+                "slow frame {cpu_ms:.0}ms (thr {thr_ms:.0}) on {tab}{det} (msgs {msgs_ms:.0} + bg {bg_ms:.0}{bg_detail} + ui {ui_ms:.0}, running={running})"
             ));
         }
 
@@ -626,6 +629,10 @@ struct ComfyApp {
     /// cheap fields (lengths, filters) can't see, e.g. re-tagging an already-indexed key.
     gallery_memo: Option<GalleryMemo>,
     gallery_dep_epoch: u64,
+    /// Per-frame attribution note from the active tab, folded into the slow-frame warn.
+    ui_detail: String,
+    /// Thumb fetches dispatched this frame (budgeted in the grid; reported in `ui_detail`).
+    thumb_claims_frame: usize,
     /// Translucent CPU/mem/task HUD (persisted); `perf_hud_min` collapses it to one line.
     perf_overlay: bool,
     perf_hud_min: bool,
@@ -1241,6 +1248,8 @@ impl ComfyApp {
             prefetch_scan_sig: (0, 0),
             gallery_memo: None,
             gallery_dep_epoch: 0,
+            ui_detail: String::new(),
+            thumb_claims_frame: 0,
             perf_overlay: false,
             perf_hud_min: false,
             sysmon: sysmon::Sampler::default(),
@@ -12240,10 +12249,12 @@ impl ComfyApp {
         #[cfg(feature = "local-npu")]
         self.wd14_sheet_window(ui.ctx(), host);
         if self.triage.is_some() {
+            self.ui_detail = "triage".into();
             self.triage_view(ui, host);
             return;
         }
         if self.viewer.is_some() {
+            self.ui_detail = "viewer".into();
             self.gallery_viewer(ui, host);
             self.remix_sheet_window(ui.ctx(), host);
             self.finish_sheet_window(ui.ctx(), host);
@@ -12443,6 +12454,8 @@ impl ComfyApp {
         if let Some(y) = self.gallery_scroll_restore.take() {
             scroll = scroll.vertical_scroll_offset(y);
         }
+        self.thumb_claims_frame = 0;
+        let t_grid = std::time::Instant::now();
         let scroll_out = scroll.show(ui, |ui| {
             self.gallery_grid_clip = ui.clip_rect();
             for group in &groups {
@@ -12509,6 +12522,22 @@ impl ComfyApp {
             ui.add_space(12.0);
         });
         self.gallery_scroll_y = scroll_out.state.offset.y;
+        let mode = if self.select_mode {
+            "select"
+        } else if self.ranked.is_some() {
+            "ranked"
+        } else if cols == 1 {
+            "feed"
+        } else if groups.len() > 1 || groups.first().is_some_and(|g| !g.label.is_empty()) {
+            "groups"
+        } else {
+            "grid"
+        };
+        self.ui_detail = format!(
+            "{mode}x{cols} grid {:.0}ms claims {}",
+            t_grid.elapsed().as_secs_f32() * 1000.0,
+            self.thumb_claims_frame
+        );
 
         if load_more {
             self.gallery_loading = true;
@@ -12987,6 +13016,11 @@ impl ComfyApp {
         if first > 0 {
             ui.allocate_space(egui::vec2(avail, first as f32 * row_h - spacing_y));
         }
+        // Bound fetch dispatches per frame: a fast scrollbar drag lands on a fresh viewport of
+        // uncached tiles every frame, and firing ~30 fetches per frame both stalls the frame and
+        // downloads screens the user already blew past. Unclaimed tiles retry once scrolling
+        // settles; the remaining tiles of a resting viewport fill within a few frames.
+        let mut claim_budget = 6usize;
         for row in indices.chunks(cols).skip(first).take(last - first) {
             ui.horizontal(|ui| {
                 for &idx in row {
@@ -13027,7 +13061,13 @@ impl ComfyApp {
                             ui.put(rect, img).clicked()
                         }
                         None => {
-                            if self.thumbs.claim(&thumb_key) {
+                            if claim_budget == 0 {
+                                // Out of budget with uncached tiles still visible: make sure a
+                                // frame comes to claim them even if no thumb result wakes us.
+                                ui.ctx().request_repaint_after(Duration::from_millis(120));
+                            } else if self.thumbs.claim(&thumb_key) {
+                                claim_budget -= 1;
+                                self.thumb_claims_frame += 1;
                                 let (subfolder, filename) = {
                                     let it = &self.gallery[idx];
                                     (it.subfolder.clone(), it.filename.clone())
@@ -15570,6 +15610,7 @@ impl EguiApp for ComfyApp {
 
     fn update(&mut self, ui: &mut egui::Ui, host: &Host) {
         let frame_start = std::time::Instant::now();
+        let thread_start_ms = sysmon::thread_cpu_ms();
         if self.engine.is_none() {
             self.engine = Some(Engine::new(ui.ctx().clone(), self.log.clone()));
         }
@@ -15681,7 +15722,7 @@ impl EguiApp for ComfyApp {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.inpaint_overlay(ui, host));
             self.error_modal_window(ui.ctx(), host);
-            self.end_frame(frame_start, msgs_ms, bg_ms, bg_top, "inpaint");
+            self.end_frame(frame_start, thread_start_ms, msgs_ms, bg_ms, bg_top, "inpaint");
             return;
         }
 
@@ -15699,7 +15740,7 @@ impl EguiApp for ComfyApp {
             if self.running || self.queue_remaining > 0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
             }
-            self.end_frame(frame_start, msgs_ms, bg_ms, bg_top, "graph*");
+            self.end_frame(frame_start, thread_start_ms, msgs_ms, bg_ms, bg_top, "graph*");
             return;
         }
         // If fullscreen was active but the user navigated away, release the lock.
@@ -15797,7 +15838,7 @@ impl EguiApp for ComfyApp {
             Tab::Gallery => "gallery",
             Tab::Settings => "settings",
         };
-        self.end_frame(frame_start, msgs_ms, bg_ms, bg_top, tab);
+        self.end_frame(frame_start, thread_start_ms, msgs_ms, bg_ms, bg_top, tab);
     }
 }
 
@@ -15806,15 +15847,18 @@ impl ComfyApp {
     fn end_frame(
         &mut self,
         start: std::time::Instant,
+        thread_start_ms: f32,
         msgs_ms: f32,
         bg_ms: f32,
         bg_top: (&'static str, f32),
         tab: &str,
     ) {
         let cpu_ms = start.elapsed().as_secs_f32() * 1000.0;
+        let thr_ms = (sysmon::thread_cpu_ms() - thread_start_ms).max(0.0);
+        let detail = std::mem::take(&mut self.ui_detail);
         let running = self.running;
         let log = self.log.clone();
-        self.perf.observe(cpu_ms, msgs_ms, bg_ms, bg_top, tab, running, &log);
+        self.perf.observe(cpu_ms, thr_ms, msgs_ms, bg_ms, bg_top, tab, &detail, running, &log);
     }
 
     /// Raise the blocking error dialog with the full text (status lines stay elided). An identical
