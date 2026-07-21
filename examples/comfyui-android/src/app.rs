@@ -2093,18 +2093,19 @@ impl ComfyApp {
                 }
                 if self.prefetch_pending.as_deref() == Some(key.as_str()) {
                     self.prefetch_pending = None;
-                    self.prefetch_failed.insert(key.clone());
                 }
+                // Poison every pump at once so no other pass re-attempts the same file.
+                self.prefetch_failed.insert(key.clone());
                 #[cfg(feature = "local-npu")]
                 {
                     if self.autotag_pending.as_deref() == Some(key.as_str()) {
                         self.autotag_pending = None;
-                        self.autotag_failed.insert(key.clone());
                     }
                     if self.clipemb_pending.as_deref() == Some(key.as_str()) {
                         self.clipemb_pending = None;
-                        self.clipemb_failed.insert(key.clone());
                     }
+                    self.autotag_failed.insert(key.clone());
+                    self.clipemb_failed.insert(key.clone());
                 }
                 if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
                     self.gallery_pick_pending = None;
@@ -8979,6 +8980,25 @@ impl ComfyApp {
         }
     }
 
+    /// Re-score every indexed gallery image against every character; run after a review sharpens
+    /// a centroid so the back catalog surfaces new suggestions, not just freshly indexed keys.
+    #[cfg(feature = "local-npu")]
+    fn rescan_suggestions(&mut self) {
+        if self.characters.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = self
+            .gallery
+            .iter()
+            .filter(|it| !it.is_video)
+            .map(|it| it.key())
+            .filter(|k| self.clip_index.contains(k))
+            .collect();
+        for k in keys {
+            self.suggest_for_new_key(&k);
+        }
+    }
+
     fn output(&mut self, ui: &mut egui::Ui, host: &Host) {
         // Sampling progress is on the bottom nav; keep idle notes (errors / Done) here only.
         if !self.running && self.queue_remaining == 0 && !self.status.is_empty() {
@@ -12910,6 +12930,8 @@ impl ComfyApp {
                     sug.retain(|k| !decided.contains(k));
                 }
                 self.character_centroids.remove(&card_name);
+                #[cfg(feature = "local-npu")]
+                self.rescan_suggestions();
                 self.gallery_status =
                     format!("Review: accepted {}, denied {}", t.keep.len(), t.trash.len());
                 host.haptic(Haptic::Success);
@@ -14516,8 +14538,7 @@ impl ComfyApp {
                 });
                 ui.weak("Tap a tag to add it to the prompt.");
                 ui.add_space(4.0);
-                crate::theme::scroll_vertical().show(ui, |ui| {
-                    ui.set_max_height(max_h);
+                crate::theme::scroll_vertical().max_height(max_h).auto_shrink([false, true]).show(ui, |ui| {
                     ui.set_min_width(320.0);
                     if !result.character.is_empty() {
                         ui.strong("Character");

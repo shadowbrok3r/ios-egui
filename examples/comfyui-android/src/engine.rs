@@ -1298,10 +1298,11 @@ impl Engine {
         self.rt.spawn(async move {
             match get_ok_bytes(&http, url).await {
                 Ok(bytes) => {
+                    // Cache even undecodable files (e.g. animated webp) so they never re-download.
+                    if let Some(dir) = cache_dir.as_ref() {
+                        crate::gallery::write_full_cache(dir, &key, &bytes);
+                    }
                     if let Some(image) = decode(&bytes) {
-                        if let Some(dir) = cache_dir.as_ref() {
-                            crate::gallery::write_full_cache(dir, &key, &bytes);
-                        }
                         let _ = tx.send(Msg::FullImage { key, image, bytes });
                     } else {
                         log.warn(format!("full image {key}: decode failed ({} bytes)", bytes.len()));
