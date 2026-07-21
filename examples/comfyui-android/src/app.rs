@@ -24,7 +24,7 @@ use crate::logger::{self, Logger};
 use crate::player::Player;
 use crate::schema::{self, SchemaSet};
 use crate::{clip_index, tag_index};
-use crate::uiwf;
+use crate::{sysmon, uiwf};
 use crate::types::{
     ActiveLora, Album, AppPack, AppStep, AppliedCharacter, CHECKPOINT_RECENT_MAX, CharacterCard,
     CharacterPack, CheckpointCatalog, CheckpointSort,
@@ -479,6 +479,130 @@ struct MyPrompt {
     added: f64,
 }
 
+/// Rolling per-frame CPU timing, mirrored to logcat (`adb logcat -s comfyui`) so on-device
+/// sluggishness can be traced to a screen and phase. `update()` feeds it each frame's splits.
+#[derive(Default)]
+struct FrameProf {
+    frames: u32,
+    cpu_ms: f32,
+    worst_ms: f32,
+    last_cpu_ms: f32,
+    win_start: Option<std::time::Instant>,
+    last_frame: Option<std::time::Instant>,
+    last_warn: Option<std::time::Instant>,
+}
+
+impl FrameProf {
+    /// Below this app-side CPU per frame reads as jank (two missed 60fps frames).
+    const SLOW_MS: f32 = 32.0;
+
+    /// `(last, window avg, window worst)` frame CPU ms, for the perf overlay.
+    fn stats(&self) -> (f32, f32, f32) {
+        let avg = if self.frames > 0 { self.cpu_ms / self.frames as f32 } else { 0.0 };
+        (self.last_cpu_ms, avg, self.worst_ms)
+    }
+
+    /// Record one frame: warn (throttled) on a slow one, and log a periodic framerate baseline.
+    /// `bg_top` names the slowest bg section, attributing spikes inside that bucket.
+    #[allow(clippy::too_many_arguments)]
+    fn observe(
+        &mut self,
+        cpu_ms: f32,
+        msgs_ms: f32,
+        bg_ms: f32,
+        bg_top: (&'static str, f32),
+        tab: &str,
+        running: bool,
+        log: &Logger,
+    ) {
+        let now = std::time::Instant::now();
+        // egui repaints on demand; an idle gap is not jank, so restart the window after one.
+        if self.last_frame.is_some_and(|t| (now - t).as_secs_f32() > 1.0) {
+            self.frames = 0;
+            self.cpu_ms = 0.0;
+            self.worst_ms = 0.0;
+            self.win_start = Some(now);
+        }
+        self.last_frame = Some(now);
+        self.frames += 1;
+        self.cpu_ms += cpu_ms;
+        self.last_cpu_ms = cpu_ms;
+        self.worst_ms = self.worst_ms.max(cpu_ms);
+        let win_start = *self.win_start.get_or_insert(now);
+
+        if cpu_ms >= Self::SLOW_MS
+            && self.last_warn.is_none_or(|t| (now - t).as_secs_f32() >= 0.5)
+        {
+            self.last_warn = Some(now);
+            let ui_ms = (cpu_ms - msgs_ms - bg_ms).max(0.0);
+            let bg_detail = if bg_top.1 >= 5.0 {
+                format!(" [{} {:.0}ms]", bg_top.0, bg_top.1)
+            } else {
+                String::new()
+            };
+            log.warn(format!(
+                "slow frame {cpu_ms:.0}ms on {tab} (msgs {msgs_ms:.0} + bg {bg_ms:.0}{bg_detail} + ui {ui_ms:.0}, running={running})"
+            ));
+        }
+
+        let secs = (now - win_start).as_secs_f32();
+        if secs >= 5.0 {
+            if self.frames >= 30 {
+                log.info(format!(
+                    "frames: {} in {secs:.0}s ({:.0}/s), avg cpu {:.1}ms worst {:.0}ms on {tab}",
+                    self.frames,
+                    self.frames as f32 / secs,
+                    self.cpu_ms / self.frames as f32,
+                    self.worst_ms
+                ));
+            }
+            self.frames = 0;
+            self.cpu_ms = 0.0;
+            self.worst_ms = 0.0;
+            self.win_start = Some(now);
+        }
+    }
+}
+
+/// Splits the bg phase into named sections and keeps the slowest, so a slow-frame warn can say
+/// which pump/poll/save ate the time instead of one opaque "bg" number.
+struct BgLap {
+    at: std::time::Instant,
+    worst: (&'static str, f32),
+}
+
+impl BgLap {
+    fn new() -> Self {
+        Self { at: std::time::Instant::now(), worst: ("", 0.0) }
+    }
+
+    fn lap(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        let ms = (now - self.at).as_secs_f32() * 1000.0;
+        if ms > self.worst.1 {
+            self.worst = (name, ms);
+        }
+        self.at = now;
+    }
+}
+
+/// The gallery's filtered/grouped view, rebuilt only when an input changes. Scrolling used to
+/// recompute all of this per frame: at ~1250 items that was thousands of key allocations and
+/// hash probes per frame (measured 40-230ms gallery frames).
+struct GalleryMemo {
+    sig: u64,
+    groups: Vec<crate::gallery::Group>,
+    facets: Vec<(String, usize)>,
+}
+
+/// A user-facing failure raised as a blocking dialog: full text, unlike the elided status lines.
+struct ErrorModal {
+    title: String,
+    detail: String,
+    /// Identical repeats fold into this counter instead of stacking dialogs.
+    count: u32,
+}
+
 struct ComfyApp {
     engine: Option<Engine>,
     loaded: bool,
@@ -487,6 +611,28 @@ struct ComfyApp {
     log: Logger,
     log_lines: Vec<logger::Line>,
     log_cursor: u64,
+    perf: FrameProf,
+    error_modal: Option<ErrorModal>,
+    /// The in-flight connect came from the Connect button; only that failure raises the modal
+    /// (auto-connect at launch or after sign-in stays a passive status line).
+    connect_manual: bool,
+    /// True while a background index write is in flight (starting another would race the file).
+    tag_index_saving: Arc<std::sync::atomic::AtomicBool>,
+    clip_index_saving: Arc<std::sync::atomic::AtomicBool>,
+    /// Prefetch scan cursor into `gallery` + the (generation, len) it belongs to.
+    prefetch_scan_pos: usize,
+    prefetch_scan_sig: (u64, usize),
+    /// Memoized gallery view; `gallery_dep_epoch` bumps on index mutations the signature's
+    /// cheap fields (lengths, filters) can't see, e.g. re-tagging an already-indexed key.
+    gallery_memo: Option<GalleryMemo>,
+    gallery_dep_epoch: u64,
+    /// Translucent CPU/mem/task HUD (persisted); `perf_hud_min` collapses it to one line.
+    perf_overlay: bool,
+    perf_hud_min: bool,
+    sysmon: sysmon::Sampler,
+    /// Last toast text + when it appeared, for the graph toast's auto-hide.
+    graph_toast_prev: String,
+    graph_toast_at: f64,
 
     server_url: String,
     api_key: String,
@@ -969,6 +1115,16 @@ struct ComfyApp {
     /// Skip pump_clipemb's idle cache-dir walk until this time (egui clock).
     #[cfg(feature = "local-npu")]
     clipemb_rescan_after: f64,
+    /// Un-embedded keys found by the last cache-dir walk, drained one per pump.
+    #[cfg(feature = "local-npu")]
+    clipemb_walk: Vec<String>,
+    /// `(gen, listing len, index len, failed len)` when a scan found nothing to embed — while it
+    /// matches, the pump skips its per-frame O(items) scan entirely (fully-indexed steady state).
+    #[cfg(feature = "local-npu")]
+    clipemb_covered: Option<(u64, usize, usize, usize)>,
+    /// Same latch for the auto-tag pump.
+    #[cfg(feature = "local-npu")]
+    autotag_covered: Option<(u64, usize, usize, usize)>,
 }
 
 /// Settings-pane cache numbers, computed on a worker thread: stat-ing every cached file through
@@ -1073,6 +1229,20 @@ impl ComfyApp {
             log,
             log_lines: Vec::new(),
             log_cursor: 0,
+            perf: FrameProf::default(),
+            error_modal: None,
+            connect_manual: false,
+            tag_index_saving: Arc::default(),
+            clip_index_saving: Arc::default(),
+            prefetch_scan_pos: 0,
+            prefetch_scan_sig: (0, 0),
+            gallery_memo: None,
+            gallery_dep_epoch: 0,
+            perf_overlay: false,
+            perf_hud_min: false,
+            sysmon: sysmon::Sampler::default(),
+            graph_toast_prev: String::new(),
+            graph_toast_at: 0.0,
             server_url: String::new(),
             api_key: String::new(),
             server_output_root: crate::types::default_server_output_root(),
@@ -1373,6 +1543,12 @@ impl ComfyApp {
             pack_mtimes: HashMap::new(),
             #[cfg(feature = "local-npu")]
             clipemb_rescan_after: 0.0,
+            #[cfg(feature = "local-npu")]
+            clipemb_walk: Vec::new(),
+            #[cfg(feature = "local-npu")]
+            clipemb_covered: None,
+            #[cfg(feature = "local-npu")]
+            autotag_covered: None,
         }
     }
 
@@ -1753,6 +1929,7 @@ impl ComfyApp {
             }
             Msg::Connected { schemas, models } => {
                 self.conn = Conn::Connected;
+                self.connect_manual = false;
                 // Albums and model facets are per-account, so they follow the credential.
                 self.engine.as_ref().unwrap().albums();
                 self.engine.as_ref().unwrap().facets();
@@ -1843,6 +2020,11 @@ impl ComfyApp {
                 host.haptic(Haptic::Success);
             }
             Msg::ConnectError(e) => {
+                // Only a Connect-button failure blocks; auto-connect failure (offline launch,
+                // post-sign-in reconnect) stays a passive "see Logs" status line.
+                if std::mem::take(&mut self.connect_manual) {
+                    self.report_error("Connection failed", &e);
+                }
                 self.conn = Conn::Failed(e);
                 host.haptic(Haptic::Error);
             }
@@ -1987,7 +2169,8 @@ impl ComfyApp {
                     self.running = false;
                     self.finish_pending = false;
                 }
-                self.status = format!("Error: {e}");
+                self.status = format!("Error: {}", elide(&e, 120));
+                self.report_error("Generation failed", &e);
                 host.haptic(Haptic::Error);
             }
             Msg::Workflows(names) => {
@@ -2016,7 +2199,7 @@ impl ComfyApp {
                         host.haptic(Haptic::Success);
                     }
                     Err(e) => {
-                        self.graph_status = format!("Load failed: {e}");
+                        self.report_error("Couldn't open workflow", &e);
                         self.log.error(format!("graph load: {e}"));
                         host.haptic(Haptic::Error);
                     }
@@ -2035,8 +2218,8 @@ impl ComfyApp {
             Msg::WorkflowError(e) => {
                 self.wf_loading = false;
                 self.saving = false;
-                self.graph_status = elide(&e, 200);
-                self.log.error(elide(&e, 200));
+                self.report_error("Workflow failed", &e);
+                self.log.error(elide(&e, 2000));
                 host.haptic(Haptic::Error);
             }
             Msg::Gallery { generation, page } => {
@@ -2294,6 +2477,68 @@ impl ComfyApp {
         Ok(())
     }
 
+    /// Selected models (checkpoint/UNET/VAE/encoder/LoRAs) that this server has no installed file
+    /// for, as a queue-blocking message — else `None`. An empty installed list means "unknown", so
+    /// it never blocks. Catches Create params remixed from a scraped image that referenced models
+    /// this server doesn't have (the server would otherwise reject with an opaque `ValueNotInList`).
+    fn uninstalled_model_msg(&self) -> Option<String> {
+        let schemas = self.schemas.as_ref()?;
+        let missing = |sel: &str, list: &[String]| -> bool {
+            !sel.trim().is_empty() && !list.is_empty() && !list.iter().any(|x| x == sel)
+        };
+        let mut bad: Vec<String> = Vec::new();
+        if self.params.mode == Mode::Video {
+            let v = &self.params.video;
+            let unets = schemas.unets();
+            for u in [&v.unet_high, &v.unet_low] {
+                if missing(u, &unets) {
+                    bad.push(format!("model '{}'", file_basename(u)));
+                }
+            }
+            if missing(&v.clip_name, &schemas.clips()) {
+                bad.push(format!("encoder '{}'", file_basename(&v.clip_name)));
+            }
+            if missing(&v.vae_name, &schemas.vaes()) {
+                bad.push(format!("VAE '{}'", file_basename(&v.vae_name)));
+            }
+            let loras = schemas.loras();
+            for l in v.loras_high.iter().chain(&v.loras_low) {
+                if missing(&l.file, &loras) {
+                    bad.push(format!("LoRA '{}'", file_basename(&l.file)));
+                }
+            }
+        } else {
+            match self.params.model_kind {
+                ModelKind::Checkpoint => {
+                    if missing(&self.params.checkpoint, &schemas.checkpoints()) {
+                        bad.push(format!("checkpoint '{}'", file_basename(&self.params.checkpoint)));
+                    }
+                }
+                ModelKind::Diffusion => {
+                    if missing(&self.params.unet_name, &schemas.unets()) {
+                        bad.push(format!("model '{}'", file_basename(&self.params.unet_name)));
+                    }
+                    if missing(&self.params.vae_name, &schemas.vaes()) {
+                        bad.push(format!("VAE '{}'", file_basename(&self.params.vae_name)));
+                    }
+                    let clips = schemas.clips();
+                    for c in self.params.active_clips() {
+                        if missing(c.as_str(), &clips) {
+                            bad.push(format!("encoder '{}'", file_basename(&c)));
+                        }
+                    }
+                }
+            }
+            let loras = schemas.loras();
+            for l in &self.params.loras {
+                if missing(&l.file, &loras) {
+                    bad.push(format!("LoRA '{}'", file_basename(&l.file)));
+                }
+            }
+        }
+        (!bad.is_empty()).then(|| format!("Not on this server: {} — pick installed model(s)", bad.join(", ")))
+    }
+
     /// Video-mode preflight: the Wan nodes must exist, the models must be chosen, and a selected
     /// device-photo source must have a photo.
     fn can_queue_video(&self) -> Result<(), &'static str> {
@@ -2351,6 +2596,21 @@ impl ComfyApp {
     fn start_generation(&mut self, ctx: &egui::Context, host: &Host) {
         if let Err(e) = self.can_queue_create() {
             self.status = e.into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        // On the server path, block selections this server has no file for, with a clear reason
+        // (the local NPU uses its own packs, so skip the check there).
+        #[cfg(feature = "local-npu")]
+        let local = self.route_local_gen();
+        #[cfg(not(feature = "local-npu"))]
+        let local = false;
+        if !local
+            && let Some(msg) = self.uninstalled_model_msg()
+        {
+            self.log.error(format!("preflight: {msg}"));
+            self.status = elide(&msg, 120);
+            self.report_error("Can't queue", msg);
             host.haptic(Haptic::Warning);
             return;
         }
@@ -2508,37 +2768,73 @@ impl ComfyApp {
     fn queue_graph(&mut self, ctx: &egui::Context, host: &Host) {
         let Some(schemas) = self.schemas.clone() else {
             self.graph_status = "Connect to the server first".into();
+            host.haptic(Haptic::Warning);
             return;
         };
-        let Some(doc) = self.active_doc_mut() else { return };
-        // Roll seeds marked randomize before export (ComfyUI control_after_generate client-side).
-        graphview::apply_pending_seed_rolls(&mut doc.graph.snarl, &doc.seed_randomize);
-        // UI export + convert respects bypass (mode 4); the snarl API path does not.
-        let ui_json = doc.view.export_ui(&doc.graph, &schemas, &doc.bypassed, &doc.seed_randomize);
+        // Export the active graph to UI json, releasing the doc borrow before we touch `self` again.
+        let ui_json = {
+            let Some(doc) = self.active_doc_mut() else {
+                self.graph_status = "Open a graph tab first".into();
+                host.haptic(Haptic::Warning);
+                return;
+            };
+            // Roll seeds marked randomize before export (ComfyUI control_after_generate client-side).
+            graphview::apply_pending_seed_rolls(&mut doc.graph.snarl, &doc.seed_randomize);
+            // UI export + convert respects bypass (mode 4); the snarl API path does not.
+            doc.view.export_ui(&doc.graph, &schemas, &doc.bypassed, &doc.seed_randomize)
+        };
         let converted = match uiwf::convert(&ui_json, &schemas) {
             Ok(c) => c,
             Err(e) => {
-                self.graph_status = format!("Queue failed: {e}");
+                self.log.error(format!("graph convert failed: {e}"));
+                self.report_error("Can't queue this graph", &e);
                 host.haptic(Haptic::Error);
                 return;
             }
         };
-        let wf = converted.workflow;
+        // Conversion warnings (dropped links, muted nodes) are why a graph can silently go invalid.
+        for w in &converted.warnings {
+            self.log.warn(format!("graph convert: {w}"));
+        }
+        let mut wf = converted.workflow;
         if wf.0.is_empty() {
             self.graph_status = "Graph is empty".into();
+            host.haptic(Haptic::Warning);
             return;
         }
-        // export_ui uses snarl id + 1 as the UI/API node id.
-        doc.node_map = doc
-            .graph
-            .snarl
-            .node_ids()
-            .filter(|(nid, _)| !doc.bypassed.contains(nid))
-            .map(|(nid, _)| ((nid.0 as u32).saturating_add(1), nid))
-            .filter(|(wid, _)| wf.0.contains_key(&WorkflowNodeId(*wid)))
-            .collect();
-        doc.outputs.clear();
-        doc.graph.populate_output_images("none", std::iter::empty());
+        // Repairs: snap stale file paths / clip types to what this server actually has installed.
+        for n in crate::preflight::snap_installed_enums(&mut wf, &schemas) {
+            self.log.info(format!("repair: {n}"));
+        }
+        for n in crate::workflow::sanitize_clip_types(&mut wf, &schemas) {
+            self.log.info(format!("repair: {n}"));
+        }
+        // Pre-flight: block on anything the server would reject (missing sockets, uninstalled
+        // models) with a clear reason, rather than queueing and letting the run "immediately stop".
+        let problems = crate::preflight::validate(&wf, &schemas);
+        if !problems.is_empty() {
+            for p in &problems {
+                self.log.error(format!("preflight: {}", p.message()));
+            }
+            let detail: Vec<String> = problems.iter().map(|p| p.message()).collect();
+            self.report_error("Can't queue this graph", detail.join("\n\n"));
+            host.haptic(Haptic::Error);
+            return;
+        }
+        // Point of no return: record the id map, reset run state, and submit.
+        if let Some(doc) = self.active_doc_mut() {
+            // export_ui uses snarl id + 1 as the UI/API node id.
+            doc.node_map = doc
+                .graph
+                .snarl
+                .node_ids()
+                .filter(|(nid, _)| !doc.bypassed.contains(nid))
+                .map(|(nid, _)| ((nid.0 as u32).saturating_add(1), nid))
+                .filter(|(wid, _)| wf.0.contains_key(&WorkflowNodeId(*wid)))
+                .collect();
+            doc.outputs.clear();
+            doc.graph.populate_output_images("none", std::iter::empty());
+        }
         let n = wf.0.len();
         let fresh = !self.running;
         self.run_seq += 1;
@@ -2559,12 +2855,6 @@ impl ComfyApp {
         };
         self.graph_status.clear();
         self.pending_job_labels.push_back("Graph".into());
-        let mut wf = wf;
-        if let Some(schemas) = self.schemas.as_deref() {
-            for n in crate::workflow::sanitize_clip_types(&mut wf, schemas) {
-                self.log.info(format!("repair: {n}"));
-            }
-        }
         self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json));
         host.haptic(Haptic::Medium);
     }
@@ -2637,16 +2927,19 @@ impl ComfyApp {
                 self.create_sync_fp = params_fingerprint(&self.params);
                 self.create_graph_export_fp = self.linked_export_fingerprint().unwrap_or(0);
                 self.create_sync_dirty_at = None;
-                self.graph_status = if placeholder {
-                    // Say it plainly: queueing this tab as-is will not find the image.
-                    format!(
-                        "LoadImage is a placeholder ('{}') — Create re-uploads the input at queue \
-                         time. Queue from Create, or set a real filename here.",
-                        crate::engine::INPUT_IMAGE_NAME
-                    )
-                } else {
-                    String::new()
-                };
+                // Say it plainly: queueing this tab as-is will not find the image. Full text in
+                // the dialog — the toast would truncate the remedy and fade in seconds.
+                if placeholder {
+                    self.report_error(
+                        "Placeholder input image",
+                        format!(
+                            "LoadImage is a placeholder ('{}') — Create re-uploads the input at \
+                             queue time. Queue from Create, or set a real filename here.",
+                            crate::engine::INPUT_IMAGE_NAME
+                        ),
+                    );
+                }
+                self.graph_status.clear();
                 self.tab = Tab::Graph;
                 self.graph_pane = GraphPane::Canvas;
                 self.status.clear();
@@ -2971,6 +3264,8 @@ impl ComfyApp {
             self.inpaint = None;
             return;
         }
+        // Pinch/pan reads raw input, which the error dialog's scrim can't intercept.
+        let modal_open = self.error_modal.is_some();
 
         if let Some(st) = self.inpaint.as_mut()
             && !st.input_inited
@@ -3100,7 +3395,9 @@ impl ComfyApp {
             // its first finger may have started in the frames before it registered.
             let mt = ui.input(|i| i.multi_touch());
             let any_down = ui.input(|i| i.pointer.any_down());
-            if let Some(mt) = &mt {
+            if let Some(mt) = &mt
+                && !modal_open
+            {
                 if st.stroke_active {
                     if let Some(start) = st.groups.pop() {
                         st.strokes.truncate(start);
@@ -3122,7 +3419,7 @@ impl ComfyApp {
                 st.nav_latch = false;
             }
             // Desktop: ctrl+scroll (folded into zoom_delta) zooms about the pointer when not pinching.
-            if mt.is_none() {
+            if mt.is_none() && !modal_open {
                 let zd = ui.input(|i| i.zoom_delta());
                 if (zd - 1.0).abs() > 1e-3 {
                     let f = resp.hover_pos().unwrap_or(fitted.center());
@@ -3381,6 +3678,7 @@ impl ComfyApp {
             gallery_semantic: self.gallery_semantic,
             gallery_page: self.gallery_page_size(),
             auto_follow: self.auto_follow,
+            perf_overlay: self.perf_overlay,
             auto_arrange: self.auto_arrange,
             fonts: self.fonts.clone(),
             workflow_name,
@@ -3462,6 +3760,7 @@ impl ComfyApp {
         self.gallery_semantic = saved.gallery_semantic;
         self.gallery_page = saved.gallery_page.clamp(20, GALLERY_PAGE_MAX);
         self.auto_follow = saved.auto_follow;
+        self.perf_overlay = saved.perf_overlay;
         self.auto_arrange = saved.auto_arrange;
         self.fonts = saved.fonts;
         self.fonts.clamp();
@@ -3792,6 +4091,7 @@ impl ComfyApp {
                     let enabled = !connecting && !self.server_url.trim().is_empty();
                     let btn = egui::Button::new(label).min_size(egui::vec2(120.0, 32.0));
                     if ui.add_enabled(enabled, btn).clicked() {
+                        self.connect_manual = true;
                         self.connect(host);
                     }
                     self.conn_status(ui);
@@ -4294,6 +4594,7 @@ impl ComfyApp {
             match rx.try_recv() {
                 Ok(index) => {
                     self.tag_index = index;
+                    self.gallery_dep_epoch += 1;
                     self.tag_index_loaded = true;
                     self.tag_index_loading = None;
                 }
@@ -4320,15 +4621,35 @@ impl ComfyApp {
 
     /// Persist the auto-tag index and clear the batched-write counter.
     #[cfg(feature = "local-npu")]
+    /// Serialize + write on a background thread (a ~2MB JSON write to FUSE stalls the UI for
+    /// hundreds of ms). A save already in flight defers: dirty stays set and the pump retries.
     fn save_tag_index(&mut self, host: &Host) {
+        let Some(path) = Self::tag_index_path(host) else {
+            self.tag_index_dirty = 0;
+            return;
+        };
+        if self.tag_index_saving.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.tag_index_dirty = 0;
-        let Some(path) = Self::tag_index_path(host) else { return };
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(json) = serde_json::to_string(&self.tag_index) {
-            let _ = std::fs::write(&path, json);
-        }
+        let index = self.tag_index.clone();
+        let flag = self.tag_index_saving.clone();
+        let log = self.log.clone();
+        std::thread::spawn(move || {
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // tmp + rename so a crash mid-write can't leave a torn index for the next launch.
+            let tmp = format!("{path}.tmp");
+            let ok = serde_json::to_string(&index)
+                .map_err(|e| e.to_string())
+                .and_then(|json| std::fs::write(&tmp, json).map_err(|e| e.to_string()))
+                .and_then(|_| std::fs::rename(&tmp, &path).map_err(|e| e.to_string()));
+            if let Err(e) = ok {
+                log.warn(format!("tag index save: {e}"));
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
     }
 
     /// Prefer durable `/sdcard/ComfyUI/clip_index.bin` (survives app data clears); fall back to documents.
@@ -4350,6 +4671,7 @@ impl ComfyApp {
             match rx.try_recv() {
                 Ok(index) => {
                     self.clip_index = index;
+                    self.gallery_dep_epoch += 1;
                     self.clip_index_loaded = true;
                     self.clip_index_loading = None;
                 }
@@ -4394,21 +4716,45 @@ impl ComfyApp {
 
     /// Persist the CLIP embedding index and clear the batched-write counter.
     #[cfg(feature = "local-npu")]
+    /// Serialize + write on a background thread (a ~2.6MB binary write to FUSE stalls the UI for
+    /// hundreds of ms). A save already in flight defers: dirty stays set and the pump retries.
     fn save_clip_index(&mut self, host: &Host) {
-        self.clip_index_dirty = 0;
-        let Some(path) = Self::clip_index_path(host) else { return };
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(dir);
+        let Some(path) = Self::clip_index_path(host) else {
+            self.clip_index_dirty = 0;
+            return;
+        };
+        if self.clip_index_saving.swap(true, Ordering::SeqCst) {
+            return;
         }
-        let _ = std::fs::write(&path, self.clip_index.to_bytes());
+        self.clip_index_dirty = 0;
+        let index = self.clip_index.clone();
+        let flag = self.clip_index_saving.clone();
+        let log = self.log.clone();
+        std::thread::spawn(move || {
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            // tmp + rename so a crash mid-write can't leave a torn index for the next launch.
+            let tmp = format!("{path}.tmp");
+            let ok = std::fs::write(&tmp, index.to_bytes())
+                .and_then(|_| std::fs::rename(&tmp, &path));
+            if let Err(e) = ok {
+                log.warn(format!("clip index save: {e}"));
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
     }
 
-    /// Drop in-flight embed work and failed-key skips so indexing can resume.
+    /// Drop in-flight embed work, failed-key skips, and the stale walk queue so indexing resumes
+    /// with a fresh cache-dir scan.
     #[cfg(feature = "local-npu")]
     fn reset_clipemb_pump(&mut self) {
         self.clipemb_pending = None;
         self.clipemb_rx = None;
         self.clipemb_failed.clear();
+        self.clipemb_walk.clear();
+        self.clipemb_rescan_after = 0.0;
+        self.clipemb_covered = None;
     }
 
     /// Wipe the on-disk CLIP index and restart embedding from scratch.
@@ -4416,6 +4762,7 @@ impl ComfyApp {
     fn rebuild_clip_index(&mut self, host: &Host) {
         self.reset_clipemb_pump();
         self.clip_index = clip_index::ClipIndex::default();
+        self.gallery_dep_epoch += 1;
         self.clip_index_loaded = true;
         self.clip_index_loading = None;
         self.clip_index_dirty = 0;
@@ -7474,16 +7821,26 @@ impl ComfyApp {
         // Reverting the insert is the general undo's job now — it snapshots this edit like any
         // other, which is both correct across later hand-edits and one less thing to keep in sync.
 
-        self.graph_status = if !missing.is_empty() {
-            format!("Inserted {n_inserted} node(s) — missing: {}", missing.join(", "))
+        // Missing node classes mean the inserted fragment is broken — that list must be readable
+        // in full, so it goes to the dialog; the happy paths stay a toast.
+        if !missing.is_empty() {
+            self.report_error(
+                "App inserted with missing nodes",
+                format!(
+                    "Inserted {n_inserted} node(s), but this server lacks: {}",
+                    missing.join(", ")
+                ),
+            );
         } else if !unset.is_empty() {
             unset.dedup();
-            format!("Inserted {n_inserted} node(s) — this build ignored: {}", unset.join(", "))
+            self.graph_status =
+                format!("Inserted {n_inserted} node(s) — this build ignored: {}", unset.join(", "));
         } else if !open.is_empty() {
-            format!("Inserted {n_inserted} node(s) — connect: {}", open.join(", "))
+            self.graph_status =
+                format!("Inserted {n_inserted} node(s) — connect: {}", open.join(", "));
         } else {
-            format!("Inserted {n_inserted} node(s)")
-        };
+            self.graph_status = format!("Inserted {n_inserted} node(s)");
+        }
         host.haptic(Haptic::Success);
     }
 
@@ -11541,39 +11898,56 @@ impl ComfyApp {
             return;
         }
         let Some(root) = self.ensure_full_cache_root(host).map(|s| s.to_string()) else { return };
-        let mut newly_cached: Vec<String> = Vec::new();
-        let next = self.gallery.iter().find_map(|it| {
+        // Budgeted scan behind a persistent cursor: a fresh listing used to trigger one frame
+        // with a FUSE stat per item (~2500 syscalls, 400ms+); now at most STAT_BUDGET stats per
+        // frame, resuming where the last frame stopped. The cursor resets when the listing does.
+        const STAT_BUDGET: usize = 16;
+        let sig = (self.gallery_gen, self.gallery.len());
+        if self.prefetch_scan_sig != sig {
+            self.prefetch_scan_sig = sig;
+            self.prefetch_scan_pos = 0;
+        }
+        let mut stats = 0usize;
+        while self.prefetch_scan_pos < self.gallery.len() && stats < STAT_BUDGET {
+            let it = &self.gallery[self.prefetch_scan_pos];
             if it.is_video {
-                return None;
+                self.prefetch_scan_pos += 1;
+                continue;
             }
             let key = it.key();
             if self.prefetch_cached.contains(&key) || self.prefetch_failed.contains(&key) {
-                return None;
+                self.prefetch_scan_pos += 1;
+                continue;
             }
-            // Stat each key once, then trust the session memo — FUSE stats per frame add up fast.
-            if gallery::full_cache_has(&root, &key) {
-                newly_cached.push(key);
-                return None;
-            }
-            // Avoid racing a viewer / pick / tag / embed fetch for the same key.
+            // A racing viewer / pick / tag / embed fetch fills the cache itself: hold the cursor
+            // (no stat spent) and re-check once it settles.
             #[cfg(feature = "local-npu")]
             if self.autotag_pending.as_deref() == Some(key.as_str())
                 || self.clipemb_pending.as_deref() == Some(key.as_str())
             {
-                return None;
+                break;
             }
-            if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
-                return None;
+            if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key)
+                || self.viewer.as_ref().is_some_and(|v| v.item.key() == key && v.loading)
+            {
+                break;
             }
-            if self.viewer.as_ref().is_some_and(|v| v.item.key() == key && v.loading) {
-                return None;
+            stats += 1;
+            if gallery::full_cache_has(&root, &key) {
+                self.prefetch_cached.insert(key);
+                self.prefetch_scan_pos += 1;
+                continue;
             }
-            Some((key, it.subfolder.clone(), it.filename.clone()))
-        });
-        self.prefetch_cached.extend(newly_cached);
-        if let Some((key, subfolder, filename)) = next {
+            // Fetch dispatched; the cursor stays on this key so its completion (memo insert or
+            // failure mark) is what advances past it.
+            let (subfolder, filename) = (it.subfolder.clone(), it.filename.clone());
             self.prefetch_pending = Some(key);
             self.engine.as_ref().unwrap().fetch_full(subfolder, filename, Some(root));
+            ctx.request_repaint();
+            return;
+        }
+        // Mid-scan with budget spent: keep scanning on subsequent frames.
+        if self.prefetch_scan_pos < self.gallery.len() && stats >= STAT_BUDGET {
             ctx.request_repaint();
         }
     }
@@ -11768,6 +12142,90 @@ impl ComfyApp {
         }
     }
 
+    /// Change-signature over every input the memoized gallery view depends on.
+    fn gallery_view_sig(&self) -> u64 {
+        use std::mem::discriminant;
+        let mut h = DefaultHasher::new();
+        self.gallery_gen.hash(&mut h);
+        self.gallery.len().hash(&mut h);
+        self.gallery_view.media.hash(&mut h);
+        self.gallery_view.rating.hash(&mut h);
+        self.gallery_view.sort.hash(&mut h);
+        self.gallery_view.group.hash(&mut h);
+        self.tag_q.trim().hash(&mut h);
+        self.tag_facets.hash(&mut h);
+        self.index_filter.hash(&mut h);
+        self.tag_index.len().hash(&mut h);
+        self.clip_index.len().hash(&mut h);
+        self.gallery_dep_epoch.hash(&mut h);
+        match &self.ranked {
+            None => false.hash(&mut h),
+            Some(r) => {
+                true.hash(&mut h);
+                discriminant(r).hash(&mut h);
+                r.keys().hash(&mut h);
+            }
+        }
+        // Grouping by character reads the cards; names change rarely enough to hash directly.
+        for c in &self.characters {
+            c.name.hash(&mut h);
+        }
+        h.finish()
+    }
+
+    /// The filtered (or ranked) item indices, in display order. O(items) — memoized by the caller.
+    fn compute_gallery_visible(&self) -> Vec<usize> {
+        // A ranked view overrides the filters and keeps cosine order.
+        if let Some(ranked) = &self.ranked {
+            let by_key: HashMap<String, usize> =
+                self.gallery.iter().enumerate().map(|(i, it)| (it.key(), i)).collect();
+            return ranked.keys().iter().filter_map(|k| by_key.get(k).copied()).collect();
+        }
+        // Client-side filters: media, then the local auto-tag layer (search box, facet chips,
+        // rating). Key-based lookups only run when some key-based filter is active.
+        let media = self.gallery_view.media;
+        let rating = self.gallery_view.rating;
+        let tag_q = self.tag_q.trim().to_string();
+        let need_key = !tag_q.is_empty()
+            || !self.tag_facets.is_empty()
+            || rating != RatingFilter::All
+            || self.index_filter != 0;
+        let mut visible: Vec<usize> = self
+            .gallery
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| media.matches(it.is_video))
+            .filter(|(_, it)| {
+                if !need_key {
+                    return true;
+                }
+                let key = it.key();
+                (tag_q.is_empty() || self.tag_index.matches(&key, &tag_q))
+                    && self.tag_facets.iter().all(|f| self.tag_index.matches(&key, f))
+                    && (rating == RatingFilter::All
+                        || rating.matches(self.tag_index.is_nsfw(&key)))
+                    && match self.index_filter {
+                        1 => self.tag_index.contains(&key),
+                        2 => !self.tag_index.contains(&key),
+                        _ => true,
+                    }
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // Aesthetic order: indexed scores descending, unscored after, stable within ties.
+        if self.gallery_view.sort == GallerySort::Score {
+            let score_of =
+                |i: usize| self.gallery.get(i).and_then(|it| self.clip_index.score(&it.key()));
+            visible.sort_by(|&a, &b| match (score_of(a), score_of(b)) {
+                (Some(x), Some(y)) => y.total_cmp(&x),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            });
+        }
+        visible
+    }
+
     fn gallery_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         // Every thumb fetch below serves from the local full cache when this is resolved.
         let _ = self.ensure_full_cache_root(host);
@@ -11901,46 +12359,36 @@ impl ComfyApp {
             );
         }
 
-        // Client-side filters: media, then the local auto-tag layer (search box, facet chips, rating).
-        let media = self.gallery_view.media;
-        let rating = self.gallery_view.rating;
-        let tag_q = self.tag_q.trim().to_string();
-        // A ranked view overrides the filters and keeps cosine order.
-        let visible: Vec<usize> = if let Some(ranked) = &self.ranked {
-            let by_key: HashMap<String, usize> =
-                self.gallery.iter().enumerate().map(|(i, it)| (it.key(), i)).collect();
-            ranked.keys().iter().filter_map(|k| by_key.get(k).copied()).collect()
-        } else {
-            self.gallery
-                .iter()
-                .enumerate()
-                .filter(|(_, it)| media.matches(it.is_video))
-                .filter(|(_, it)| {
-                    let key = it.key();
-                    (tag_q.is_empty() || self.tag_index.matches(&key, &tag_q))
-                        && self.tag_facets.iter().all(|f| self.tag_index.matches(&key, f))
-                        && rating.matches(self.tag_index.is_nsfw(&key))
-                        && match self.index_filter {
-                            1 => self.tag_index.contains(&key),
-                            2 => !self.tag_index.contains(&key),
-                            _ => true,
-                        }
-                })
-                .map(|(i, _)| i)
-                .collect()
-        };
-        let mut visible = visible;
-        // Aesthetic order: indexed scores descending, unscored after, stable within ties.
-        if self.gallery_view.sort == GallerySort::Score && self.ranked.is_none() {
-            let score_of =
-                |i: usize| self.gallery.get(i).and_then(|it| self.clip_index.score(&it.key()));
-            visible.sort_by(|&a, &b| match (score_of(a), score_of(b)) {
-                (Some(x), Some(y)) => y.total_cmp(&x),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            });
+        // The filtered/grouped view and facet chips are memoized: rebuilding them is O(items)
+        // with a key-allocation storm — far too heavy to repeat on every scroll frame.
+        let sig = self.gallery_view_sig();
+        if self.gallery_memo.as_ref().map(|m| m.sig) != Some(sig) {
+            let visible = self.compute_gallery_visible();
+            // Facet chips reflect the currently visible set.
+            let facets = if self.tag_index.is_empty() {
+                Vec::new()
+            } else {
+                let keys: Vec<String> = visible
+                    .iter()
+                    .filter_map(|&i| self.gallery.get(i).map(|it| it.key()))
+                    .collect();
+                self.tag_index.top_tags(&keys, 12)
+            };
+            // Ranked order is the point of that view; grouping would destroy it.
+            let group = if self.ranked.is_some() {
+                crate::types::GalleryGroup::None
+            } else {
+                self.gallery_view.group
+            };
+            let groups =
+                crate::gallery::group_selected(&self.gallery, &visible, group, &self.characters);
+            self.gallery_memo = Some(GalleryMemo { sig, groups, facets });
         }
+        // Cloned out of the memo (tens of KB) so the grid below can borrow self mutably.
+        let (groups, facets) = {
+            let m = self.gallery_memo.as_ref().unwrap();
+            (m.groups.clone(), m.facets.clone())
+        };
         // Banner only for More like this — semantic search clears by emptying the box.
         if self.ranked.as_ref().is_some_and(|r| r.is_similar()) {
             ui.horizontal(|ui| {
@@ -11950,19 +12398,7 @@ impl ComfyApp {
                 }
             });
         }
-        // Facet chips reflect the currently visible set.
-        let facet_keys: Vec<String> =
-            visible.iter().filter_map(|&i| self.gallery.get(i).map(|it| it.key())).collect();
-        let facets = self.tag_index.top_tags(&facet_keys, 12);
         self.gallery_tag_bar(ui, &facets);
-        // Ranked order is the point of that view; grouping would destroy it.
-        let group = if self.ranked.is_some() {
-            crate::types::GalleryGroup::None
-        } else {
-            self.gallery_view.group
-        };
-        let groups =
-            crate::gallery::group_selected(&self.gallery, &visible, group, &self.characters);
         let cols = self.gallery_view.columns.clamp(1, 3);
         let mut open: Option<usize> = None;
         let mut load_more = false;
@@ -12060,7 +12496,7 @@ impl ComfyApp {
                         load_more = true;
                     }
                 });
-            } else if visible.is_empty() && !self.gallery_loading {
+            } else if groups.iter().all(|g| g.items.is_empty()) && !self.gallery_loading {
                 ui.add_space(16.0);
                 ui.vertical_centered(|ui| ui.weak("Nothing matches these filters."));
             }
@@ -12531,25 +12967,32 @@ impl ComfyApp {
         for row in indices.chunks(cols) {
             ui.horizontal(|ui| {
                 for &idx in row {
-                    let (item_key, thumb_key, subfolder, filename, is_video) = {
+                    // Grid tiles are square, so laying out an off-screen tile touches no item
+                    // data at all; only the 1-column feed needs the aspect (cached or decoded)
+                    // for a stable row height while thumbs load.
+                    let alloc = if cols == 1 {
                         let Some(item) = self.gallery.get(idx) else { continue };
-                        (item.key(), item.thumb_key(size), item.subfolder.clone(), item.filename.clone(), item.is_video)
-                    };
-                    // Prefer cached aspect so 1-column rows keep a stable height while thumbs load.
-                    let aspect = self.thumb_aspects.get(&item_key).copied().or_else(|| {
-                        self.thumbs.get(&thumb_key).map(|t| t.size_vec2()).and_then(|s| {
-                            (s.x > 0.0).then_some(s.y / s.x)
-                        })
-                    });
-                    let alloc = match (cols, aspect) {
-                        (1, Some(a)) => egui::vec2(tile, tile * a),
-                        _ => egui::vec2(tile, tile),
+                        let aspect = self.thumb_aspects.get(&item.key()).copied().or_else(|| {
+                            self.thumbs.get(&item.thumb_key(size)).map(|t| t.size_vec2()).and_then(
+                                |s| (s.x > 0.0).then_some(s.y / s.x),
+                            )
+                        });
+                        match aspect {
+                            Some(a) => egui::vec2(tile, tile * a),
+                            None => egui::vec2(tile, tile),
+                        }
+                    } else {
+                        egui::vec2(tile, tile)
                     };
                     let (rect, _) = ui.allocate_exact_size(alloc, egui::Sense::hover());
                     // Off-screen tiles keep their space but skip paint + fetch.
                     if !ui.is_rect_visible(rect) {
                         continue;
                     }
+                    let (item_key, thumb_key, is_video) = {
+                        let Some(item) = self.gallery.get(idx) else { continue };
+                        (item.key(), item.thumb_key(size), item.is_video)
+                    };
                     // Clip to the viewport so a straddling tile can't catch presses under the nav bar.
                     self.tile_hits.push((rect.intersect(clip), idx));
                     let selected = self.selected.contains(&item_key);
@@ -12562,6 +13005,10 @@ impl ComfyApp {
                         }
                         None => {
                             if self.thumbs.claim(&thumb_key) {
+                                let (subfolder, filename) = {
+                                    let it = &self.gallery[idx];
+                                    (it.subfolder.clone(), it.filename.clone())
+                                };
                                 self.engine.as_ref().unwrap().fetch_thumb(
                                     subfolder,
                                     filename,
@@ -14227,6 +14674,8 @@ impl ComfyApp {
                     self.log_lines.clear();
                     self.log.clear();
                 }
+                ui.checkbox(&mut self.perf_overlay, "Perf HUD")
+                    .on_hover_text("Floating CPU / memory / active-task overlay");
                 ui.weak(format!("{} lines", self.log_lines.len()));
             });
             ui.add_space(2.0);
@@ -14720,6 +15169,31 @@ impl ComfyApp {
         });
     }
 
+    /// Like [`Self::autotag_run`], but reading the cached bytes on the worker thread — a multi-MB
+    /// FUSE read on the UI thread is a visible hitch.
+    #[cfg(feature = "local-npu")]
+    fn autotag_run_cached(&mut self, ctx: &egui::Context, host: &Host, key: String, root: String) {
+        let (Some(lib_dir), Some(pack_dir)) = (host.native_lib_dir(), self.wd14_pack.clone()) else {
+            self.autotag_failed.insert(key);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.autotag_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = match gallery::read_full_cache(&root, &key) {
+                Some(bytes) => crate::local_engine::read_tags(
+                    std::path::PathBuf::from(lib_dir),
+                    pack_dir,
+                    bytes,
+                ),
+                None => Err("cached image vanished before read".to_string()),
+            };
+            let _ = tx.send((key, result));
+            ctx.request_repaint();
+        });
+    }
+
     /// Drain a finished auto-tag into the index; feed cooc, batch-save, and mark failures.
     #[cfg(feature = "local-npu")]
     fn poll_autotag(&mut self, host: &Host) {
@@ -14758,6 +15232,7 @@ impl ComfyApp {
             }
         }
         self.tag_index.insert(key, entry);
+        self.gallery_dep_epoch += 1;
         self.tag_index_dirty += 1;
         if self.tag_index_dirty >= Self::AUTOTAG_SAVE_EVERY {
             self.save_tag_index(host);
@@ -14788,6 +15263,19 @@ impl ComfyApp {
             }
             return;
         }
+        // Fully-tagged steady state: skip the per-frame O(items) scan until an input moves.
+        let coverage = (
+            self.gallery_gen,
+            self.gallery.len(),
+            self.tag_index.len(),
+            self.autotag_failed.len(),
+        );
+        if self.autotag_covered == Some(coverage) {
+            if self.tag_index_dirty > 0 {
+                self.save_tag_index(host);
+            }
+            return;
+        }
         let next = self.gallery.iter().find_map(|it| {
             if it.is_video {
                 return None;
@@ -14800,19 +15288,24 @@ impl ComfyApp {
         });
         if let Some((key, subfolder, filename)) = next {
             let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
-            // Prefer disk bytes so we skip the network when prefetch already won.
+            // Prefer disk bytes so we skip the network when prefetch already won; the worker
+            // thread does the actual read.
             if let Some(root) = cache_dir.as_ref()
-                && let Some(bytes) = gallery::read_full_cache(root, &key)
+                && gallery::full_cache_has(root, &key)
             {
                 self.autotag_pending = None;
-                self.autotag_run(ctx, host, key, bytes);
+                let root = root.clone();
+                self.autotag_run_cached(ctx, host, key, root);
                 return;
             }
             self.autotag_pending = Some(key);
             self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
             ctx.request_repaint();
-        } else if self.tag_index_dirty > 0 {
-            self.save_tag_index(host);
+        } else {
+            self.autotag_covered = Some(coverage);
+            if self.tag_index_dirty > 0 {
+                self.save_tag_index(host);
+            }
         }
     }
 
@@ -14833,6 +15326,20 @@ impl ComfyApp {
             }
             return;
         }
+        // Fully-indexed steady state: while nothing relevant has changed since a scan found no
+        // work, skip the per-frame O(items) scan (and the walk) outright.
+        let coverage = (
+            self.gallery_gen,
+            self.gallery.len(),
+            self.clip_index.len(),
+            self.clipemb_failed.len(),
+        );
+        if self.clipemb_covered == Some(coverage) {
+            if self.clip_index_dirty > 0 {
+                self.save_clip_index(host);
+            }
+            return;
+        }
         let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
         let mut next = self.gallery.iter().find_map(|it| {
             if it.is_video {
@@ -14847,33 +15354,41 @@ impl ComfyApp {
         if next.is_none()
             && let Some(root) = cache_dir.as_ref()
         {
-            // Walking the cache dir reads every .key sidecar — off-limits per frame on FUSE, so
-            // once a walk comes up empty, hold off before checking the dir again.
+            // Walking the cache dir reads every .key sidecar — off-limits per frame on FUSE. One
+            // walk fills a work queue that later pumps drain, and every walk (not just an empty
+            // one) backs off, so per-embed completions don't each re-walk thousands of files.
             let now = ctx.input(|i| i.time);
-            if now >= self.clipemb_rescan_after {
-                next = gallery::full_cache_keys(root).into_iter().find_map(|key| {
-                    if self.clip_index.contains(&key) || self.clipemb_failed.contains(&key) {
-                        return None;
-                    }
-                    let (subfolder, filename) = match key.rsplit_once('/') {
-                        Some((s, f)) => (s.to_string(), f.to_string()),
-                        None => (String::new(), key.clone()),
-                    };
-                    Some((key, subfolder, filename))
-                });
-                if next.is_none() {
-                    self.clipemb_rescan_after = now + 10.0;
+            if self.clipemb_walk.is_empty() && now >= self.clipemb_rescan_after {
+                self.clipemb_walk = gallery::full_cache_keys(root)
+                    .into_iter()
+                    .filter(|k| !self.clip_index.contains(k) && !self.clipemb_failed.contains(k))
+                    .collect();
+                // An empty walk means the cache holds nothing new: never re-walk this session
+                // (fetches land through the listing, which the scan above covers). Resume /
+                // Rebuild in Settings resets this via reset_clipemb_pump.
+                self.clipemb_rescan_after =
+                    if self.clipemb_walk.is_empty() { f64::INFINITY } else { now + 10.0 };
+            }
+            while next.is_none()
+                && let Some(key) = self.clipemb_walk.pop()
+            {
+                // Re-check: the index may have gained the key since the walk.
+                if self.clip_index.contains(&key) || self.clipemb_failed.contains(&key) {
+                    continue;
                 }
+                let (subfolder, filename) = match key.rsplit_once('/') {
+                    Some((s, f)) => (s.to_string(), f.to_string()),
+                    None => (String::new(), key.clone()),
+                };
+                next = Some((key, subfolder, filename));
             }
         }
         let Some((key, subfolder, filename)) = next else {
             // Still paging the gallery — keep the UI alive until the listing is complete.
-            if matches!(self.conn, Conn::Connected)
+            let wants_page = matches!(self.conn, Conn::Connected)
                 && self.gallery.len() < self.gallery_total as usize
-                && self.gallery.len() < GALLERY_LOAD_ALL_CAP as usize
-                && !self.gallery_loading
-                && self.engine.is_some()
-            {
+                && self.gallery.len() < GALLERY_LOAD_ALL_CAP as usize;
+            if wants_page && !self.gallery_loading && self.engine.is_some() {
                 self.gallery_loading = true;
                 self.engine.as_ref().unwrap().gallery_list(
                     self.gallery_gen,
@@ -14883,15 +15398,23 @@ impl ComfyApp {
                     &self.gallery_view,
                 );
             }
+            // Everything reachable is embedded and the walk is spent: latch until an input moves.
+            if !wants_page
+                && self.clipemb_walk.is_empty()
+                && (cache_dir.is_none() || self.clipemb_rescan_after.is_infinite())
+            {
+                self.clipemb_covered = Some(coverage);
+            }
             if self.clip_index_dirty > 0 {
                 self.save_clip_index(host);
             }
             return;
         };
         if let Some(root) = cache_dir.as_ref()
-            && let Some(bytes) = gallery::read_full_cache(root, &key)
+            && gallery::full_cache_has(root, &key)
         {
-            self.clipemb_run(ctx, host, key, bytes);
+            let root = root.clone();
+            self.clipemb_run_cached(ctx, host, key, root);
             return;
         }
         if !matches!(self.conn, Conn::Connected) || self.engine.is_none() {
@@ -14919,6 +15442,31 @@ impl ComfyApp {
         });
     }
 
+    /// Like [`Self::clipemb_run`], but reading the cached bytes on the worker thread — a multi-MB
+    /// FUSE read on the UI thread is a visible hitch.
+    #[cfg(feature = "local-npu")]
+    fn clipemb_run_cached(&mut self, ctx: &egui::Context, host: &Host, key: String, root: String) {
+        let (Some(lib_dir), Some(pack_dir)) = (host.native_lib_dir(), self.clip_pack.clone()) else {
+            self.clipemb_failed.insert(key);
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.clipemb_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let result = match gallery::read_full_cache(&root, &key) {
+                Some(bytes) => crate::local_engine::embed_clip(
+                    std::path::PathBuf::from(lib_dir),
+                    pack_dir,
+                    bytes,
+                ),
+                None => Err("cached image vanished before read".to_string()),
+            };
+            let _ = tx.send((key, result));
+            ctx.request_repaint();
+        });
+    }
+
     /// Drain a finished embedding into the index; batch-save and mark failures.
     #[cfg(feature = "local-npu")]
     fn poll_clipemb(&mut self, host: &Host) {
@@ -14927,6 +15475,7 @@ impl ComfyApp {
             Ok((key, Ok((emb, score)))) => {
                 self.clipemb_rx = None;
                 self.clip_index.insert(key.clone(), emb, score);
+                self.gallery_dep_epoch += 1;
                 self.clip_index_dirty += 1;
                 // A newly indexed image may match a character — record high-confidence suggestions.
                 self.suggest_for_new_key(&key);
@@ -14972,6 +15521,7 @@ impl EguiApp for ComfyApp {
     }
 
     fn update(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let frame_start = std::time::Instant::now();
         if self.engine.is_none() {
             self.engine = Some(Engine::new(ui.ctx().clone(), self.log.clone()));
         }
@@ -14994,11 +15544,19 @@ impl EguiApp for ComfyApp {
         self.kb_open_edge = kb_open && !self.kb_was_open;
         self.kb_was_open = kb_open;
 
+        let t_msgs = std::time::Instant::now();
         for m in self.engine.as_ref().unwrap().drain() {
             self.handle(ui.ctx(), host, m);
         }
+        let msgs_ms = t_msgs.elapsed().as_secs_f32() * 1000.0;
+
+        // Background upkeep (polls, cache/index pumps, autosave) runs every frame regardless of
+        // screen; time it apart from message handling and UI so a slow frame can be attributed.
+        let t_bg = std::time::Instant::now();
+        let mut bg_lap = BgLap::new();
         let now = ui.ctx().input(|i| i.time);
         self.sync_create_graph_link(now);
+        bg_lap.lap("link");
         // Don't burn CPU decoding video nobody can see: pause while the viewer is off-screen and
         // resume where it left off on return (unless the user paused it themselves).
         if let Some(p) = &mut self.player {
@@ -15013,25 +15571,28 @@ impl EguiApp for ComfyApp {
             }
         }
         #[cfg(feature = "local-npu")]
-        #[cfg(feature = "local-npu")]
-        #[cfg(feature = "local-npu")]
-        self.poll_d3_anima();
-        #[cfg(feature = "local-npu")]
-        self.poll_wd14();
-        #[cfg(feature = "local-npu")]
-        self.poll_rewrite();
-        #[cfg(feature = "local-npu")]
-        self.poll_clip_search();
+        {
+            self.poll_d3_anima();
+            self.poll_wd14();
+            self.poll_rewrite();
+            self.poll_clip_search();
+        }
+        bg_lap.lap("npu-polls");
         let _ = self.ensure_full_cache_root(host);
         self.ensure_tag_index_warm(ui.ctx(), host);
         self.ensure_clip_index_warm(ui.ctx(), host);
+        bg_lap.lap("index-warm");
         self.pump_full_cache(ui.ctx(), host);
+        bg_lap.lap("cache-pump");
         #[cfg(feature = "local-npu")]
         {
             self.poll_autotag(host);
             self.poll_clipemb(host);
+            bg_lap.lap("npu-poll2");
             self.pump_autotag(ui.ctx(), host);
+            bg_lap.lap("autotag-pump");
             self.pump_clipemb(ui.ctx(), host);
+            bg_lap.lap("clipemb-pump");
         }
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
         if self.log_lines.len() > logger::MAX_LINES {
@@ -15039,6 +15600,9 @@ impl EguiApp for ComfyApp {
             self.log_lines.drain(..excess);
         }
         self.autosave_settings(ui.ctx(), host);
+        bg_lap.lap("autosave");
+        let bg_ms = t_bg.elapsed().as_secs_f32() * 1000.0;
+        let bg_top = bg_lap.worst;
 
         // Second gallery refresh after generate — server index often lags the write.
         if let Some(at) = self.gallery_refresh_at {
@@ -15053,11 +15617,23 @@ impl EguiApp for ComfyApp {
             }
         }
 
+        // The open error dialog owns the back key: consumed here, before any other handler runs.
+        if self.error_modal.is_some()
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            self.error_modal = None;
+        }
+
         // Inpaint takes over the whole screen, above the tabs, until closed.
         if self.inpaint.is_some() {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| self.inpaint_overlay(ui, host));
+            self.error_modal_window(ui.ctx(), host);
+            self.end_frame(frame_start, msgs_ms, bg_ms, bg_top, "inpaint");
             return;
         }
 
@@ -15069,9 +15645,13 @@ impl EguiApp for ComfyApp {
             self.app_picker_window(ui.ctx(), host);
             self.publish_window(ui.ctx(), host);
             self.queue_sheet_window(ui.ctx(), host);
+            self.graph_toast(ui.ctx());
+            self.perf_overlay_window(ui.ctx());
+            self.error_modal_window(ui.ctx(), host);
             if self.running || self.queue_remaining > 0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
             }
+            self.end_frame(frame_start, msgs_ms, bg_ms, bg_top, "graph*");
             return;
         }
         // If fullscreen was active but the user navigated away, release the lock.
@@ -15142,6 +15722,11 @@ impl EguiApp for ComfyApp {
         self.publish_window(ui.ctx(), host);
         self.gallery_pick_window(ui.ctx(), host);
         self.queue_sheet_window(ui.ctx(), host);
+        if self.tab == Tab::Graph {
+            self.graph_toast(ui.ctx());
+        }
+        self.perf_overlay_window(ui.ctx());
+        self.error_modal_window(ui.ctx(), host);
 
         // Keep the server-wide queue in view even when jobs were started on the website. Poll faster
         // while the queue sheet is open so per-row actions reflect quickly.
@@ -15157,10 +15742,285 @@ impl EguiApp for ComfyApp {
         if self.running || self.queue_remaining > 0 || self.queue_sheet_open {
             ui.ctx().request_repaint_after(Duration::from_millis(200));
         }
+
+        let tab = match self.tab {
+            Tab::Generate => "create",
+            Tab::Graph => "graph",
+            Tab::Gallery => "gallery",
+            Tab::Settings => "settings",
+        };
+        self.end_frame(frame_start, msgs_ms, bg_ms, bg_top, tab);
     }
 }
 
 impl ComfyApp {
+    /// Feed one finished frame's timing to the profiler (mirrors to logcat when slow).
+    fn end_frame(
+        &mut self,
+        start: std::time::Instant,
+        msgs_ms: f32,
+        bg_ms: f32,
+        bg_top: (&'static str, f32),
+        tab: &str,
+    ) {
+        let cpu_ms = start.elapsed().as_secs_f32() * 1000.0;
+        let running = self.running;
+        let log = self.log.clone();
+        self.perf.observe(cpu_ms, msgs_ms, bg_ms, bg_top, tab, running, &log);
+    }
+
+    /// Raise the blocking error dialog with the full text (status lines stay elided). An identical
+    /// repeat folds into a counter instead of stacking; call sites handle their own logging.
+    fn report_error(&mut self, title: &str, detail: impl Into<String>) {
+        let detail = detail.into();
+        if let Some(m) = &mut self.error_modal
+            && m.title == title
+            && m.detail == detail
+        {
+            m.count += 1;
+            return;
+        }
+        self.error_modal = Some(ErrorModal { title: title.to_string(), detail, count: 1 });
+    }
+
+    /// Blocking error dialog: scrim + centered window with the full, scrollable error text.
+    /// Dismissed by the Android back button (consumed early in `update` for priority), a scrim
+    /// tap, X, or Dismiss; "Go to Logs" jumps to Settings -> Logs. Drawn LAST in every `update`
+    /// branch so the scrim stacks above the other Foreground areas (FABs, minimap, HUD).
+    fn error_modal_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(m) = &self.error_modal else { return };
+        let (title, detail, count) = (m.title.clone(), m.detail.clone(), m.count);
+
+        let mut open = true;
+        let mut close = false;
+        // Dimming click-catcher below the window: blocks the UI, tap outside closes. Tooltip
+        // order (registered just before the window) so other centered() windows — which are also
+        // Tooltip and would stack above a Foreground scrim — end up covered and unclickable.
+        let scrim = egui::Area::new(egui::Id::new("error-scrim"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                let resp = ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+                resp
+            });
+        if scrim.inner.clicked() {
+            close = true;
+        }
+        centered(ctx, egui::Window::new(format!("{} {title}", icons::WARN)))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                if count > 1 {
+                    ui.weak(format!("Repeated {count}x"));
+                }
+                let max_h = (ctx.content_rect().height() * 0.45).max(80.0);
+                egui::ScrollArea::vertical()
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(&detail).monospace().size(12.0));
+                    });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 6.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    // Inpaint owns the whole screen, so a Logs jump would be invisible: hide it.
+                    let can_go = self.inpaint.is_none();
+                    let n = if can_go { 3.0 } else { 2.0 };
+                    let size =
+                        egui::vec2(((ui.available_width() - GAP * (n - 1.0)) / n).max(64.0), 30.0);
+                    if can_go && ui.add_sized(size, egui::Button::new("Go to Logs")).clicked() {
+                        self.tab = Tab::Settings;
+                        self.settings_pane = SettingsPane::Logs;
+                        close = true;
+                    }
+                    if ui.add_sized(size, egui::Button::new("Copy")).clicked() {
+                        host.copy_text(detail.clone());
+                    }
+                    if ui.add_sized(size, egui::Button::new("Dismiss")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if !open || close {
+            self.error_modal = None;
+        }
+    }
+
+    /// Floating feedback pill for `graph_status` (undo / duplicate / auto-wire notes — errors go
+    /// to the modal). Auto-hides after a few seconds; a tap dismisses it.
+    fn graph_toast(&mut self, ctx: &egui::Context) {
+        let now = ctx.input(|i| i.time);
+        if self.graph_status != self.graph_toast_prev {
+            self.graph_toast_prev = self.graph_status.clone();
+            self.graph_toast_at = now;
+        }
+        if self.graph_status.is_empty() {
+            // Forget the last text on an external clear, so the same text re-toasts fresh.
+            self.graph_toast_prev.clear();
+            return;
+        }
+        if now - self.graph_toast_at > 6.0 {
+            self.graph_status.clear();
+            self.graph_toast_prev.clear();
+            return;
+        }
+        let text = elide(&self.graph_status, 120);
+        egui::Area::new(egui::Id::new("graph-toast"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 52.0))
+            .show(ctx, |ui| {
+                let r = egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(190))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(90)))
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.set_max_width(ctx.content_rect().width() - 48.0);
+                        ui.label(egui::RichText::new(text).size(12.0));
+                    });
+                let tap = ui.interact(
+                    r.response.rect,
+                    egui::Id::new("graph-toast-tap"),
+                    egui::Sense::click(),
+                );
+                if tap.clicked() {
+                    self.graph_status.clear();
+                    self.graph_toast_prev.clear();
+                }
+            });
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    /// App-level work in flight, as short labels for the perf HUD.
+    fn active_tasks(&self) -> Vec<String> {
+        let mut t = Vec::new();
+        if self.jobs_left > 0 {
+            t.push(format!("gen x{}", self.jobs_left));
+        }
+        // Stale queue counts linger after a network drop; only show them while live.
+        if self.queue_remaining > 0 && matches!(self.conn, Conn::Connected) {
+            t.push(format!("queue {}", self.queue_remaining));
+        }
+        if self.gallery_loading {
+            t.push("gallery".into());
+        }
+        if self.wf_loading {
+            t.push("workflows".into());
+        }
+        if self.saving {
+            t.push("saving".into());
+        }
+        if self.prefetch_pending.is_some() {
+            t.push("prefetch".into());
+        }
+        if self.tag_index_loading.is_some() || self.clip_index_loading.is_some() {
+            t.push("index load".into());
+        }
+        #[cfg(feature = "local-npu")]
+        {
+            if self.wd14_running {
+                t.push("wd14 npu".into());
+            }
+            if self.autotag_pending.is_some() {
+                t.push("autotag".into());
+            }
+            if self.clipemb_pending.is_some() || self.clipemb_rx.is_some() {
+                t.push("clip embed".into());
+            }
+            if self.clip_search_running {
+                t.push("search".into());
+            }
+            if self.rewrite_running {
+                t.push("rewrite".into());
+            }
+            if self.d3_running {
+                t.push("anima npu".into());
+            }
+        }
+        t
+    }
+
+    /// Translucent top-right HUD: app CPU%, hottest threads, memory, GPU busy%, frame time, and
+    /// the in-flight task list. Tap toggles the one-line collapsed form.
+    fn perf_overlay_window(&mut self, ctx: &egui::Context) {
+        if !self.perf_overlay {
+            return;
+        }
+        let snap = self.sysmon.tick();
+        let (last_ms, avg_ms, worst_ms) = self.perf.stats();
+        let tasks = self.active_tasks();
+        let minimized = self.perf_hud_min;
+
+        egui::Area::new(egui::Id::new("perf-hud"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+            .show(ctx, |ui| {
+                let row = |ui: &mut egui::Ui, s: String| {
+                    ui.label(
+                        egui::RichText::new(s)
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(225)),
+                    );
+                };
+                let r = egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(180))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(90)))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(7, 5))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        let cpu = snap
+                            .as_ref()
+                            .map(|s| format!("{:.0}%", s.cpu_pct))
+                            .unwrap_or_else(|| "--".into());
+                        if minimized {
+                            row(ui, format!("cpu {cpu} · ui {last_ms:.0}ms"));
+                            return;
+                        }
+                        let gpu = snap
+                            .as_ref()
+                            .and_then(|s| s.gpu_pct)
+                            .map(|g| format!(" · gpu {g:.0}%"))
+                            .unwrap_or_default();
+                        row(ui, format!("cpu {cpu}{gpu} · ui {avg_ms:.1}ms w{worst_ms:.0}"));
+                        if let Some(s) = &snap {
+                            row(
+                                ui,
+                                format!(
+                                    "rss {:.0}M · free {:.1}/{:.1}G",
+                                    s.rss_mb,
+                                    s.mem_avail_mb / 1024.0,
+                                    s.mem_total_mb / 1024.0
+                                ),
+                            );
+                            for (name, pct) in &s.threads {
+                                row(ui, format!("{} {pct:.0}%", elide(name, 18)));
+                            }
+                        }
+                        if !tasks.is_empty() {
+                            row(ui, elide(&tasks.join(" · "), 44));
+                        }
+                    });
+                let tap = ui.interact(
+                    r.response.rect,
+                    egui::Id::new("perf-hud-tap"),
+                    egui::Sense::click(),
+                );
+                if tap.clicked() {
+                    self.perf_hud_min = !self.perf_hud_min;
+                }
+            });
+        // Keep sampling while the app is otherwise idle.
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
     /// Create/Graph labeled on the left; Gallery/Settings as a tight icon cluster.
     fn nav_bar(&mut self, ui: &mut egui::Ui) {
         const ROW_H: f32 = 32.0;

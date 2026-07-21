@@ -903,6 +903,7 @@ fn evict_full_cache(dir: &Path) {
 }
 
 /// One collapsing header's worth of items, as indices into the listing.
+#[derive(Clone)]
 pub struct Group {
     /// Stable id for the header's `id_salt` (the label can repeat across groups).
     pub key: String,

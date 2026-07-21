@@ -1926,6 +1926,154 @@ mod tests {
         }
     }
 
+    /// A minimal object_info covering a standard SDXL img2img graph.
+    fn img2img_schemas() -> crate::schema::SchemaSet {
+        crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+            "CheckpointLoaderSimple": {"input": {"required": {"ckpt_name": [["sd.safetensors"]]}},
+                "output": ["MODEL","CLIP","VAE"], "output_name": ["MODEL","CLIP","VAE"], "output_is_list": [false,false,false]},
+            "LoadImage": {"input": {"required": {"image": [["photo.png"]]}},
+                "output": ["IMAGE","MASK"], "output_name": ["IMAGE","MASK"], "output_is_list": [false,false]},
+            "VAEEncode": {"input": {"required": {"pixels": ["IMAGE"], "vae": ["VAE"]}},
+                "output": ["LATENT"], "output_name": ["LATENT"], "output_is_list": [false]},
+            "CLIPTextEncode": {"input": {"required": {"text": ["STRING", {"multiline": true}], "clip": ["CLIP"]}},
+                "output": ["CONDITIONING"], "output_name": ["CONDITIONING"], "output_is_list": [false]},
+            "KSampler": {"input": {"required": {
+                "model": ["MODEL"], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"], "latent_image": ["LATENT"],
+                "seed": ["INT", {"default": 0}], "steps": ["INT", {"default": 20}], "cfg": ["FLOAT", {"default": 8.0}],
+                "sampler_name": [["euler"]], "scheduler": [["normal"]], "denoise": ["FLOAT", {"default": 1.0}]}},
+                "output": ["LATENT"], "output_name": ["LATENT"], "output_is_list": [false]},
+            "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}},
+                "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]},
+            "SaveImage": {"input": {"required": {"images": ["IMAGE"], "filename_prefix": ["STRING", {"default": "ComfyUI"}]}},
+                "output": [], "output_name": [], "output_is_list": []}
+        }"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A UI-format img2img workflow whose image source has node type `loader_ty` (vary it to a
+    /// custom node the server lacks). node 2 feeds VAEEncode(3).pixels.
+    fn img2img_ui(loader_ty: &str) -> serde_json::Value {
+        serde_json::json!({
+            "nodes": [
+                {"id": 1, "type": "CheckpointLoaderSimple", "mode": 0,
+                 "outputs": [
+                    {"name": "MODEL", "type": "MODEL", "links": [10]},
+                    {"name": "CLIP", "type": "CLIP", "links": [11, 12]},
+                    {"name": "VAE", "type": "VAE", "links": [13, 14]}],
+                 "widgets_values": ["sd.safetensors"]},
+                {"id": 2, "type": loader_ty, "mode": 0,
+                 "outputs": [
+                    {"name": "IMAGE", "type": "IMAGE", "links": [15]},
+                    {"name": "MASK", "type": "MASK", "links": []}],
+                 "widgets_values": ["photo.png", "image"]},
+                {"id": 3, "type": "VAEEncode", "mode": 0,
+                 "inputs": [
+                    {"name": "pixels", "type": "IMAGE", "link": 15},
+                    {"name": "vae", "type": "VAE", "link": 13}],
+                 "outputs": [{"name": "LATENT", "type": "LATENT", "links": [16]}],
+                 "widgets_values": []},
+                {"id": 4, "type": "CLIPTextEncode", "mode": 0,
+                 "inputs": [{"name": "clip", "type": "CLIP", "link": 11}],
+                 "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [17]}],
+                 "widgets_values": ["a cat"]},
+                {"id": 5, "type": "CLIPTextEncode", "mode": 0,
+                 "inputs": [{"name": "clip", "type": "CLIP", "link": 12}],
+                 "outputs": [{"name": "CONDITIONING", "type": "CONDITIONING", "links": [18]}],
+                 "widgets_values": ["blurry"]},
+                {"id": 6, "type": "KSampler", "mode": 0,
+                 "inputs": [
+                    {"name": "model", "type": "MODEL", "link": 10},
+                    {"name": "positive", "type": "CONDITIONING", "link": 17},
+                    {"name": "negative", "type": "CONDITIONING", "link": 18},
+                    {"name": "latent_image", "type": "LATENT", "link": 16}],
+                 "outputs": [{"name": "LATENT", "type": "LATENT", "links": [19]}],
+                 "widgets_values": [123, "fixed", 20, 8.0, "euler", "normal", 0.6]},
+                {"id": 7, "type": "VAEDecode", "mode": 0,
+                 "inputs": [
+                    {"name": "samples", "type": "LATENT", "link": 19},
+                    {"name": "vae", "type": "VAE", "link": 14}],
+                 "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [20]}],
+                 "widgets_values": []},
+                {"id": 8, "type": "SaveImage", "mode": 0,
+                 "inputs": [{"name": "images", "type": "IMAGE", "link": 20}],
+                 "widgets_values": ["ComfyUI"]}
+            ],
+            "links": [
+                [10, 1, 0, 6, 0, "MODEL"],
+                [11, 1, 1, 4, 0, "CLIP"],
+                [12, 1, 1, 5, 0, "CLIP"],
+                [13, 1, 2, 3, 1, "VAE"],
+                [14, 1, 2, 7, 1, "VAE"],
+                [15, 2, 0, 3, 0, "IMAGE"],
+                [16, 3, 0, 6, 3, "LATENT"],
+                [17, 4, 0, 6, 1, "CONDITIONING"],
+                [18, 5, 0, 6, 2, "CONDITIONING"],
+                [19, 6, 0, 7, 0, "LATENT"],
+                [20, 7, 0, 8, 0, "IMAGE"]
+            ]
+        })
+    }
+
+    /// The VAEEncode node's `pixels` input in a converted workflow, as (has_key, is_slot).
+    fn pixels_state(wf: &rucomfyui::Workflow) -> (bool, bool) {
+        let enc = wf.0.values().find(|n| n.class_type == "VAEEncode").expect("no VAEEncode");
+        match enc.inputs.get("pixels") {
+            Some(rucomfyui::workflow::WorkflowInput::Slot(..)) => (true, true),
+            Some(_) => (true, false),
+            None => (false, false),
+        }
+    }
+
+    /// Load an img2img graph from an image and queue it: the full convert -> load -> export -> convert
+    /// round trip must keep VAEEncode.pixels wired to the LoadImage.
+    #[test]
+    fn img2img_graph_roundtrip_keeps_pixels() {
+        let schemas = img2img_schemas();
+        let ui = img2img_ui("LoadImage");
+
+        // Load into the editor (what tapping "open workflow" on a gallery image does).
+        let loaded = crate::uiwf::convert(&ui, &schemas).unwrap();
+        assert_eq!(pixels_state(&loaded.workflow), (true, true), "convert-on-load dropped pixels");
+        let mut graph = ComfyUiNodeGraph::new(crate::schema::to_object_info(&schemas));
+        graph.load_api_workflow(&loaded.workflow).unwrap();
+
+        // Queue from the editor (export_ui -> convert).
+        let view = GraphView::default();
+        let exported = view.export_ui(&graph, &schemas, &HashSet::new(), &HashMap::new());
+        let queued = crate::uiwf::convert(&exported, &schemas).unwrap();
+        assert_eq!(
+            pixels_state(&queued.workflow),
+            (true, true),
+            "round trip lost VAEEncode.pixels: warnings={:?}",
+            queued.warnings
+        );
+    }
+
+    /// When the image source is a custom node the server lacks, convert drops it and VAEEncode is
+    /// left with no `pixels` — reproducing the "VAEEncode missing pixels" server rejection. The
+    /// pre-flight must catch it so the queue is blocked with a clear message instead of failing
+    /// opaquely on the server.
+    #[test]
+    fn img2img_unknown_loader_is_caught_by_preflight() {
+        let schemas = img2img_schemas();
+        let ui = img2img_ui("Image Load");
+        let loaded = crate::uiwf::convert(&ui, &schemas).unwrap();
+        assert_eq!(
+            pixels_state(&loaded.workflow),
+            (false, false),
+            "expected pixels to be dropped when its source node is unknown"
+        );
+        let problems = crate::preflight::validate(&loaded.workflow, &schemas);
+        assert!(
+            problems.iter().any(|p| p.class == "VAEEncode" && p.input == "pixels"),
+            "preflight missed the dropped pixels input: {problems:?}"
+        );
+    }
+
     #[test]
     fn fit_maps_view_center_to_screen_center_and_clamps_scale() {
         let view = egui::Rect::from_min_size(egui::pos2(1000.0, 2000.0), egui::vec2(4000.0, 2000.0));

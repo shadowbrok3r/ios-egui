@@ -1242,7 +1242,7 @@ fn is_quality_tag(tag: &str) -> bool {
 
 /// How the gallery orders results. Mirrors comfy-gate's `sort` values; the server silently falls
 /// back to `new` for anything it doesn't know, and offers no sort-by-model.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GallerySort {
     Newest,
     Oldest,
@@ -1282,7 +1282,7 @@ impl GallerySort {
 
 /// What the gallery's collapsing headers bucket by. The server only orders rows to match; the
 /// header text is derived client-side.
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GalleryGroup {
     None,
     Folder,
@@ -1319,7 +1319,7 @@ impl GalleryGroup {
 
 /// Media-type filter for the gallery listing. Applied client-side (the listing API has no media
 /// param), so a non-All value triggers the same load-the-whole-set paging as grouping does.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum GalleryMedia {
     #[default]
     All,
@@ -1350,7 +1350,7 @@ impl GalleryMedia {
 
 /// Rating filter for the gallery, applied client-side over the local auto-tag index. Unindexed
 /// items (rating unknown) count as Safe, so a fresh library isn't emptied by the filter.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum RatingFilter {
     #[default]
     All,
@@ -1497,6 +1497,9 @@ pub struct Settings {
     /// Auto-follow: pan/zoom the graph to whichever node is currently executing.
     #[serde(default)]
     pub auto_follow: bool,
+    /// Translucent CPU/memory/task HUD in the top-right corner.
+    #[serde(default)]
+    pub perf_overlay: bool,
     /// Auto-arrange the canvas when a loaded workflow is first shown.
     #[serde(default = "default_true")]
     pub auto_arrange: bool,

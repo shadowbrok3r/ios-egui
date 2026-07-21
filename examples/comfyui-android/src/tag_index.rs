@@ -57,6 +57,10 @@ impl TagIndex {
         self.entries.is_empty()
     }
 
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Whether `key` carries a current-version entry; stale-version entries report absent so the
     /// pump re-tags them.
     pub fn contains(&self, key: &str) -> bool {

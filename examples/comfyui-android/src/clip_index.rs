@@ -7,13 +7,14 @@ use std::collections::{HashMap, HashSet};
 const MAGIC: &[u8; 4] = b"CIDX";
 pub const SCHEMA_VERSION: u32 = 1;
 
+#[derive(Clone)]
 pub struct ClipEntry {
     pub key: String,
     pub emb: Vec<f32>,
     pub score: Option<f32>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ClipIndex {
     entries: Vec<ClipEntry>,
     by_key: HashMap<String, usize>,
