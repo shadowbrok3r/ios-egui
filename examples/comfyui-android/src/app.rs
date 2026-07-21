@@ -197,6 +197,28 @@ struct Viewer {
     meta_loading: bool,
 }
 
+/// Ranked gallery override: image-similarity ("More like this") or text semantic search.
+enum RankedGallery {
+    Similar(Vec<String>),
+    Semantic(Vec<String>),
+}
+
+impl RankedGallery {
+    fn keys(&self) -> &[String] {
+        match self {
+            Self::Similar(k) | Self::Semantic(k) => k,
+        }
+    }
+
+    fn is_similar(&self) -> bool {
+        matches!(self, Self::Similar(_))
+    }
+
+    fn is_semantic(&self) -> bool {
+        matches!(self, Self::Semantic(_))
+    }
+}
+
 /// Minimum cosine similarity for a "Find images" character match (tunable).
 const CHARACTER_MATCH_COS: f32 = 0.55;
 /// Higher bar for an unprompted auto-suggestion when a freshly indexed image scores against a card.
@@ -839,8 +861,8 @@ struct ComfyApp {
     clip_search_rx: Option<std::sync::mpsc::Receiver<Result<Vec<f32>, String>>>,
     #[cfg(feature = "local-npu")]
     clip_search_running: bool,
-    /// Similarity view: source key + ordered similar keys; overrides the gallery filters while set.
-    similar_filter: Option<(String, Vec<String>)>,
+    /// Ranked gallery override (More like this / semantic search); overrides filters while set.
+    ranked: Option<RankedGallery>,
     /// The gallery grid's visible viewport this frame; gates pull-to-refresh and tile hits.
     gallery_grid_clip: egui::Rect,
     /// Gallery client-side tag search box (session-only).
@@ -894,6 +916,22 @@ struct ComfyApp {
     /// Settings: background-tag the server gallery when idle.
     #[cfg(feature = "local-npu")]
     auto_tag: bool,
+    /// Settings: idle-download full gallery images into the on-device cache.
+    cache_prefetch: bool,
+    /// Resolved `gallery_full` directory (durable or app files); filled on first Settings/update.
+    full_cache_root: Option<String>,
+    /// Key of the full-image prefetch currently in flight.
+    prefetch_pending: Option<String>,
+    /// Prefetch failures this session; skipped until restart.
+    prefetch_failed: HashSet<String>,
+    /// Keys verified present in the full cache this session; spares per-frame re-stats (FUSE is slow).
+    prefetch_cached: HashSet<String>,
+    /// Last finished Settings cache scan, the worker computing the next one, and its kick time.
+    full_cache_report: Option<FullCacheReport>,
+    full_cache_report_rx: Option<std::sync::mpsc::Receiver<FullCacheReport>>,
+    full_cache_report_at: f64,
+    /// Confirm wipe of the full-image cache.
+    cache_clear_confirm: bool,
     /// Awaiting full bytes for an auto-tag job: the item key being fetched.
     #[cfg(feature = "local-npu")]
     autotag_pending: Option<String>,
@@ -920,6 +958,27 @@ struct ComfyApp {
     local_packs: Vec<crate::local_engine::PackEntry>,
     #[cfg(feature = "local-npu")]
     local_packs_scanned: bool,
+    /// Newest file mtime per pack dir, captured at scan time (stat per frame is too slow on FUSE).
+    #[cfg(feature = "local-npu")]
+    pack_mtimes: HashMap<std::path::PathBuf, std::time::SystemTime>,
+    /// Skip pump_clipemb's idle cache-dir walk until this time (egui clock).
+    #[cfg(feature = "local-npu")]
+    clipemb_rescan_after: f64,
+}
+
+/// Settings-pane cache numbers, computed on a worker thread: stat-ing every cached file through
+/// Android's FUSE storage takes far too long to run per frame.
+#[derive(Clone)]
+struct FullCacheReport {
+    /// Listed non-video keys present in the cache when the scan ran.
+    cached: usize,
+    /// Non-video keys in the loaded listing when the scan ran.
+    listed: usize,
+    stats: gallery::FullCacheStats,
+    /// `.key` sidecars with a live image (CLIP index candidates).
+    #[cfg_attr(not(feature = "local-npu"), allow(dead_code))]
+    keyed: usize,
+    root: String,
 }
 
 /// Which prompt string a chip/text view edits.
@@ -1240,7 +1299,7 @@ impl ComfyApp {
             clip_search_rx: None,
             #[cfg(feature = "local-npu")]
             clip_search_running: false,
-            similar_filter: None,
+            ranked: None,
             tag_q: String::new(),
             tag_facets: Vec::new(),
             #[cfg(feature = "local-npu")]
@@ -1275,6 +1334,15 @@ impl ComfyApp {
             rewrite_running: false,
             #[cfg(feature = "local-npu")]
             auto_tag: false,
+            cache_prefetch: true,
+            full_cache_root: None,
+            prefetch_pending: None,
+            prefetch_failed: HashSet::new(),
+            prefetch_cached: HashSet::new(),
+            full_cache_report: None,
+            full_cache_report_rx: None,
+            full_cache_report_at: 0.0,
+            cache_clear_confirm: false,
             #[cfg(feature = "local-npu")]
             autotag_pending: None,
             #[cfg(feature = "local-npu")]
@@ -1293,6 +1361,10 @@ impl ComfyApp {
             local_packs: Vec::new(),
             #[cfg(feature = "local-npu")]
             local_packs_scanned: false,
+            #[cfg(feature = "local-npu")]
+            pack_mtimes: HashMap::new(),
+            #[cfg(feature = "local-npu")]
+            clipemb_rescan_after: 0.0,
         }
     }
 
@@ -1993,7 +2065,7 @@ impl ComfyApp {
                         self.gallery_gen,
                         loaded,
                         self.gallery_page_size(),
-                        &self.gallery_q,
+                        self.gallery_list_q(),
                         &self.gallery_view,
                     );
                 } else if self.viewer_after_delete.is_some() || page.offset == 0 {
@@ -2006,6 +2078,36 @@ impl ComfyApp {
                     v.loading = false;
                 }
                 self.gallery_status = elide(&e, 200);
+            }
+            // A full-image fetch died (HTTP error / undecodable file / not connected). Fail exactly
+            // the consumer waiting on that key — a dangling pending wedges its pump forever.
+            Msg::FullImageError { key, why } => {
+                self.log.warn(format!("full image {}: {}", elide(&key, 60), elide(&why, 120)));
+                if let Some(v) = &mut self.viewer
+                    && v.item.key() == key
+                {
+                    v.loading = false;
+                }
+                if self.prefetch_pending.as_deref() == Some(key.as_str()) {
+                    self.prefetch_pending = None;
+                    self.prefetch_failed.insert(key.clone());
+                }
+                #[cfg(feature = "local-npu")]
+                {
+                    if self.autotag_pending.as_deref() == Some(key.as_str()) {
+                        self.autotag_pending = None;
+                        self.autotag_failed.insert(key.clone());
+                    }
+                    if self.clipemb_pending.as_deref() == Some(key.as_str()) {
+                        self.clipemb_pending = None;
+                        self.clipemb_failed.insert(key.clone());
+                    }
+                }
+                if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
+                    self.gallery_pick_pending = None;
+                    self.note = format!("Image load failed: {}", elide(&why, 80));
+                }
+                self.gallery_status = elide(&format!("{key}: {why}"), 200);
             }
             Msg::Thumb { key, image } => {
                 let (w, h) = (image.width(), image.height());
@@ -2022,6 +2124,7 @@ impl ComfyApp {
                 if w > 0 {
                     self.thumb_aspects.insert(key.clone(), h as f32 / w as f32);
                 }
+                let for_prefetch = self.prefetch_pending.as_deref() == Some(key.as_str());
                 #[cfg(feature = "local-npu")]
                 let for_pump = self.autotag_pending.as_deref() == Some(key.as_str());
                 #[cfg(not(feature = "local-npu"))]
@@ -2030,7 +2133,10 @@ impl ComfyApp {
                 let for_emb = self.clipemb_pending.as_deref() == Some(key.as_str());
                 #[cfg(not(feature = "local-npu"))]
                 let for_emb = false;
-                if for_pump {
+                if for_prefetch {
+                    self.prefetch_pending = None;
+                    // Bytes already written by fetch_full; nothing else to do.
+                } else if for_pump {
                     #[cfg(feature = "local-npu")]
                     {
                         self.autotag_pending = None;
@@ -3261,7 +3367,8 @@ impl ComfyApp {
             session: self.session.clone(),
             params: self.params.clone(),
             gallery: self.gallery_view.clone(),
-            gallery_q: self.gallery_q.clone(),
+            // Search box is session-only (especially semantic queries).
+            gallery_q: String::new(),
             gallery_semantic: self.gallery_semantic,
             gallery_page: self.gallery_page_size(),
             auto_follow: self.auto_follow,
@@ -3287,6 +3394,7 @@ impl ComfyApp {
             auto_tag: self.auto_tag,
             #[cfg(not(feature = "local-npu"))]
             auto_tag: false,
+            cache_prefetch: self.cache_prefetch,
             #[cfg(feature = "local-npu")]
             local_backend: self.local_backend,
             #[cfg(not(feature = "local-npu"))]
@@ -3340,7 +3448,7 @@ impl ComfyApp {
         // The masked photo went with the Picked bytes, so drop the flag on restore too.
         self.params.inpaint_mask = false;
         self.gallery_view = saved.gallery;
-        self.gallery_q = saved.gallery_q;
+        // gallery_q is session-only; ignore any legacy persisted value.
         self.gallery_semantic = saved.gallery_semantic;
         self.gallery_page = saved.gallery_page.clamp(20, GALLERY_PAGE_MAX);
         self.auto_follow = saved.auto_follow;
@@ -3362,6 +3470,7 @@ impl ComfyApp {
         self.create_setup_open = saved.create_setup_open;
         self.create_companions_open = saved.create_companions_open;
         self.prompt_history = saved.prompt_history;
+        self.cache_prefetch = saved.cache_prefetch;
         #[cfg(feature = "local-npu")]
         {
             self.local_npu = saved.local_npu;
@@ -3789,6 +3898,8 @@ impl ComfyApp {
                         .logarithmic(true),
                 );
                 ui.weak("How many rows Load more / preload fetches at once.");
+                ui.add_space(8.0);
+                self.gallery_cache_settings(ui, host);
                 ui.add_space(4.0);
                 ui.checkbox(&mut self.gallery_view.groups_open, "Open group headers by default");
                 ui.checkbox(
@@ -4209,7 +4320,13 @@ impl ComfyApp {
         }
     }
 
+    /// Prefer durable `/sdcard/ComfyUI/clip_index.bin` (survives app data clears); fall back to documents.
     fn clip_index_path(host: &Host) -> Option<String> {
+        if let Some(full) = gallery::resolve_full_cache_root(host.documents_dir().as_deref())
+            && let Some(parent) = std::path::Path::new(&full).parent()
+        {
+            return Some(parent.join("clip_index.bin").to_string_lossy().into_owned());
+        }
         host.documents_dir().map(|d| format!("{d}/comfyui/clip_index.bin"))
     }
 
@@ -4232,13 +4349,31 @@ impl ComfyApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint(),
             }
         } else {
-            let path = Self::clip_index_path(host);
+            let primary = Self::clip_index_path(host);
+            let legacy = host.documents_dir().map(|d| format!("{d}/comfyui/clip_index.bin"));
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let index = path
-                    .and_then(|p| std::fs::read(&p).ok())
-                    .map(|b| clip_index::ClipIndex::from_bytes(&b))
+                let read = |p: &str| std::fs::read(p).ok().map(|b| clip_index::ClipIndex::from_bytes(&b));
+                let mut index = primary
+                    .as_deref()
+                    .and_then(read)
                     .unwrap_or_default();
+                // Migrate a larger legacy documents index onto the durable root.
+                if let Some(leg) = legacy.as_deref()
+                    && primary.as_deref() != Some(leg)
+                {
+                    if let Some(old) = read(leg)
+                        && old.len() > index.len()
+                    {
+                        index = old;
+                        if let Some(dst) = primary.as_deref() {
+                            if let Some(dir) = std::path::Path::new(dst).parent() {
+                                let _ = std::fs::create_dir_all(dir);
+                            }
+                            let _ = std::fs::write(dst, index.to_bytes());
+                        }
+                    }
+                }
                 let _ = tx.send(index);
             });
             self.clip_index_loading = Some(rx);
@@ -4255,6 +4390,28 @@ impl ComfyApp {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&path, self.clip_index.to_bytes());
+    }
+
+    /// Drop in-flight embed work and failed-key skips so indexing can resume.
+    #[cfg(feature = "local-npu")]
+    fn reset_clipemb_pump(&mut self) {
+        self.clipemb_pending = None;
+        self.clipemb_rx = None;
+        self.clipemb_failed.clear();
+    }
+
+    /// Wipe the on-disk CLIP index and restart embedding from scratch.
+    #[cfg(feature = "local-npu")]
+    fn rebuild_clip_index(&mut self, host: &Host) {
+        self.reset_clipemb_pump();
+        self.clip_index = clip_index::ClipIndex::default();
+        self.clip_index_loaded = true;
+        self.clip_index_loading = None;
+        self.clip_index_dirty = 0;
+        if let Some(path) = Self::clip_index_path(host) {
+            let _ = std::fs::remove_file(path);
+        }
+        self.save_clip_index(host);
     }
 
     /// Dict count + category for a folded tag, for styling co-oc suggestion buttons like prefix ones.
@@ -5368,7 +5525,9 @@ impl ComfyApp {
                         let base = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
                         let (loc, wiped) = pack_root_note(dir, app_root.as_deref(), durable);
                         ui.weak(sanitize_ui_text(ui, &format!("{base} - {loc}")));
-                        if let Some(secs) = crate::local_engine::dir_newest_mtime(dir)
+                        if let Some(secs) = self
+                            .pack_mtimes
+                            .get(dir)
                             .and_then(|m| m.elapsed().ok())
                             .map(|d| d.as_secs())
                         {
@@ -8651,7 +8810,12 @@ impl ComfyApp {
                 if self.thumbs.claim(&thumb_key)
                     && let Some((sub, file)) = key.rsplit_once('/')
                 {
-                    self.engine.as_ref().unwrap().fetch_thumb(sub.to_string(), file.to_string(), size);
+                    self.engine.as_ref().unwrap().fetch_thumb(
+                        sub.to_string(),
+                        file.to_string(),
+                        size,
+                        self.full_cache_root.clone(),
+                    );
                 }
                 ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
             }
@@ -10790,7 +10954,7 @@ impl ComfyApp {
             self.gallery_gen,
             0,
             self.gallery_page_size(),
-            &self.gallery_q,
+            self.gallery_list_q(),
             &self.gallery_view,
         );
     }
@@ -10800,11 +10964,20 @@ impl ComfyApp {
     /// applied server-side across the whole listing, not to the page already fetched.
     /// Should the whole filtered/grouped set be auto-loaded (rather than paged by hand)?
     fn gallery_wants_all(&self) -> bool {
-        self.gallery_view.group != GalleryGroup::None
+        if self.gallery_view.group != GalleryGroup::None
             || !self.gallery_view.model.is_empty()
             || self.gallery_view.album.is_some()
             // The media filter is client-side, so the full set must be present to filter over.
             || self.gallery_view.media != GalleryMedia::All
+        {
+            return true;
+        }
+        // CLIP embed / full-cache prefetch need every listed key, not just the first page.
+        #[cfg(feature = "local-npu")]
+        if self.clip_pack.is_some() {
+            return true;
+        }
+        self.cache_prefetch
     }
 
     fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool, host: &Host) -> bool {
@@ -10830,13 +11003,17 @@ impl ComfyApp {
                 egui::vec2(search_w, 28.0),
                 egui::TextEdit::singleline(&mut self.gallery_q).hint_text(hint),
             );
+            #[cfg(feature = "local-npu")]
+            if semantic && self.gallery_q.trim().is_empty() {
+                self.clear_semantic_ranked();
+            }
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 if semantic {
                     #[cfg(feature = "local-npu")]
                     {
                         let q = self.gallery_q.trim().to_string();
                         if q.is_empty() {
-                            self.similar_filter = None;
+                            self.clear_semantic_ranked();
                         } else {
                             self.start_clip_search(ui.ctx(), host, q);
                         }
@@ -10871,8 +11048,15 @@ impl ComfyApp {
                 ui.separator();
 
                 #[cfg(feature = "local-npu")]
-                ui.checkbox(&mut self.gallery_semantic, "Semantic search")
-                    .on_hover_text("Search box describes an image; ranks the CLIP index instead of the server text query");
+                {
+                    let was = self.gallery_semantic;
+                    ui.checkbox(&mut self.gallery_semantic, "Semantic search").on_hover_text(
+                        "Search box describes an image; ranks the CLIP index instead of the server text query",
+                    );
+                    if was && !self.gallery_semantic {
+                        self.clear_semantic_ranked();
+                    }
+                }
 
                 ui.menu_button(
                     format!("{} Sort · {}", icons::SORT, self.gallery_view.sort.label()),
@@ -11090,6 +11274,252 @@ impl ComfyApp {
             })
     }
 
+    /// Query string for server gallery list calls. Empty while semantic search owns the box so the
+    /// server does not filter away images the CLIP ranker needs.
+    fn gallery_list_q(&self) -> &str {
+        #[cfg(feature = "local-npu")]
+        if self.gallery_semantic_active() {
+            return "";
+        }
+        self.gallery_q.as_str()
+    }
+
+    /// Durable or app-files `gallery_full` directory for full-resolution image cache.
+    fn resolve_full_cache_root(host: &Host) -> Option<String> {
+        gallery::resolve_full_cache_root(host.documents_dir().as_deref())
+    }
+
+    /// Memoized cache root; refreshes when missing.
+    fn ensure_full_cache_root(&mut self, host: &Host) -> Option<&str> {
+        if self.full_cache_root.is_none() {
+            self.full_cache_root = Self::resolve_full_cache_root(host);
+        }
+        self.full_cache_root.as_deref()
+    }
+
+    fn format_bytes(n: u64) -> String {
+        const KB: f64 = 1024.0;
+        const MB: f64 = KB * 1024.0;
+        const GB: f64 = MB * 1024.0;
+        let x = n as f64;
+        if x >= GB {
+            format!("{:.1} GB", x / GB)
+        } else if x >= MB {
+            format!("{:.0} MB", x / MB)
+        } else if x >= KB {
+            format!("{:.0} KB", x / KB)
+        } else {
+            format!("{n} B")
+        }
+    }
+
+    /// Last finished cache scan, kicking a worker refresh at most every few seconds. The scan
+    /// stats every listed key plus the whole cache dir — minutes-of-jank territory if run per frame.
+    fn full_cache_progress(&mut self, ctx: &egui::Context, host: &Host) -> Option<FullCacheReport> {
+        let root = self.ensure_full_cache_root(host)?.to_string();
+        if let Some(rx) = &self.full_cache_report_rx {
+            match rx.try_recv() {
+                Ok(report) => {
+                    self.full_cache_report = Some(report);
+                    self.full_cache_report_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.full_cache_report_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let now = ctx.input(|i| i.time);
+        let stale = self.full_cache_report.is_none() || now - self.full_cache_report_at > 2.5;
+        if stale && self.full_cache_report_rx.is_none() {
+            self.full_cache_report_at = now;
+            let keys: Vec<String> = self
+                .gallery
+                .iter()
+                .filter(|it| !it.is_video)
+                .map(|it| it.key())
+                .collect();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.full_cache_report_rx = Some(rx);
+            let ctx = ctx.clone();
+            std::thread::spawn(move || {
+                let report = FullCacheReport {
+                    cached: gallery::full_cache_hits(&root, &keys),
+                    listed: keys.len(),
+                    stats: gallery::full_cache_stats(&root),
+                    keyed: gallery::full_cache_keys(&root).len(),
+                    root,
+                };
+                let _ = tx.send(report);
+                ctx.request_repaint();
+            });
+        }
+        self.full_cache_report.clone()
+    }
+
+    fn gallery_cache_settings(&mut self, ui: &mut egui::Ui, host: &Host) {
+        ui.label("Full-image cache");
+        let report = self.full_cache_progress(ui.ctx(), host);
+        // Keep the numbers ticking over while the pane sits open without input.
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(3));
+        if self.full_cache_root.is_none() {
+            ui.weak("Cache unavailable (need storage / All files access for /sdcard/ComfyUI).");
+        } else if let Some(r) = report {
+            let missing = r.listed.saturating_sub(r.cached);
+            ui.label(format!(
+                "{} cached · {missing} not cached · {} on disk ({})",
+                r.cached,
+                Self::format_bytes(r.stats.bytes),
+                elide(&r.root, 42)
+            ));
+            #[cfg(feature = "local-npu")]
+            if self.clip_pack.is_some() {
+                let (embedded, target, stuck) = self.clip_index_progress(&r);
+                ui.weak(format!("CLIP index: {embedded} / {target} embedded"));
+                if stuck {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 160, 120),
+                        "CLIP embed looks stuck — use Resume below.",
+                    );
+                }
+            }
+        } else {
+            ui.weak("Measuring cache…");
+        }
+        ui.checkbox(&mut self.cache_prefetch, "Prefetch full images")
+            .on_hover_text("Download missing full-resolution gallery images while idle");
+        ui.horizontal(|ui| {
+            if ui.button("Cache missing now").clicked() {
+                self.cache_prefetch = true;
+                self.prefetch_failed.clear();
+                self.prefetch_cached.clear();
+                self.note = "Caching missing full images…".into();
+            }
+            let pause_label = if self.cache_prefetch { "Pause" } else { "Resume" };
+            if ui.button(pause_label).clicked() {
+                self.cache_prefetch = !self.cache_prefetch;
+            }
+            if !self.cache_clear_confirm {
+                if ui.button("Clear cache").clicked() {
+                    self.cache_clear_confirm = true;
+                }
+            } else {
+                if ui.button("Confirm clear").clicked() {
+                    if let Some(root) = self.ensure_full_cache_root(host).map(|s| s.to_string()) {
+                        match gallery::clear_full_cache(&root) {
+                            Ok(n) => self.note = format!("Cleared {n} cached images"),
+                            Err(e) => self.note = format!("Clear failed: {e}"),
+                        }
+                    }
+                    self.cache_clear_confirm = false;
+                    self.prefetch_failed.clear();
+                    self.prefetch_cached.clear();
+                    self.full_cache_report = None;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.cache_clear_confirm = false;
+                }
+            }
+        });
+        #[cfg(feature = "local-npu")]
+        if self.clip_pack.is_some() {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Resume CLIP index")
+                    .on_hover_text("Clear stuck in-flight embeds and failed keys, then keep indexing")
+                    .clicked()
+                {
+                    self.reset_clipemb_pump();
+                    if let Some(root) = self.ensure_full_cache_root(host).map(|s| s.to_string()) {
+                        for it in &self.gallery {
+                            if it.is_video {
+                                continue;
+                            }
+                            gallery::ensure_full_cache_key(&root, &it.key());
+                        }
+                    }
+                    self.note = "CLIP indexing resumed".into();
+                }
+                if ui
+                    .button("Rebuild CLIP index")
+                    .on_hover_text("Delete the saved CLIP index and re-embed from the full-image cache")
+                    .clicked()
+                {
+                    self.rebuild_clip_index(host);
+                    self.note = "CLIP index cleared — re-embedding from cache…".into();
+                }
+            });
+        }
+        ui.weak("Full images (not thumbs). Powers offline viewer loads and CLIP semantic search.");
+    }
+
+    /// Embedded count vs the best available library size (cache / listing / server total).
+    #[cfg(feature = "local-npu")]
+    fn clip_index_progress(&self, report: &FullCacheReport) -> (usize, usize, bool) {
+        let embedded = self.clip_index.len();
+        let listed = self.gallery.iter().filter(|it| !it.is_video).count();
+        let total = self.gallery_total as usize;
+        let target = embedded.max(listed).max(report.stats.files).max(report.keyed).max(total);
+        let has_work = embedded < target;
+        let stuck = has_work && (self.clipemb_pending.is_some() || !self.clipemb_failed.is_empty());
+        (embedded, target, stuck)
+    }
+
+    /// Idle download of the next listed image missing from the full-image cache.
+    fn pump_full_cache(&mut self, ctx: &egui::Context, host: &Host) {
+        if !self.cache_prefetch || self.prefetch_pending.is_some() {
+            return;
+        }
+        if !matches!(self.conn, Conn::Connected) || self.gallery.is_empty() || self.engine.is_none() {
+            return;
+        }
+        let Some(root) = self.ensure_full_cache_root(host).map(|s| s.to_string()) else { return };
+        let mut newly_cached: Vec<String> = Vec::new();
+        let next = self.gallery.iter().find_map(|it| {
+            if it.is_video {
+                return None;
+            }
+            let key = it.key();
+            if self.prefetch_cached.contains(&key) || self.prefetch_failed.contains(&key) {
+                return None;
+            }
+            // Stat each key once, then trust the session memo — FUSE stats per frame add up fast.
+            if gallery::full_cache_has(&root, &key) {
+                newly_cached.push(key);
+                return None;
+            }
+            // Avoid racing a viewer / pick / tag / embed fetch for the same key.
+            #[cfg(feature = "local-npu")]
+            if self.autotag_pending.as_deref() == Some(key.as_str())
+                || self.clipemb_pending.as_deref() == Some(key.as_str())
+            {
+                return None;
+            }
+            if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
+                return None;
+            }
+            if self.viewer.as_ref().is_some_and(|v| v.item.key() == key && v.loading) {
+                return None;
+            }
+            Some((key, it.subfolder.clone(), it.filename.clone()))
+        });
+        self.prefetch_cached.extend(newly_cached);
+        if let Some((key, subfolder, filename)) = next {
+            self.prefetch_pending = Some(key);
+            self.engine.as_ref().unwrap().fetch_full(subfolder, filename, Some(root));
+            ctx.request_repaint();
+        }
+    }
+
+    /// Drop a semantic ranked view and any in-flight text embed when the search box is emptied.
+    #[cfg(feature = "local-npu")]
+    fn clear_semantic_ranked(&mut self) {
+        if self.ranked.as_ref().is_some_and(|r| r.is_semantic()) {
+            self.ranked = None;
+        }
+        self.clip_search_rx = None;
+        self.clip_search_running = false;
+        self.clip_text_q.clear();
+    }
+
     /// Pinned all-tags browser: a filter box over every indexed tag with counts, tap to toggle a
     /// facet. A real window keeps the TextEdit focused where a menu popup would auto-close on IME.
     fn tags_window(&mut self, ctx: &egui::Context) {
@@ -11168,11 +11598,28 @@ impl ComfyApp {
                 let n = ranked.len().min(200);
                 let keys: Vec<String> = ranked.into_iter().take(200).map(|(k, _)| k).collect();
                 let q = self.clip_text_q.trim().to_string();
+                // Stale result after the box was cleared or edited.
+                if q.is_empty() || self.gallery_q.trim() != q {
+                    return;
+                }
                 if keys.is_empty() {
-                    self.status = format!("No matches for \"{}\"", elide(&q, 32));
+                    self.status = format!(
+                        "No matches for \"{}\" ({} indexed)",
+                        elide(&q, 32),
+                        self.clip_index.len()
+                    );
+                    if self.ranked.as_ref().is_some_and(|r| r.is_semantic()) {
+                        self.ranked = None;
+                    }
                 } else {
-                    self.status = format!("{n} matches for \"{}\"", elide(&q, 32));
-                    self.similar_filter = Some((format!("query: {q}"), keys));
+                    let visible_n =
+                        keys.iter().filter(|k| self.gallery.iter().any(|it| it.key() == **k)).count();
+                    self.status = format!(
+                        "{n} matches for \"{}\" ({visible_n} in view, {} indexed)",
+                        elide(&q, 32),
+                        self.clip_index.len()
+                    );
+                    self.ranked = Some(RankedGallery::Semantic(keys));
                 }
             }
             Ok(Err(e)) => {
@@ -11354,7 +11801,7 @@ impl ComfyApp {
                 self.gallery_gen,
                 0,
                 self.gallery_page_size(),
-                &self.gallery_q,
+                self.gallery_list_q(),
                 &self.gallery_view,
             );
         }
@@ -11363,11 +11810,11 @@ impl ComfyApp {
         let media = self.gallery_view.media;
         let rating = self.gallery_view.rating;
         let tag_q = self.tag_q.trim().to_string();
-        // A similarity view overrides the filters and keeps the ranked order.
-        let visible: Vec<usize> = if let Some((_, keys)) = &self.similar_filter {
+        // A ranked view overrides the filters and keeps cosine order.
+        let visible: Vec<usize> = if let Some(ranked) = &self.ranked {
             let by_key: HashMap<String, usize> =
                 self.gallery.iter().enumerate().map(|(i, it)| (it.key(), i)).collect();
-            keys.iter().filter_map(|k| by_key.get(k).copied()).collect()
+            ranked.keys().iter().filter_map(|k| by_key.get(k).copied()).collect()
         } else {
             self.gallery
                 .iter()
@@ -11389,7 +11836,7 @@ impl ComfyApp {
         };
         let mut visible = visible;
         // Aesthetic order: indexed scores descending, unscored after, stable within ties.
-        if self.gallery_view.sort == GallerySort::Score && self.similar_filter.is_none() {
+        if self.gallery_view.sort == GallerySort::Score && self.ranked.is_none() {
             let score_of =
                 |i: usize| self.gallery.get(i).and_then(|it| self.clip_index.score(&it.key()));
             visible.sort_by(|&a, &b| match (score_of(a), score_of(b)) {
@@ -11399,11 +11846,12 @@ impl ComfyApp {
                 (None, None) => std::cmp::Ordering::Equal,
             });
         }
-        if self.similar_filter.is_some() {
+        // Banner only for More like this — semantic search clears by emptying the box.
+        if self.ranked.as_ref().is_some_and(|r| r.is_similar()) {
             ui.horizontal(|ui| {
                 ui.label(format!("{} Similar images", icons::SEARCH));
                 if ui.small_button("Show all").clicked() {
-                    self.similar_filter = None;
+                    self.ranked = None;
                 }
             });
         }
@@ -11412,8 +11860,8 @@ impl ComfyApp {
             visible.iter().filter_map(|&i| self.gallery.get(i).map(|it| it.key())).collect();
         let facets = self.tag_index.top_tags(&facet_keys, 12);
         self.gallery_tag_bar(ui, &facets);
-        // Similarity order is the point of that view; grouping would destroy it.
-        let group = if self.similar_filter.is_some() {
+        // Ranked order is the point of that view; grouping would destroy it.
+        let group = if self.ranked.is_some() {
             crate::types::GalleryGroup::None
         } else {
             self.gallery_view.group
@@ -11459,18 +11907,53 @@ impl ComfyApp {
             scroll = scroll.vertical_scroll_offset(y);
         }
         let scroll_out = scroll.show(ui, |ui| {
+            self.gallery_grid_clip = ui.clip_rect();
             for group in &groups {
                 if group.label.is_empty() {
                     open = self.gallery_grid(ui, &group.items, cols).or(open);
                     continue;
                 }
                 let header = format!("{} ({})", elide(&group.label, 40), group.items.len());
-                egui::CollapsingHeader::new(header)
-                    .id_salt(&group.key)
-                    .default_open(self.gallery_view.groups_open)
-                    .show(ui, |ui| {
-                        open = self.gallery_grid(ui, &group.items, cols).or(open);
-                    });
+                let id = ui.make_persistent_id(&group.key);
+                egui::collapsing_header::CollapsingState::load_with_default_open(
+                    ui.ctx(),
+                    id,
+                    self.gallery_view.groups_open,
+                )
+                .show_header(ui, |ui| {
+                    ui.label(&header);
+                    let keys: Vec<String> = group
+                        .items
+                        .iter()
+                        .filter_map(|&i| self.gallery.get(i).map(|it| it.key()))
+                        .collect();
+                    let all_sel =
+                        !keys.is_empty() && keys.iter().all(|k| self.selected.contains(k));
+                    let btn = if all_sel { "None" } else { "All" };
+                    if ui
+                        .small_button(btn)
+                        .on_hover_text(if all_sel {
+                            "Clear selection in this group"
+                        } else {
+                            "Select every image in this group"
+                        })
+                        .clicked()
+                    {
+                        self.select_mode = true;
+                        if all_sel {
+                            for k in &keys {
+                                self.selected.remove(k);
+                            }
+                        } else {
+                            for k in keys {
+                                self.selected.insert(k);
+                            }
+                        }
+                    }
+                })
+                .body(|ui| {
+                    open = self.gallery_grid(ui, &group.items, cols).or(open);
+                });
             }
 
             ui.add_space(6.0);
@@ -11496,7 +11979,7 @@ impl ComfyApp {
                 self.gallery_gen,
                 self.gallery.len() as u64,
                 self.gallery_page_size(),
-                &self.gallery_q,
+                self.gallery_list_q(),
                 &self.gallery_view,
             );
         }
@@ -11907,11 +12390,30 @@ impl ComfyApp {
                 }
             }
         }
-        if self.sel_painting
-            && let Some(idx) = tile_at(pos, &self.tile_hits)
-            && let Some(item) = self.gallery.get(idx)
-        {
-            self.selected.insert(item.key());
+        if self.sel_painting {
+            if let Some(idx) = tile_at(pos, &self.tile_hits)
+                && let Some(item) = self.gallery.get(idx)
+            {
+                self.selected.insert(item.key());
+            }
+            // Auto-scroll when the finger sits in the top/bottom edge of the grid.
+            let clip = self.gallery_grid_clip;
+            if clip.height() > 8.0 {
+                const ZONE: f32 = 72.0;
+                let dt = ui.input(|i| i.stable_dt).clamp(1.0 / 120.0, 0.05);
+                let mut dy = 0.0_f32;
+                if pos.y < clip.top() + ZONE {
+                    let t = ((clip.top() + ZONE - pos.y) / ZONE).clamp(0.0, 1.0);
+                    dy = -(280.0 + 720.0 * t) * dt;
+                } else if pos.y > clip.bottom() - ZONE {
+                    let t = ((pos.y - (clip.bottom() - ZONE)) / ZONE).clamp(0.0, 1.0);
+                    dy = (280.0 + 720.0 * t) * dt;
+                }
+                if dy != 0.0 {
+                    self.gallery_scroll_restore = Some((self.gallery_scroll_y + dy).max(0.0));
+                    ui.ctx().request_repaint();
+                }
+            }
         }
     }
 
@@ -11923,7 +12425,6 @@ impl ComfyApp {
     fn gallery_grid(&mut self, ui: &mut egui::Ui, indices: &[usize], cols: usize) -> Option<usize> {
         let mut open = None;
         let clip = ui.clip_rect();
-        self.gallery_grid_clip = clip;
         let spacing = ui.spacing().item_spacing.x;
         let avail = ui.available_width();
         let tile = ((avail - spacing * (cols as f32 - 1.0)) / cols as f32).max(48.0);
@@ -11966,7 +12467,12 @@ impl ComfyApp {
                         }
                         None => {
                             if self.thumbs.claim(&thumb_key) {
-                                self.engine.as_ref().unwrap().fetch_thumb(subfolder, filename, size);
+                                self.engine.as_ref().unwrap().fetch_thumb(
+                                    subfolder,
+                                    filename,
+                                    size,
+                                    self.full_cache_root.clone(),
+                                );
                             }
                             ui.put(rect, egui::Button::new(elide(&item_key, 14)).wrap()).clicked()
                         }
@@ -12074,7 +12580,7 @@ impl ComfyApp {
                 self.gallery_gen,
                 0,
                 self.gallery_page_size(),
-                &self.gallery_q,
+                self.gallery_list_q(),
                 &self.gallery_view,
             );
         }
@@ -12115,7 +12621,12 @@ impl ComfyApp {
                         }
                         None => {
                             if self.thumbs.claim(&thumb_key) {
-                                self.engine.as_ref().unwrap().fetch_thumb(subfolder, filename, size);
+                                self.engine.as_ref().unwrap().fetch_thumb(
+                                    subfolder,
+                                    filename,
+                                    size,
+                                    self.full_cache_root.clone(),
+                                );
                             }
                             ui.put(rect, egui::Button::new(elide(&thumb_key, 12)).wrap()).clicked()
                         }
@@ -12132,7 +12643,7 @@ impl ComfyApp {
     /// Fetch the tapped gallery image's full bytes; the result lands as the picked input.
     fn pick_gallery_input(&mut self, idx: usize, host: &Host) {
         let Some(item) = self.gallery.get(idx).cloned() else { return };
-        let cache_dir = host.documents_dir();
+        let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
         self.gallery_pick_pending = Some((item.key(), item.filename.clone()));
         self.engine.as_ref().unwrap().fetch_full(item.subfolder, item.filename, cache_dir);
         self.gallery_pick_open = false;
@@ -12144,8 +12655,8 @@ impl ComfyApp {
         let Some(item) = self.gallery.get(idx).cloned() else { return };
         // Any previous item's playback ends here (drop stops the decode thread).
         self.player = None;
+        let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
         let engine = self.engine.as_ref().unwrap();
-        let cache_dir = host.documents_dir();
         // Videos download the raw file — the poster shows immediately, Save works, and playback
         // starts once the bytes land (Msg::VideoReady). Images decode as usual (disk-cached).
         if item.is_video {
@@ -12423,7 +12934,7 @@ impl ComfyApp {
     /// Fetch a gallery image's full bytes as the img2img input and jump to Create.
     fn use_key_as_input(&mut self, key: &str, host: &Host) {
         let Some(item) = self.gallery.iter().find(|it| it.key() == key).cloned() else { return };
-        let cache_dir = host.documents_dir();
+        let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
         self.gallery_pick_pending = Some((item.key(), item.filename.clone()));
         self.engine.as_ref().unwrap().fetch_full(item.subfolder, item.filename, cache_dir);
         self.params.mode = Mode::Img2Img;
@@ -12657,6 +13168,7 @@ impl ComfyApp {
                                     item.subfolder.clone(),
                                     item.filename.clone(),
                                     size,
+                                    self.full_cache_root.clone(),
                                 );
                             }
                             ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
@@ -13195,7 +13707,7 @@ impl ComfyApp {
                     if similar.is_empty() {
                         self.gallery_status = "No similar images indexed yet".into();
                     } else {
-                        self.similar_filter = Some((key, similar));
+                        self.ranked = Some(RankedGallery::Similar(similar));
                         self.close_viewer();
                         host.haptic(Haptic::Light);
                     }
@@ -13543,6 +14055,7 @@ impl ComfyApp {
                                                 item.subfolder.clone(),
                                                 item.filename.clone(),
                                                 320,
+                                                self.full_cache_root.clone(),
                                             );
                                         }
                                         if ui.put(rect, egui::Button::new("")).clicked() {
@@ -13667,6 +14180,17 @@ impl ComfyApp {
         self.wd14_pack = crate::local_engine::find_wd14_pack_many(&roots);
         self.clip_pack = crate::local_engine::find_clip_pack_many(&roots);
         self.rewrite_pack = crate::local_engine::find_rewrite_pack_many(&roots);
+        self.pack_mtimes = self
+            .local_packs
+            .iter()
+            .map(|p| p.dir.clone())
+            .chain(
+                [self.wd14_pack.clone(), self.clip_pack.clone(), self.rewrite_pack.clone()]
+                    .into_iter()
+                    .flatten(),
+            )
+            .filter_map(|d| crate::local_engine::dir_newest_mtime(&d).map(|m| (d, m)))
+            .collect();
         self.log.info(format!(
             "local-npu: {} pack(s) found: {}; wd14 pack: {}; rewrite pack: {} (roots: app files + {durable})",
             self.local_packs.len(),
@@ -14044,12 +14568,11 @@ impl ComfyApp {
     /// stops it choosing new work (an in-flight tag holds the run_lock and finishes).
     #[cfg(feature = "local-npu")]
     fn pump_autotag(&mut self, ctx: &egui::Context, host: &Host) {
-        // A fetch, tag, or embed is in flight — let it finish; not a pause, so don't flush.
-        if self.autotag_pending.is_some()
-            || self.autotag_rx.is_some()
-            || self.clipemb_pending.is_some()
-            || self.clipemb_rx.is_some()
-        {
+        if self.autotag_pending.is_some() || self.autotag_rx.is_some() {
+            return;
+        }
+        // Don't contend with CLIP embed for the HTP.
+        if self.clipemb_pending.is_some() || self.clipemb_rx.is_some() {
             return;
         }
         let idle = self.auto_tag
@@ -14059,61 +14582,124 @@ impl ComfyApp {
             && !self.wd14_running
             && self.tag_index_loaded
             && !self.gallery.is_empty();
-        let next = idle
-            .then(|| {
-                self.gallery.iter().find_map(|it| {
-                    if it.is_video {
-                        return None;
-                    }
-                    let key = it.key();
-                    if self.tag_index.contains(&key) || self.autotag_failed.contains(&key) {
-                        return None;
-                    }
-                    Some((key, it.subfolder.clone(), it.filename.clone()))
-                })
-            })
-            .flatten();
-        match next {
-            Some((key, subfolder, filename)) => {
-                self.autotag_pending = Some(key);
-                let cache_dir = host.documents_dir();
-                self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
-                ctx.request_repaint();
+        if !idle {
+            if self.tag_index_dirty > 0 {
+                self.save_tag_index(host);
             }
-            // Everything tagged (or tagging paused): embed the next un-embedded image, else flush.
-            None => {
-                let next_emb = (idle && self.clip_pack.is_some() && self.clip_index_loaded)
-                    .then(|| {
-                        self.gallery.iter().find_map(|it| {
-                            if it.is_video {
-                                return None;
-                            }
-                            let key = it.key();
-                            if self.clip_index.contains(&key) || self.clipemb_failed.contains(&key) {
-                                return None;
-                            }
-                            Some((key, it.subfolder.clone(), it.filename.clone()))
-                        })
-                    })
-                    .flatten();
-                match next_emb {
-                    Some((key, subfolder, filename)) => {
-                        self.clipemb_pending = Some(key);
-                        let cache_dir = host.documents_dir();
-                        self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
-                        ctx.request_repaint();
+            return;
+        }
+        let next = self.gallery.iter().find_map(|it| {
+            if it.is_video {
+                return None;
+            }
+            let key = it.key();
+            if self.tag_index.contains(&key) || self.autotag_failed.contains(&key) {
+                return None;
+            }
+            Some((key, it.subfolder.clone(), it.filename.clone()))
+        });
+        if let Some((key, subfolder, filename)) = next {
+            let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
+            // Prefer disk bytes so we skip the network when prefetch already won.
+            if let Some(root) = cache_dir.as_ref()
+                && let Some(bytes) = gallery::read_full_cache(root, &key)
+            {
+                self.autotag_pending = None;
+                self.autotag_run(ctx, host, key, bytes);
+                return;
+            }
+            self.autotag_pending = Some(key);
+            self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
+            ctx.request_repaint();
+        } else if self.tag_index_dirty > 0 {
+            self.save_tag_index(host);
+        }
+    }
+
+    /// Embed the next un-indexed image for semantic search. Independent of Auto-tag.
+    /// Prefers the loaded listing, then any keyed files already in the full-image cache.
+    #[cfg(feature = "local-npu")]
+    fn pump_clipemb(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.clipemb_pending.is_some() || self.clipemb_rx.is_some() {
+            return;
+        }
+        // Don't contend with tagging for the HTP.
+        if self.autotag_pending.is_some() || self.autotag_rx.is_some() {
+            return;
+        }
+        if self.clip_pack.is_none() || !self.clip_index_loaded || self.running || self.wd14_running {
+            if self.clip_index_dirty > 0 {
+                self.save_clip_index(host);
+            }
+            return;
+        }
+        let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
+        let mut next = self.gallery.iter().find_map(|it| {
+            if it.is_video {
+                return None;
+            }
+            let key = it.key();
+            if self.clip_index.contains(&key) || self.clipemb_failed.contains(&key) {
+                return None;
+            }
+            Some((key, it.subfolder.clone(), it.filename.clone()))
+        });
+        if next.is_none()
+            && let Some(root) = cache_dir.as_ref()
+        {
+            // Walking the cache dir reads every .key sidecar — off-limits per frame on FUSE, so
+            // once a walk comes up empty, hold off before checking the dir again.
+            let now = ctx.input(|i| i.time);
+            if now >= self.clipemb_rescan_after {
+                next = gallery::full_cache_keys(root).into_iter().find_map(|key| {
+                    if self.clip_index.contains(&key) || self.clipemb_failed.contains(&key) {
+                        return None;
                     }
-                    None => {
-                        if self.tag_index_dirty > 0 {
-                            self.save_tag_index(host);
-                        }
-                        if self.clip_index_dirty > 0 {
-                            self.save_clip_index(host);
-                        }
-                    }
+                    let (subfolder, filename) = match key.rsplit_once('/') {
+                        Some((s, f)) => (s.to_string(), f.to_string()),
+                        None => (String::new(), key.clone()),
+                    };
+                    Some((key, subfolder, filename))
+                });
+                if next.is_none() {
+                    self.clipemb_rescan_after = now + 10.0;
                 }
             }
         }
+        let Some((key, subfolder, filename)) = next else {
+            // Still paging the gallery — keep the UI alive until the listing is complete.
+            if matches!(self.conn, Conn::Connected)
+                && self.gallery.len() < self.gallery_total as usize
+                && self.gallery.len() < GALLERY_LOAD_ALL_CAP as usize
+                && !self.gallery_loading
+                && self.engine.is_some()
+            {
+                self.gallery_loading = true;
+                self.engine.as_ref().unwrap().gallery_list(
+                    self.gallery_gen,
+                    self.gallery.len() as u64,
+                    self.gallery_page_size(),
+                    self.gallery_list_q(),
+                    &self.gallery_view,
+                );
+            }
+            if self.clip_index_dirty > 0 {
+                self.save_clip_index(host);
+            }
+            return;
+        };
+        if let Some(root) = cache_dir.as_ref()
+            && let Some(bytes) = gallery::read_full_cache(root, &key)
+        {
+            self.clipemb_run(ctx, host, key, bytes);
+            return;
+        }
+        if !matches!(self.conn, Conn::Connected) || self.engine.is_none() {
+            return;
+        }
+        self.clipemb_pending = Some(key);
+        self.engine.as_ref().unwrap().fetch_full(subfolder, filename, cache_dir);
+        ctx.request_repaint();
     }
 
     #[cfg(feature = "local-npu")]
@@ -14236,13 +14822,16 @@ impl EguiApp for ComfyApp {
         self.poll_rewrite();
         #[cfg(feature = "local-npu")]
         self.poll_clip_search();
+        let _ = self.ensure_full_cache_root(host);
         self.ensure_tag_index_warm(ui.ctx(), host);
         self.ensure_clip_index_warm(ui.ctx(), host);
+        self.pump_full_cache(ui.ctx(), host);
         #[cfg(feature = "local-npu")]
         {
             self.poll_autotag(host);
             self.poll_clipemb(host);
             self.pump_autotag(ui.ctx(), host);
+            self.pump_clipemb(ui.ctx(), host);
         }
         self.log_lines.extend(self.log.take_new(&mut self.log_cursor));
         if self.log_lines.len() > logger::MAX_LINES {

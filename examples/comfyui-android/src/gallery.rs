@@ -705,11 +705,40 @@ fn push_unique(list: &mut Vec<String>, value: String) {
     }
 }
 
-/// On-disk cache for full-resolution gallery images under `{documents}/gallery_full/`.
-const FULL_CACHE_BUDGET: u64 = 256 * 1024 * 1024;
+/// Durable gallery tree (same root as model packs). Full images live in `gallery_full/`.
+pub const DURABLE_GALLERY_ROOT: &str = "/storage/emulated/0/ComfyUI";
 
-pub fn full_cache_dir(documents: &str) -> PathBuf {
-    Path::new(documents).join("gallery_full")
+/// Soft cap on the full-image cache; oldest mtime files evict first.
+const FULL_CACHE_BUDGET: u64 = 32 * 1024 * 1024 * 1024;
+
+/// File/byte counts for a full-image cache root.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FullCacheStats {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Prefer durable `/sdcard/ComfyUI/gallery_full`; fall back to `{documents}/gallery_full`.
+pub fn resolve_full_cache_root(documents: Option<&str>) -> Option<String> {
+    let durable = format!("{DURABLE_GALLERY_ROOT}/gallery_full");
+    if probe_writable_dir(&durable) {
+        return Some(durable);
+    }
+    let docs = documents?;
+    let fallback = format!("{docs}/gallery_full");
+    probe_writable_dir(&fallback).then_some(fallback)
+}
+
+fn probe_writable_dir(dir: &str) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = Path::new(dir).join(".write_test");
+    if std::fs::write(&probe, b"").is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&probe);
+    true
 }
 
 fn full_cache_path(dir: &Path, key: &str) -> PathBuf {
@@ -721,23 +750,125 @@ fn full_cache_path(dir: &Path, key: &str) -> PathBuf {
     dir.join(safe)
 }
 
+fn full_cache_key_path(dir: &Path, key: &str) -> PathBuf {
+    let mut os = full_cache_path(dir, key).into_os_string();
+    os.push(".key");
+    PathBuf::from(os)
+}
+
+fn is_full_cache_meta(name: &std::ffi::OsStr) -> bool {
+    let s = name.to_string_lossy();
+    s == ".write_test" || s.ends_with(".key")
+}
+
+/// Persist the original gallery key next to a cached image (for CLIP indexing without a listing).
+pub fn ensure_full_cache_key(root: &str, key: &str) {
+    let dir = Path::new(root);
+    if !full_cache_has(root, key) {
+        return;
+    }
+    let path = full_cache_key_path(dir, key);
+    if path.is_file() {
+        return;
+    }
+    let _ = std::fs::write(path, key.as_bytes());
+}
+
+/// True when `root` holds a non-empty file for gallery key `subfolder/filename`.
+pub fn full_cache_has(root: &str, key: &str) -> bool {
+    let path = full_cache_path(Path::new(root), key);
+    path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+}
+
 /// Read a previously cached full image, or `None` on miss / IO error.
-pub fn read_full_cache(documents: &str, key: &str) -> Option<Vec<u8>> {
-    let path = full_cache_path(&full_cache_dir(documents), key);
-    std::fs::read(path).ok().filter(|b| !b.is_empty())
+/// `root` is the `gallery_full` directory itself.
+pub fn read_full_cache(root: &str, key: &str) -> Option<Vec<u8>> {
+    let path = full_cache_path(Path::new(root), key);
+    let bytes = std::fs::read(path).ok().filter(|b| !b.is_empty())?;
+    ensure_full_cache_key(root, key);
+    Some(bytes)
 }
 
 /// Persist a full image and evict oldest files when the cache exceeds the budget.
-pub fn write_full_cache(documents: &str, key: &str, bytes: &[u8]) {
-    let dir = full_cache_dir(documents);
-    if std::fs::create_dir_all(&dir).is_err() {
+pub fn write_full_cache(root: &str, key: &str, bytes: &[u8]) {
+    let dir = Path::new(root);
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
-    let path = full_cache_path(&dir, key);
+    let path = full_cache_path(dir, key);
     if std::fs::write(&path, bytes).is_err() {
         return;
     }
-    evict_full_cache(&dir);
+    let _ = std::fs::write(full_cache_key_path(dir, key), key.as_bytes());
+    evict_full_cache(dir);
+}
+
+/// Original gallery keys recorded beside cached images (via `.key` sidecars).
+pub fn full_cache_keys(root: &str) -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    for ent in rd.flatten() {
+        let path = ent.path();
+        let name = ent.file_name();
+        let name_s = name.to_string_lossy();
+        if !name_s.ends_with(".key") || !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let key = raw.trim();
+        if key.is_empty() {
+            continue;
+        }
+        // Image file is the sidecar stem (strip trailing ".key").
+        let img = Path::new(root).join(name_s.trim_end_matches(".key"));
+        if img.is_file() && img.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            keys.push(key.to_string());
+        }
+    }
+    keys
+}
+
+/// Count files and total bytes under the full-image cache root.
+pub fn full_cache_stats(root: &str) -> FullCacheStats {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return FullCacheStats::default();
+    };
+    let mut stats = FullCacheStats::default();
+    for ent in rd.flatten() {
+        let Ok(meta) = ent.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = ent.file_name();
+        if is_full_cache_meta(&name) {
+            continue;
+        }
+        stats.files += 1;
+        stats.bytes = stats.bytes.saturating_add(meta.len());
+    }
+    stats
+}
+
+/// How many of `keys` are present as non-empty files under `root`.
+pub fn full_cache_hits(root: &str, keys: impl IntoIterator<Item = impl AsRef<str>>) -> usize {
+    keys.into_iter().filter(|k| full_cache_has(root, k.as_ref())).count()
+}
+
+/// Delete every file in the full-image cache directory.
+pub fn clear_full_cache(root: &str) -> Result<usize, String> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Ok(0);
+    };
+    let mut n = 0usize;
+    for ent in rd.flatten() {
+        let path = ent.path();
+        if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 fn evict_full_cache(dir: &Path) {
@@ -746,7 +877,7 @@ fn evict_full_cache(dir: &Path) {
     let mut total = 0u64;
     for ent in rd.flatten() {
         let Ok(meta) = ent.metadata() else { continue };
-        if !meta.is_file() {
+        if !meta.is_file() || is_full_cache_meta(&ent.file_name()) {
             continue;
         }
         let len = meta.len();
@@ -764,6 +895,9 @@ fn evict_full_cache(dir: &Path) {
         }
         if std::fs::remove_file(&path).is_ok() {
             total = total.saturating_sub(len);
+            let mut key_os = path.as_os_str().to_os_string();
+            key_os.push(".key");
+            let _ = std::fs::remove_file(PathBuf::from(key_os));
         }
     }
 }

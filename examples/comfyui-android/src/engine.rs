@@ -105,6 +105,8 @@ pub enum Msg {
     Thumb { key: String, image: egui::ColorImage },
     /// A decoded full-resolution gallery image with its raw bytes.
     FullImage { key: String, image: egui::ColorImage, bytes: Vec<u8> },
+    /// A full-image fetch failed; consumers waiting on `key` must give up rather than wait forever.
+    FullImageError { key: String, why: String },
     /// A downloaded video's raw bytes (no decode — for the poster viewer + Save).
     VideoReady { key: String, bytes: Vec<u8> },
     /// One downloaded file to save to the device gallery (batch "Save all"); `name` is the filename.
@@ -1133,8 +1135,25 @@ impl Engine {
         });
     }
 
-    /// Fetch and decode a gallery thumbnail at `size` (server-side downscale, clamped 64..=1024).
-    pub fn fetch_thumb(&self, subfolder: String, filename: String, size: u32) {
+    /// Fetch and decode a gallery thumbnail at `size` (clamped 64..=1024).
+    /// When `cache_root` has the full image, downscale locally and skip the network.
+    pub fn fetch_thumb(
+        &self,
+        subfolder: String,
+        filename: String,
+        size: u32,
+        cache_root: Option<String>,
+    ) {
+        let key = format!("{subfolder}/{filename}");
+        let thumb_key = format!("{key}#{size}");
+        if let Some(root) = cache_root.as_ref()
+            && let Some(bytes) = crate::gallery::read_full_cache(root, &key)
+            && let Some(image) = decode_thumb(&bytes, size)
+        {
+            let _ = self.tx.send(Msg::Thumb { key: thumb_key, image });
+            self.ctx.request_repaint();
+            return;
+        }
         let size_s = size.to_string();
         let Some((http, url)) = self.authed_url(
             "/gallery/api/thumb",
@@ -1147,8 +1166,7 @@ impl Engine {
             if let Ok(bytes) = get_ok_bytes(&http, url).await
                 && let Some(image) = decode(&bytes)
             {
-                let key = format!("{subfolder}/{filename}#{size}");
-                let _ = tx.send(Msg::Thumb { key, image });
+                let _ = tx.send(Msg::Thumb { key: thumb_key, image });
                 ctx.request_repaint();
             }
         });
@@ -1272,6 +1290,8 @@ impl Engine {
             "/view",
             &[("type", "output"), ("subfolder", &subfolder), ("filename", &filename)],
         ) else {
+            let _ = self.tx.send(Msg::FullImageError { key, why: "not connected".into() });
+            self.ctx.request_repaint();
             return;
         };
         let (tx, ctx, log) = self.emitters();
@@ -1284,12 +1304,13 @@ impl Engine {
                         }
                         let _ = tx.send(Msg::FullImage { key, image, bytes });
                     } else {
-                        let _ = tx.send(Msg::GalleryError("image decode failed".into()));
+                        log.warn(format!("full image {key}: decode failed ({} bytes)", bytes.len()));
+                        let _ = tx.send(Msg::FullImageError { key, why: "image decode failed".into() });
                     }
                 }
                 Err(e) => {
-                    log.error(format!("full image: {e}"));
-                    let _ = tx.send(Msg::GalleryError(e));
+                    log.error(format!("full image {key}: {e}"));
+                    let _ = tx.send(Msg::FullImageError { key, why: e });
                 }
             }
             ctx.request_repaint();
@@ -1977,7 +1998,16 @@ async fn fetch_bytes(
         .map_err(|e| e.to_string())
 }
 
-/// Decode encoded image bytes (PNG/JPEG) into an egui image for display.
+/// Decode encoded image bytes and downscale so the longest edge is at most `size`.
+pub(crate) fn decode_thumb(bytes: &[u8], size: u32) -> Option<egui::ColorImage> {
+    let img = image::load_from_memory(bytes).ok()?;
+    let size = size.clamp(64, 1024);
+    let img = img.thumbnail(size, size);
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+    Some(egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw()))
+}
+
 pub(crate) fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
     let rgba = img.to_rgba8();

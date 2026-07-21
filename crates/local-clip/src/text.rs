@@ -1,5 +1,5 @@
 //! CLIP text tower: tokenize a query to fixed [1,77] `input_ids`/`attention_mask`, run the HTP
-//! text graph (two I32 inputs), and L2-normalize the 512-d `text_embeds` for cosine ranking.
+//! text graph (one or two I32 inputs), and L2-normalize the 512-d `text_embeds` for cosine ranking.
 //!
 //! The graph pools at the first EOS via an internal argmax over `input_ids`, so padding must not
 //! introduce another max token before the real EOS. HF CLIP pads `input_ids` with the EOS id
@@ -42,28 +42,33 @@ pub fn encode_query(tokenizer: &Tokenizer, query: &str) -> Result<(Vec<i32>, Vec
     Ok(build_inputs(&content))
 }
 
-/// Run the text graph on `input_ids`/`attention_mask`, returning the raw `text_embeds`.
-/// The mask input is picked by name (`*mask*`); the other input takes the ids.
+/// Run the text graph on `input_ids` (and `attention_mask` when present), returning raw `text_embeds`.
+/// HTP conversion often folds `attention_mask` away; a single `input_ids*` input is enough then.
 fn run_text(ctx: &Context<'_>, ids: &[i32], mask: &[i32]) -> Result<Vec<f32>> {
     let info = ctx.info();
     let graph = info.graphs.first().ok_or(Error::NoTensors("graph"))?;
-    if graph.inputs.len() < 2 {
+    if graph.inputs.is_empty() {
         return Err(Error::NoTensors("text input"));
     }
-    let mask_name = graph.inputs.iter().find(|t| t.name.to_lowercase().contains("mask")).map(|t| t.name.clone());
-    let (ids_name, mask_name) = match mask_name {
-        Some(m) => {
-            let i = graph.inputs.iter().find(|t| t.name != m).ok_or(Error::NoTensors("input_ids"))?;
-            (i.name.clone(), m)
-        }
-        None => (graph.inputs[0].name.clone(), graph.inputs[1].name.clone()),
-    };
     let out_name = graph.outputs.first().ok_or(Error::NoTensors("output"))?.name.clone();
     let graph_name = graph.name.clone();
-    let mut out = ctx.execute_mixed(
-        &graph_name,
-        &[(ids_name.as_str(), TensorIn::I32(ids)), (mask_name.as_str(), TensorIn::I32(mask))],
-    )?;
+    let mut feeds: Vec<(&str, TensorIn<'_>)> = Vec::with_capacity(2);
+    if graph.inputs.len() == 1 {
+        feeds.push((graph.inputs[0].name.as_str(), TensorIn::I32(ids)));
+    } else {
+        let mask_name =
+            graph.inputs.iter().find(|t| t.name.to_lowercase().contains("mask")).map(|t| t.name.as_str());
+        let (ids_name, mask_name) = match mask_name {
+            Some(m) => {
+                let i = graph.inputs.iter().find(|t| t.name != m).ok_or(Error::NoTensors("input_ids"))?;
+                (i.name.as_str(), m)
+            }
+            None => (graph.inputs[0].name.as_str(), graph.inputs[1].name.as_str()),
+        };
+        feeds.push((ids_name, TensorIn::I32(ids)));
+        feeds.push((mask_name, TensorIn::I32(mask)));
+    }
+    let mut out = ctx.execute_mixed(&graph_name, &feeds)?;
     out.remove(&out_name).ok_or(Error::NoTensors("output"))
 }
 

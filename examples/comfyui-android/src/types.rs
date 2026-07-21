@@ -1485,7 +1485,7 @@ pub struct Settings {
     pub params: Params,
     #[serde(default)]
     pub gallery: GalleryView,
-    /// Gallery search box text.
+    /// Legacy gallery search box text; ignored on load (session-only in the app).
     #[serde(default)]
     pub gallery_q: String,
     /// Main gallery search box runs CLIP semantic search where the local pack supports it.
@@ -1544,6 +1544,9 @@ pub struct Settings {
     /// Background-tag the whole server gallery when idle (feature `local-npu`).
     #[serde(default)]
     pub auto_tag: bool,
+    /// Background-download full gallery images to the on-device cache while idle.
+    #[serde(default = "default_true")]
+    pub cache_prefetch: bool,
     /// Which on-device pipeline `local_npu` runs; absent in older settings, so SD1.5 by default.
     #[serde(default)]
     pub local_backend: LocalBackend,
