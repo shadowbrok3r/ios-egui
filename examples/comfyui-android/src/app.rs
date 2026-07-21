@@ -9176,6 +9176,8 @@ impl ComfyApp {
     }
 
     fn generate_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
+        // The result filmstrip fetches thumbs; resolve the cache root before it runs.
+        let _ = self.ensure_full_cache_root(host);
         if self.result_view.is_some() {
             let pane = ui.available_rect_before_wrap();
             self.result_viewer(ui, host);
@@ -11714,6 +11716,8 @@ impl ComfyApp {
     }
 
     fn gallery_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
+        // Every thumb fetch below serves from the local full cache when this is resolved.
+        let _ = self.ensure_full_cache_root(host);
         let connected = matches!(self.conn, Conn::Connected);
         // A finished WD14 read floats over the gallery, viewer open or not.
         #[cfg(feature = "local-npu")]
