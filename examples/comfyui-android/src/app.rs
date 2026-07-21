@@ -1118,6 +1118,9 @@ struct ComfyApp {
     /// Un-embedded keys found by the last cache-dir walk, drained one per pump.
     #[cfg(feature = "local-npu")]
     clipemb_walk: Vec<String>,
+    /// In-flight background cache-dir walk (Some while the walker thread runs).
+    #[cfg(feature = "local-npu")]
+    clipemb_walk_rx: Option<std::sync::mpsc::Receiver<Vec<String>>>,
     /// `(gen, listing len, index len, failed len)` when a scan found nothing to embed — while it
     /// matches, the pump skips its per-frame O(items) scan entirely (fully-indexed steady state).
     #[cfg(feature = "local-npu")]
@@ -1545,6 +1548,8 @@ impl ComfyApp {
             clipemb_rescan_after: 0.0,
             #[cfg(feature = "local-npu")]
             clipemb_walk: Vec::new(),
+            #[cfg(feature = "local-npu")]
+            clipemb_walk_rx: None,
             #[cfg(feature = "local-npu")]
             clipemb_covered: None,
             #[cfg(feature = "local-npu")]
@@ -4753,6 +4758,7 @@ impl ComfyApp {
         self.clipemb_rx = None;
         self.clipemb_failed.clear();
         self.clipemb_walk.clear();
+        self.clipemb_walk_rx = None;
         self.clipemb_rescan_after = 0.0;
         self.clipemb_covered = None;
     }
@@ -12964,7 +12970,24 @@ impl ComfyApp {
         // A click that ends a long-press IS the select gesture, not a tap — don't also toggle/open.
         let suppress_click = self.sel_long_fired;
 
-        for row in indices.chunks(cols) {
+        // Grid rows are fixed-height, so off-screen rows collapse into two spacers instead of
+        // hundreds of per-tile widget allocations (the 1-column feed has variable row heights
+        // and keeps the full loop; its off-screen rows already cost only the allocation).
+        let spacing_y = ui.spacing().item_spacing.y;
+        let row_h = tile + spacing_y;
+        let n_rows = indices.len().div_ceil(cols.max(1));
+        let (first, last) = if cols == 1 || n_rows == 0 {
+            (0, n_rows)
+        } else {
+            let top = ui.cursor().top();
+            let first = ((((clip.top() - top) / row_h).floor()).max(0.0) as usize).min(n_rows);
+            let last = ((((clip.bottom() - top) / row_h).floor()).max(0.0) as usize + 1).min(n_rows);
+            (first, last.max(first))
+        };
+        if first > 0 {
+            ui.allocate_space(egui::vec2(avail, first as f32 * row_h - spacing_y));
+        }
+        for row in indices.chunks(cols).skip(first).take(last - first) {
             ui.horizontal(|ui| {
                 for &idx in row {
                     // Grid tiles are square, so laying out an off-screen tile touches no item
@@ -13046,6 +13069,9 @@ impl ComfyApp {
                     }
                 }
             });
+        }
+        if last < n_rows {
+            ui.allocate_space(egui::vec2(avail, (n_rows - last) as f32 * row_h - spacing_y));
         }
         open
     }
@@ -15354,20 +15380,41 @@ impl ComfyApp {
         if next.is_none()
             && let Some(root) = cache_dir.as_ref()
         {
-            // Walking the cache dir reads every .key sidecar — off-limits per frame on FUSE. One
-            // walk fills a work queue that later pumps drain, and every walk (not just an empty
-            // one) backs off, so per-embed completions don't each re-walk thousands of files.
+            // Walking the cache dir reads every .key sidecar — hundreds of ms on FUSE, so the
+            // walk runs on its own thread and fills a work queue that later pumps drain. The walk
+            // waits for the listing (its keys cover fresh fetches anyway), and an empty result
+            // disables re-walking for the session (Resume/Rebuild reset via reset_clipemb_pump).
             let now = ctx.input(|i| i.time);
-            if self.clipemb_walk.is_empty() && now >= self.clipemb_rescan_after {
-                self.clipemb_walk = gallery::full_cache_keys(root)
-                    .into_iter()
-                    .filter(|k| !self.clip_index.contains(k) && !self.clipemb_failed.contains(k))
-                    .collect();
-                // An empty walk means the cache holds nothing new: never re-walk this session
-                // (fetches land through the listing, which the scan above covers). Resume /
-                // Rebuild in Settings resets this via reset_clipemb_pump.
-                self.clipemb_rescan_after =
-                    if self.clipemb_walk.is_empty() { f64::INFINITY } else { now + 10.0 };
+            if let Some(rx) = &self.clipemb_walk_rx {
+                match rx.try_recv() {
+                    Ok(keys) => {
+                        self.clipemb_walk_rx = None;
+                        self.clipemb_walk = keys
+                            .into_iter()
+                            .filter(|k| {
+                                !self.clip_index.contains(k) && !self.clipemb_failed.contains(k)
+                            })
+                            .collect();
+                        self.clipemb_rescan_after =
+                            if self.clipemb_walk.is_empty() { f64::INFINITY } else { now + 10.0 };
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.clipemb_walk_rx = None;
+                    }
+                }
+            } else if self.clipemb_walk.is_empty()
+                && now >= self.clipemb_rescan_after
+                && (!self.gallery.is_empty() || !matches!(self.conn, Conn::Connected))
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.clipemb_walk_rx = Some(rx);
+                let root = root.clone();
+                let ctx2 = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(gallery::full_cache_keys(&root));
+                    ctx2.request_repaint();
+                });
             }
             while next.is_none()
                 && let Some(key) = self.clipemb_walk.pop()
@@ -15401,6 +15448,7 @@ impl ComfyApp {
             // Everything reachable is embedded and the walk is spent: latch until an input moves.
             if !wants_page
                 && self.clipemb_walk.is_empty()
+                && self.clipemb_walk_rx.is_none()
                 && (cache_dir.is_none() || self.clipemb_rescan_after.is_infinite())
             {
                 self.clipemb_covered = Some(coverage);
@@ -15646,7 +15694,7 @@ impl EguiApp for ComfyApp {
             self.publish_window(ui.ctx(), host);
             self.queue_sheet_window(ui.ctx(), host);
             self.graph_toast(ui.ctx());
-            self.perf_overlay_window(ui.ctx());
+            self.perf_overlay_window(ui.ctx(), host);
             self.error_modal_window(ui.ctx(), host);
             if self.running || self.queue_remaining > 0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
@@ -15725,7 +15773,7 @@ impl EguiApp for ComfyApp {
         if self.tab == Tab::Graph {
             self.graph_toast(ui.ctx());
         }
-        self.perf_overlay_window(ui.ctx());
+        self.perf_overlay_window(ui.ctx(), host);
         self.error_modal_window(ui.ctx(), host);
 
         // Keep the server-wide queue in view even when jobs were started on the website. Poll faster
@@ -15948,7 +15996,7 @@ impl ComfyApp {
 
     /// Translucent top-right HUD: app CPU%, hottest threads, memory, GPU busy%, frame time, and
     /// the in-flight task list. Tap toggles the one-line collapsed form.
-    fn perf_overlay_window(&mut self, ctx: &egui::Context) {
+    fn perf_overlay_window(&mut self, ctx: &egui::Context, host: &Host) {
         if !self.perf_overlay {
             return;
         }
@@ -15957,9 +16005,14 @@ impl ComfyApp {
         let tasks = self.active_tasks();
         let minimized = self.perf_hud_min;
 
+        // Areas anchor to the full screen, not the inset app rect: clear the status bar / cutout.
+        let insets = host.safe_area_insets();
         egui::Area::new(egui::Id::new("perf-hud"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-6.0, 6.0))
+            .anchor(
+                egui::Align2::RIGHT_TOP,
+                egui::vec2(-(6.0 + insets.right), 6.0 + insets.top),
+            )
             .show(ctx, |ui| {
                 let row = |ui: &mut egui::Ui, s: String| {
                     ui.label(
