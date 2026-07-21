@@ -62,7 +62,7 @@ pub fn embed_image(
     Ok(emb)
 }
 
-/// [`embed_image`] from encoded (png/jpeg) image bytes.
+/// [`embed_image`] from encoded (png/jpeg/webp) image bytes.
 pub fn embed_bytes(
     pack: &ClipPack,
     session: &Session<'_>,

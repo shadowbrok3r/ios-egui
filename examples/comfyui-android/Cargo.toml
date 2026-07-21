@@ -46,7 +46,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "
 # can't attach auth headers to the handshake, so the engine runs its own socket alongside polling.
 tokio-tungstenite = "0.24"
 futures = "0.3"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 # Decompresses the bundled Danbooru tag dictionary (assets/tags/danbooru.csv.gz); rust_backend so it
 # cross-compiles to the NDK with no system zlib.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

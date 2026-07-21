@@ -134,7 +134,7 @@ pub fn tag(
     Ok(params.rank(&probs, pack.tags()))
 }
 
-/// [`tag`] from encoded (png/jpeg) image bytes.
+/// [`tag`] from encoded (png/jpeg/webp) image bytes.
 pub fn tag_bytes(
     pack: &Wd14Pack,
     session: &Session<'_>,

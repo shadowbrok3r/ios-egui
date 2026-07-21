@@ -59,7 +59,7 @@ pub fn preprocess(rgba: &[u8], w: u32, h: u32, size: u32) -> Vec<f32> {
     rgb_to_bgr_nhwc(canvas.as_raw(), size)
 }
 
-/// Decode encoded image bytes (png/jpeg) to `(rgba, width, height)`.
+/// Decode encoded image bytes (png/jpeg/webp) to `(rgba, width, height)`.
 pub fn decode_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let img = image::load_from_memory(bytes)?.to_rgba8();
     let (w, h) = (img.width(), img.height());

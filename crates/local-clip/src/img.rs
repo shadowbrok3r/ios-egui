@@ -55,7 +55,7 @@ pub fn preprocess(rgb: &[u8], w: u32, h: u32, size: u32) -> Vec<f32> {
     normalize_nchw(cropped.as_raw(), size)
 }
 
-/// Decode encoded image bytes (png/jpeg) to `(rgb, width, height)`, dropping any alpha.
+/// Decode encoded image bytes (png/jpeg/webp) to `(rgb, width, height)`, dropping any alpha.
 pub fn decode_rgb(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32)> {
     let img = image::load_from_memory(bytes)?.to_rgb8();
     let (w, h) = (img.width(), img.height());

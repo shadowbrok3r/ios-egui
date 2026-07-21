@@ -4609,17 +4609,21 @@ impl ComfyApp {
             .desired_width(f32::INFINITY)
             .hint_text(field.hint())
             .show(ui);
-        // Tapping a suggestion steals focus at press, hiding the row before the release can
-        // click it — keep the row alive while a press that began inside it is still in flight.
-        let row_rect_id = egui::Id::new(("tag_suggest_rect", field.disc()));
+        // Tapping anything steals focus at press; collapsing the row mid-press shifts the
+        // layout under the finger, so neither a suggestion nor the widget below can complete
+        // its click. Hold the row from press through release whenever it was visible when the
+        // press began; egui clears `press_origin` on the release frame, so visibility lives
+        // in a flag rather than being re-derived from the press position.
+        let row_alive_id = egui::Id::new(("tag_suggest_alive", field.disc()));
         let cursor_id = egui::Id::new(("tag_suggest_cursor", field.disc()));
-        let press_in_row = ui.ctx().input(|i| i.pointer.any_down() || i.pointer.any_released())
-            && ui
-                .ctx()
-                .data(|d| d.get_temp::<egui::Rect>(row_rect_id))
-                .zip(ui.ctx().input(|i| i.pointer.press_origin()))
-                .is_some_and(|(r, p)| r.contains(p));
-        if !out.response.has_focus() && !press_in_row {
+        let press_in_flight = ui.ctx().input(|i| i.pointer.any_down() || i.pointer.any_released());
+        let keep_alive = press_in_flight
+            && ui.ctx().data(|d| d.get_temp::<bool>(row_alive_id).unwrap_or(false));
+        let set_alive = |ctx: &egui::Context, on: bool| {
+            ctx.data_mut(|d| d.insert_temp(row_alive_id, on));
+        };
+        if !out.response.has_focus() && !keep_alive {
+            set_alive(ui.ctx(), false);
             return;
         }
         let cursor_char = match out.cursor_range.map(|r| r.primary.index.0) {
@@ -4629,7 +4633,10 @@ impl ComfyApp {
             }
             None => match ui.ctx().data(|d| d.get_temp::<usize>(cursor_id)) {
                 Some(c) => c,
-                None => return,
+                None => {
+                    set_alive(ui.ctx(), false);
+                    return;
+                }
             },
         };
         let text = self.field_text(field).clone();
@@ -4653,10 +4660,11 @@ impl ComfyApp {
             m
         };
         if sugg.is_empty() {
+            set_alive(ui.ctx(), false);
             return;
         }
         let mut accepted: Option<(String, usize)> = None;
-        let sao = crate::theme::scroll_horizontal()
+        crate::theme::scroll_horizontal()
             .id_salt(("tag_suggest_row", field.disc()))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -4672,7 +4680,7 @@ impl ComfyApp {
                     }
                 });
             });
-        ui.ctx().data_mut(|d| d.insert_temp(row_rect_id, sao.inner_rect));
+        set_alive(ui.ctx(), true);
         if let Some((new_text, cursor_byte)) = accepted {
             let char_idx = new_text[..cursor_byte].chars().count();
             *self.field_text_mut(field) = new_text;

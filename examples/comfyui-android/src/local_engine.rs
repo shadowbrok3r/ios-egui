@@ -794,6 +794,8 @@ pub fn embed_clip(
     pack_dir: PathBuf,
     image: Vec<u8>,
 ) -> Result<(Vec<f32>, Option<f32>), String> {
+    // Decode before any HTP setup so undecodable bytes fail without touching the NPU.
+    let (rgb, w, h) = local_clip::img::decode_rgb(&image).map_err(|e| format!("decode: {e}"))?;
     let _gate = run_lock().lock();
     drop_generation_caches();
     let t = Instant::now();
@@ -804,7 +806,7 @@ pub fn embed_clip(
     if let Err(e) = session.set_htp_performance_mode() {
         log::warn!("local-clip: performance mode unavailable: {e}");
     }
-    let emb = local_clip::embed_bytes(&pack, &session, &cache.system, &image)
+    let emb = local_clip::embed_image(&pack, &session, &cache.system, &rgb, w, h)
         .map_err(|e| format!("embed: {e}"))?;
     let score = match pack.aesthetic() {
         Ok(head) => head.map(|h| local_clip::aesthetic_score(&h, &emb)),
@@ -850,6 +852,8 @@ pub fn read_tags(
     pack_dir: PathBuf,
     image: Vec<u8>,
 ) -> Result<local_wd14::TagResult, String> {
+    // Decode before any HTP setup so undecodable bytes fail without touching the NPU.
+    let (rgba, w, h) = local_wd14::img::decode_rgba(&image).map_err(|e| format!("decode: {e}"))?;
     let _gate = run_lock().lock();
     drop_generation_caches();
     let t = Instant::now();
@@ -860,11 +864,13 @@ pub fn read_tags(
     if let Err(e) = session.set_htp_performance_mode() {
         log::warn!("local-wd14: performance mode unavailable: {e}");
     }
-    let result = local_wd14::tag_bytes(
+    let result = local_wd14::tag(
         &pack,
         &session,
         &cache.system,
-        &image,
+        &rgba,
+        w,
+        h,
         &local_wd14::Wd14Params::default(),
     )
     .map_err(|e| format!("tag: {e}"))?;
