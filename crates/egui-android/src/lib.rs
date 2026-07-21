@@ -285,7 +285,9 @@ impl eframe::App for Adapter {
             && state.cursor.char_range().is_some()
         {
             let (s, e) = crate::ime_bridge::selection_chars(&state);
-            crate::ime_bridge::sync_caret_to_ime(s, e);
+            let user_tap =
+                ui.ctx().input(|i| i.pointer.any_pressed() || i.pointer.any_released());
+            crate::ime_bridge::sync_caret_to_ime(s, e, user_tap);
         }
         // Mirror this frame's egui copies (host widgets and plugin viewports alike) into the
         // system clipboard; winit has no Android clipboard backend.

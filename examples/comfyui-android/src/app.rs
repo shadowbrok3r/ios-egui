@@ -913,6 +913,9 @@ struct ComfyApp {
     /// Prompt-rewrite worker result (rewritten positive prompt or an error string).
     #[cfg(feature = "local-npu")]
     rewrite_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// A finished rewrite awaiting review: `(original, rewritten)` for the diff modal.
+    #[cfg(feature = "local-npu")]
+    rewrite_review: Option<(String, String)>,
     #[cfg(feature = "local-npu")]
     rewrite_running: bool,
     /// Settings: background-tag the server gallery when idle.
@@ -1333,6 +1336,8 @@ impl ComfyApp {
             rewrite_pack: None,
             #[cfg(feature = "local-npu")]
             rewrite_rx: None,
+            #[cfg(feature = "local-npu")]
+            rewrite_review: None,
             #[cfg(feature = "local-npu")]
             rewrite_running: false,
             #[cfg(feature = "local-npu")]
@@ -4604,11 +4609,28 @@ impl ComfyApp {
             .desired_width(f32::INFINITY)
             .hint_text(field.hint())
             .show(ui);
-        if !out.response.has_focus() {
+        // Tapping a suggestion steals focus at press, hiding the row before the release can
+        // click it — keep the row alive while a press that began inside it is still in flight.
+        let row_rect_id = egui::Id::new(("tag_suggest_rect", field.disc()));
+        let cursor_id = egui::Id::new(("tag_suggest_cursor", field.disc()));
+        let press_in_row = ui.ctx().input(|i| i.pointer.any_down() || i.pointer.any_released())
+            && ui
+                .ctx()
+                .data(|d| d.get_temp::<egui::Rect>(row_rect_id))
+                .zip(ui.ctx().input(|i| i.pointer.press_origin()))
+                .is_some_and(|(r, p)| r.contains(p));
+        if !out.response.has_focus() && !press_in_row {
             return;
         }
-        let Some(cursor_char) = out.cursor_range.map(|r| r.primary.index.0) else {
-            return;
+        let cursor_char = match out.cursor_range.map(|r| r.primary.index.0) {
+            Some(c) => {
+                ui.ctx().data_mut(|d| d.insert_temp(cursor_id, c));
+                c
+            }
+            None => match ui.ctx().data(|d| d.get_temp::<usize>(cursor_id)) {
+                Some(c) => c,
+                None => return,
+            },
         };
         let text = self.field_text(field).clone();
         let cursor_byte =
@@ -4634,7 +4656,7 @@ impl ComfyApp {
             return;
         }
         let mut accepted: Option<(String, usize)> = None;
-        crate::theme::scroll_horizontal()
+        let sao = crate::theme::scroll_horizontal()
             .id_salt(("tag_suggest_row", field.disc()))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -4650,6 +4672,7 @@ impl ComfyApp {
                     }
                 });
             });
+        ui.ctx().data_mut(|d| d.insert_temp(row_rect_id, sao.inner_rect));
         if let Some((new_text, cursor_byte)) = accepted {
             let char_idx = new_text[..cursor_byte].chars().count();
             *self.field_text_mut(field) = new_text;
@@ -9198,6 +9221,8 @@ impl ComfyApp {
     fn generate_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         // The result filmstrip fetches thumbs; resolve the cache root before it runs.
         let _ = self.ensure_full_cache_root(host);
+        #[cfg(feature = "local-npu")]
+        self.rewrite_review_window(ui.ctx());
         if self.result_view.is_some() {
             let pane = ui.available_rect_before_wrap();
             self.result_viewer(ui, host);
@@ -14490,8 +14515,8 @@ impl ComfyApp {
             Ok(Ok(text)) => {
                 self.rewrite_rx = None;
                 self.rewrite_running = false;
-                self.params.positive = text;
-                self.status = "Rewrite done".into();
+                self.rewrite_review = Some((self.params.positive.clone(), text));
+                self.status = "Rewrite ready — review the changes".into();
             }
             Ok(Err(e)) => {
                 self.rewrite_rx = None;
@@ -14504,6 +14529,81 @@ impl ComfyApp {
                 self.rewrite_running = false;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Review a finished rewrite as a comma-segment diff: kept plain, removed struck red,
+    /// added green. Accept applies the rewritten prompt; Discard keeps the original.
+    #[cfg(feature = "local-npu")]
+    fn rewrite_review_window(&mut self, ctx: &egui::Context) {
+        let Some((original, rewritten)) = self.rewrite_review.clone() else { return };
+        egui::Area::new(egui::Id::new("rewrite-scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
+            });
+        let mut act: Option<bool> = None;
+        let diff = tags::prompt_diff(&original, &rewritten);
+        let changed = diff.iter().any(|(op, _)| *op != 0);
+        let max_h = (ctx.content_rect().height() * 0.45).clamp(140.0, 360.0);
+        centered(ctx, egui::Window::new("Rewrite review"))
+            .collapsible(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                if !changed {
+                    ui.weak("The rewrite made no changes.");
+                }
+                crate::theme::scroll_vertical().max_height(max_h).auto_shrink([false, true]).show(
+                    ui,
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (op, seg) in &diff {
+                                let text = sanitize_ui_text(ui, seg);
+                                match op {
+                                    -1 => ui.label(
+                                        egui::RichText::new(text)
+                                            .color(egui::Color32::from_rgb(225, 105, 105))
+                                            .strikethrough(),
+                                    ),
+                                    1 => ui.label(
+                                        egui::RichText::new(text)
+                                            .color(egui::Color32::from_rgb(110, 200, 120)),
+                                    ),
+                                    _ => ui.label(egui::RichText::new(text).weak()),
+                                };
+                            }
+                        });
+                    },
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let w = ((ui.available_width() - 4.0) / 2.0).max(60.0);
+                    let size = egui::vec2(w, 32.0);
+                    if ui
+                        .add_enabled(changed, egui::Button::new(format!("{} Accept", icons::CHECK)).min_size(size))
+                        .clicked()
+                    {
+                        act = Some(true);
+                    }
+                    if ui.add_sized(size, egui::Button::new(format!("{} Discard", icons::CLOSE))).clicked() {
+                        act = Some(false);
+                    }
+                });
+            });
+        match act {
+            Some(true) => {
+                self.params.positive = rewritten;
+                self.rewrite_review = None;
+                self.status = "Rewrite applied".into();
+            }
+            Some(false) => {
+                self.rewrite_review = None;
+                self.status = "Rewrite discarded".into();
+            }
+            None => {}
         }
     }
 

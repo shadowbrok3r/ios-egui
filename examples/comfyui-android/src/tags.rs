@@ -486,6 +486,43 @@ pub fn dedupe(text: &str) -> String {
         .join(", ")
 }
 
+/// Comma-segment diff of two prompts via LCS: `-1` removed, `0` unchanged, `1` added, in order.
+pub fn prompt_diff(a: &str, b: &str) -> Vec<(i8, String)> {
+    let seg = |s: &str| -> Vec<String> {
+        s.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+    };
+    let (a, b) = (seg(a), seg(b));
+    let (n, m) = (a.len(), b.len());
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if a[i] == b[j] {
+            out.push((0, a[i].clone()));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push((-1, a[i].clone()));
+            i += 1;
+        } else {
+            out.push((1, b[j].clone()));
+            j += 1;
+        }
+    }
+    out.extend(a[i..].iter().map(|s| (-1, s.clone())));
+    out.extend(b[j..].iter().map(|s| (1, s.clone())));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -645,5 +682,22 @@ mod tests {
         let dict = TagDict::bundled();
         assert!(dict.len() > 10_000, "bundled dict too small: {}", dict.len());
         assert!(!dict.suggest("1girl", 5).is_empty());
+    }
+
+    #[test]
+    fn prompt_diff_marks_changes_in_order() {
+        let d = prompt_diff("1girl, red hair, smile", "1girl, blue hair, smile, outdoors");
+        assert_eq!(
+            d,
+            vec![
+                (0, "1girl".into()),
+                (-1, "red hair".into()),
+                (1, "blue hair".into()),
+                (0, "smile".into()),
+                (1, "outdoors".into()),
+            ]
+        );
+        assert!(prompt_diff("a, b", "a, b").iter().all(|(op, _)| *op == 0));
+        assert_eq!(prompt_diff("", "a"), vec![(1, "a".into())]);
     }
 }

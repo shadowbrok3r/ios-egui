@@ -277,7 +277,7 @@ pub fn sync_selection_to_ime(start: usize, end: usize, clear_composing: bool) {
 ///
 /// Non-collapsed egui selections mirror as a caret at the selection end: pushing a real range
 /// puts the selectable EditText into selection mode, which dismisses the keyboard.
-pub fn sync_caret_to_ime(start: usize, end: usize) {
+pub fn sync_caret_to_ime(start: usize, end: usize, user_tap: bool) {
     let preedit_len = LAST_PREEDIT.lock().map(|g| g.chars().count()).unwrap_or(0);
     let caret = if start == end { start } else { end } as i32;
     let (mirror, stale) = match LAST_SYNC.lock() {
@@ -292,10 +292,11 @@ pub fn sync_caret_to_ime(start: usize, end: usize) {
         return;
     }
     if preedit_len > 0 {
-        // Composition active: preedit growth moves the caret too, so only a move that lands
-        // clearly outside the composing word is a user tap. Finish the composition in place
-        // first — otherwise the IME re-anchors it and retypes the word at the tap point.
-        if (caret - mirror).unsigned_abs() as usize > preedit_len {
+        // Composition active: preedit growth moves the caret too, so a move is a user tap when
+        // it lands clearly outside the composing word — or when a pointer press on the app
+        // surface says so directly (keyboard touches never reach egui). Finish the composition
+        // in place first, else the IME re-anchors it and retypes the word at the tap point.
+        if user_tap || (caret - mirror).unsigned_abs() as usize > preedit_len {
             if let Ok(mut g) = LAST_PREEDIT.lock() {
                 g.clear();
             }
