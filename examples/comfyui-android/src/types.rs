@@ -1568,6 +1568,9 @@ pub struct Settings {
     /// Per-character pending match suggestions awaiting review, keyed by card name (capped).
     #[serde(default)]
     pub character_suggestions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-character accepted gallery keys; every approval sharpens the match centroid.
+    #[serde(default)]
+    pub character_approved: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 pub fn default_server_output_root() -> String {

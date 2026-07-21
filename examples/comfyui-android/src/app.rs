@@ -542,6 +542,8 @@ struct ComfyApp {
     character_denied: std::collections::BTreeMap<String, Vec<String>>,
     /// Per-character pending match suggestions (persisted, capped), keyed by card name.
     character_suggestions: std::collections::BTreeMap<String, Vec<String>>,
+    /// Per-character accepted keys (persisted); each approval sharpens the match centroid.
+    character_approved: std::collections::BTreeMap<String, Vec<String>>,
     /// Session cache of per-character CLIP centroids for the suggest hot loop; cleared on change.
     character_centroids: HashMap<String, Vec<f32>>,
     /// After creating a character's collection album, stamp its id onto the card and add these
@@ -1108,6 +1110,7 @@ impl ComfyApp {
             character_draft: None,
             character_denied: std::collections::BTreeMap::new(),
             character_suggestions: std::collections::BTreeMap::new(),
+            character_approved: std::collections::BTreeMap::new(),
             character_centroids: HashMap::new(),
             char_album_pending: None,
             apps: Arc::new(AppSet::builtin()),
@@ -3410,6 +3413,7 @@ impl ComfyApp {
             prompt_history: self.prompt_history.clone(),
             character_denied: self.character_denied.clone(),
             character_suggestions: self.character_suggestions.clone(),
+            character_approved: self.character_approved.clone(),
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -3462,6 +3466,7 @@ impl ComfyApp {
         self.active_character = saved.active_character;
         self.character_denied = saved.character_denied;
         self.character_suggestions = saved.character_suggestions;
+        self.character_approved = saved.character_approved;
         self.character_centroids.clear();
         self.checkpoint_sort = saved.checkpoint_sort;
         self.checkpoint_favorites = saved.checkpoint_favorites;
@@ -6255,6 +6260,7 @@ impl ComfyApp {
                 self.characters.retain(|c| c.name != name);
                 self.character_denied.remove(&name);
                 self.character_suggestions.remove(&name);
+                self.character_approved.remove(&name);
                 self.character_centroids.remove(&name);
                 host.haptic(Haptic::Warning);
             }
@@ -8833,6 +8839,14 @@ impl ComfyApp {
             for it in self.gallery.iter().filter(|it| !it.is_video) {
                 if seen.insert(it.key()) {
                     keys.push(it.key());
+                }
+            }
+        }
+        // Reviewer-approved keys always count; the centroid sharpens with every accepted card.
+        if let Some(approved) = self.character_approved.get(&card.name) {
+            for k in approved {
+                if seen.insert(k.clone()) {
+                    keys.push(k.clone());
                 }
             }
         }
@@ -12847,6 +12861,14 @@ impl ComfyApp {
                 if !items.is_empty() {
                     self.add_to_character_album(&card_name, items);
                 }
+                if !t.keep.is_empty() {
+                    let approved = self.character_approved.entry(card_name.clone()).or_default();
+                    for k in &t.keep {
+                        if !approved.contains(k) {
+                            approved.push(k.clone());
+                        }
+                    }
+                }
                 if !t.trash.is_empty() {
                     let denied = self.character_denied.entry(card_name.clone()).or_default();
                     for k in &t.trash {
@@ -13007,24 +13029,20 @@ impl ComfyApp {
 
         ui.horizontal(|ui| {
             match &review {
-                Some(card) => ui.strong(format!("{} Review: {}", icons::STAR, elide(card, 22))),
+                Some(card) => ui.strong(format!("{} {}", icons::STAR, elide(card, 14))),
                 None => ui.strong(format!("{} Grade pass", icons::STAR)),
             };
             ui.separator();
+            let mut info = String::new();
             if pos < total {
-                ui.weak(format!("{}/{}", pos + 1, total));
-                if let Some(k) = &cur_key {
-                    if let Some(s) = self.clip_index.score(k) {
-                        ui.weak(format!("· score {s:.2}"));
-                    }
+                info.push_str(&format!("{}/{} · ", pos + 1, total));
+                if let Some(s) = cur_key.as_ref().and_then(|k| self.clip_index.score(k)) {
+                    info.push_str(&format!("{s:.2} · "));
                 }
-                ui.separator();
             }
-            if review.is_some() {
-                ui.weak(format!("Accepted {kept} · Denied {trashed} · {left} left"));
-            } else {
-                ui.weak(format!("Kept {kept} · Trashed {trashed} · {left} left"));
-            }
+            let (a, d) = if review.is_some() { ("Yes", "No") } else { ("Kept", "Trash") };
+            info.push_str(&format!("{a} {kept} · {d} {trashed} · {left} left"));
+            ui.add(egui::Label::new(egui::RichText::new(info).weak()).truncate());
         });
         ui.separator();
 
@@ -13053,31 +13071,37 @@ impl ComfyApp {
                 };
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP;
-                    let w = ((ui.available_width() - GAP * 3.0) / 4.0).max(40.0);
+                    // Undo stays icon-thin so the three labeled buttons share the rest.
+                    let undo_w = 44.0f32;
+                    let w = ((ui.available_width() - undo_w - GAP * 3.0) / 3.0).max(40.0);
                     let size = egui::vec2(w, BTN_H);
+                    let trunc = egui::TextWrapMode::Truncate;
                     if ui
-                        .add_sized(size, egui::Button::new(left_lbl))
+                        .add_sized(size, egui::Button::new(left_lbl).wrap_mode(trunc))
                         .on_hover_text(left_hint)
                         .clicked()
                     {
                         act = Some(TA::Pick(TriagePick::Trash));
                     }
                     if ui
-                        .add_sized(size, egui::Button::new(mid_lbl))
+                        .add_sized(size, egui::Button::new(mid_lbl).wrap_mode(trunc))
                         .on_hover_text(mid_hint)
                         .clicked()
                     {
                         act = Some(TA::Pick(TriagePick::Input));
                     }
                     if ui
-                        .add_enabled(can_undo, egui::Button::new(icons::UNDO).min_size(size))
+                        .add_enabled(
+                            can_undo,
+                            egui::Button::new(icons::UNDO).min_size(egui::vec2(undo_w, BTN_H)),
+                        )
                         .on_hover_text("Undo last")
                         .clicked()
                     {
                         act = Some(TA::Undo);
                     }
                     if ui
-                        .add_sized(size, egui::Button::new(right_lbl))
+                        .add_sized(size, egui::Button::new(right_lbl).wrap_mode(trunc))
                         .on_hover_text("Swipe right")
                         .clicked()
                     {
@@ -13148,7 +13172,26 @@ impl ComfyApp {
                 Some(item) => {
                     let size = 1024u32;
                     let thumb_key = item.thumb_key(size);
-                    let rect = ui.available_rect_before_wrap();
+                    let rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+                    // Prefetch upcoming cards so a decision never waits on the network.
+                    let upcoming: Vec<String> = self
+                        .triage
+                        .as_ref()
+                        .map(|t| t.deck.iter().skip(t.pos + 1).take(3).cloned().collect())
+                        .unwrap_or_default();
+                    for k in upcoming {
+                        if let Some(it) = self.gallery.iter().find(|it| it.key() == k).cloned() {
+                            let tk = it.thumb_key(size);
+                            if self.thumbs.get(&tk).is_none() && self.thumbs.claim(&tk) {
+                                self.engine.as_ref().unwrap().fetch_thumb(
+                                    it.subfolder,
+                                    it.filename,
+                                    size,
+                                    self.full_cache_root.clone(),
+                                );
+                            }
+                        }
+                    }
                     match self.thumbs.get(&thumb_key) {
                         Some(tex) => {
                             let sized = egui::load::SizedTexture::from_handle(tex);
