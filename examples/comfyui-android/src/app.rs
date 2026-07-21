@@ -11541,6 +11541,19 @@ impl ComfyApp {
             return;
         }
         let mut open = true;
+        // Dimming click-catcher below the window: blocks the gallery, tap outside closes.
+        let scrim = egui::Area::new(egui::Id::new("tags-scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                let resp = ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
+                resp
+            });
+        if scrim.inner.clicked() {
+            open = false;
+        }
         centered(ctx, egui::Window::new(format!("{} Tags", icons::SEARCH)))
             .collapsible(false)
             .open(&mut open)
@@ -11552,6 +11565,17 @@ impl ComfyApp {
                         .hint_text("filter tags")
                         .desired_width(f32::INFINITY),
                 );
+                ui.horizontal(|ui| {
+                    let n = self.tag_facets.len();
+                    match n {
+                        0 => ui.weak("No tags selected"),
+                        1 => ui.weak("1 tag selected"),
+                        _ => ui.weak(format!("{n} tags selected")),
+                    };
+                    if n > 0 && ui.button("Clear").clicked() {
+                        self.tag_facets.clear();
+                    }
+                });
                 let keys: Vec<String> = self.gallery.iter().map(|it| it.key()).collect();
                 let all = self.tag_index.top_tags(&keys, 400);
                 let q = self.tag_browse_q.trim().to_lowercase();
