@@ -69,7 +69,9 @@ pub enum Msg {
     EnhanceNote(String),
     Queued,
     /// The server assigned this prompt id to a job we submitted (server transport only).
-    PromptId(String),
+    /// Carries the job's display label so it can never be attributed to the wrong submission
+    /// (a FIFO pop on the UI side mislabels when concurrent queue POSTs answer out of order).
+    PromptId { id: String, label: String },
     Progress { value: u32, max: u32 },
     Status(String),
     /// Server-wide queue depth from the WS `status` broadcast (includes jobs from other clients).
@@ -82,7 +84,8 @@ pub enum Msg {
     NodeExecuting(Option<u32>),
     /// A node finished and produced images (raw encoded bytes, for graph-node display).
     NodeExecuted { node: u32, images: Vec<Vec<u8>> },
-    Done,
+    /// One job finished; carries its display label for the completion notification.
+    Done(String),
     Cancelled,
     GenError(String),
     /// Server-side workflow file names (`/userdata?dir=workflows`).
@@ -124,8 +127,17 @@ pub enum Msg {
     AlbumError(String),
     /// A gallery mutation (delete) finished; the UI clears its selection and reloads the listing.
     GalleryMutated(String),
+    /// Trash row ids for the images a delete just moved — fuels the Undo snackbar.
+    TrashedIds(Vec<i64>),
+    /// One page of the server trash listing (`/gallery/api/list?trash=1`).
+    TrashPage { total: u64, items: Vec<crate::types::TrashItem> },
+    /// A restore/purge finished; the UI reloads the trash view (and the gallery on restore).
+    TrashChanged { note: String, restored: bool },
     /// Which albums one image belongs to (`GET /gallery/api/meta`); `key` is `subfolder/filename`.
     ItemAlbums { key: String, albums: Vec<i64> },
+    /// The gate's pre-parsed prompt summary from the same `/gallery/api/meta` payload — fills the
+    /// viewer's info/Remix panel immediately; the full workflow fetch refines it when it lands.
+    ItemMeta { key: String, meta: Box<crate::gallery::ImageMeta> },
     /// Raw embedded workflow JSON for a gallery image (`GET /gallery/api/workflow`).
     ItemWorkflow { key: String, json: String },
     /// Fetching the embedded workflow failed (image may still have `has_workflow: false` scrapes).
@@ -318,6 +330,7 @@ impl Engine {
         current: Option<Vec<u8>>,
         gcx: GenCtx,
         ui_workflow: Option<Value>,
+        label: String,
     ) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
@@ -349,26 +362,27 @@ impl Engine {
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
-            run_generate(client, params, current, gcx, ui_workflow, current_prompt, authed, tx, ctx, log).await;
+            run_generate(client, params, current, gcx, ui_workflow, label, current_prompt, authed, tx, ctx, log).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
 
     /// Queue an arbitrary API-format workflow (from the graph editor).
     /// `ui_workflow` is the UI-format JSON to embed in the PNG via `extra_pnginfo`.
-    pub fn run_workflow(&mut self, wf: Workflow, ui_workflow: Option<Value>) {
+    pub fn run_workflow(&mut self, wf: Workflow, ui_workflow: Option<Value>, label: String) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
             return;
         };
         self.log.info(format!("queue graph workflow: {} nodes", wf.0.len()));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
+        let authed = self.http.clone().map(|h| (self.base.clone(), h));
         let current = self.current_prompt.clone();
         let inflight = self.inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
-            stream_execution(client, wf, ui_workflow, tx, ctx, log, current).await;
+            stream_execution(client, wf, ui_workflow, authed, label, tx, ctx, log, current).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
@@ -383,6 +397,7 @@ impl Engine {
         rife_multiplier: u32,
         output_fps: u32,
         schemas: Arc<SchemaSet>,
+        label: String,
     ) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
@@ -392,14 +407,15 @@ impl Engine {
             "queue finish pass: {video_path} scale={scale_by} rife={rife_multiplier} fps={output_fps}"
         ));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
+        let authed = self.http.clone().map(|h| (self.base.clone(), h));
         let current = self.current_prompt.clone();
         let inflight = self.inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
             run_finish_job(
-                client, video_path, reference, scale_by, rife_multiplier, output_fps, schemas, tx,
-                ctx, log, current,
+                client, video_path, reference, scale_by, rife_multiplier, output_fps, schemas,
+                authed, label, tx, ctx, log, current,
             )
             .await;
             inflight.fetch_sub(1, Ordering::SeqCst);
@@ -997,6 +1013,15 @@ impl Engine {
                         Ok(v) => {
                             let trashed = v.get("trashed").and_then(Value::as_u64).unwrap_or(0);
                             let cleared = v.get("cleared").and_then(Value::as_u64).unwrap_or(0);
+                            // Row ids of what just moved to trash — the client's Undo handle.
+                            let ids: Vec<i64> = v
+                                .get("ids")
+                                .and_then(Value::as_array)
+                                .map(|a| a.iter().filter_map(Value::as_i64).collect())
+                                .unwrap_or_default();
+                            if !ids.is_empty() {
+                                let _ = tx.send(Msg::TrashedIds(ids));
+                            }
                             let errors: Vec<String> = v
                                 .get("errors")
                                 .and_then(Value::as_array)
@@ -1047,6 +1072,85 @@ impl Engine {
         });
     }
 
+    /// One page of the server trash listing.
+    pub fn trash_list(&self, offset: u64, limit: u64) {
+        let Some((http, url)) = self.authed_url(
+            "/gallery/api/list",
+            &[("trash", "1"), ("offset", &offset.to_string()), ("limit", &limit.to_string())],
+        ) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<Value>(&body) {
+                    Ok(v) => {
+                        let total = v.get("total").and_then(Value::as_u64).unwrap_or(0);
+                        let items = v
+                            .get("items")
+                            .cloned()
+                            .map(|i| serde_json::from_value(i).unwrap_or_default())
+                            .unwrap_or_default();
+                        Msg::TrashPage { total, items }
+                    }
+                    Err(e) => Msg::GalleryError(format!("trash listing: {e}")),
+                },
+                Err(e) => Msg::GalleryError(format!("trash listing: {e}")),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Restore trashed rows to where they came from (`all` ignores `ids`).
+    pub fn trash_restore(&self, ids: Vec<i64>, all: bool) {
+        self.trash_op("/gallery/api/restore", ids, all, "restored", true);
+    }
+
+    /// Permanently unlink trashed rows — the only destructive call in the gallery API.
+    pub fn trash_purge(&self, ids: Vec<i64>, all: bool) {
+        self.trash_op("/gallery/api/purge", ids, all, "purged", false);
+    }
+
+    fn trash_op(&self, path: &str, ids: Vec<i64>, all: bool, verb: &'static str, restored: bool) {
+        let Some((http, url)) = self.authed_url(path, &[]) else { return };
+        let body = serde_json::json!({ "ids": ids, "all": all });
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            log.info(format!("POST {url} ({} id(s), all={all})", body["ids"].as_array().map(|a| a.len()).unwrap_or(0)));
+            let msg = match http.post(url).json(&body).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let text = resp.text().await.unwrap_or_default();
+                    log.info(format!("-> {}", head(&text, 200)));
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    let n = v.get(verb).and_then(Value::as_u64).unwrap_or(0);
+                    let errs = v
+                        .get("errors")
+                        .and_then(Value::as_array)
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    let note = if errs > 0 {
+                        format!("{verb} {n} ({errs} failed)")
+                    } else {
+                        format!("{verb} {n}")
+                    };
+                    Msg::TrashChanged { note, restored }
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    log.error(format!("{verb} failed: HTTP {status}"));
+                    Msg::AlbumError(format!("Trash {verb} failed: HTTP {status}"))
+                }
+                Err(e) => {
+                    log.error(format!("{verb} failed: {e}"));
+                    Msg::AlbumError(format!("Trash {verb} failed: {e}"))
+                }
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
     /// Which albums one image is in — the only endpoint that reports membership.
     ///
     /// Also forwards any embedded workflow / prompt JSON the meta payload may carry (some gate
@@ -1070,6 +1174,13 @@ impl Engine {
                     .map(|a| a.iter().filter_map(|x| x.get("id").and_then(Value::as_i64)).collect())
                     .unwrap_or_default();
                 let _ = tx.send(Msg::ItemAlbums { key: key.clone(), albums });
+                // comfy-gate parses the prompt summary server-side (a 2MB prefix read) and ships
+                // it on this same payload — use it so info/Remix don't wait on the workflow fetch.
+                if let Some(meta) = v.get("meta").map(item_meta_from_gate) {
+                    if !meta.is_empty() {
+                        let _ = tx.send(Msg::ItemMeta { key: key.clone(), meta: Box::new(meta) });
+                    }
+                }
                 // Prefer an embedded graph on the meta payload when present.
                 let embedded = v
                     .get("workflow")
@@ -1108,6 +1219,9 @@ impl Engine {
         }
         if !view.model.is_empty() {
             query.push(("model", view.model.as_str()));
+        }
+        if !view.lora.is_empty() {
+            query.push(("lora", view.lora.as_str()));
         }
         let album_s;
         if let Some(id) = view.album {
@@ -1347,6 +1461,51 @@ impl Engine {
     }
 }
 
+/// Map comfy-gate's `/gallery/api/meta` `meta` object onto the viewer's [`ImageMeta`]. The gate
+/// scrapes positive/negative/model/loras/sampler/seed/steps/cfg server-side; LoRA strengths and
+/// encoder details aren't in the payload, so those slots stay default until the workflow lands.
+fn item_meta_from_gate(v: &Value) -> crate::gallery::ImageMeta {
+    let s = |k: &str| v.get(k).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    crate::gallery::ImageMeta {
+        models: s("model").into_iter().collect(),
+        loras: v
+            .get("loras")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(gate_lora_meta).collect())
+            .unwrap_or_default(),
+        positive: s("positive"),
+        negative: s("negative"),
+        sampler: s("sampler"),
+        scheduler: s("scheduler"),
+        steps: v.get("steps").and_then(Value::as_u64),
+        cfg: v.get("cfg").and_then(Value::as_f64),
+        // Seeds run to 64 bits; the gate ships them lossless as raw JSON numbers, which
+        // serde_json stores as u64 above i64::MAX — bit-cast so the value round-trips into
+        // the u64 Params slot instead of vanishing.
+        seed: v
+            .get("seed")
+            .and_then(|x| x.as_i64().or_else(|| x.as_u64().map(|u| u as i64))),
+        ..Default::default()
+    }
+}
+
+/// The gate serializes each LoRA as `"file (strength)"` — split the suffix back out so a
+/// remix from this summary doesn't ask the server for a file literally named `"x (0.85)"`
+/// loaded at strength 0.
+fn gate_lora_meta(s: &str) -> crate::gallery::LoraMeta {
+    if let Some((name, tail)) = s.rsplit_once(" (")
+        && let Some(num) = tail.strip_suffix(')')
+        && let Ok(strength) = num.parse::<f64>()
+    {
+        return crate::gallery::LoraMeta {
+            name: name.to_string(),
+            strength_model: strength,
+            ..Default::default()
+        };
+    }
+    crate::gallery::LoraMeta { name: s.to_string(), ..Default::default() }
+}
+
 /// Build the Loaded/Error message from a fetched workflow body: UI-format bodies convert via
 /// [`uiwf`], API-format bodies parse directly.
 fn workflow_msg(name: &str, body: &str, schemas: &SchemaSet, log: &Logger) -> Msg {
@@ -1460,6 +1619,7 @@ async fn run_generate(
     current: Option<Vec<u8>>,
     gcx: GenCtx,
     ui_workflow: Option<Value>,
+    label: String,
     current_prompt: CurrentPrompt,
     authed: Option<(String, reqwest::Client)>,
     tx: Sender<Msg>,
@@ -1526,7 +1686,7 @@ async fn run_generate(
         log.info(format!("enhance: {note}"));
         let _ = tx.send(Msg::EnhanceNote(note));
     }
-    stream_execution(client, wf, ui_workflow, tx, ctx, log, current_prompt).await;
+    stream_execution(client, wf, ui_workflow, authed, label, tx, ctx, log, current_prompt).await;
 }
 
 /// Upload the colour-match reference (when any), build the finish graph, and stream it. Mirrors
@@ -1540,6 +1700,8 @@ async fn run_finish_job(
     rife_multiplier: u32,
     output_fps: u32,
     schemas: Arc<SchemaSet>,
+    authed: Option<(String, reqwest::Client)>,
+    label: String,
     tx: Sender<Msg>,
     ctx: egui::Context,
     log: Logger,
@@ -1580,7 +1742,7 @@ async fn run_finish_job(
         log.info(format!("finish: {note}"));
         let _ = tx.send(Msg::EnhanceNote(note));
     }
-    stream_execution(client, wf, None, tx, ctx, log, current_prompt).await;
+    stream_execution(client, wf, None, authed, label, tx, ctx, log, current_prompt).await;
 }
 
 /// POST `/prompt` with `extra_pnginfo.workflow` so `SaveImage` embeds the UI JSON in the PNG.
@@ -1619,6 +1781,8 @@ async fn stream_execution(
     client: Client,
     wf: Workflow,
     ui_workflow: Option<Value>,
+    authed: Option<(String, reqwest::Client)>,
+    label: String,
     tx: Sender<Msg>,
     ctx: egui::Context,
     log: Logger,
@@ -1645,12 +1809,13 @@ async fn stream_execution(
             }
         };
         *current_prompt.lock().unwrap() = Some(prompt_id.clone());
-        send!(Msg::PromptId(prompt_id.clone()));
+        send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone() });
         send!(Msg::Queued);
-        let outcome = reconcile_from_history(&client, &prompt_id, &tx, &ctx, &log).await;
+        let outcome =
+            reconcile_from_history(&client, &authed, &prompt_id, &tx, &ctx, &log).await;
         *current_prompt.lock().unwrap() = None;
         match outcome {
-            Ok(()) => send!(Msg::Done),
+            Ok(()) => send!(Msg::Done(label)),
             Err(m) => send!(Msg::GenError(m)),
         }
         return;
@@ -1667,7 +1832,7 @@ async fn stream_execution(
     let prompt_id = execution.prompt_id().to_string();
     log.info(format!("queued prompt {prompt_id}"));
     *current_prompt.lock().unwrap() = Some(prompt_id.clone());
-    send!(Msg::PromptId(prompt_id.clone()));
+    send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone() });
     send!(Msg::Queued);
 
     let mut outcome = None;
@@ -1692,9 +1857,28 @@ async fn stream_execution(
                 }
             }
             Ok(Event::Executed { node, output, .. }) => {
-                log.info(format!("node {} executed: {} image(s)", node.0, output.images.len()));
-                send!(Msg::NodeExecuted { node: node.0, images: output.images.clone() });
-                for bytes in output.images {
+                // rucomfyui downloads these without checking the HTTP status, so an auth/proxy
+                // error page can arrive here as "image bytes" — drop those instead of letting the
+                // graph render garbage.
+                let images: Vec<Vec<u8>> = output
+                    .images
+                    .into_iter()
+                    .filter(|b| {
+                        let ok = looks_like_image(b);
+                        if !ok {
+                            log.error(format!(
+                                "node {}: output is not an image ({} bytes: {})",
+                                node.0,
+                                b.len(),
+                                head(&String::from_utf8_lossy(&b[..b.len().min(160)]), 120)
+                            ));
+                        }
+                        ok
+                    })
+                    .collect();
+                log.info(format!("node {} executed: {} image(s)", node.0, images.len()));
+                send!(Msg::NodeExecuted { node: node.0, images: images.clone() });
+                for bytes in images {
                     if let Some(ci) = decode(&bytes) {
                         send!(Msg::Result { image: ci, bytes });
                     }
@@ -1720,13 +1904,13 @@ async fn stream_execution(
     let outcome = match outcome {
         Some(o) => o,
         // Stream ended without a verdict: reconcile from the history endpoint.
-        None => reconcile_from_history(&client, &prompt_id, &tx, &ctx, &log).await,
+        None => reconcile_from_history(&client, &authed, &prompt_id, &tx, &ctx, &log).await,
     };
     *current_prompt.lock().unwrap() = None;
     match outcome {
         Ok(()) => {
             log.info("generation done");
-            send!(Msg::Done);
+            send!(Msg::Done(label));
         }
         Err(message) => send!(Msg::GenError(message)),
     }
@@ -1735,6 +1919,7 @@ async fn stream_execution(
 /// Poll `/history` (gently, tolerating errors) until the prompt completes, then emit its outputs.
 async fn reconcile_from_history(
     client: &Client,
+    authed: &Option<(String, reqwest::Client)>,
     prompt_id: &str,
     tx: &Sender<Msg>,
     ctx: &egui::Context,
@@ -1753,15 +1938,28 @@ async fn reconcile_from_history(
                     }
                     continue;
                 }
+                let mut delivered = 0usize;
+                let mut first_fail: Option<String> = None;
+                let mut fails = 0usize;
+                let mut all_missing = true;
                 for (name, node_output) in &data.outputs.nodes {
                     let Ok(node) = name.parse::<WorkflowNodeId>() else { continue };
                     let mut images = Vec::new();
                     for image in &node_output.images {
-                        match image.download(client).await {
+                        match fetch_output_image(client, authed, image, log).await {
                             Ok(bytes) => images.push(bytes),
-                            Err(e) => log.warn(format!("output download failed: {e}")),
+                            Err(e) => {
+                                log.error(format!(
+                                    "output download failed ({}/{} type={}): {e}",
+                                    image.subfolder, image.filename, image.image_type
+                                ));
+                                all_missing &= e.starts_with("HTTP 404");
+                                fails += 1;
+                                first_fail.get_or_insert(e);
+                            }
                         }
                     }
+                    delivered += images.len();
                     log.info(format!("node {} finished: {} image(s)", node.0, images.len()));
                     let _ = tx.send(Msg::NodeExecuted { node: node.0, images: images.clone() });
                     for bytes in images {
@@ -1770,6 +1968,23 @@ async fn reconcile_from_history(
                         }
                     }
                     ctx.request_repaint();
+                }
+                // Every produced image failed to fetch: fail the run so the user gets the reason
+                // in a modal instead of a blank/broken node preview. (Partial failures only log.)
+                if delivered == 0 && fails > 0 {
+                    // All-404 means the server "finished" from its node cache but the cached
+                    // files are gone (deleted from the gallery): an unchanged re-run of a
+                    // fixed-seed workflow reproduces exactly this. A new seed re-generates.
+                    let hint = if all_missing {
+                        "\n\nThe server answered from its cache with files that no longer exist \
+                         (deleted outputs?). Change the seed and run again to re-generate."
+                    } else {
+                        ""
+                    };
+                    return Err(format!(
+                        "{fails} output download(s) failed — first: {}{hint}",
+                        first_fail.unwrap_or_default()
+                    ));
                 }
                 return Ok(());
             }
@@ -1784,6 +1999,54 @@ async fn reconcile_from_history(
             }
         }
     }
+}
+
+/// Fetch one history output via `/api/view`, with a properly encoded query (rucomfyui's own
+/// `HistoryImage::download` concatenates raw values, so a filename/subfolder with `&`, `#`, `+`
+/// or `%` builds a different request than intended) and a checked response: comfy-gate answers
+/// denied or missing files with a text/HTML body, which reqwest happily returns as "bytes" — the
+/// graph editor then renders it as a broken image with no hint of why. Falls back to rucomfyui's
+/// downloader when no authed client is available (not expected once connected).
+async fn fetch_output_image(
+    client: &Client,
+    authed: &Option<(String, reqwest::Client)>,
+    image: &rucomfyui::history::HistoryImage,
+    log: &Logger,
+) -> Result<Vec<u8>, String> {
+    let Some((base, http)) = authed.as_ref() else {
+        return image.download(client).await.map_err(|e| e.to_string());
+    };
+    let mut url =
+        reqwest::Url::parse(&format!("{base}/api/view")).map_err(|e| e.to_string())?;
+    url.query_pairs_mut()
+        .append_pair("filename", &image.filename)
+        .append_pair("subfolder", &image.subfolder)
+        .append_pair("type", &image.image_type);
+    log.info(format!("GET {url}"));
+    let resp = http.get(url).send().await.map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = resp.bytes().await.map_err(|e| format!("reading body failed: {e}"))?;
+    log.info(format!("-> {status} {} bytes ({mime})", bytes.len()));
+    if !status.is_success() || !looks_like_image(&bytes) {
+        let peek = head(&String::from_utf8_lossy(&bytes[..bytes.len().min(300)]), 200);
+        return Err(format!("HTTP {status} ({mime}): {peek}"));
+    }
+    Ok(bytes.to_vec())
+}
+
+/// True when the bytes start with a magic number of a format the app can actually decode
+/// (PNG / JPEG / WebP — see the `image` crate features). Content-type alone can't be trusted
+/// and a body that fails this check would only ever render as egui's broken-image glyph.
+fn looks_like_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"\xff\xd8\xff")
+        || (bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
 }
 
 /// Persistent authenticated `/ws` listener. ComfyUI broadcasts `executing`/`progress`/preview
@@ -2349,5 +2612,41 @@ mod tests {
         truncated.extend_from_slice(&9999u32.to_be_bytes());
         truncated.extend_from_slice(b"short");
         assert_eq!(parse_ws_preview(&truncated), None);
+    }
+
+    /// The gate meta payload maps into ImageMeta: `"file (strength)"` LoRA strings split, and
+    /// full-u64 seeds bit-cast instead of vanishing.
+    #[test]
+    fn gate_meta_parses_lora_suffixes_and_u64_seeds() {
+        let l = gate_lora_meta("Illustrious/BentBack.safetensors (0.85)");
+        assert_eq!(l.name, "Illustrious/BentBack.safetensors");
+        assert!((l.strength_model - 0.85).abs() < 1e-9);
+        // No suffix / unparsable suffix: whole string is the name, strength stays default.
+        assert_eq!(gate_lora_meta("plain.safetensors").name, "plain.safetensors");
+        assert_eq!(gate_lora_meta("odd (name)").name, "odd (name)");
+        let v: Value = serde_json::json!({
+            "positive": "1girl", "model": "m.safetensors",
+            "loras": ["a.safetensors (0.5)"],
+            "seed": 18446744073709551615u64, "steps": 25, "cfg": 4.0
+        });
+        let m = item_meta_from_gate(&v);
+        assert_eq!(m.seed, Some(-1), "u64::MAX must bit-cast, not drop");
+        assert_eq!(m.loras.len(), 1);
+        assert_eq!(m.steps, Some(25));
+        assert!(!m.is_empty());
+    }
+
+    /// Output fetches must reject bodies that aren't decodable images (comfy-gate error pages,
+    /// JSON, videos) so they never reach the graph's image slots.
+    #[test]
+    fn image_sniff_accepts_supported_formats_only() {
+        assert!(looks_like_image(b"\x89PNG\r\n\x1a\nrest"));
+        assert!(looks_like_image(b"\xff\xd8\xff\xe0jfif"));
+        assert!(looks_like_image(b"RIFF\x00\x00\x00\x00WEBPVP8 "));
+        assert!(!looks_like_image(b"401 Unauthorized"));
+        assert!(!looks_like_image(b"<!DOCTYPE html><html>error</html>"));
+        assert!(!looks_like_image(b"{\"error\":\"denied\"}"));
+        assert!(!looks_like_image(b"RIFF\x00\x00\x00\x00AVI LIST"));
+        assert!(!looks_like_image(b""));
     }
 }

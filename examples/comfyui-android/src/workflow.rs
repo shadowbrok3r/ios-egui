@@ -6,10 +6,10 @@
 //! app's nodes onto the same graph, so upscalers and face fixes are data, not code.
 
 use rucomfyui::nodes::all::{
-    CLIPLoader, CLIPTextEncode, CheckpointLoaderSimple, DualCLIPLoader, EmptyLatentImage,
-    ImageFromBatch, ImageScaleBy, KSampler, KSamplerAdvanced, LoadImage, LoraLoader,
-    LoraLoaderModelOnly, ModelSamplingSD3, SaveImage, SetLatentNoiseMask, UNETLoader, VAEDecode,
-    VAEEncode, VAELoader, WanImageToVideo,
+    CLIPLoader, CLIPSetLastLayer, CLIPTextEncode, CheckpointLoaderSimple, DualCLIPLoader,
+    EmptyLatentImage, ImageFromBatch, ImageScaleBy, KSampler, KSamplerAdvanced, LoadImage,
+    LoraLoader, LoraLoaderModelOnly, ModelSamplingSD3, SaveImage, SetLatentNoiseMask, UNETLoader,
+    VAEDecode, VAEEncode, VAELoader, WanImageToVideo,
 };
 use rucomfyui::nodes::types::{
     ClipOut, ClipVisionOutputOut, ImageOut, LatentOut, ModelOut, Out, VaeOut,
@@ -135,6 +135,14 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
     // denoise 1.0 regenerates fully; < 1.0 keeps the input image's structure for img2img.
     let denoise = if p.mode == Mode::Img2Img { p.denoise } else { 1.0 };
 
+    // CLIP skip (checkpoints only): Pony/Illustrious conventionally encode at -2. Diffusion-model
+    // text encoders (Anima/Flux qwen/t5 towers) have no CLIP layers to stop at.
+    let clip = if p.clip_skip >= 1 && p.model_kind == ModelKind::Checkpoint {
+        g.add(CLIPSetLastLayer::new(clip, -(p.clip_skip.min(24) as i64)))
+    } else {
+        clip
+    };
+
     let positive = g.add(CLIPTextEncode::new(p.combined_positive(), clip.clone()));
     let negative = g.add(CLIPTextEncode::new(p.negative.clone(), clip.clone()));
     let samples = g.add(KSampler {
@@ -153,6 +161,50 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
     let image = g.add(VAEDecode { samples, vae });
     let ctx = Ctx { image, latent: samples, model, clip, vae, positive, negative };
     (g, ctx)
+}
+
+/// Order-independent structural hash of an API workflow, for the duplicate-run guard. The
+/// serialized text is NOT canonical here — rucomfyui turns on serde_json's `preserve_order`,
+/// and node `inputs` are HashMaps whose iteration order changes per rebuild — so object keys
+/// hash sorted.
+pub fn fingerprint(wf: &Workflow) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn hash_value<H: Hasher>(v: &serde_json::Value, h: &mut H) {
+        match v {
+            serde_json::Value::Null => 0u8.hash(h),
+            serde_json::Value::Bool(b) => {
+                (1u8, b).hash(h);
+            }
+            serde_json::Value::Number(n) => {
+                2u8.hash(h);
+                n.to_string().hash(h);
+            }
+            serde_json::Value::String(s) => {
+                3u8.hash(h);
+                s.hash(h);
+            }
+            serde_json::Value::Array(a) => {
+                (4u8, a.len()).hash(h);
+                for x in a {
+                    hash_value(x, h);
+                }
+            }
+            serde_json::Value::Object(m) => {
+                (5u8, m.len()).hash(h);
+                let mut keys: Vec<&String> = m.keys().collect();
+                keys.sort_unstable();
+                for k in keys {
+                    k.hash(h);
+                    hash_value(&m[k.as_str()], h);
+                }
+            }
+        }
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(v) = serde_json::to_value(wf) {
+        hash_value(&v, &mut h);
+    }
+    h.finish()
 }
 
 /// Emit a dynamic (custom-node) node with the given literal / slot inputs.
@@ -549,6 +601,50 @@ mod tests {
         assert_eq!(wf.0[&sharp].class_type, "ImageSharpen");
         let (dec, _) = wf.0[&sharp].inputs["image"].as_slot().unwrap();
         assert_eq!(wf.0[&dec].class_type, "VAEDecode");
+    }
+
+    /// The duplicate-run fingerprint is stable across independent rebuilds of the same params
+    /// (HashMap input order must not leak in) and moves when any input value moves.
+    #[test]
+    fn fingerprint_is_content_addressed() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let p = params();
+        let (a, _, _) = build(&p, None, &apps, &schemas);
+        let (b, _, _) = build(&p, None, &apps, &schemas);
+        assert_eq!(fingerprint(&a), fingerprint(&b), "same params must fingerprint identically");
+        let mut p2 = p.clone();
+        p2.seed = p.seed.wrapping_add(1);
+        let (c, _, _) = build(&p2, None, &apps, &schemas);
+        assert_ne!(fingerprint(&a), fingerprint(&c), "a changed seed must change the fingerprint");
+    }
+
+    /// clip_skip >= 1 splices CLIPSetLastLayer between the loader chain and both text encodes;
+    /// 0 leaves the graph untouched, and diffusion models never get one (no CLIP tower).
+    #[test]
+    fn clip_skip_splices_set_last_layer_for_checkpoints_only() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = params();
+        p.clip_skip = 2;
+        let (wf, out, _) = build(&p, None, &apps, &schemas);
+        let dec = upstream(&wf, &out, "images");
+        let sampler = upstream(&wf, &dec, "samples");
+        for input in ["positive", "negative"] {
+            let enc = upstream(&wf, &sampler, input);
+            assert_eq!(class_of(&wf, &enc), "CLIPTextEncode");
+            let skip = upstream(&wf, &enc, "clip");
+            assert_eq!(class_of(&wf, &skip), "CLIPSetLastLayer");
+            assert_eq!(wf.0[&skip].inputs["stop_at_clip_layer"], WorkflowInput::I64(-2));
+        }
+        p.clip_skip = 0;
+        let (wf, _, _) = build(&p, None, &apps, &schemas);
+        assert_eq!(wf.0.values().filter(|n| n.class_type == "CLIPSetLastLayer").count(), 0);
+        // Diffusion-model topology ignores the setting entirely.
+        p.clip_skip = 2;
+        p.model_kind = ModelKind::Diffusion;
+        p.unet_name = "anima.safetensors".into();
+        p.clip_names = vec!["qwen.safetensors".into()];
+        let (wf, _, _) = build(&p, None, &apps, &schemas);
+        assert_eq!(wf.0.values().filter(|n| n.class_type == "CLIPSetLastLayer").count(), 0);
     }
 
     #[test]

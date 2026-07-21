@@ -174,6 +174,10 @@ pub struct Params {
     pub lora_triggers: String,
     pub steps: u32,
     pub cfg: f32,
+    /// `CLIPSetLastLayer` depth: 0 = off, n>=1 emits `stop_at_clip_layer = -n` (checkpoints only —
+    /// Pony/Illustrious conventionally run 2; diffusion-model encoders are not CLIP towers).
+    #[serde(default)]
+    pub clip_skip: u32,
     pub width: u32,
     pub height: u32,
     pub batch_size: u32,
@@ -276,6 +280,7 @@ impl Default for Params {
             lora_triggers: String::new(),
             steps: 20,
             cfg: 7.0,
+            clip_skip: 0,
             width: 1024,
             height: 1024,
             batch_size: 1,
@@ -305,6 +310,7 @@ impl Params {
         self.lora_triggers = d.lora_triggers;
         self.steps = d.steps;
         self.cfg = d.cfg;
+        self.clip_skip = d.clip_skip;
         self.width = d.width;
         self.height = d.height;
         self.batch_size = d.batch_size;
@@ -1385,6 +1391,12 @@ pub struct GalleryView {
     /// Exact model name from `/gallery/api/facets`; empty = all models.
     #[serde(default)]
     pub model: String,
+    /// Exact LoRA filename from `/gallery/api/facets`; empty = all. Server-side filter (needs a
+    /// gate that indexes LoRAs; older gates ignore the param and return everything). Session-only
+    /// (`skip`): a persisted value would apply to a different account or a LoRA-unaware gate where
+    /// it can't be cleared or even seen, silently mis-filtering the whole namespace.
+    #[serde(skip)]
+    pub lora: String,
     #[serde(default)]
     pub album: Option<i64>,
     /// Images / videos / everything, filtered client-side.
@@ -1414,6 +1426,7 @@ impl Default for GalleryView {
     fn default() -> Self {
         Self {
             model: String::new(),
+            lora: String::new(),
             album: None,
             media: GalleryMedia::All,
             rating: RatingFilter::All,
@@ -1602,7 +1615,7 @@ pub struct AlbumList {
     pub albums: Vec<Album>,
 }
 
-/// One distinct model name across the account's gallery, with how many images used it.
+/// One distinct model or LoRA name across the account's gallery, with how many images used it.
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelFacet {
     pub name: String,
@@ -1610,11 +1623,77 @@ pub struct ModelFacet {
     pub count: i64,
 }
 
-/// `GET /gallery/api/facets` — the source of the model filter's options.
+/// `GET /gallery/api/facets` — the source of the model filter's options and the checkpoint/LoRA
+/// example-count lookups. `loras` is empty on gates that don't index LoRAs yet.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Facets {
     #[serde(default)]
     pub models: Vec<ModelFacet>,
+    #[serde(default)]
+    pub loras: Vec<ModelFacet>,
+}
+
+impl Facets {
+    /// The exact indexed name and image count for a checkpoint, matched basename-insensitively so a
+    /// picker entry like `Pony/foo.safetensors` finds an index value of `foo.safetensors` (and the
+    /// reverse). The returned name is the exact string to pass as the server `model` filter.
+    pub fn model_example<'a>(&'a self, file: &str) -> Option<(&'a str, i64)> {
+        facet_match(&self.models, file)
+    }
+
+    /// The exact indexed name and image count for a LoRA (the `lora` filter value), same match.
+    pub fn lora_example<'a>(&'a self, file: &str) -> Option<(&'a str, i64)> {
+        facet_match(&self.loras, file)
+    }
+}
+
+fn facet_match<'a>(facets: &'a [ModelFacet], file: &str) -> Option<(&'a str, i64)> {
+    // Exact name wins; basename is only a fallback. The gate sorts facets by count, so without
+    // the exact-first pass a higher-count same-basename file in another folder (SDXL/x vs Pony/x)
+    // would shadow the one actually picked — showing its count and opening its gallery.
+    if let Some(f) = facets.iter().find(|f| f.name == file) {
+        return Some((f.name.as_str(), f.count));
+    }
+    let base = file_basename(file);
+    facets
+        .iter()
+        .find(|f| file_basename(&f.name) == base)
+        .map(|f| (f.name.as_str(), f.count))
+}
+
+/// The trailing save counter in a ComfyUI output filename (`str0.4_00003_.png` -> 3): the last
+/// all-digit `_` segment of the stem. Same-counter files across sibling strength folders are the
+/// same seed of a sweep, which is what pairs them for review.
+pub fn file_counter(name: &str) -> Option<u64> {
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    stem.rsplit('_')
+        .find(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|seg| seg.parse().ok())
+}
+
+/// One row of the server trash listing (`/gallery/api/list?trash=1`). `subfolder`/`filename`
+/// point at the file inside `.trash/` (thumb-fetchable); `orig_*` say where restore puts it back.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TrashItem {
+    pub id: i64,
+    pub subfolder: String,
+    pub filename: String,
+    #[serde(default)]
+    pub orig_subfolder: String,
+    #[serde(default)]
+    pub orig_filename: String,
+    /// Unix seconds when it was deleted.
+    #[serde(default)]
+    pub deleted: f64,
+    #[serde(default)]
+    pub is_video: bool,
+}
+
+impl TrashItem {
+    /// Thumbnail cache key, matching [`GalleryItem::thumb_key`].
+    pub fn thumb_key(&self, size: u32) -> String {
+        format!("{}/{}#{size}", self.subfolder, self.filename)
+    }
 }
 
 /// One image in the server's `/gallery/api/list` response.
@@ -1722,6 +1801,33 @@ fn unix_ymd(secs: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Example-count lookup: exact name beats a basename collision, even when the collision has a
+    /// higher count and sorts first (the gate returns facets count-descending).
+    #[test]
+    fn facet_match_prefers_exact_over_basename() {
+        let facets = vec![
+            ModelFacet { name: "SDXL/detail.safetensors".into(), count: 10 },
+            ModelFacet { name: "Pony/detail.safetensors".into(), count: 3 },
+        ];
+        let f = Facets { models: facets.clone(), loras: facets };
+        assert_eq!(f.model_example("Pony/detail.safetensors"), Some(("Pony/detail.safetensors", 3)));
+        assert_eq!(f.lora_example("SDXL/detail.safetensors"), Some(("SDXL/detail.safetensors", 10)));
+        // No exact match → basename fallback still resolves (bare picker name vs stored path).
+        assert_eq!(f.model_example("detail.safetensors").map(|(_, c)| c), Some(10));
+        assert_eq!(f.model_example("missing.safetensors"), None);
+    }
+
+    /// The sweep-pairing counter: last all-digit `_` segment of the stem, or None.
+    #[test]
+    fn file_counter_reads_the_save_counter() {
+        assert_eq!(file_counter("str0.4_00003_.png"), Some(3));
+        assert_eq!(file_counter("comfyui_android_00221_.png"), Some(221));
+        assert_eq!(file_counter("baseline_no_lora_00002_.png"), Some(2));
+        // No counter: names without an all-digit segment.
+        assert_eq!(file_counter("cover.png"), None);
+        assert_eq!(file_counter("str0.4.png"), None);
+    }
 
     /// Settings written before the Anima backend existed still load, as SD1.5.
     #[test]

@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use egui_mobile::{CreateContext, EguiApp, Haptic, Host, HostExt, ScreenOrientation, device_orientation_deg, app, egui};
 use egui_snarl::{InPinId, OutPinId};
+use rucomfyui::Workflow;
 use rucomfyui::workflow::WorkflowNodeId;
 use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
 
@@ -31,6 +32,7 @@ use crate::types::{
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, Img2ImgSource, LoraCatalog, LoraPack, Mode,
+    TrashItem,
     ModelKind, Params, PromptHist, RatingFilter, SamplerPack, Settings, append_negatives,
     checkpoint_family, fallback_vec, file_basename, merge_triggers, push_prompt_hist, strip_injected,
 };
@@ -194,6 +196,9 @@ struct Viewer {
     workflow_json: Option<String>,
     /// Parsed prompts / LoRAs / sampler summary from the workflow.
     meta: Option<ImageMeta>,
+    /// `meta` is the gate's quick summary (no LoRA strengths / encoder details) — good enough for
+    /// the info panel, not for Remix; the full workflow scrape clears this when it lands.
+    meta_partial: bool,
     meta_loading: bool,
 }
 
@@ -419,6 +424,37 @@ struct GraphDoc {
     /// A load is still settling its auto-layout; re-baseline the history once it does, so the
     /// refined positions are the starting point rather than an edit the user never made.
     history_rebase: bool,
+    /// Conversion warnings from the load (nodes dropped, inputs lost) — shown as a canvas banner
+    /// until dismissed; log-only warnings meant silently incomplete workflows.
+    load_warnings: Vec<String>,
+}
+
+/// A pending destructive action awaiting a Yes/Cancel confirm. Used for menu items where the
+/// two-tap "Sure?" pattern can't work — an up_menu/down_menu closes on the arming click, so the
+/// confirm would never render. Docs are pinned by id, not index (indices shift as tabs close).
+enum ConfirmKind {
+    ClearCanvas,
+    CloseTab(u64),
+    CloseAllTabs,
+}
+
+struct ConfirmDialog {
+    title: String,
+    body: String,
+    confirm_label: String,
+    kind: ConfirmKind,
+}
+
+/// A graph run held back by the duplicate-workflow guard: the exact prompt was queued before, so
+/// the server would replay it from cache instead of generating. `doc_id` pins the modal's actions
+/// to the doc that was queued — the Create-linked redirect restores `active_graph` before the
+/// modal resolves, so "the active doc" can be a completely different tab by then.
+struct DupRun {
+    wf: Workflow,
+    ui_json: serde_json::Value,
+    label: String,
+    fp: u64,
+    doc_id: u64,
 }
 
 impl GraphDoc {
@@ -436,6 +472,7 @@ impl GraphDoc {
             epoch: 0,
             history: crate::history::History::default(),
             history_rebase: false,
+            load_warnings: Vec::new(),
         }
     }
 
@@ -451,6 +488,7 @@ impl GraphDoc {
         self.props_node = None;
         self.bypassed.clear();
         self.seed_randomize.clear();
+        self.load_warnings.clear();
         self.view.reset();
         // Snarl ids restart at 0 on a fresh graph, so anything holding old ids must be stale.
         self.epoch += 1;
@@ -740,8 +778,6 @@ struct ComfyApp {
     queue_jobs: (Vec<QueueJob>, Vec<QueueJob>),
     /// Prompts this app submitted (id, short label, added time) for "Yours" rows + our-pending cancel.
     my_prompts: Vec<MyPrompt>,
-    /// Job labels awaiting a server prompt id, paired in submit order.
-    pending_job_labels: std::collections::VecDeque<String>,
     /// The pending-jobs queue sheet is open.
     queue_sheet_open: bool,
     /// Two-tap arm state for the sheet's "Clear pending" button.
@@ -761,6 +797,9 @@ struct ComfyApp {
     note: String,
     /// First Reset tap arms the confirm; a second within `RESET_CONFIRM_SECS` runs it.
     reset_armed_at: Option<f64>,
+    /// Keyed two-tap confirm state for small destructive buttons: (site key, armed-at time).
+    /// One site armed at a time — arming another (or the timeout) disarms the previous one.
+    armed_confirm: Option<(String, f64)>,
 
     /// Open workflow editor tabs (created on connect / when loading graphs).
     graph_tabs: Vec<GraphDoc>,
@@ -806,14 +845,39 @@ struct ComfyApp {
     /// Nodes in the running workflow and the ones seen executing, for the global progress bar.
     run_total: usize,
     run_seen: HashSet<u32>,
+    /// Canonical-JSON hash of the last graph workflow queued. An identical re-queue is a full
+    /// server-side cache replay (2ms "success" pointing at the old files), so it asks first.
+    last_graph_fp: Option<u64>,
+    /// A queue_graph held back because it matched `last_graph_fp` — awaiting the user's choice.
+    dup_run: Option<DupRun>,
+    /// A pending destructive graph action (Clear canvas / tab close) awaiting confirmation.
+    confirm: Option<ConfirmDialog>,
+    /// Preflight failures from the last queue attempt, shown as a tap-to-fix list (each row can
+    /// jump to its node with Properties open) instead of a dead-end text modal. The `u64` pins
+    /// the doc that was queued: the Create-linked redirect restores `active_graph` before the
+    /// modal resolves, so "the active doc" at Fix-tap time can be the wrong tab.
+    preflight_problems: Option<(u64, Vec<crate::preflight::Problem>)>,
 
     gallery: Vec<GalleryItem>,
     gallery_total: u64,
     gallery_loading: bool,
     gallery_status: String,
     gallery_q: String,
+    /// The query actually applied to the listing (snapshotted on refresh). Server calls read this,
+    /// never the live `gallery_q` buffer — background pagers used to fire mid-typing text.
+    gallery_active_q: String,
+    /// A listing response (or error) has arrived for the current `gallery_gen`. Gates the
+    /// empty-gallery auto-fetch: without it a legitimately empty result refires every frame.
+    gallery_fetched: bool,
     /// Main search box runs CLIP semantic search instead of the server text query.
     gallery_semantic: bool,
+    /// The server trash browser window (restore / purge soft-deleted images).
+    trash_open: bool,
+    trash_items: Vec<TrashItem>,
+    trash_total: u64,
+    trash_loading: bool,
+    /// Ids from the last delete + when it landed, for the "Undo" snackbar window.
+    undo_trash: Option<(Vec<i64>, f64)>,
     /// Query + layout of the Gallery tab (model filter, album, sort, grouping, columns).
     gallery_view: GalleryView,
     thumbs: ThumbCache,
@@ -949,6 +1013,9 @@ struct ComfyApp {
     untriaged: Vec<String>,
     /// Re-fetch the gallery listing at this time (server indexing lag after generate).
     gallery_refresh_at: Option<f64>,
+    /// A background gallery refresh deferred because a triage deck is open — clearing the listing
+    /// mid-deck stampede-skips the remaining cards. Runs when the deck commits/closes.
+    gallery_refresh_pending: bool,
     /// Create-tab menu FAB position; `None` = default under the queue FAB.
     create_fab_pos: Option<egui::Pos2>,
     create_fab_open: bool,
@@ -1319,7 +1386,6 @@ impl ComfyApp {
             last_queue_poll: 0.0,
             queue_jobs: (Vec::new(), Vec::new()),
             my_prompts: Vec::new(),
-            pending_job_labels: std::collections::VecDeque::new(),
             queue_sheet_open: false,
             queue_clear_arm: false,
             preview: None,
@@ -1331,6 +1397,7 @@ impl ComfyApp {
             save_counter: 0,
             note: String::new(),
             reset_armed_at: None,
+            armed_confirm: None,
             graph_tabs: Vec::new(),
             active_graph: 0,
             next_graph_id: 1,
@@ -1363,12 +1430,23 @@ impl ComfyApp {
             run_seq: 0,
             run_total: 0,
             run_seen: HashSet::new(),
+            last_graph_fp: None,
+            dup_run: None,
+            confirm: None,
+            preflight_problems: None,
             gallery: Vec::new(),
             gallery_total: 0,
             gallery_loading: false,
             gallery_status: String::new(),
             gallery_q: String::new(),
+            gallery_active_q: String::new(),
+            gallery_fetched: false,
             gallery_semantic: true,
+            trash_open: false,
+            trash_items: Vec::new(),
+            trash_total: 0,
+            trash_loading: false,
+            undo_trash: None,
             gallery_view: GalleryView::default(),
             thumbs: ThumbCache::default(),
             viewer: None,
@@ -1439,6 +1517,7 @@ impl ComfyApp {
             triage_collect: 0,
             untriaged: Vec::new(),
             gallery_refresh_at: None,
+            gallery_refresh_pending: false,
             create_fab_pos: None,
             create_fab_open: false,
             create_fab_clip: None,
@@ -1803,11 +1882,28 @@ impl ComfyApp {
                 }
             }
             Msg::Facets(f) => {
-                // A model filter whose option disappeared would silently return nothing.
+                // A model/LoRA filter whose option disappeared would silently return nothing.
+                // Older gates don't report `loras` at all, so only clear a LoRA filter when the
+                // gate DID return a (non-empty) LoRA facet set that omits it — otherwise a
+                // LoRA-unaware gate would wrongly clear the filter every refresh.
+                let mut vanished = false;
                 if !self.gallery_view.model.is_empty()
                     && !f.models.iter().any(|m| m.name == self.gallery_view.model)
                 {
                     self.gallery_view.model.clear();
+                    vanished = true;
+                }
+                if !self.gallery_view.lora.is_empty()
+                    && !f.loras.is_empty()
+                    && !f.loras.iter().any(|l| l.name == self.gallery_view.lora)
+                {
+                    self.gallery_view.lora.clear();
+                    vanished = true;
+                }
+                // The listing on screen was fetched WITH that filter — refetch without it
+                // (mirrors the vanished-album handling below).
+                if vanished && matches!(self.conn, Conn::Connected) {
+                    self.refresh_gallery();
                 }
                 self.facets = f;
             }
@@ -1840,11 +1936,44 @@ impl ComfyApp {
                 self.refresh_gallery();
                 host.haptic(Haptic::Success);
             }
+            Msg::TrashedIds(ids) => {
+                // Undo handle for the snackbar; a newer delete replaces the older window.
+                self.undo_trash = Some((ids, ctx.input(|i| i.time)));
+            }
+            Msg::TrashPage { total, items } => {
+                self.trash_loading = false;
+                self.trash_total = total;
+                self.trash_items = items;
+            }
+            Msg::TrashChanged { note, restored } => {
+                self.gallery_status = note;
+                self.undo_trash = None;
+                if self.trash_open {
+                    self.trash_loading = true;
+                    self.engine.as_ref().unwrap().trash_list(0, 200);
+                }
+                // Restored files re-enter the listing; purges don't change it.
+                if restored {
+                    self.refresh_gallery();
+                }
+                host.haptic(Haptic::Success);
+            }
             Msg::ItemAlbums { key, albums } => {
                 if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
                     v.albums = Some(albums);
+                }
+            }
+            Msg::ItemMeta { key, meta } => {
+                // The gate's pre-parsed summary fills the info panel instantly; the workflow fetch
+                // overwrites it with the richer scrape (LoRA strengths, encoders) when it lands.
+                if let Some(v) = &mut self.viewer
+                    && v.item.key() == key
+                    && v.meta.as_ref().is_none_or(|m| m.is_empty())
+                {
+                    v.meta = Some(*meta);
+                    v.meta_partial = true;
                 }
             }
             Msg::Img2ImgUrlPreview { url, image, error } => {
@@ -1944,6 +2073,14 @@ impl ComfyApp {
             Msg::Connected { schemas, models } => {
                 self.conn = Conn::Connected;
                 self.connect_manual = false;
+                // Re-arm the gallery auto-fetch: a fetch that failed (or answered for another
+                // account) before this connect must not stay latched as "settled".
+                self.gallery_fetched = false;
+                // The LoRA filter is per-account/per-gate browse state; a fresh connect (server
+                // switch / account change) must not carry a stale one into a gate that can't
+                // clear or even show it. (Model stays: it's always indexed and intentionally
+                // persistent.)
+                self.gallery_view.lora.clear();
                 // Albums and model facets are per-account, so they follow the credential.
                 self.engine.as_ref().unwrap().albums();
                 self.engine.as_ref().unwrap().facets();
@@ -2044,8 +2181,7 @@ impl ComfyApp {
             }
             Msg::EnhanceNote(note) => self.enhance_note = note,
             Msg::Queued => self.status = "Queued".into(),
-            Msg::PromptId(id) => {
-                let label = self.pending_job_labels.pop_front().unwrap_or_else(|| "Create".into());
+            Msg::PromptId { id, label } => {
                 let added = ctx.input(|i| i.time);
                 self.my_prompts.push(MyPrompt { id, label, added });
             }
@@ -2130,7 +2266,7 @@ impl ComfyApp {
                     doc.graph.populate_output_images(&prefix, imgs.into_iter());
                 }
             }
-            Msg::Done => {
+            Msg::Done(label) => {
                 self.jobs_left = self.jobs_left.saturating_sub(1);
                 self.progress = (0, 0);
                 self.executing = None;
@@ -2145,15 +2281,22 @@ impl ComfyApp {
                         self.gallery_status = "Finished video saved to the Gallery".into();
                     }
                     host.haptic(Haptic::Success);
-                    host.notify("ComfyUI", "Generation finished");
+                    // No image count here: `results` accumulates across mixed create/graph runs,
+                    // so any number would routinely be a lie.
+                    host.notify("ComfyUI", &format!("{} finished", elide(&label, 40)));
                     // New outputs should show up without a manual refresh (retry once for index lag).
                     if matches!(self.conn, Conn::Connected) {
                         // Snapshot the pre-refresh listing to diff out the post-burst results.
                         self.pre_burst_keys = self.gallery.iter().map(|it| it.key()).collect();
                         self.pending_triage_n = self.results.len();
                         self.triage_collect = 2;
-                        self.refresh_gallery();
-                        self.gallery_refresh_at = Some(ctx.input(|i| i.time) + 2.0);
+                        // Don't clear the listing out from under an open triage deck.
+                        if self.triage.is_some() {
+                            self.gallery_refresh_pending = true;
+                        } else {
+                            self.refresh_gallery();
+                            self.gallery_refresh_at = Some(ctx.input(|i| i.time) + 2.0);
+                        }
                     }
                 } else {
                     self.status = format!("{} still in queue", self.jobs_left);
@@ -2168,7 +2311,9 @@ impl ComfyApp {
                 self.preview = None;
                 self.finish_pending = false;
                 self.my_prompts.clear();
-                self.pending_job_labels.clear();
+                // A cancelled run left no completed cache entry — an identical retry genuinely
+                // re-generates, so it must not trip the duplicate guard.
+                self.last_graph_fp = None;
                 self.status = if matches!(self.conn, Conn::Connected) {
                     "Cancelled — server interrupted".into()
                 } else {
@@ -2179,9 +2324,15 @@ impl ComfyApp {
                 self.jobs_left = self.jobs_left.saturating_sub(1);
                 self.progress = (0, 0);
                 self.executing = None;
+                // The failed prompt may never have reached the server (queue POST error) and
+                // certainly left no completed cache entry — a retry is not a duplicate.
+                self.last_graph_fp = None;
                 if self.jobs_left == 0 {
                     self.running = false;
                     self.finish_pending = false;
+                    // A failed overnight batch used to die silently — the finish notification
+                    // exists, so its failure counterpart must too. Once per drain, not per job.
+                    host.notify("ComfyUI", &format!("Generation failed: {}", elide(&e, 90)));
                 }
                 self.status = format!("Error: {}", elide(&e, 120));
                 self.report_error("Generation failed", &e);
@@ -2194,6 +2345,10 @@ impl ComfyApp {
             Msg::WorkflowLoaded { name, workflow, warnings, seed_randomize } => {
                 self.wf_loading = false;
                 self.executing = None;
+                // A load can replace/create the active doc; any open graph modal referencing the
+                // old doc's node ids is now stale.
+                self.preflight_problems = None;
+                self.dup_run = None;
                 match self.load_workflow_into_tab_with_seeds(name, &workflow, &seed_randomize, None) {
                     Ok(()) => {
                         if !warnings.is_empty() {
@@ -2201,6 +2356,11 @@ impl ComfyApp {
                                 "workflow loaded with {} warning(s) — see earlier log lines",
                                 warnings.len()
                             ));
+                        }
+                        // The canvas banner shows what conversion changed; a workflow that lost
+                        // nodes must not load looking complete.
+                        if let Some(doc) = self.active_doc_mut() {
+                            doc.load_warnings = warnings.clone();
                         }
                         self.graph_status.clear();
                         self.wf_open = false;
@@ -2243,6 +2403,7 @@ impl ComfyApp {
                     return;
                 }
                 self.gallery_loading = false;
+                self.gallery_fetched = true;
                 self.gallery_total = page.total;
                 if page.offset == 0 {
                     self.gallery = page.items;
@@ -2279,6 +2440,12 @@ impl ComfyApp {
             }
             Msg::GalleryError(e) => {
                 self.gallery_loading = false;
+                // The trash listing shares this error message; clear its spinner too, else the
+                // trash window spins forever on a failed fetch.
+                self.trash_loading = false;
+                // An error also settles the fetch — otherwise the empty-gallery kick retries the
+                // same failing request every frame. Pull-to-refresh retries deliberately.
+                self.gallery_fetched = true;
                 if let Some(v) = &mut self.viewer {
                     v.loading = false;
                 }
@@ -2391,19 +2558,30 @@ impl ComfyApp {
                         meta.positive.as_ref().map(|p| p.len()).unwrap_or(0)
                     ));
                     let empty = meta.is_empty();
-                    v.meta = Some(meta);
+                    // The full scrape wins over the gate's quick summary — unless it scraped
+                    // nothing and the summary has something (odd multi-save graphs).
+                    if !empty || v.meta.as_ref().is_none_or(|m| m.is_empty()) {
+                        v.meta = Some(meta);
+                    }
+                    v.meta_partial = false;
                     v.workflow_json = Some(json);
                     v.item.has_workflow = true;
                     v.meta_loading = false;
-                    open_sheet = self.viewer_remix_pending && !empty;
+                    open_sheet = self.viewer_remix_pending;
                 }
                 if open_sheet {
+                    // The fetch settled either way — a pending Remix must resolve, not strand
+                    // the "Loading workflow to remix…" status forever on an empty scrape.
                     self.viewer_remix_pending = false;
-                    self.gallery_status.clear();
-                    if let Some(meta) = self.viewer.as_ref().and_then(|v| v.meta.clone()) {
-                        self.open_remix_sheet(meta);
+                    match self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
+                    {
+                        Some(meta) => {
+                            self.gallery_status.clear();
+                            self.open_remix_sheet(meta);
+                            host.haptic(Haptic::Light);
+                        }
+                        None => self.gallery_status = "No workflow metadata to remix".into(),
                     }
-                    host.haptic(Haptic::Light);
                 }
             }
             Msg::ItemWorkflowError { key, error } => {
@@ -2417,7 +2595,15 @@ impl ComfyApp {
                 }
                 if for_current && self.viewer_remix_pending {
                     self.viewer_remix_pending = false;
-                    self.gallery_status = "No workflow metadata to remix".into();
+                    // The workflow fetch is gone for good — the gate's quick summary (if any)
+                    // is the best remix material this image will ever have.
+                    match self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty()) {
+                        Some(meta) => {
+                            self.gallery_status.clear();
+                            self.open_remix_sheet(meta);
+                        }
+                        None => self.gallery_status = "No workflow metadata to remix".into(),
+                    }
                 }
             }
             Msg::VideoReady { key, bytes } => {
@@ -2704,8 +2890,7 @@ impl ComfyApp {
             let p = self.params.positive.trim();
             if p.is_empty() { "Create".to_string() } else { elide(p, 28) }
         };
-        self.pending_job_labels.push_back(label);
-        self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow);
+        self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow, label);
         host.haptic(Haptic::Medium);
     }
 
@@ -2830,12 +3015,45 @@ impl ComfyApp {
             for p in &problems {
                 self.log.error(format!("preflight: {}", p.message()));
             }
-            let detail: Vec<String> = problems.iter().map(|p| p.message()).collect();
-            self.report_error("Can't queue this graph", detail.join("\n\n"));
+            // Tap-to-fix list instead of a dead-end text modal: each row jumps to its node.
+            let doc_id = self.active_doc().map(|d| d.id).unwrap_or(0);
+            self.preflight_problems = Some((doc_id, problems));
             host.haptic(Haptic::Error);
             return;
         }
-        // Point of no return: record the id map, reset run state, and submit.
+        // Create-linked runs are labeled by the prompt, not the linked doc's fixed "create.json"
+        // name — that's what shows in the queue sheet and finish notification.
+        let label = if self.create_graph_id.is_some()
+            && self.create_graph_id == self.active_doc().map(|d| d.id)
+        {
+            let p = self.params.positive.trim();
+            if p.is_empty() { "Create".to_string() } else { elide(p, 28) }
+        } else {
+            self.active_doc().map(|d| d.title()).unwrap_or_else(|| "Graph".into())
+        };
+        // Duplicate guard: an identical re-queue is a whole-graph server cache replay — ComfyUI
+        // "finishes" it in ~2ms pointing at the previous files (which may since be deleted).
+        // Verified live 2026-07-21; ask instead of silently replaying.
+        let fp = crate::workflow::fingerprint(&wf);
+        if self.last_graph_fp == Some(fp) {
+            let doc_id = self.active_doc().map(|d| d.id).unwrap_or(0);
+            self.dup_run = Some(DupRun { wf, ui_json, label, fp, doc_id });
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        self.submit_graph_run(ctx, host, wf, ui_json, label, fp);
+    }
+
+    /// Point of no return for a graph run: record the id map, reset run state, and submit.
+    fn submit_graph_run(
+        &mut self,
+        ctx: &egui::Context,
+        host: &Host,
+        wf: Workflow,
+        ui_json: serde_json::Value,
+        label: String,
+        fp: u64,
+    ) {
         if let Some(doc) = self.active_doc_mut() {
             // export_ui uses snarl id + 1 as the UI/API node id.
             doc.node_map = doc
@@ -2868,8 +3086,8 @@ impl ComfyApp {
             "Queued".into()
         };
         self.graph_status.clear();
-        self.pending_job_labels.push_back("Graph".into());
-        self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json));
+        self.last_graph_fp = Some(fp);
+        self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json), label);
         host.haptic(Haptic::Medium);
     }
 
@@ -4466,7 +4684,7 @@ impl ComfyApp {
         match self.create_pane {
             CreatePane::Main => self.create_main_pane(ui, host),
             CreatePane::Models => self.create_models_pane(ui, host),
-            CreatePane::Loras => self.create_loras_pane(ui),
+            CreatePane::Loras => self.create_loras_pane(ui, host),
             CreatePane::Enhance => self.create_enhance_pane(ui),
             CreatePane::Presets => self.create_presets_pane(ui, host),
             CreatePane::Characters => self.create_characters_pane(ui, host),
@@ -4594,8 +4812,19 @@ impl ComfyApp {
         }
     }
 
-    /// On-disk path of the persistent auto-tag index.
+    /// On-disk path of the persistent auto-tag index. Prefer durable `/sdcard/ComfyUI` (survives
+    /// reinstall — a wiped index costs a multi-hour NPU re-crawl), matching clip_index_path.
     fn tag_index_path(host: &Host) -> Option<String> {
+        if let Some(full) = gallery::resolve_full_cache_root(host.documents_dir().as_deref())
+            && let Some(parent) = std::path::Path::new(&full).parent()
+        {
+            return Some(parent.join("tag_index.json").to_string_lossy().into_owned());
+        }
+        host.documents_dir().map(|d| format!("{d}/comfyui/tag_index.json"))
+    }
+
+    /// Pre-durable location of the tag index, for one-time migration reads.
+    fn tag_index_legacy_path(host: &Host) -> Option<String> {
         host.documents_dir().map(|d| format!("{d}/comfyui/tag_index.json"))
     }
 
@@ -4620,11 +4849,20 @@ impl ComfyApp {
             }
         } else {
             let path = Self::tag_index_path(host);
+            // Existing installs have the index at the old app-files path; read it once as a
+            // fallback — the next save lands at the durable path.
+            let legacy = Self::tag_index_legacy_path(host).filter(|l| Some(l) != path.as_ref());
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                let read = |p: &String| {
+                    std::fs::read_to_string(p)
+                        .ok()
+                        .and_then(|t| serde_json::from_str::<tag_index::TagIndex>(&t).ok())
+                };
                 let index = path
-                    .and_then(|p| std::fs::read_to_string(&p).ok())
-                    .and_then(|t| serde_json::from_str::<tag_index::TagIndex>(&t).ok())
+                    .as_ref()
+                    .and_then(read)
+                    .or_else(|| legacy.as_ref().and_then(read))
                     .unwrap_or_default();
                 let _ = tx.send(index);
             });
@@ -5505,6 +5743,17 @@ impl ComfyApp {
                 self.queue_variants = variants as usize;
             });
         });
+        // CLIP skip only exists for checkpoint text encoders; Pony/Illustrious conventionally
+        // run 2. Diffusion models (Anima/Flux) encode through qwen/t5 towers with no CLIP layers.
+        if self.params.model_kind == ModelKind::Checkpoint {
+            ui.add_space(4.0);
+            ui.vertical_centered(|ui| {
+                stepper_u32(ui, "CLIP skip", &mut self.params.clip_skip, 0..=12, 1);
+                if self.params.clip_skip == 0 {
+                    ui.weak("0 = model default");
+                }
+            });
+        }
 
         ui.add_space(4.0);
         ui.vertical_centered(|ui| {
@@ -5785,7 +6034,8 @@ impl ComfyApp {
     /// the section expanded (from the Model packs status rows); `None` keeps the remembered state.
     #[cfg(feature = "local-npu")]
     fn local_import_ui(&mut self, ui: &mut egui::Ui, host: &Host, open: Option<bool>) {
-        self.poll_pack_import(host);
+        // poll_pack_import also runs every frame in update(); the duplicate here is harmless
+        // (the channel is drained once) and keeps the status line live while the panel is open.
         let busy = self.pack_import_rx.is_some();
         ui.add_space(6.0);
         egui::CollapsingHeader::new("Import a pack").open(open).show(ui, |ui| {
@@ -5827,21 +6077,56 @@ impl ComfyApp {
     fn local_import_ui(&mut self, _ui: &mut egui::Ui, _host: &Host, _open: Option<bool>) {}
 
     #[cfg(feature = "local-npu")]
+    /// The durable pack root when it is actually writable (needs All files access), probed with
+    /// a real write — MANAGE_EXTERNAL_STORAGE being declared doesn't mean it was granted.
+    fn writable_durable_root() -> Option<std::path::PathBuf> {
+        let root = std::path::PathBuf::from(Self::durable_models_dir());
+        std::fs::create_dir_all(&root).ok()?;
+        let probe = root.join(".cg_write_probe");
+        std::fs::write(&probe, b"x").ok()?;
+        let _ = std::fs::remove_file(&probe);
+        Some(root)
+    }
+
+    #[cfg(feature = "local-npu")]
     fn start_pack_import(&mut self, ctx: &egui::Context, host: &Host) {
-        let Some(root) = self.external_files_dir(host) else {
-            self.pack_import_status = "app files dir unavailable".into();
+        // Prefer the durable root: an app-files import is wiped with every reinstall and then
+        // nags to be moved anyway. App files stay the fallback when /sdcard isn't writable.
+        let root = Self::writable_durable_root()
+            .map(|p| p.display().to_string())
+            .or_else(|| self.external_files_dir(host));
+        let Some(root) = root else {
+            self.pack_import_status = "no writable pack dir (app files unavailable)".into();
             return;
         };
         let name = self.pack_name.trim().to_string();
         let url = self.pack_url.trim().to_string();
-        self.pack_import_status = "starting...".into();
-        self.log.info(format!("local-npu: importing pack '{name}' from {url}"));
+        self.pack_import_status = format!("starting… (into {root})");
+        self.log.info(format!("local-npu: importing pack '{name}' from {url} into {root}"));
         self.pack_import_rx = Some(crate::local_engine::spawn_import(
             url,
             std::path::PathBuf::from(root),
             name,
             ctx.clone(),
         ));
+    }
+
+    /// Move one pack from app files to the durable root on a worker thread; reuses the import
+    /// progress channel so status/rescan handling comes for free.
+    #[cfg(feature = "local-npu")]
+    fn start_pack_move(&mut self, ctx: &egui::Context, dir: std::path::PathBuf) {
+        if self.pack_import_rx.is_some() {
+            self.pack_import_status = "another import/move is still running".into();
+            return;
+        }
+        let Some(dst) = Self::writable_durable_root() else {
+            self.pack_import_status =
+                "/sdcard/ComfyUI isn't writable — grant All files access".into();
+            return;
+        };
+        self.pack_import_status = "moving…".into();
+        self.log.info(format!("local-npu: moving {} to {}", dir.display(), dst.display()));
+        self.pack_import_rx = Some(crate::local_engine::spawn_move(dir, dst, ctx.clone()));
     }
 
     #[cfg(feature = "local-npu")]
@@ -5894,6 +6179,7 @@ impl ComfyApp {
         rows.push(("Rewriter".into(), None, self.rewrite_pack.clone(), format!("{durable}/rewrite")));
         let mut rescan = false;
         let mut open_import = false;
+        let mut mov: Option<std::path::PathBuf> = None;
         ui.add_space(8.0);
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -5933,7 +6219,15 @@ impl ComfyApp {
                             ui.weak(format!("updated {}", crate::local_engine::humanize_ago(secs)));
                         }
                         if wiped {
-                            ui.colored_label(warn, "(wiped on reinstall - move to /sdcard/ComfyUI)");
+                            ui.colored_label(warn, "(wiped on reinstall)");
+                            let moving = self.pack_import_rx.is_some();
+                            if ui
+                                .add_enabled(!moving, egui::Button::new("Move to /sdcard").small())
+                                .on_hover_text("Copy to /sdcard/ComfyUI (survives reinstall), then remove the app-files copy")
+                                .clicked()
+                            {
+                                mov = Some(dir.clone());
+                            }
                         }
                     } else {
                         ui.weak(sanitize_ui_text(ui, &format!("missing - expected {hint}")));
@@ -5948,6 +6242,9 @@ impl ComfyApp {
             }
         });
         self.local_import_ui(ui, host, open_import.then_some(true));
+        if let Some(dir) = mov {
+            self.start_pack_move(ui.ctx(), dir);
+        }
         if rescan {
             self.ensure_local_packs(host, true);
         }
@@ -6256,6 +6553,8 @@ impl ComfyApp {
 
         let mut pick: Option<(String, ModelKind)> = None;
         let mut toggle_fav: Option<String> = None;
+        let mut examples: Option<String> = None;
+        let facets = self.facets.clone();
         let force_closed = self.checkpoints_force_collapse;
         let mut shown = 0usize;
 
@@ -6295,6 +6594,7 @@ impl ComfyApp {
                             .show(ui, |ui| {
                                 ui.set_max_width(ui.available_width());
                                 for (file, kind, meta) in versions {
+                                    let ex = facets.model_example(file).map(|(_, c)| c).unwrap_or(0);
                                     model_version_row(
                                         ui,
                                         file,
@@ -6303,8 +6603,10 @@ impl ComfyApp {
                                         &current,
                                         true,
                                         "ckpt_fav",
+                                        ex,
                                         &mut pick,
                                         &mut toggle_fav,
+                                        &mut examples,
                                     );
                                     shown += 1;
                                 }
@@ -6372,6 +6674,7 @@ impl ComfyApp {
                                 ui.set_max_width(ui.available_width());
                                 for (file, kind, meta) in versions {
                                     let fav = fav_files.contains(file);
+                                    let ex = facets.model_example(file).map(|(_, c)| c).unwrap_or(0);
                                     model_version_row(
                                         ui,
                                         file,
@@ -6380,8 +6683,10 @@ impl ComfyApp {
                                         &current,
                                         fav,
                                         "ckpt_ver",
+                                        ex,
                                         &mut pick,
                                         &mut toggle_fav,
+                                        &mut examples,
                                     );
                                     shown += 1;
                                 }
@@ -6396,6 +6701,14 @@ impl ComfyApp {
         }
         if let Some(file) = toggle_fav {
             self.toggle_checkpoint_favorite(&file);
+        }
+        if let Some(file) = examples {
+            // Filter by the exact indexed name (basename-matched from the picker file).
+            let name = facets
+                .model_example(&file)
+                .map(|(n, _)| n.to_string())
+                .unwrap_or(file);
+            self.open_examples(&name, false, host);
         }
         if fav_groups.is_empty() && families.is_empty() {
             let empty = self.checkpoints.is_empty() && self.unets.is_empty();
@@ -6418,14 +6731,12 @@ impl ComfyApp {
                 self.preset_save_open = true;
             }
             let can_del = !self.selected_preset.is_empty();
-            if ui
-                .add_enabled(can_del, egui::Button::new(icons::TRASH))
-                .on_hover_text("Delete selected preset")
-                .clicked()
-            {
-                self.delete_selected_preset();
-                host.haptic(Haptic::Warning);
-            }
+            ui.add_enabled_ui(can_del, |ui| {
+                if self.armed_button(ui, host, "preset-del-selected", icons::TRASH.into(), false) {
+                    self.delete_selected_preset();
+                    host.haptic(Haptic::Warning);
+                }
+            });
         });
 
         if self.preset_save_open {
@@ -6465,7 +6776,13 @@ impl ComfyApp {
                 ui.set_max_width(list_w);
                 let (use_clicked, trash_clicked) = ui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-                        let trash = ui.small_button(icons::TRASH).clicked();
+                        let trash = self.armed_button(
+                            ui,
+                            host,
+                            &format!("preset-del:{}", preset.name),
+                            icons::TRASH.into(),
+                            true,
+                        );
                         let use_btn = ui
                             .add_enabled(!selected, egui::Button::new("Use").small())
                             .clicked();
@@ -6618,7 +6935,13 @@ impl ComfyApp {
                             {
                                 act = Some(Act::Share(i));
                             }
-                            if ui.small_button(icons::TRASH).clicked() {
+                            if self.armed_button(
+                                ui,
+                                host,
+                                &format!("char-del:{}", card.name),
+                                icons::TRASH.into(),
+                                true,
+                            ) {
                                 act = Some(Act::Delete(card.name.clone()));
                             }
                         });
@@ -6878,6 +7201,9 @@ impl ComfyApp {
 
     /// Overwrite sampler / steps / cfg / size from `file`'s catalog recommendation, where present.
     fn apply_recommended_settings(&mut self, file: &str) {
+        // clip_skip is a per-model convention, not a sticky tunable: a model without a catalog
+        // recommendation reverts to off rather than inheriting the previous model's skip.
+        self.params.clip_skip = 0;
         let Some(rec) = self
             .checkpoint_catalog
             .entry(file)
@@ -6905,6 +7231,10 @@ impl ComfyApp {
             rec.scheduler.as_ref().and_then(|s| match_sampler_name(s, &self.schedulers))
         {
             self.params.scheduler = name;
+        }
+        // The catalog has carried clip_skip all along; the workflow finally emits it.
+        if let Some(v) = rec.clip_skip {
+            self.params.clip_skip = v.min(12);
         }
     }
 
@@ -6949,6 +7279,43 @@ impl ComfyApp {
     fn seed_reset_recommendation(&mut self) {
         let file = self.params.model_file().to_string();
         self.apply_recommended_settings(&file);
+    }
+
+    /// Keyed two-tap guard for destructive buttons: renders `label` (or "Sure?" once armed);
+    /// returns true only on the second tap within the confirm window. `small` picks the button
+    /// size to match the row it sits in. One-tap deletes of presets/characters/tabs were
+    /// unrecoverable — a mis-tap purged curation history instantly.
+    fn armed_button(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &Host,
+        key: &str,
+        label: String,
+        small: bool,
+    ) -> bool {
+        let now = ui.input(|i| i.time);
+        let armed = self
+            .armed_confirm
+            .as_ref()
+            .is_some_and(|(k, t)| k == key && now - t < RESET_CONFIRM_SECS);
+        let text = if armed { "Sure?".to_string() } else { label };
+        let resp = if small {
+            ui.small_button(text)
+        } else {
+            ui.add(egui::Button::new(text))
+        };
+        if armed {
+            ui.ctx().request_repaint_after(Duration::from_secs_f64(RESET_CONFIRM_SECS));
+        }
+        if resp.clicked() {
+            if armed {
+                self.armed_confirm = None;
+                return true;
+            }
+            self.armed_confirm = Some((key.to_string(), now));
+            host.haptic(Haptic::Light);
+        }
+        false
     }
 
     /// Two-tap Reset: first tap arms ("Sure?"), a second within the window clears Create.
@@ -7098,7 +7465,7 @@ impl ComfyApp {
         self.lora_catalog.bases_for_checkpoint(checkpoint)
     }
 
-    fn create_loras_pane(&mut self, ui: &mut egui::Ui) {
+    fn create_loras_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
         // ScrollArea can report infinite width; pin to the clip so trailing buttons stay visible.
         let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
         ui.set_max_width(list_w);
@@ -7207,18 +7574,27 @@ impl ComfyApp {
         let mut shown = 0usize;
         let mut hidden = 0usize;
         let mut add: Option<String> = None;
+        let mut examples: Option<String> = None;
+        let facets = self.facets.clone();
         for (file, label, meta) in &rows {
             if shown >= 80 {
                 hidden += 1;
                 continue;
             }
+            let ex = facets.lora_example(file).map(|(_, c)| c).unwrap_or(0);
             ui.horizontal(|ui| {
                 ui.set_max_width(list_w);
-                let clicked = ui
+                let (clicked, ex_clicked) = ui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         let clicked = ui.small_button("Add").clicked();
+                        // Visual reference: this LoRA's example images.
+                        let ex_clicked = ex > 0
+                            && ui
+                                .add(egui::Button::new(format!("{} {ex}", icons::GALLERY)).small())
+                                .on_hover_text("See example images using this LoRA")
+                                .clicked();
                         ui.add_space(6.0);
-                        // Collapse arrow (~18px) + gap; keep the label clear of Add.
+                        // Collapse arrow (~18px) + gap; keep the label clear of Add / examples.
                         let max_w = (ui.available_width() - 22.0).max(32.0);
                         let header = elide_width(ui, &sanitize_ui_text(ui, label), max_w);
                         egui::CollapsingHeader::new(header)
@@ -7228,17 +7604,24 @@ impl ComfyApp {
                                 ui.set_max_width((list_w - 56.0).max(100.0));
                                 lora_meta_body(ui, file, meta.as_ref());
                             });
-                        clicked
+                        (clicked, ex_clicked)
                     })
                     .inner;
                 if clicked {
                     add = Some(file.clone());
+                }
+                if ex_clicked {
+                    examples = Some(file.clone());
                 }
             });
             shown += 1;
         }
         if let Some(file) = add {
             self.add_lora(&file);
+        }
+        if let Some(file) = examples {
+            let name = facets.lora_example(&file).map(|(n, _)| n.to_string()).unwrap_or(file);
+            self.open_examples(&name, true, host);
         }
         if shown == 0 {
             ui.weak(if self.installed_loras.is_empty() {
@@ -8409,7 +8792,16 @@ impl ComfyApp {
                     self.params.weight_dtype = d.clone();
                 }
             } else if let Some(m) = meta.models.first() {
-                self.select_model(m, Some(ModelKind::Checkpoint));
+                // The gate's quick summary folds UNET names into the same single "model" field —
+                // a hard Checkpoint hint would rebuild those under the wrong loader topology.
+                let kind = if self.unets.iter().any(|u| u == m)
+                    && !self.checkpoints.iter().any(|c| c == m)
+                {
+                    ModelKind::Diffusion
+                } else {
+                    ModelKind::Checkpoint
+                };
+                self.select_model(m, Some(kind));
             }
         }
         if sel.positive {
@@ -8429,7 +8821,9 @@ impl ComfyApp {
             cfg: sel.cfg.then(|| meta.cfg.map(|n| n as f32)).flatten(),
         });
         if sel.seed {
-            if let Some(v) = meta.seed.filter(|&s| s >= 0) {
+            // Negative here means a real > i64::MAX seed that was bit-cast on parse; `as u64`
+            // restores it exactly. (ComfyUI seeds span the full u64 range.)
+            if let Some(v) = meta.seed {
                 self.params.seed = v as u64;
                 self.params.randomize_seed = false;
             }
@@ -8730,7 +9124,6 @@ impl ComfyApp {
             })
             .flatten();
         let schemas = self.schemas.clone().unwrap_or_default();
-        self.pending_job_labels.push_back("Video finish".into());
         self.engine.as_mut().unwrap().run_finish(
             sheet.video_path.clone(),
             reference,
@@ -8738,6 +9131,7 @@ impl ComfyApp {
             sheet.rife_multiplier,
             sheet.output_fps,
             schemas,
+            "Video finish".into(),
         );
         self.finish_pending = true;
         self.running = true;
@@ -9435,6 +9829,18 @@ impl ComfyApp {
             });
         }
 
+        // The note renders regardless of results: "Remixed into Create", "Gallery image set as
+        // input", and pick failures all land on a screen with no results yet.
+        if !self.note.is_empty() {
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(self.note.clone());
+                if ui.small_button(icons::CLOSE).on_hover_text("Dismiss").clicked() {
+                    self.note.clear();
+                }
+            });
+        }
+
         if let Some(tex) = &self.preview {
             image_view(ui, tex);
         }
@@ -9447,9 +9853,6 @@ impl ComfyApp {
                 } else {
                     format!("Results ({n})")
                 });
-                if !self.note.is_empty() {
-                    ui.weak(self.note.clone());
-                }
             });
             let mut open: Option<usize> = None;
             let mut save_idx: Option<usize> = None;
@@ -10109,9 +10512,45 @@ impl ComfyApp {
             ui.add_space(2.0);
         });
 
+        self.load_warnings_banner(ui);
         match self.graph_pane {
             GraphPane::Canvas => self.graph_canvas(ui, host),
             GraphPane::Props => self.props_tab(ui, host),
+        }
+    }
+
+    /// Banner over the canvas when the last workflow load dropped or changed anything (muted
+    /// nodes, unknown classes, lost inputs). Log-only warnings meant a desktop workflow with
+    /// custom nodes loaded looking complete while silently missing pieces.
+    fn load_warnings_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(doc) = self.active_doc() else { return };
+        let n = doc.load_warnings.len();
+        if n == 0 {
+            return;
+        }
+        let mut dismiss = false;
+        let mut show = false;
+        ui.horizontal(|ui| {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{} Load changed {n} thing{}", icons::WARN, if n == 1 { "" } else { "s" }),
+            );
+            if ui.small_button("Details").clicked() {
+                show = true;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(icons::CLOSE).on_hover_text("Dismiss").clicked() {
+                    dismiss = true;
+                }
+            });
+        });
+        if show {
+            let detail =
+                self.active_doc().map(|d| d.load_warnings.join("\n\n")).unwrap_or_default();
+            self.report_error("Workflow load warnings", detail);
+        }
+        if dismiss && let Some(doc) = self.active_doc_mut() {
+            doc.load_warnings.clear();
         }
     }
 
@@ -10128,12 +10567,17 @@ impl ComfyApp {
             title
         };
         let mut switch_to: Option<usize> = None;
+        // Empty tabs close on one tap (nothing to lose); a tab with content routes through the
+        // confirm modal — the menu closes on the tap, so an in-menu "Sure?" could never render.
         let mut close_idx: Option<usize> = None;
-        let mut close_all = false;
+        let mut confirm_close: Option<(u64, String)> = None;
+        let mut close_all_now = false;
+        let mut confirm_close_all = false;
+        let any_content = self.graph_tabs.iter().any(|d| !d.is_empty());
         // Header control: open below and left so the list isn't clipped by the status bar.
         down_menu(ui, label, |ui| {
             const ROW_W: f32 = 260.0;
-            const CLOSE_W: f32 = 36.0;
+            const CLOSE_W: f32 = 40.0;
             const ROW_H: f32 = 32.0;
             ui.set_min_width(ROW_W);
             for (i, doc) in self.graph_tabs.iter().enumerate() {
@@ -10159,13 +10603,21 @@ impl ComfyApp {
                         .on_hover_text("Close tab")
                         .clicked()
                     {
-                        close_idx = Some(i);
+                        if doc.is_empty() {
+                            close_idx = Some(i);
+                        } else {
+                            confirm_close = Some((doc.id, doc.title()));
+                        }
                     }
                 });
             }
             ui.separator();
             if ui.button("Close all").clicked() {
-                close_all = true;
+                if any_content {
+                    confirm_close_all = true;
+                } else {
+                    close_all_now = true;
+                }
             }
         });
         if let Some(i) = switch_to {
@@ -10175,7 +10627,23 @@ impl ComfyApp {
         if let Some(i) = close_idx {
             self.close_graph_tab(i);
         }
-        if close_all {
+        if let Some((id, title)) = confirm_close {
+            self.confirm = Some(ConfirmDialog {
+                title: "Close this tab?".into(),
+                body: format!("“{}” isn't saved — closing it discards the graph.", elide(&title, 40)),
+                confirm_label: "Close".into(),
+                kind: ConfirmKind::CloseTab(id),
+            });
+        }
+        if confirm_close_all {
+            self.confirm = Some(ConfirmDialog {
+                title: "Close all tabs?".into(),
+                body: "Unsaved graphs in every tab will be discarded.".into(),
+                confirm_label: "Close all".into(),
+                kind: ConfirmKind::CloseAllTabs,
+            });
+        }
+        if close_all_now {
             self.close_all_graph_tabs();
         }
     }
@@ -10669,7 +11137,14 @@ impl ComfyApp {
                 )
                 .clicked()
             {
-                self.clear_graph();
+                // Full wipe with no undo — confirm (the menu closes on this click, so an in-menu
+                // "Sure?" would never show; a modal is the menu-safe guard).
+                self.confirm = Some(ConfirmDialog {
+                    title: "Clear canvas?".into(),
+                    body: "This erases the current graph and its undo history.".into(),
+                    confirm_label: "Clear".into(),
+                    kind: ConfirmKind::ClearCanvas,
+                });
             }
         });
 
@@ -10746,6 +11221,9 @@ impl ComfyApp {
         });
     }
 
+    /// File > Clear canvas: a full document reset (history included). Guarded by a confirm dialog
+    /// rather than left undoable — a "keep history through an emptied tab" scheme was silently
+    /// destroyed the moment any ordinary action (opening a workflow) reused the now-empty tab.
     fn clear_graph(&mut self) {
         if let Some(doc) = self.active_doc_mut() {
             doc.clear_content();
@@ -11380,7 +11858,12 @@ impl ComfyApp {
         self.add_open = open;
     }
 
+    /// Re-query the listing with the CURRENTLY APPLIED query (`gallery_active_q`). Background
+    /// callers (post-run refresh, delete mutations, album changes) land here — they must never
+    /// commit the live search buffer mid-typing. User-initiated search commits go through
+    /// [`Self::refresh_gallery_commit_query`].
     fn refresh_gallery(&mut self) {
+        self.gallery_fetched = false;
         self.gallery.clear();
         self.gallery_total = 0;
         self.gallery_loading = true;
@@ -11400,6 +11883,40 @@ impl ComfyApp {
         );
     }
 
+    /// A user-initiated refresh (Enter in the search box, the clear/refresh buttons, filter
+    /// changes, pull-to-refresh): applies whatever is in the search box, then re-queries.
+    fn refresh_gallery_commit_query(&mut self) {
+        self.gallery_active_q = self.gallery_q.trim().to_string();
+        self.refresh_gallery();
+    }
+
+    /// Open the Gallery tab filtered to a checkpoint's or a LoRA's example images — the reference
+    /// gallery behind the "examples" affordance in the Create pickers. Clears the other filters so
+    /// the view is exactly that model/LoRA's images. `lora=false` filters by model.
+    fn open_examples(&mut self, name: &str, lora: bool, host: &Host) {
+        if !matches!(self.conn, Conn::Connected) {
+            self.status = "Connect to the server to see examples".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        self.ranked = None;
+        self.gallery_q.clear();
+        #[cfg(feature = "local-npu")]
+        self.clear_semantic_ranked();
+        self.gallery_view.album = None;
+        if lora {
+            self.gallery_view.lora = name.to_string();
+            self.gallery_view.model.clear();
+        } else {
+            self.gallery_view.model = name.to_string();
+            self.gallery_view.lora.clear();
+        }
+        self.tab = Tab::Gallery;
+        self.viewer = None;
+        self.refresh_gallery_commit_query();
+        host.haptic(Haptic::Light);
+    }
+
     /// The gallery's bottom control bar: search, model filter, sort, grouping and column count.
     /// Returns whether the listing must be re-queried — every control except the column count is
     /// applied server-side across the whole listing, not to the page already fetched.
@@ -11407,6 +11924,7 @@ impl ComfyApp {
     fn gallery_wants_all(&self) -> bool {
         if self.gallery_view.group != GalleryGroup::None
             || !self.gallery_view.model.is_empty()
+            || !self.gallery_view.lora.is_empty()
             || self.gallery_view.album.is_some()
             // The media filter is client-side, so the full set must be present to filter over.
             || self.gallery_view.media != GalleryMedia::All
@@ -11430,7 +11948,9 @@ impl ComfyApp {
             let refresh_w = 40.0;
             let view_w = 72.0;
             let tags_w = 60.0;
-            let search_w = (ui.available_width() - refresh_w - view_w - tags_w - 12.0).max(96.0);
+            let clear_w = if self.gallery_q.is_empty() { 0.0 } else { 32.0 };
+            let search_w =
+                (ui.available_width() - refresh_w - view_w - tags_w - clear_w - 12.0).max(96.0);
             #[cfg(feature = "local-npu")]
             let semantic = self.gallery_semantic_active();
             #[cfg(not(feature = "local-npu"))]
@@ -11444,6 +11964,29 @@ impl ComfyApp {
                 egui::vec2(search_w, 28.0),
                 egui::TextEdit::singleline(&mut self.gallery_q).hint_text(hint),
             );
+            if !self.gallery_q.is_empty()
+                && ui
+                    .add(egui::Button::new(icons::CLOSE).min_size(egui::vec2(28.0, 28.0)))
+                    .on_hover_text("Clear search")
+                    .clicked()
+            {
+                self.gallery_q.clear();
+                #[cfg(feature = "local-npu")]
+                if semantic {
+                    self.clear_semantic_ranked();
+                }
+                // Semantic queries never reached the server, so clearing one has nothing to
+                // refetch — dropping the ranked overlay restores the already-loaded listing.
+                changed = !semantic;
+            }
+            // Backspacing the box empty commits the clear too — otherwise the applied query
+            // lingers invisibly (the x button is gone and there's nothing left to Enter).
+            if resp.changed()
+                && self.gallery_q.trim().is_empty()
+                && !self.gallery_active_q.is_empty()
+            {
+                changed = true;
+            }
             #[cfg(feature = "local-npu")]
             if semantic && self.gallery_q.trim().is_empty() {
                 self.clear_semantic_ranked();
@@ -11485,6 +12028,28 @@ impl ComfyApp {
                     .clicked()
                 {
                     self.select_mode = true;
+                }
+                if ui
+                    .button(format!("{} Trash", icons::TRASH))
+                    .on_hover_text("Deleted images — restore or purge")
+                    .clicked()
+                {
+                    self.trash_open = true;
+                    self.trash_loading = true;
+                    self.trash_items.clear();
+                    self.engine.as_ref().unwrap().trash_list(0, 200);
+                }
+                if ui
+                    .button(format!("{} Grade visible", icons::STAR))
+                    .on_hover_text("Grade-pass everything the grid currently shows (filters included)")
+                    .clicked()
+                {
+                    let keys: Vec<String> = self
+                        .compute_gallery_visible()
+                        .into_iter()
+                        .filter_map(|i| self.gallery.get(i).map(|it| it.key()))
+                        .collect();
+                    self.open_triage_keys(keys, host);
                 }
                 ui.separator();
 
@@ -11602,6 +12167,30 @@ impl ComfyApp {
                     });
                 });
 
+                // LoRA filter — server-side, mirrors the model filter. Empty on gates that don't
+                // index LoRAs yet (the section then just says so).
+                let lora_label = if self.gallery_view.lora.is_empty() {
+                    format!("{} LoRA · All", icons::MODEL)
+                } else {
+                    format!("{} LoRA · {}", icons::MODEL, elide(file_basename(&self.gallery_view.lora), 18))
+                };
+                ui.menu_button(lora_label, |ui| {
+                    crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
+                        changed |= ui
+                            .selectable_value(&mut self.gallery_view.lora, String::new(), "All LoRAs")
+                            .clicked();
+                        for l in &self.facets.loras {
+                            let label = format!("{}  ({})", elide(file_basename(&l.name), 40), l.count);
+                            changed |= ui
+                                .selectable_value(&mut self.gallery_view.lora, l.name.clone(), label)
+                                .clicked();
+                        }
+                        if self.facets.loras.is_empty() {
+                            ui.weak("no LoRAs indexed (needs an updated gate)");
+                        }
+                    });
+                });
+
                 let album_label = match self.gallery_view.album {
                     None => format!("{} Album · All", icons::ALBUM),
                     Some(id) => self
@@ -11715,14 +12304,16 @@ impl ComfyApp {
             })
     }
 
-    /// Query string for server gallery list calls. Empty while semantic search owns the box so the
-    /// server does not filter away images the CLIP ranker needs.
+    /// Query string for server gallery list calls: the snapshot applied by the last refresh, NOT
+    /// the live search buffer (background pagers fire while the user is still typing). Empty
+    /// while semantic search owns the box so the server does not filter away images the CLIP
+    /// ranker needs.
     fn gallery_list_q(&self) -> &str {
         #[cfg(feature = "local-npu")]
         if self.gallery_semantic_active() {
             return "";
         }
-        self.gallery_q.as_str()
+        self.gallery_active_q.as_str()
     }
 
     /// Durable or app-files `gallery_full` directory for full-resolution image cache.
@@ -12361,11 +12952,14 @@ impl ComfyApp {
             refresh = true;
         }
         if refresh && connected {
-            self.refresh_gallery();
+            self.refresh_gallery_commit_query();
             self.gallery_pull = 0.0;
             self.gallery_pull_tracking = false;
         }
-        if self.gallery.is_empty() && self.gallery_total == 0 && !self.gallery_loading {
+        // First-visit auto-fetch. `gallery_fetched` (not emptiness) is the gate: a query that
+        // legitimately matches nothing used to refire this every response round-trip — the
+        // 20x-request storms in the device logs.
+        if connected && !self.gallery_fetched && !self.gallery_loading {
             self.gallery_loading = true;
             self.engine.as_ref().unwrap().gallery_list(
                 self.gallery_gen,
@@ -12637,15 +13231,22 @@ impl ComfyApp {
         let mut save_all = false;
         let mut select_all = false;
         let mut invert = false;
+        let mut triage_sel = false;
+        #[cfg_attr(not(feature = "local-npu"), allow(unused_mut, unused_variables))]
+        let mut similar_sel = false;
         const ICON: f32 = 36.0;
         ui.horizontal(|ui| {
             ui.strong(format!("{n}"));
-            if ui.small_button("All").on_hover_text("Select every visible image").clicked() {
-                select_all = true;
-            }
-            if ui.small_button("Inv").on_hover_text("Flip the current selection").clicked() {
-                invert = true;
-            }
+            // All / Inv stack vertically so they take one button-width, not two — otherwise the
+            // rightmost action icon (More-like-these) is clipped by the Clear (X) button.
+            ui.vertical(|ui| {
+                if ui.small_button("All").on_hover_text("Select every visible image").clicked() {
+                    select_all = true;
+                }
+                if ui.small_button("Inv").on_hover_text("Flip the current selection").clicked() {
+                    invert = true;
+                }
+            });
             ui.add_enabled_ui(n > 0, |ui| {
                 let album_label = format!("{}{}", icons::ALBUM, icons::ADD);
                 up_menu_sized(ui, album_label, egui::vec2(ICON + 8.0, ICON), |ui| {
@@ -12682,6 +13283,21 @@ impl ComfyApp {
                 {
                     delete = true;
                 }
+                if ui
+                    .add(egui::Button::new(icons::STAR).min_size(egui::vec2(ICON, ICON)))
+                    .on_hover_text("Grade-pass exactly these — swipe keep / trash / reuse")
+                    .clicked()
+                {
+                    triage_sel = true;
+                }
+                #[cfg(feature = "local-npu")]
+                if ui
+                    .add(egui::Button::new(icons::SEARCH).min_size(egui::vec2(ICON, ICON)))
+                    .on_hover_text("More like these — rank the gallery by similarity to the selection")
+                    .clicked()
+                {
+                    similar_sel = true;
+                }
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -12700,21 +13316,18 @@ impl ComfyApp {
                 }
             });
         });
-        if select_all {
-            let media = self.gallery_view.media;
-            for it in &self.gallery {
-                if media.matches(it.is_video) {
-                    self.selected.insert(it.key());
-                }
-            }
-        } else if invert {
-            let media = self.gallery_view.media;
-            for it in &self.gallery {
-                if !media.matches(it.is_video) {
-                    continue;
-                }
-                let key = it.key();
-                if !self.selected.remove(&key) {
+        if select_all || invert {
+            // Operate on what the grid actually SHOWS (tag/rating/ranked filters included) — the
+            // raw listing here meant "All → Trash" could delete images the filter was hiding.
+            let keys: Vec<String> = self
+                .compute_gallery_visible()
+                .into_iter()
+                .filter_map(|i| self.gallery.get(i).map(|it| it.key()))
+                .collect();
+            for key in keys {
+                if select_all {
+                    self.selected.insert(key);
+                } else if !self.selected.remove(&key) {
                     self.selected.insert(key);
                 }
             }
@@ -12733,6 +13346,38 @@ impl ComfyApp {
         } else if delete {
             self.request_delete_images(items);
             host.haptic(Haptic::Warning);
+        } else if triage_sel {
+            // Grade-pass exactly the selection (doesn't touch the post-burst `untriaged` set).
+            let keys: Vec<String> = self.selected.iter().cloned().collect();
+            self.exit_select_mode();
+            self.open_triage_keys(keys, host);
+        } else if similar_sel {
+            #[cfg(feature = "local-npu")]
+            {
+                let keys: Vec<String> = self.selected.iter().cloned().collect();
+                match clip_index::character_centroid(&keys, &self.clip_index) {
+                    Some(centroid) => {
+                        let exclude: HashSet<String> = keys.into_iter().collect();
+                        let ranked: Vec<String> =
+                            clip_index::rank_candidates(&centroid, &self.clip_index, &exclude, 0.1)
+                                .into_iter()
+                                .take(120)
+                                .map(|(k, _)| k)
+                                .collect();
+                        if ranked.is_empty() {
+                            self.gallery_status = "Nothing similar in the CLIP index yet".into();
+                        } else {
+                            self.ranked = Some(RankedGallery::Similar(ranked));
+                            self.exit_select_mode();
+                            host.haptic(Haptic::Light);
+                        }
+                    }
+                    None => {
+                        self.gallery_status =
+                            "None of the selection is CLIP-indexed yet — let indexing catch up".into();
+                    }
+                }
+            }
         } else if clear {
             self.selected.clear();
         } else if done {
@@ -13180,8 +13825,9 @@ impl ComfyApp {
                         ui.add_space(8.0);
                     });
             });
-        // Load the listing if the Gallery tab hasn't already fetched it.
-        if connected && self.gallery.is_empty() && self.gallery_total == 0 && !self.gallery_loading {
+        // Load the listing if the Gallery tab hasn't already fetched it (same fetched-once latch
+        // as the gallery tab — emptiness alone refires forever on a no-match query).
+        if connected && !self.gallery_fetched && !self.gallery_loading {
             self.gallery_loading = true;
             self.engine.as_ref().unwrap().gallery_list(
                 self.gallery_gen,
@@ -13192,7 +13838,7 @@ impl ComfyApp {
             );
         }
         if refresh && connected {
-            self.refresh_gallery();
+            self.refresh_gallery_commit_query();
         }
         if let Some(idx) = pick {
             self.pick_gallery_input(idx, host);
@@ -13292,6 +13938,7 @@ impl ComfyApp {
             meta_open: false,
             workflow_json: None,
             meta: None,
+            meta_partial: false,
             meta_loading: true,
         });
     }
@@ -13364,8 +14011,35 @@ impl ComfyApp {
         self.untriaged = cand.into_iter().map(|i| self.gallery[i].key()).collect();
     }
 
-    /// Deck order: aesthetic score descending when any card is scored, else newest first.
+    /// Deck order: sweep decks (several subfolders with save counters — LoRA-strength trees)
+    /// go counter-then-folder so one seed's variants sit back-to-back; otherwise aesthetic
+    /// score descending when any card is scored, else newest first.
     fn triage_deck_order(&self, keys: &[String]) -> Vec<String> {
+        let info: HashMap<&String, (&str, Option<u64>)> = self
+            .gallery
+            .iter()
+            .filter_map(|it| {
+                let k = keys.iter().find(|k| **k == it.key())?;
+                Some((k, (it.subfolder.as_str(), crate::types::file_counter(&it.filename))))
+            })
+            .collect();
+        let folders: HashSet<&str> = info.values().map(|(f, _)| *f).collect();
+        let counted = info.values().filter(|(_, c)| c.is_some()).count();
+        // Real sweeps are sibling folders under one matrix dir (LoRA/<wf>/<ckpt>/<lora>). Require
+        // a shared parent path so an ordinary browse across unrelated folders isn't reordered.
+        fn parent(f: &str) -> &str {
+            f.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+        }
+        let siblings = folders.iter().map(|f| parent(f)).collect::<HashSet<_>>().len() == 1;
+        if folders.len() > 1 && siblings && counted * 2 >= keys.len() {
+            let mut order = keys.to_vec();
+            order.sort_by(|a, b| {
+                let (fa, ca) = info.get(a).copied().unwrap_or(("", None));
+                let (fb, cb) = info.get(b).copied().unwrap_or(("", None));
+                ca.unwrap_or(u64::MAX).cmp(&cb.unwrap_or(u64::MAX)).then_with(|| fa.cmp(fb))
+            });
+            return order;
+        }
         let scored = keys.iter().any(|k| self.clip_index.score(k).is_some());
         let mtime: HashMap<String, f64> =
             self.gallery.iter().map(|it| (it.key(), it.mtime.unwrap_or(0.0))).collect();
@@ -13387,15 +14061,28 @@ impl ComfyApp {
         order
     }
 
-    /// Enter the grade-pass triage overlay over the current untriaged results.
+    /// Enter the grade-pass triage overlay over the current untriaged results (the post-burst set).
     fn open_triage(&mut self, host: &Host) {
         let present: HashSet<String> =
             self.gallery.iter().filter(|it| !it.is_video).map(|it| it.key()).collect();
         self.untriaged.retain(|k| present.contains(k));
-        if self.untriaged.is_empty() {
+        let keys = self.untriaged.clone();
+        self.open_triage_keys(keys, host);
+    }
+
+    /// Grade-pass an explicit key set (a selection / the visible grid). Filters to present,
+    /// non-images-only itself and no-ops on an empty result WITHOUT touching `untriaged` — a
+    /// video-only selection must not wipe the pending post-burst triage.
+    fn open_triage_keys(&mut self, keys: Vec<String>, host: &Host) {
+        let present: HashSet<String> =
+            self.gallery.iter().filter(|it| !it.is_video).map(|it| it.key()).collect();
+        let deck_keys: Vec<String> =
+            keys.into_iter().filter(|k| present.contains(k)).collect();
+        if deck_keys.is_empty() {
+            self.gallery_status = "Nothing to grade (images only)".into();
             return;
         }
-        let deck = self.triage_deck_order(&self.untriaged);
+        let deck = self.triage_deck_order(&deck_keys);
         self.tab = Tab::Gallery;
         self.viewer = None;
         self.triage_swipe_origin = None;
@@ -13481,6 +14168,13 @@ impl ComfyApp {
                     format!("Review: accepted {}, denied {}", t.keep.len(), t.trash.len());
                 host.haptic(Haptic::Success);
             }
+        }
+        // A refresh deferred during the deck (a burst that finished mid-triage) runs now that
+        // the listing is safe to clear. A trash delete above also refreshes via GalleryMutated.
+        if std::mem::take(&mut self.gallery_refresh_pending)
+            && matches!(self.conn, Conn::Connected)
+        {
+            self.refresh_gallery();
         }
     }
 
@@ -13633,6 +14327,15 @@ impl ComfyApp {
                 info.push_str(&format!("{}/{} · ", pos + 1, total));
                 if let Some(s) = cur_key.as_ref().and_then(|k| self.clip_index.score(k)) {
                     info.push_str(&format!("{s:.2} · "));
+                }
+                // Sweep decks span folders — say which variant this card is.
+                if let Some(it) =
+                    cur_key.as_ref().and_then(|k| self.gallery.iter().find(|g| g.key() == *k))
+                {
+                    let gl = it.group_label();
+                    if gl != "Output" {
+                        info.push_str(&format!("{} · ", elide(&gl, 20)));
+                    }
                 }
             }
             let (a, d) = if review.is_some() { ("Yes", "No") } else { ("Kept", "Trash") };
@@ -13820,7 +14523,15 @@ impl ComfyApp {
                         act = Some(TA::Pick(pick));
                     }
                 }
-                None => act = Some(TA::Skip),
+                // Card image not in the current listing. Background refreshes are deferred while a
+                // deck is open, so this only happens if the file was removed elsewhere — hold on a
+                // spinner rather than stampede-advancing one card per frame.
+                None => {
+                    let rect = ui.available_rect_before_wrap().intersect(ui.clip_rect());
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        ui.centered_and_justified(|ui| ui.spinner());
+                    });
+                }
             }
         } else {
             ui.add_space(20.0);
@@ -14169,9 +14880,15 @@ impl ComfyApp {
                 });
                 ui.add_space(2.0);
             });
-            // A held Remix skips the diff sheet and applies the full meta instantly.
+            // A held Remix skips the diff sheet and applies the full meta instantly. Partial
+            // (gate-summary) meta doesn't qualify while the workflow scrape is still coming.
             let meta_ready = self.remix_sheet.is_none()
-                && self.viewer.as_ref().and_then(|v| v.meta.as_ref()).is_some_and(|m| !m.is_empty());
+                && self
+                    .viewer
+                    .as_ref()
+                    .filter(|v| !v.meta_partial || !v.meta_loading)
+                    .and_then(|v| v.meta.as_ref())
+                    .is_some_and(|m| !m.is_empty());
             if remix_held && meta_ready {
                 let now = ui.input(|i| i.time);
                 ui.ctx().request_repaint();
@@ -14297,8 +15014,14 @@ impl ComfyApp {
                 self.gallery_status = self.save_bytes(host, &bytes, &name);
             }
             Some(Act::Remix) => {
-                if let Some(meta) =
-                    self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
+                // Only the full workflow scrape may feed a remix — the gate's quick summary has
+                // LoRA names without strengths, which would remix them at 0.0.
+                if let Some(meta) = self
+                    .viewer
+                    .as_ref()
+                    .filter(|v| !v.meta_partial || !v.meta_loading)
+                    .and_then(|v| v.meta.clone())
+                    .filter(|m| !m.is_empty())
                 {
                     self.open_remix_sheet(meta);
                     host.haptic(Haptic::Light);
@@ -14309,8 +15032,12 @@ impl ComfyApp {
                 }
             }
             Some(Act::RemixInstant) => {
-                if let Some(meta) =
-                    self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
+                if let Some(meta) = self
+                    .viewer
+                    .as_ref()
+                    .filter(|v| !v.meta_partial || !v.meta_loading)
+                    .and_then(|v| v.meta.clone())
+                    .filter(|m| !m.is_empty())
                 {
                     self.remix_from_meta(&meta);
                     self.close_viewer();
@@ -14318,8 +15045,14 @@ impl ComfyApp {
                 }
             }
             Some(Act::SaveCharacter) => {
-                if let Some(meta) =
-                    self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
+                // Same partial-meta gate as Remix: a card baked from the gate summary would
+                // freeze whatever detail the workflow scrape was about to correct.
+                if let Some(meta) = self
+                    .viewer
+                    .as_ref()
+                    .filter(|v| !v.meta_partial || !v.meta_loading)
+                    .and_then(|v| v.meta.clone())
+                    .filter(|m| !m.is_empty())
                 {
                     self.character_draft = Some(CharacterDraft {
                         editing: None,
@@ -14448,7 +15181,9 @@ impl ComfyApp {
         let left = anchor.left().clamp(screen.left() + margin, screen.right() - 180.0);
         // Stay inside the screen so the popup frame/margins are not clipped on the right.
         let width = (screen.right() - margin - left).max(160.0);
-        let meta_loading = v.meta_loading;
+        // Show the gate's quick summary as soon as it lands — the whole point of fetching it is
+        // that the info panel doesn't wait on the (bigger) workflow scrape.
+        let meta_loading = v.meta_loading && v.meta.as_ref().is_none_or(|m| m.is_empty());
         let has_workflow = v.item.has_workflow;
         let item_models = v.item.models.clone();
         let meta = v.meta.clone();
@@ -15664,6 +16399,10 @@ impl EguiApp for ComfyApp {
             self.poll_wd14();
             self.poll_rewrite();
             self.poll_clip_search();
+            // Pack import/move finishes on a worker; poll every frame so a move that completes
+            // after the user navigates away still rescans (else stale local_packs point at the
+            // deleted source and the next NPU run fails on a missing file).
+            self.poll_pack_import(host);
         }
         bg_lap.lap("npu-polls");
         let _ = self.ensure_full_cache_root(host);
@@ -15698,15 +16437,36 @@ impl EguiApp for ComfyApp {
             if now >= at {
                 self.gallery_refresh_at = None;
                 if matches!(self.conn, Conn::Connected) {
-                    self.refresh_gallery();
+                    // Still defer while triaging; the deferred flag runs it once the deck closes.
+                    if self.triage.is_some() {
+                        self.gallery_refresh_pending = true;
+                    } else {
+                        self.refresh_gallery();
+                    }
                 }
             } else {
                 ui.ctx().request_repaint_after(Duration::from_secs_f64((at - now).max(0.05)));
             }
         }
 
-        // The open error dialog owns the back key: consumed here, before any other handler runs.
-        if self.error_modal.is_some()
+        // Open blocking dialogs own the back key: consumed here, before any other handler runs
+        // (else Back falls through to the fullscreen-exit / app-background handlers while a modal —
+        // including a destructive confirm — is still up). Cancel is the Android Back convention.
+        if self.confirm.is_some() || self.dup_run.is_some() || self.preflight_problems.is_some() {
+            if ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            }) {
+                // Innermost-first: a confirm sits above the modal that spawned it.
+                if self.confirm.is_some() {
+                    self.confirm = None;
+                } else if self.dup_run.is_some() {
+                    self.dup_run = None;
+                } else {
+                    self.preflight_problems = None;
+                }
+            }
+        } else if self.error_modal.is_some()
             && ui.ctx().input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
                     || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
@@ -15735,6 +16495,9 @@ impl EguiApp for ComfyApp {
             self.queue_sheet_window(ui.ctx(), host);
             self.graph_toast(ui.ctx());
             self.perf_overlay_window(ui.ctx(), host);
+            self.preflight_window(ui.ctx(), host);
+            self.confirm_window(ui.ctx(), host);
+            self.dup_run_window(ui.ctx(), host);
             self.error_modal_window(ui.ctx(), host);
             if self.running || self.queue_remaining > 0 {
                 ui.ctx().request_repaint_after(Duration::from_millis(200));
@@ -15814,6 +16577,11 @@ impl EguiApp for ComfyApp {
             self.graph_toast(ui.ctx());
         }
         self.perf_overlay_window(ui.ctx(), host);
+        self.trash_window(ui.ctx(), host);
+        self.undo_trash_pill(ui.ctx(), host);
+        self.preflight_window(ui.ctx(), host);
+        self.confirm_window(ui.ctx(), host);
+        self.dup_run_window(ui.ctx(), host);
         self.error_modal_window(ui.ctx(), host);
 
         // Keep the server-wide queue in view even when jobs were started on the website. Poll faster
@@ -15940,6 +16708,401 @@ impl ComfyApp {
             });
         if !open || close {
             self.error_modal = None;
+        }
+    }
+
+    /// Duplicate-run dialog: the exact workflow was queued before, so the server would replay it
+    /// from cache (instantly, pointing at the previous output files) instead of generating.
+    fn dup_run_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if self.dup_run.is_none() {
+            return;
+        }
+        #[derive(Clone, Copy)]
+        enum DAct {
+            NewSeed,
+            RunAnyway,
+            Cancel,
+        }
+        let mut act: Option<DAct> = None;
+        let mut open = true;
+        let scrim = egui::Area::new(egui::Id::new("dup-run-scrim"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                let resp = ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+                resp
+            });
+        if scrim.inner.clicked() {
+            act = Some(DAct::Cancel);
+        }
+        centered(ctx, egui::Window::new(format!("{} Same workflow as the last run", icons::WARN)))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Nothing changed since this workflow last ran, so the server will answer \
+                     from its cache instead of generating a new image.",
+                );
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 6.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let size =
+                        egui::vec2(((ui.available_width() - GAP * 2.0) / 3.0).max(64.0), 30.0);
+                    if ui.add_sized(size, egui::Button::new("New seed & run")).clicked() {
+                        act = Some(DAct::NewSeed);
+                    }
+                    if ui.add_sized(size, egui::Button::new("Run anyway")).clicked() {
+                        act = Some(DAct::RunAnyway);
+                    }
+                    if ui.add_sized(size, egui::Button::new("Cancel")).clicked() {
+                        act = Some(DAct::Cancel);
+                    }
+                });
+            });
+        if !open {
+            act = Some(DAct::Cancel);
+        }
+        match act {
+            Some(DAct::NewSeed) => {
+                let Some(d) = self.dup_run.take() else { return };
+                // Act on the doc that was queued, not whatever tab is active now — the
+                // Create-linked redirect restores active_graph before the modal resolves.
+                let Some(idx) = self.graph_tabs.iter().position(|t| t.id == d.doc_id) else {
+                    self.graph_status = "That graph tab is gone".into();
+                    return;
+                };
+                let prev = self.active_graph;
+                self.active_graph = idx;
+                if let Some(doc) = self.active_doc_mut() {
+                    graphview::roll_all_seeds(&mut doc.graph.snarl);
+                }
+                // The user chose to run: clear the fingerprint unconditionally. Rolled literals
+                // on connected/bypassed seed inputs don't survive export→convert, so the re-queue
+                // can legitimately hash identically — without this the modal would just re-open.
+                self.last_graph_fp = None;
+                // Re-export so the queued prompt matches the widgets the canvas now shows.
+                self.queue_graph(ctx, host);
+                self.active_graph = prev;
+            }
+            Some(DAct::RunAnyway) => {
+                if let Some(d) = self.dup_run.take() {
+                    // Same doc pinning: submit_graph_run writes node_map / clears outputs on the
+                    // active doc, which must be the one this workflow came from.
+                    let prev = self.active_graph;
+                    if let Some(idx) = self.graph_tabs.iter().position(|t| t.id == d.doc_id) {
+                        self.active_graph = idx;
+                    }
+                    self.submit_graph_run(ctx, host, d.wf, d.ui_json, d.label, d.fp);
+                    self.active_graph = prev;
+                }
+            }
+            Some(DAct::Cancel) => self.dup_run = None,
+            None => {}
+        }
+    }
+
+    /// Server trash browser: soft-deleted images with per-row Restore/Purge, Restore-all and an
+    /// armed Empty-trash. The delete dialog has promised "you can restore it later" since the
+    /// gate grew soft-delete — this is the first UI that can actually do it from the phone.
+    fn trash_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if !self.trash_open {
+            return;
+        }
+        let mut open = true;
+        let mut restore: Option<i64> = None;
+        let mut purge: Option<i64> = None;
+        let mut restore_all = false;
+        let mut purge_all = false;
+        let items = self.trash_items.clone();
+        centered(ctx, egui::Window::new(format!("{} Trash", icons::TRASH)))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak(format!("{} item(s)", self.trash_total));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.armed_button(ui, host, "trash-empty", "Empty trash".into(), true) {
+                            purge_all = true;
+                        }
+                        if !items.is_empty() && ui.small_button("Restore all").clicked() {
+                            restore_all = true;
+                        }
+                    });
+                });
+                ui.separator();
+                if self.trash_loading {
+                    ui.vertical_centered(|ui| ui.spinner());
+                    return;
+                }
+                if items.is_empty() {
+                    ui.weak("Trash is empty.");
+                    return;
+                }
+                let max_h = (ctx.content_rect().height() * 0.55).max(160.0);
+                const THUMB: f32 = 44.0;
+                crate::theme::scroll_vertical().max_height(max_h).show(ui, |ui| {
+                    let now_secs =
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs_f64())
+                            .unwrap_or(0.0);
+                    for it in &items {
+                        ui.horizontal(|ui| {
+                            let size = 148u32;
+                            let tk = it.thumb_key(size);
+                            match self.thumbs.get(&tk) {
+                                Some(tex) => {
+                                    let sized = egui::load::SizedTexture::from_handle(tex);
+                                    ui.add(
+                                        egui::Image::new(sized)
+                                            .max_size(egui::vec2(THUMB, THUMB))
+                                            .maintain_aspect_ratio(true),
+                                    );
+                                }
+                                None => {
+                                    if self.thumbs.claim(&tk) {
+                                        self.engine.as_ref().unwrap().fetch_thumb(
+                                            it.subfolder.clone(),
+                                            it.filename.clone(),
+                                            size,
+                                            self.full_cache_root.clone(),
+                                        );
+                                    }
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(THUMB, THUMB),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.put(rect, egui::Spinner::new());
+                                }
+                            }
+                            ui.vertical(|ui| {
+                                ui.label(elide(&it.orig_filename, 30));
+                                let age = (now_secs - it.deleted).max(0.0);
+                                let ago = if age < 3600.0 {
+                                    format!("{}m ago", (age / 60.0) as u64)
+                                } else if age < 86400.0 {
+                                    format!("{}h ago", (age / 3600.0) as u64)
+                                } else {
+                                    format!("{}d ago", (age / 86400.0) as u64)
+                                };
+                                ui.weak(format!(
+                                    "{ago} · {}",
+                                    elide(it.orig_subfolder.split('/').next_back().unwrap_or(""), 24)
+                                ));
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if self.armed_button(
+                                        ui,
+                                        host,
+                                        &format!("trash-purge:{}", it.id),
+                                        icons::TRASH.into(),
+                                        true,
+                                    ) {
+                                        purge = Some(it.id);
+                                    }
+                                    if ui.small_button("Restore").clicked() {
+                                        restore = Some(it.id);
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                    }
+                    if (items.len() as u64) < self.trash_total {
+                        ui.weak(format!("Showing first {} of {}", items.len(), self.trash_total));
+                    }
+                });
+            });
+        let engine = self.engine.as_ref().unwrap();
+        if let Some(id) = restore {
+            engine.trash_restore(vec![id], false);
+        } else if let Some(id) = purge {
+            engine.trash_purge(vec![id], false);
+        } else if restore_all {
+            engine.trash_restore(Vec::new(), true);
+        } else if purge_all {
+            engine.trash_purge(Vec::new(), true);
+        }
+        self.trash_open = open;
+    }
+
+    /// Post-delete Undo snackbar: a floating pill for a few seconds after images move to trash.
+    fn undo_trash_pill(&mut self, ctx: &egui::Context, host: &Host) {
+        const UNDO_WINDOW: f64 = 8.0;
+        let Some((ids, at)) = self.undo_trash.clone() else { return };
+        let now = ctx.input(|i| i.time);
+        if now - at > UNDO_WINDOW || ids.is_empty() {
+            self.undo_trash = None;
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(250));
+        let mut undo = false;
+        egui::Area::new(egui::Id::new("undo-trash-pill"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0))
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(200))
+                    .corner_radius(16.0)
+                    .inner_margin(egui::Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} moved to trash", ids.len()));
+                            if ui.button("Undo").clicked() {
+                                undo = true;
+                            }
+                        });
+                    });
+            });
+        if undo {
+            self.engine.as_ref().unwrap().trash_restore(ids, false);
+            self.undo_trash = None;
+            host.haptic(Haptic::Light);
+        }
+    }
+
+    /// Preflight-failure dialog: one row per problem, each with a Fix button that jumps to the
+    /// offending node with Properties open. Preflight already knows {node, class, input} — a
+    /// dead-end text modal was throwing that precision away.
+    fn preflight_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some((doc_id, problems)) = self.preflight_problems.clone() else { return };
+        let mut close = false;
+        let mut open = true;
+        let mut fix: Option<u32> = None;
+        let scrim = egui::Area::new(egui::Id::new("preflight-scrim"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                let resp = ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+                resp
+            });
+        if scrim.inner.clicked() {
+            close = true;
+        }
+        centered(ctx, egui::Window::new(format!("{} Can't queue this graph", icons::WARN)))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                let max_h = (ctx.content_rect().height() * 0.45).max(80.0);
+                egui::ScrollArea::vertical().max_height(max_h).auto_shrink([false, true]).show(
+                    ui,
+                    |ui| {
+                        for p in &problems {
+                            ui.horizontal(|ui| {
+                                if ui.button("Fix").on_hover_text("Jump to this node").clicked() {
+                                    fix = Some(p.node);
+                                }
+                                ui.label(p.message());
+                            });
+                            ui.add_space(2.0);
+                        }
+                    },
+                );
+                ui.add_space(6.0);
+                ui.separator();
+                if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("Dismiss")).clicked()
+                {
+                    close = true;
+                }
+            });
+        if let Some(wid) = fix {
+            // Resolve against the doc that was QUEUED, not whatever tab is active now — the
+            // Create-linked redirect restores active_graph before this modal resolves.
+            let idx = self.graph_tabs.iter().position(|d| d.id == doc_id);
+            // export_ui numbers API nodes snarl id + 1 (see queue_graph's node_map).
+            let nid = NodeId(wid.saturating_sub(1) as usize);
+            match idx.and_then(|i| self.graph_tabs.get_mut(i).map(|d| (i, d))) {
+                Some((i, doc)) => {
+                    if let Some(info) = doc.graph.snarl.get_node_info(nid) {
+                        doc.props_node = Some(nid);
+                        doc.view.center_on(info.pos);
+                        self.active_graph = i;
+                        self.graph_pane = GraphPane::Props;
+                        self.tab = Tab::Graph;
+                    } else {
+                        self.graph_status = "That node is no longer on the canvas".into();
+                    }
+                }
+                None => self.graph_status = "That graph tab is gone".into(),
+            }
+            close = true;
+            host.haptic(Haptic::Light);
+        }
+        if !open || close {
+            self.preflight_problems = None;
+        }
+    }
+
+    /// Generic Yes/Cancel confirm for menu-triggered destructive actions (Clear canvas, tab
+    /// close) where an in-menu two-tap can't render.
+    fn confirm_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(dialog) = self.confirm.as_ref() else { return };
+        let (title, body, confirm_label) =
+            (dialog.title.clone(), dialog.body.clone(), dialog.confirm_label.clone());
+        let mut open = true;
+        let mut act = false;
+        let mut cancel = false;
+        let scrim = egui::Area::new(egui::Id::new("confirm-scrim"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                let resp = ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+                resp
+            });
+        if scrim.inner.clicked() {
+            cancel = true;
+        }
+        centered(ctx, egui::Window::new(format!("{} {title}", icons::WARN)))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.label(body);
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 6.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let w = ((ui.available_width() - GAP) / 2.0).max(64.0);
+                    if ui.add_sized([w, 30.0], egui::Button::new(confirm_label)).clicked() {
+                        act = true;
+                    }
+                    if ui.add_sized([w, 30.0], egui::Button::new("Cancel")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if act {
+            match self.confirm.take().map(|d| d.kind) {
+                Some(ConfirmKind::ClearCanvas) => self.clear_graph(),
+                Some(ConfirmKind::CloseTab(id)) => {
+                    if let Some(i) = self.graph_tabs.iter().position(|d| d.id == id) {
+                        self.close_graph_tab(i);
+                    }
+                }
+                Some(ConfirmKind::CloseAllTabs) => self.close_all_graph_tabs(),
+                None => {}
+            }
+            host.haptic(Haptic::Medium);
+        } else if cancel || !open {
+            self.confirm = None;
         }
     }
 
@@ -16331,6 +17494,7 @@ fn wrap_meta(ui: &mut egui::Ui, label: &str, value: &str) {
 
 /// One model row: Use, pin, and expandable catalog metadata.
 /// Buttons are placed first (RTL) so they keep the right edge; the label elides into what's left.
+#[allow(clippy::too_many_arguments)]
 fn model_version_row(
     ui: &mut egui::Ui,
     file: &str,
@@ -16339,8 +17503,10 @@ fn model_version_row(
     current: &str,
     favorite: bool,
     salt: &str,
+    example_count: i64,
     pick: &mut Option<(String, ModelKind)>,
     toggle_fav: &mut Option<String>,
+    examples: &mut Option<String>,
 ) {
     let selected = current == file;
     let mut ver = meta
@@ -16359,7 +17525,7 @@ fn model_version_row(
         // Nested collapsing indents shrink the row — never size past what's left.
         let row_w = ui.available_width();
         ui.set_max_width(row_w);
-        let (use_clicked, star_clicked) = ui
+        let (use_clicked, star_clicked, ex_clicked) = ui
             .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 let use_clicked = ui
                     .add_enabled(!selected, egui::Button::new("Use").small())
@@ -16373,7 +17539,14 @@ fn model_version_row(
                         "Pin favorite"
                     })
                     .clicked();
-                // Collapse arrow (~18px); keep the label clear of Use / pin.
+                // Visual reference: jump to this checkpoint's example images. Only when the gate
+                // has some indexed (count 0 usually means an older gate or an unused model).
+                let ex_clicked = example_count > 0
+                    && ui
+                        .add(egui::Button::new(format!("{} {example_count}", icons::GALLERY)).small())
+                        .on_hover_text("See example images made with this checkpoint")
+                        .clicked();
+                // Collapse arrow (~18px); keep the label clear of Use / pin / examples.
                 let max_w = (ui.available_width() - 22.0).max(32.0);
                 let header = elide_width(ui, &sanitize_ui_text(ui, &ver_header), max_w);
                 egui::CollapsingHeader::new(header)
@@ -16383,7 +17556,7 @@ fn model_version_row(
                         ui.set_max_width(ui.available_width().max(40.0));
                         checkpoint_meta_body(ui, file, meta.as_ref());
                     });
-                (use_clicked, star_clicked)
+                (use_clicked, star_clicked, ex_clicked)
             })
             .inner;
         if use_clicked {
@@ -16391,6 +17564,9 @@ fn model_version_row(
         }
         if star_clicked {
             *toggle_fav = Some(file.to_string());
+        }
+        if ex_clicked {
+            *examples = Some(file.to_string());
         }
     });
 }

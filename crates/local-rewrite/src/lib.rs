@@ -24,7 +24,7 @@ pub use error::{Error, Result};
 pub use pack::{RewritePack, MARKER, MODEL_FILE, TOKENIZER_FILE};
 pub use rewriter::Rewriter;
 pub use templates::{
-    build_prompt, convert_family, PromptFamily, RewriteKind, ILLUSTRIOUS_QUALITY_BLOCK,
-    PONY_QUALITY_BLOCK, SYS_FAMILY_TO_ILLUSTRIOUS, SYS_FAMILY_TO_PONY, SYS_PROSE_TO_TAGS,
-    SYS_TAGS_TO_VIDEO,
+    build_prompt, convert_family, dedupe_comma_segments, PromptFamily, RewriteKind,
+    ILLUSTRIOUS_QUALITY_BLOCK, PONY_QUALITY_BLOCK, SYS_FAMILY_TO_ILLUSTRIOUS, SYS_FAMILY_TO_PONY,
+    SYS_PROSE_TO_TAGS, SYS_TAGS_TO_VIDEO,
 };

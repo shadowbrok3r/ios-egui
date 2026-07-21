@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use egui::emath::TSTransform;
-use egui_snarl::ui::{PinInfo, SnarlStyle, SnarlViewer, SnarlWidget};
+use egui_snarl::ui::{PinInfo, PinPlacement, SnarlStyle, SnarlViewer, SnarlWidget, WireStyle};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, Snarl};
 use rucomfyui_node_graph::ComfyUiNodeGraph;
 use rucomfyui_node_graph::internal::{FlowInput, FlowNodeData, FlowValueType, FlowViewer};
@@ -56,9 +56,10 @@ pub struct GraphView {
     sizes: HashMap<NodeId, egui::Vec2>,
     to_global: TSTransform,
     pub view_rect: egui::Rect,
-    /// Whether the in-progress drag started on top of a node. In locked mode that drag pans the
-    /// canvas instead of doing nothing, so panning never depends on finding empty space.
-    drag_from_node: bool,
+    /// Where the in-progress drag started (classified once at press). Header drags move a node;
+    /// body drags pan (and the node move is vetoed — see [`Self::drag_gate`]); canvas/pin drags
+    /// are left to snarl. In locked mode any node drag pans instead.
+    drag_kind: DragKind,
     /// A press held still: (start time, screen origin, node under press if any).
     press: Option<(f64, egui::Pos2, Option<NodeId>)>,
     /// One long-press has already fired for the current press.
@@ -161,6 +162,24 @@ pub fn apply_pending_seed_rolls(
     }
 }
 
+/// Re-roll EVERY seed widget in the graph, returning how many changed. The duplicate-run guard's
+/// "New seed & run": an unchanged fixed-seed workflow is a whole-graph server cache replay, so
+/// every seed moves — and the widgets update so the canvas shows what actually ran.
+pub fn roll_all_seeds(snarl: &mut Snarl<FlowNodeData>) -> usize {
+    let ids: Vec<NodeId> = snarl.node_ids().map(|(id, _)| id).collect();
+    let mut rolled = 0;
+    for id in ids {
+        let Some(data) = snarl.get_node_mut(id) else { continue };
+        for input in data.inputs.iter_mut() {
+            if is_seed_widget(input) {
+                roll_seed_value(input);
+                rolled += 1;
+            }
+        }
+    }
+    rolled
+}
+
 impl Default for GraphView {
     fn default() -> Self {
         Self::new(0)
@@ -180,7 +199,7 @@ impl GraphView {
             sizes: HashMap::new(),
             to_global: TSTransform::IDENTITY,
             view_rect: egui::Rect::ZERO,
-            drag_from_node: false,
+            drag_kind: DragKind::None,
             press: None,
             long_fired: false,
             long_press: None,
@@ -331,17 +350,18 @@ impl GraphView {
             }
         }
 
-        // Snapshot after arrange so lock-restore cannot undo a fresh layout.
-        let saved: Option<Vec<(NodeId, egui::Pos2)>> = self
-            .locked
-            .then(|| g.snarl.nodes_pos_ids().map(|(id, pos, _)| (id, pos)).collect());
-
         // The snarl response rect is unbounded (scene ui); measure the canvas region ourselves.
+        // (Before drag_gate: classify_press needs an up-to-date view_rect.)
         let canvas = ui.available_rect_before_wrap();
         if canvas.is_finite() && canvas.width() > 0.0 {
             self.view_rect = canvas;
         }
-        let pan = self.locked_pan(ui.ctx(), &g.snarl);
+        // Header-only node dragging: pan from a body drag, and veto any node move that didn't
+        // start on a title bar. Snapshot the positions to restore after show() (same mechanism as
+        // lock). Snapshot after arrange so a fresh layout is never undone.
+        let (pan, veto_move) = self.drag_gate(ui.ctx(), &g.snarl);
+        let saved: Option<Vec<(NodeId, egui::Pos2)>> = (self.locked || veto_move)
+            .then(|| g.snarl.nodes_pos_ids().map(|(id, pos, _)| (id, pos)).collect());
         let cmd = if self.view_rect.width() > 0.0 { self.cmd.take() } else { None };
         let mut viewer = Wrapper {
             inner: FlowViewer { user_state: &mut g.user_state, object_info: &g.object_info },
@@ -478,32 +498,81 @@ impl GraphView {
         None
     }
 
-    /// The pan to apply this frame because a locked-mode drag began on a node.
+    /// Classify a drag by where it began and return `(pan, veto_move)`:
+    /// - **Header** drag → the node moves (snarl handles it): no pan, no veto.
+    /// - **Body** drag (node, below the title bar) → pan the canvas and veto the node move, so a
+    ///   finger that misses a pin scrolls the view instead of dragging the node around.
+    /// - **Canvas / pin** drag → left to snarl (empty-canvas pan or wire drag): no pan, no veto.
+    /// - **Locked**: any node drag pans; every node move is vetoed by the caller's snapshot.
     ///
-    /// Snarl only pans from empty canvas, and a dense graph leaves little of it — so in view-only
-    /// mode a drag starting anywhere, node or not, moves the view. The node itself can't move: its
-    /// position is snapshotted and restored around the canvas.
-    fn locked_pan(&mut self, ctx: &egui::Context, snarl: &Snarl<FlowNodeData>) -> egui::Vec2 {
-        if !self.locked {
-            self.drag_from_node = false;
-            return egui::Vec2::ZERO;
-        }
-        let (pressed, down, press_origin, delta) = ctx.input(|i| {
+    /// The classification is captured at press and held for the whole drag (press_origin is fixed),
+    /// so a drag that starts in the body can't "slide" into moving a node.
+    fn drag_gate(&mut self, ctx: &egui::Context, snarl: &Snarl<FlowNodeData>) -> (egui::Vec2, bool) {
+        let (pressed, down, press_origin, delta, zooming) = ctx.input(|i| {
             (
                 i.pointer.any_pressed(),
                 i.pointer.any_down(),
                 i.pointer.press_origin(),
                 i.pointer.delta(),
+                (i.zoom_delta() - 1.0).abs() > f32::EPSILON || i.multi_touch().is_some(),
             )
         });
         if pressed {
-            self.drag_from_node =
-                press_origin.is_some_and(|p| self.node_at(ctx, p, snarl).is_some());
+            self.drag_kind =
+                press_origin.map(|p| self.classify_press(ctx, p, snarl)).unwrap_or(DragKind::None);
         }
         if !down {
-            self.drag_from_node = false;
+            self.drag_kind = DragKind::None;
         }
-        if self.drag_from_node && delta.is_finite() { delta } else { egui::Vec2::ZERO }
+        // During a pinch, snarl zooms the scene and the primary pointer still reports a delta —
+        // don't add a body-pan on top of that (it drifts the view while zooming).
+        let d = if delta.is_finite() && !zooming { delta } else { egui::Vec2::ZERO };
+        match (self.locked, self.drag_kind) {
+            // Locked: a drag from any node pans; the snapshot/restore freezes every position.
+            (true, DragKind::Header | DragKind::Body) => (d, false),
+            (true, _) => (egui::Vec2::ZERO, false),
+            // Unlocked header-only dragging: body drag pans + vetoes the node move.
+            (false, DragKind::Body) => (d, true),
+            (false, _) => (egui::Vec2::ZERO, false),
+        }
+    }
+
+    /// Which region a screen-space press landed on, for [`Self::drag_gate`].
+    fn classify_press(
+        &self,
+        ctx: &egui::Context,
+        pos: egui::Pos2,
+        snarl: &Snarl<FlowNodeData>,
+    ) -> DragKind {
+        if !self.view_rect.contains(pos)
+            || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
+        {
+            return DragKind::None;
+        }
+        let gp = self.to_global.inverse() * pos;
+        // Any overlapping node's HEADER wins over any body: this classify order is slab order,
+        // not snarl's draw order, so it can't tell which overlapping node snarl will actually drag
+        // — but biasing to "header" guarantees a title-bar grab can always move a node, and only
+        // ever mis-allows a move (never wrongly blocks one) where nodes overlap.
+        let mut on_body = false;
+        for (id, node_pos, _) in snarl.nodes_pos_ids() {
+            let size = self.sizes.get(&id).copied().unwrap_or(NOMINAL_NODE);
+            // Shift by the frame margin so the hit rect matches the drawn frame; with pins placed
+            // outside, this keeps the pin dots out of the body region (a wire-start there must not
+            // be read as a body-pan).
+            let frame =
+                egui::Rect::from_min_size(node_pos - egui::vec2(FRAME_MARGIN, FRAME_MARGIN), size);
+            if !frame.contains(gp) {
+                continue;
+            }
+            let header =
+                egui::Rect::from_min_size(frame.min, egui::vec2(size.x, NODE_HEADER_H.min(size.y)));
+            if header.contains(gp) {
+                return DragKind::Header;
+            }
+            on_body = true;
+        }
+        if on_body { DragKind::Body } else { DragKind::Canvas }
     }
 
     /// Floating lock toggle under the queue FAB (bottom-right stack).
@@ -607,12 +676,42 @@ impl GraphView {
     }
 }
 
+/// Graph-space height of a node's title bar, for header-only node dragging. Roughly the title
+/// row (one line + header frame margins); generous enough to grab, thin enough that the body and
+/// its pin rows below stay free for wiring.
+const NODE_HEADER_H: f32 = 30.0;
+
+/// egui-snarl's node frame margin (default `Frame::window` inner margin). `sizes` stores the outer
+/// frame rect while `nodes_pos_ids` reports the inner content origin, so the frame starts this far
+/// above-left of the stored position; shifting by it aligns hit-testing with what snarl draws.
+const FRAME_MARGIN: f32 = 6.0;
+
+/// Where a canvas drag began — decides whether it moves a node, pans, or wires. See
+/// [`GraphView::drag_gate`].
+#[derive(Clone, Copy, PartialEq)]
+enum DragKind {
+    None,
+    /// On a node's title bar → moves the node.
+    Header,
+    /// On a node body below the title → pans (node move vetoed).
+    Body,
+    /// Empty canvas or a pin → left to snarl.
+    Canvas,
+}
+
 fn style() -> SnarlStyle {
     let mut s = SnarlStyle::new();
     s.bg_frame = Some(egui::Frame::new().fill(egui::Color32::from_rgb(10, 10, 13)));
     s.min_scale = Some(MIN_SCALE);
     s.max_scale = Some(MAX_SCALE);
     s.centering = Some(true);
+    // Orthogonal wires with rounded corners — a structured "network diagram" look instead of
+    // droopy beziers, and easier to read where they run.
+    s.wire_style = Some(WireStyle::AxisAligned { corner_radius: 8.0 });
+    // Pins sit just outside the node body: their dots stop overlapping the input/output labels,
+    // and they become fat finger targets clear of the draggable node frame.
+    s.pin_placement = Some(PinPlacement::Outside { margin: 3.0 });
+    s.pin_size = Some(15.0);
     s
 }
 

@@ -450,7 +450,7 @@ fn run_sd15(
     })();
 
     match result {
-        Ok(()) => send(Msg::Done),
+        Ok(()) => send(Msg::Done("Local NPU".into())),
         Err(e) if e == "cancelled" || cancel.load(Ordering::Relaxed) => send(Msg::Cancelled),
         Err(e) => {
             log.error(format!("local-npu: {e}"));
@@ -585,7 +585,7 @@ fn run_anima(
     })();
 
     match result {
-        Ok(()) => send(Msg::Done),
+        Ok(()) => send(Msg::Done("Local Anima".into())),
         Err(e) if e.ends_with("cancelled") || cancel.load(Ordering::Relaxed) => send(Msg::Cancelled),
         Err(e) => {
             log.error(format!("local-anima: {e}"));
@@ -780,6 +780,9 @@ pub fn rewrite_prompt(
     let t = Instant::now();
     let rw = local_rewrite::Rewriter::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
     let out = rw.rewrite(kind.system(), &text, 256).map_err(|e| format!("rewrite: {e}"))?;
+    // Tag-shaped outputs never legitimately repeat a tag; drop echoes from a degenerate decode.
+    let out =
+        if kind.dedupes_tags() { local_rewrite::dedupe_comma_segments(&out) } else { out };
     if out.is_empty() {
         return Err("model returned nothing".into());
     }
@@ -895,6 +898,75 @@ fn image_stats(image: &local_anima::Image) -> String {
 pub enum ImportMsg {
     Progress(String),
     Done(Result<String, String>),
+}
+
+/// Move a pack directory into `dst_root` on a worker thread: copy file-by-file with progress,
+/// then remove the source. Copy-then-delete, not rename — the roots are different filesystems
+/// (app files vs the FUSE-backed /sdcard), where rename fails with EXDEV.
+pub fn spawn_move(
+    src: PathBuf,
+    dst_root: PathBuf,
+    ctx: Context,
+) -> std::sync::mpsc::Receiver<ImportMsg> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let send = |m: ImportMsg| {
+            let _ = tx.send(m);
+            ctx.request_repaint();
+        };
+        let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("pack").to_string();
+        let dst = dst_root.join(&name);
+        if dst.exists() {
+            return send(ImportMsg::Done(Err(format!("{} already exists", dst.display()))));
+        }
+        match copy_tree(&src, &dst, &send) {
+            Ok(n) => {
+                // The copy is complete and verified file-by-file; only now drop the source.
+                if let Err(e) = std::fs::remove_dir_all(&src) {
+                    return send(ImportMsg::Done(Ok(format!(
+                        "moved {name} ({n} files) — source cleanup failed: {e}"
+                    ))));
+                }
+                send(ImportMsg::Done(Ok(format!("moved {name} ({n} files) to {}", dst_root.display()))));
+            }
+            Err(e) => {
+                // A half-copied destination must not be discovered as a valid pack.
+                let _ = std::fs::remove_dir_all(&dst);
+                send(ImportMsg::Done(Err(e)));
+            }
+        }
+    });
+    rx
+}
+
+/// Recursively copy `src` into `dst`, reporting per-file progress; returns files copied.
+fn copy_tree(
+    src: &Path,
+    dst: &Path,
+    progress: &dyn Fn(ImportMsg),
+) -> Result<usize, String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir {}: {e}", dst.display()))?;
+    let mut copied = 0usize;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type().map_err(|e| e.to_string())?;
+        if ft.is_dir() {
+            copied += copy_tree(&from, &to, progress)?;
+        } else {
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            progress(ImportMsg::Progress(format!("moving {fname}…")));
+            let want = std::fs::metadata(&from).map(|m| m.len()).unwrap_or(0);
+            let got = std::fs::copy(&from, &to).map_err(|e| format!("{fname}: {e}"))?;
+            if got != want {
+                return Err(format!("{fname}: short copy ({got} of {want} bytes)"));
+            }
+            copied += 1;
+        }
+    }
+    Ok(copied)
 }
 
 /// Fetch a pack zip and unpack it into `root/<name>`.

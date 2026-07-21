@@ -20,17 +20,27 @@ of a tag. Order: subject count, then subject, then appearance, clothing, pose, s
 lighting. Output only the tags, no prose, no preamble.";
 
 /// System prompt: rewrite a prompt into the Pony Diffusion dialect (score_ quality block).
+/// Each family prompt carries one worked example: the 0.5B model holds a format far better
+/// than it follows a description of one, and without it a prose input can send it parroting
+/// the instructions instead of rewriting.
 pub const SYS_FAMILY_TO_PONY: &str = "\
 You rewrite an anime image prompt into the Pony Diffusion dialect. Begin with the quality \
 block 'score_9, score_8_up, score_7_up, score_6_up, score_5_up, score_4_up' then the source \
-content as comma-separated tags. Remove any masterpiece/best-quality style tags. Output only \
-the rewritten prompt.";
+content as comma-separated tags. Remove any masterpiece/best-quality style tags. Never repeat \
+a tag. Output only the rewritten prompt.\n\
+Example input: a girl in silver armor standing on a cliff at sunset\n\
+Example output: score_9, score_8_up, score_7_up, score_6_up, score_5_up, score_4_up, 1girl, \
+solo, silver armor, standing, cliff, sunset, dramatic lighting";
 
 /// System prompt: rewrite a prompt into the Illustrious/NoobAI dialect (masterpiece block).
 pub const SYS_FAMILY_TO_ILLUSTRIOUS: &str = "\
 You rewrite an anime image prompt into the Illustrious/NoobAI dialect. Begin with the quality \
 block 'masterpiece, best quality, newest, absurdres, highres' then the source content as \
-comma-separated tags. Remove any score_ quality tags. Output only the rewritten prompt.";
+comma-separated tags. Remove any score_ quality tags. Never repeat a tag; never write model \
+or dialect names into the prompt. Output only the rewritten prompt.\n\
+Example input: a girl in silver armor standing on a cliff at sunset\n\
+Example output: masterpiece, best quality, newest, absurdres, highres, 1girl, solo, silver \
+armor, standing, cliff, sunset, dramatic lighting";
 
 /// System prompt: rewrite a prompt for the Anima (Qwen3-encoder) DiT — hybrid prose + tags, no
 /// quality block.
@@ -39,8 +49,11 @@ You rewrite an anime image prompt for the Anima model, whose Qwen3 text encoder 
 of natural language plus booru tags. Remove any Pony score_ tags and any Illustrious/NoobAI \
 quality tags (masterpiece, best quality, newest, absurdres, highres); do not add any quality \
 block. Keep the character, subject, and content tags. Begin with one short natural-language \
-sentence describing the scene, then the kept content as comma-separated tags. Output only the \
-rewritten prompt.";
+sentence describing the scene, then the kept content as comma-separated tags. Never repeat a \
+tag. Output only the rewritten prompt.\n\
+Example input: masterpiece, best quality, 1girl, solo, silver armor, cliff, sunset\n\
+Example output: A lone girl in silver armor stands on a cliff at sunset. 1girl, solo, silver \
+armor, cliff, sunset";
 
 /// Which rewrite the model should perform; maps to a system prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +87,30 @@ impl RewriteKind {
             RewriteKind::ToAnima => "To Anima",
         }
     }
+
+    /// True when the output is tag-shaped and should be run through
+    /// [`dedupe_comma_segments`] (video prose is the one free-text output).
+    pub fn dedupes_tags(self) -> bool {
+        !matches!(self, RewriteKind::TagsToVideo)
+    }
+}
+
+/// Drop exact-duplicate comma segments (case-insensitive), keeping first occurrences. A tag
+/// never needs to appear twice in a prompt, and a degenerate decode's favourite failure is
+/// repeating one — this makes even a cut-off loop come out clean.
+pub fn dedupe_comma_segments(s: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut kept: Vec<&str> = Vec::new();
+    for raw in s.split(',') {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if seen.insert(t.to_ascii_lowercase()) {
+            kept.push(t);
+        }
+    }
+    kept.join(", ")
 }
 
 /// Assemble the Qwen2.5 chat prompt: one system turn, one user turn, open assistant turn.
@@ -220,5 +257,50 @@ mod tests {
         assert_eq!(out, format!("{PONY_QUALITY_BLOCK}, 1girl, solo"));
         // Empty input yields just the block.
         assert_eq!(convert_family("   ", PromptFamily::Pony), PONY_QUALITY_BLOCK);
+    }
+
+    /// The reported degeneration: the quality block followed by one phrase echoed ~20 times.
+    /// Dedupe must collapse the echoes and keep first occurrences in order.
+    #[test]
+    fn dedupe_collapses_a_degenerate_decode() {
+        let bad = format!(
+            "{ILLUSTRIOUS_QUALITY_BLOCK}, illustrious NoobAI{}",
+            ", illustrious NoobAI".repeat(20)
+        );
+        let out = dedupe_comma_segments(&bad);
+        assert_eq!(out, format!("{ILLUSTRIOUS_QUALITY_BLOCK}, illustrious NoobAI"));
+        // Case-insensitive, order-preserving, trims blanks.
+        assert_eq!(dedupe_comma_segments("1girl, Solo, solo, , 1girl"), "1girl, Solo");
+        assert_eq!(dedupe_comma_segments(""), "");
+    }
+
+    /// Only free-prose video output skips tag dedupe.
+    #[test]
+    fn tag_kinds_opt_into_dedupe() {
+        assert!(!RewriteKind::TagsToVideo.dedupes_tags());
+        for k in [
+            RewriteKind::ProseToTags,
+            RewriteKind::ToPony,
+            RewriteKind::ToIllustrious,
+            RewriteKind::ToAnima,
+        ] {
+            assert!(k.dedupes_tags());
+        }
+    }
+
+    /// The family prompts each carry a worked example ending in tag output — the anchor that
+    /// keeps the 0.5B model emitting tags instead of parroting the instructions.
+    #[test]
+    fn family_prompts_carry_examples() {
+        for sys in [SYS_FAMILY_TO_PONY, SYS_FAMILY_TO_ILLUSTRIOUS, SYS_FAMILY_TO_ANIMA] {
+            assert!(sys.contains("Example input:"));
+            assert!(sys.contains("Example output:"));
+        }
+        assert!(SYS_FAMILY_TO_PONY.contains("Example output: score_9"));
+        assert!(SYS_FAMILY_TO_ILLUSTRIOUS.contains("Example output: masterpiece"));
+        // Anima's example must not smuggle a quality block back in.
+        let example = SYS_FAMILY_TO_ANIMA.split("Example output:").nth(1).unwrap();
+        assert!(!example.contains("masterpiece"));
+        assert!(!example.contains("score_"));
     }
 }
