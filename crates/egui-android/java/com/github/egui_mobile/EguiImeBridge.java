@@ -255,14 +255,19 @@ public class EguiImeBridge extends InputConnectionWrapper {
 
     @Override
     public boolean sendKeyEvent(KeyEvent event) {
-        // No enqueue: IME key events (DEL, DPAD, ENTER) are dispatched into the window and reach
-        // egui once via the native input queue. Enqueuing them here delivered them twice.
-        // DEL is mirrored into the hidden Editable, which the dispatched key never touches —
-        // without this the EditText keeps deleted chars and getTextBeforeCursor lies to the IME.
-        if (event != null && event.getAction() == KeyEvent.ACTION_DOWN) {
+        // DEL/FORWARD_DEL: mirror into the hidden Editable and ride the IC queue instead of the
+        // native window dispatch — the dispatched key lands frames later and reorders against
+        // commitText/setComposingText, which is how a backspace hold types behind the caret.
+        // Other keys (DPAD, ENTER) keep the native path and reach egui once via the input queue.
+        if (event != null) {
             int code = event.getKeyCode();
             if (code == KeyEvent.KEYCODE_DEL || code == KeyEvent.KEYCODE_FORWARD_DEL) {
-                activity.mirrorDeleteKey(code == KeyEvent.KEYCODE_DEL);
+                if (event.getAction() == KeyEvent.ACTION_DOWN) {
+                    activity.mirrorDeleteKey(code == KeyEvent.KEYCODE_DEL);
+                    activity.enqueue("K\t" + code);
+                    if (TRACE) trace("sendKeyEvent(" + KeyEvent.keyCodeToString(code) + ") queued");
+                }
+                return true;
             }
         }
         boolean ret = super.sendKeyEvent(event);

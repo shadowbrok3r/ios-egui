@@ -134,9 +134,10 @@ impl eframe::App for Adapter {
         // Drain InputConnection → egui before the app frame. Do NOT show/hide the IME here:
         // that decision needs this frame's focus after `app.update` (pre-update `ime` output
         // flickers with keyboard-inset layout and caused a show/hide loop).
+        let mut ime_applied = false;
         if self.ime_bridge_hot || hold {
             let _ = crate::ime_bridge::bind_ime();
-            let _ = crate::ime_bridge::apply_pending(
+            ime_applied = crate::ime_bridge::apply_pending(
                 ui.ctx(),
                 self.last_focus,
                 &mut self.pending_events,
@@ -182,6 +183,14 @@ impl eframe::App for Adapter {
         );
         if switched_field {
             crate::ime_bridge::clear_preedit_tracking();
+        }
+        // A field gaining focus may carry a stuck composition from an earlier tap/dismissal —
+        // egui paints no caret while composing. Empty Preedit resets it; no-op otherwise.
+        if self.ime_bridge_hot && self.last_focus.is_some() && prev_focus != self.last_focus {
+            self.pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: String::new(),
+                active_range_chars: None,
+            }));
         }
         // Keep `PlatformOutput::ime` stable while editing. A one-frame `ime: None` makes
         // egui-winit call `set_ime_allowed(false)` → hideSoftInput on the DecorView token,
@@ -260,7 +269,8 @@ impl eframe::App for Adapter {
         // never while typing (setText resets the caret and triggers invalidateInput).
         // Retries until the undoer has a stable snapshot: seeding before that pushed "" into the
         // EditText, and every later IME op then edited against an empty mirror.
-        let need_sync = self.ime_force_sync || switched_field;
+        let need_sync =
+            self.ime_force_sync || switched_field || crate::ime_bridge::take_needs_reseed();
         if need_sync {
             crate::ime_bridge::invalidate_last_sync();
             let seeded = crate::ime_bridge::sync_focused_text_edit(ui.ctx(), self.last_focus);
@@ -277,17 +287,24 @@ impl eframe::App for Adapter {
         // Mirror egui's caret into the EditText every frame it differs (the call is a no-op when
         // it matches or a composition is active). Not gated on a pointer release: the seed can
         // land frames after the tap that caused it, by which point the release is long gone and
-        // the mirror would keep a stale caret for the rest of the session.
+        // the mirror would keep a stale caret for the rest of the session. Skipped on frames
+        // that applied IME events — egui's caret is mid-convergence then and pushing it back
+        // would plant a stale offset in the EditText.
         if self.ime_bridge_hot
             && !need_sync
+            && !ime_applied
             && let Some(id) = self.last_focus
             && let Some(state) = egui::text_edit::TextEditState::load(ui.ctx(), id)
             && state.cursor.char_range().is_some()
         {
-            let (s, e) = crate::ime_bridge::selection_chars(&state);
-            let user_tap =
-                ui.ctx().input(|i| i.pointer.any_pressed() || i.pointer.any_released());
-            crate::ime_bridge::sync_caret_to_ime(s, e, user_tap);
+            // Text changed outside the IME (app edits, hardware keys): push the whole buffer
+            // instead of just the caret, restarting the IME session over the new document.
+            if !crate::ime_bridge::resync_out_of_band(ui.ctx(), self.last_focus) {
+                let (s, e) = crate::ime_bridge::selection_chars(&state);
+                let user_tap =
+                    ui.ctx().input(|i| i.pointer.any_pressed() || i.pointer.any_released());
+                crate::ime_bridge::sync_caret_to_ime(s, e, user_tap);
+            }
         }
         // Mirror this frame's egui copies (host widgets and plugin viewports alike) into the
         // system clipboard; winit has no Android clipboard backend.

@@ -850,6 +850,10 @@ struct ComfyApp {
     last_graph_fp: Option<u64>,
     /// A queue_graph held back because it matched `last_graph_fp` — awaiting the user's choice.
     dup_run: Option<DupRun>,
+    /// Fingerprint of the last Create run submitted on the engine path (no linked graph tab).
+    last_create_fp: Option<u64>,
+    /// A Create queue held back because it matched `last_create_fp` — awaiting the user's choice.
+    dup_create: bool,
     /// A pending destructive graph action (Clear canvas / tab close) awaiting confirmation.
     confirm: Option<ConfirmDialog>,
     /// Preflight failures from the last queue attempt, shown as a tap-to-fix list (each row can
@@ -1432,6 +1436,8 @@ impl ComfyApp {
             run_seen: HashSet::new(),
             last_graph_fp: None,
             dup_run: None,
+            last_create_fp: None,
+            dup_create: false,
             confirm: None,
             preflight_problems: None,
             gallery: Vec::new(),
@@ -2314,6 +2320,7 @@ impl ComfyApp {
                 // A cancelled run left no completed cache entry — an identical retry genuinely
                 // re-generates, so it must not trip the duplicate guard.
                 self.last_graph_fp = None;
+                self.last_create_fp = None;
                 self.status = if matches!(self.conn, Conn::Connected) {
                     "Cancelled — server interrupted".into()
                 } else {
@@ -2327,6 +2334,7 @@ impl ComfyApp {
                 // The failed prompt may never have reached the server (queue POST error) and
                 // certainly left no completed cache entry — a retry is not a duplicate.
                 self.last_graph_fp = None;
+                self.last_create_fp = None;
                 if self.jobs_left == 0 {
                     self.running = false;
                     self.finish_pending = false;
@@ -2891,6 +2899,7 @@ impl ComfyApp {
             if p.is_empty() { "Create".to_string() } else { elide(p, 28) }
         };
         self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow, label);
+        self.last_create_fp = self.create_engine_fp();
         host.haptic(Haptic::Medium);
     }
 
@@ -2940,12 +2949,61 @@ impl ComfyApp {
         host.haptic(Haptic::Medium);
     }
 
+    /// Fingerprint of the workflow the engine path would submit for the current params, or None
+    /// when this queue routes elsewhere (local NPU, Create-linked txt2img via queue_graph).
+    fn create_engine_fp(&self) -> Option<u64> {
+        #[cfg(feature = "local-npu")]
+        if self.route_local_gen() {
+            return None;
+        }
+        if self.params.mode == Mode::Txt2Img
+            && let Some(id) = self.create_graph_id
+            && self.graph_tabs.iter().any(|d| d.id == id)
+        {
+            return None;
+        }
+        let schemas = self.schemas.as_ref()?;
+        let wants_input = self.params.mode == Mode::Img2Img
+            || (self.params.mode == Mode::Video && !self.params.video.video_t2v);
+        let input = wants_input.then(|| crate::engine::INPUT_IMAGE_NAME.to_string());
+        let (mut wf, _, _) =
+            crate::workflow::build_dispatch(&self.params, input, &self.apps, schemas);
+        let _ = crate::workflow::sanitize_clip_types(&mut wf, schemas);
+        let fp = crate::workflow::fingerprint(&wf);
+        if !wants_input {
+            return Some(fp);
+        }
+        // The graph references a fixed upload name; the server caches LoadImage by content,
+        // so the input's identity is part of what makes a re-queue a replay. For Url the URL
+        // string stands in for content fetched at submit time (a changed remote image behind
+        // the same URL can false-positive).
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        fp.hash(&mut h);
+        match self.params.img2img_source {
+            Img2ImgSource::Picked => self.picked_input.as_ref().map(|p| &p.bytes).hash(&mut h),
+            Img2ImgSource::Url => self.params.input_url.hash(&mut h),
+            Img2ImgSource::CurrentOutput => self.result_bytes.hash(&mut h),
+        }
+        Some(h.finish())
+    }
+
     /// Queue `queue_variants` Create jobs. With seed randomization off, iterations after the first
     /// re-roll the seed so the variants differ; iteration 0 keeps the user's seed. (With it on,
     /// start_generation already re-rolls per call.)
     fn queue_create_variants(&mut self, ctx: &egui::Context, host: &Host) {
         if let Err(e) = self.can_queue_create() {
             self.status = e.into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        // Identical re-queue on the engine path is a whole-graph server cache replay — the run
+        // "finishes" instantly with the previous images. Ask, like queue_graph does for its path.
+        if !self.params.randomize_seed
+            && self.last_create_fp.is_some()
+            && self.last_create_fp == self.create_engine_fp()
+        {
+            self.dup_create = true;
             host.haptic(Haptic::Warning);
             return;
         }
@@ -5101,25 +5159,25 @@ impl ComfyApp {
         }
     }
 
-    /// Positive prompt: label + chip toggle, then the chip editor or text field, then the scrubber.
+    /// Positive prompt: label + chip toggle, then the editor with the history gutter.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
         ui.horizontal(|ui| {
             self.rewrite_menu_ui(ui, host);
             self.dup_fix_chip_ui(ui);
+            if self.hist_stash.is_some() {
+                let total = self.prompt_history.len() + 1;
+                ui.weak(format!("history {}/{total}", self.hist_slider.clamp(1, total)));
+            }
         });
-        self.prompt_history_ui(ui);
     }
 
-    /// Prompt-history scrubber: a compact row that slides `params.positive`/`negative` back through
-    /// recorded generations. The live draft is stashed as the newest slot, so the far end restores
-    /// it; a manual edit detaches. Hidden while history is empty.
-    fn prompt_history_ui(&mut self, ui: &mut egui::Ui) {
-        let n = self.prompt_history.len();
-        if n == 0 {
+    /// Maintain scrub state; false hides the history gutter (empty history).
+    fn hist_gutter_prep(&mut self) -> bool {
+        if self.prompt_history.is_empty() {
             self.hist_stash = None;
             self.hist_applied = None;
-            return;
+            return false;
         }
         // A manual edit to either field while scrubbing detaches: drop the stash, snap to live.
         let edited = self
@@ -5130,14 +5188,21 @@ impl ComfyApp {
             self.hist_stash = None;
             self.hist_applied = None;
         }
-        let total = n + 1;
+        true
+    }
+
+    /// Vertical prompt-history scrubber spanning the editor height; top = live draft. The live
+    /// draft is stashed as the newest slot, so the top restores it; a manual edit detaches.
+    fn hist_gutter_slider(&mut self, ui: &mut egui::Ui, height: f32) {
+        let total = self.prompt_history.len() + 1;
         let mut val = if self.hist_stash.is_some() { self.hist_slider.clamp(1, total) } else { total };
         let before = val;
-        ui.horizontal(|ui| {
-            ui.label("Hist");
-            ui.spacing_mut().slider_width = (ui.available_width() - 52.0).max(80.0);
-            ui.add(egui::Slider::new(&mut val, 1..=total).show_value(false));
-            ui.label(format!("{val}/{total}"));
+        ui.scope(|ui| {
+            // slider_width is a vertical slider's length; grow past the editor with deep
+            // history so per-entry travel stays scrubbable by touch.
+            let min_len = ((total as f32) * 4.0 + 15.0).min(160.0);
+            ui.spacing_mut().slider_width = height.max(min_len);
+            ui.add(egui::Slider::new(&mut val, 1..=total).vertical().show_value(false));
         });
         if val != before {
             self.scrub_to(ui.ctx(), val, total);
@@ -5181,6 +5246,7 @@ impl ComfyApp {
     }
 
     /// One prompt field: a `label` + chip-view toggle, then the chip editor or the text field.
+    /// The positive field gets the vertical history gutter on the editor's left.
     fn prompt_field_ui(&mut self, ui: &mut egui::Ui, field: PromptField, label: &str) {
         ui.horizontal(|ui| {
             ui.label(label);
@@ -5193,6 +5259,25 @@ impl ComfyApp {
                 self.set_field_chips(field, !on);
             }
         });
+        if field == PromptField::Positive && self.hist_gutter_prep() {
+            let height_id = egui::Id::new("hist-gutter-height");
+            // Last-frame editor height; rows-based estimate on the first frame.
+            let fallback =
+                ui.text_style_height(&egui::TextStyle::Body) * field.rows() as f32 + 4.0;
+            let height =
+                ui.ctx().data(|d| d.get_temp::<f32>(height_id)).unwrap_or(fallback);
+            ui.horizontal_top(|ui| {
+                self.hist_gutter_slider(ui, height);
+                let body = ui.vertical(|ui| self.prompt_editor_body(ui, field));
+                ui.ctx().data_mut(|d| d.insert_temp(height_id, body.response.rect.height()));
+            });
+        } else {
+            self.prompt_editor_body(ui, field);
+        }
+    }
+
+    /// The chip editor or the text field for `field`.
+    fn prompt_editor_body(&mut self, ui: &mut egui::Ui, field: PromptField) {
         if self.field_chips(field) {
             self.prompt_chip_view(ui, field);
         } else {
@@ -16452,7 +16537,11 @@ impl EguiApp for ComfyApp {
         // Open blocking dialogs own the back key: consumed here, before any other handler runs
         // (else Back falls through to the fullscreen-exit / app-background handlers while a modal —
         // including a destructive confirm — is still up). Cancel is the Android Back convention.
-        if self.confirm.is_some() || self.dup_run.is_some() || self.preflight_problems.is_some() {
+        if self.confirm.is_some()
+            || self.dup_run.is_some()
+            || self.dup_create
+            || self.preflight_problems.is_some()
+        {
             if ui.ctx().input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
                     || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
@@ -16462,6 +16551,8 @@ impl EguiApp for ComfyApp {
                     self.confirm = None;
                 } else if self.dup_run.is_some() {
                     self.dup_run = None;
+                } else if self.dup_create {
+                    self.dup_create = false;
                 } else {
                     self.preflight_problems = None;
                 }
@@ -16582,6 +16673,7 @@ impl EguiApp for ComfyApp {
         self.preflight_window(ui.ctx(), host);
         self.confirm_window(ui.ctx(), host);
         self.dup_run_window(ui.ctx(), host);
+        self.dup_create_window(ui.ctx(), host);
         self.error_modal_window(ui.ctx(), host);
 
         // Keep the server-wide queue in view even when jobs were started on the website. Poll faster
@@ -16803,6 +16895,79 @@ impl ComfyApp {
                 }
             }
             Some(DAct::Cancel) => self.dup_run = None,
+            None => {}
+        }
+    }
+
+    /// Create-path twin of [`Self::dup_run_window`]: an identical engine-path re-queue held back.
+    fn dup_create_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if !self.dup_create {
+            return;
+        }
+        #[derive(Clone, Copy)]
+        enum DAct {
+            NewSeed,
+            RunAnyway,
+            Cancel,
+        }
+        let mut act: Option<DAct> = None;
+        let mut open = true;
+        let scrim = egui::Area::new(egui::Id::new("dup-create-scrim"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                let resp = ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(120));
+                resp
+            });
+        if scrim.inner.clicked() {
+            act = Some(DAct::Cancel);
+        }
+        centered(ctx, egui::Window::new(format!("{} Same settings as the last run", icons::WARN)))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Nothing changed since this exact generation last ran (the seed is fixed), \
+                     so the server will answer from its cache instead of generating a new image.",
+                );
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    const GAP: f32 = 6.0;
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    let size =
+                        egui::vec2(((ui.available_width() - GAP * 2.0) / 3.0).max(64.0), 30.0);
+                    if ui.add_sized(size, egui::Button::new("New seed & run")).clicked() {
+                        act = Some(DAct::NewSeed);
+                    }
+                    if ui.add_sized(size, egui::Button::new("Run anyway")).clicked() {
+                        act = Some(DAct::RunAnyway);
+                    }
+                    if ui.add_sized(size, egui::Button::new("Cancel")).clicked() {
+                        act = Some(DAct::Cancel);
+                    }
+                });
+            });
+        if !open {
+            act = Some(DAct::Cancel);
+        }
+        match act {
+            Some(DAct::NewSeed) => {
+                self.dup_create = false;
+                self.params.seed = random_seed();
+                self.queue_create_variants(ctx, host);
+            }
+            Some(DAct::RunAnyway) => {
+                self.dup_create = false;
+                // Clear the fingerprint so the guard passes; the submit re-records it.
+                self.last_create_fp = None;
+                self.queue_create_variants(ctx, host);
+            }
+            Some(DAct::Cancel) => self.dup_create = false,
             None => {}
         }
     }

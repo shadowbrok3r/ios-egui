@@ -153,11 +153,15 @@ public class EguiNativeActivity extends NativeActivity {
         imeEdit = edit;
     }
 
-    /** Latch a keyboard dismissal the app never asked for; Rust drains it and drops focus. */
+    /** Latch a keyboard dismissal the app never asked for; Rust drains it and drops focus.
+     * Drops the dead session's queued events so they cannot block the next session's seed. */
     void noteImeDismissed() {
         imeDismissed = true;
         softImeRequested = false;
         lastShowUptimeMs = 0;
+        pending.clear();
+        batchDepth = 0;
+        batchSawSelChange = false;
         if (TRACE) Log.i("EguiIme", "ime dismissed externally");
         if (!nativeWakeBroken) {
             try {
@@ -285,8 +289,11 @@ public class EguiNativeActivity extends NativeActivity {
         return Character.offsetByCodePoints(ed, 0, cp);
     }
 
-    /** Replace EditText contents/selection from egui; start/end are code-point offsets. */
-    public void setImeState(String text, int start, int end) {
+    /** Replace EditText contents/selection from egui; start/end are code-point offsets.
+     * `restart` asserts the mirror is untrusted: undrained IC events are dropped wholesale and
+     * the IME session restarts over the pushed document. Without it, undrained events skip the
+     * push and a "Y" marker tells Rust to invalidate its mirror record and reseed. */
+    public void setImeState(String text, int start, int end, boolean restart) {
         runOnUiThread(
                 () -> {
                     ensureImeView();
@@ -294,11 +301,27 @@ public class EguiNativeActivity extends NativeActivity {
                     if (edit == null) {
                         return;
                     }
+                    if (!pending.isEmpty()) {
+                        if (restart) {
+                            pending.clear();
+                        } else {
+                            pending.offer("Y\t");
+                            if (TRACE) Log.i("EguiIme", "setImeState skipped (pending IC events)");
+                            return;
+                        }
+                    }
                     updatingFromNative = true;
                     try {
                         CharSequence curCs = edit.getText();
                         String cur = curCs != null ? curCs.toString() : "";
-                        if (!cur.equals(text)) {
+                        boolean changed = !cur.equals(text);
+                        // Callers never push mid-composition, so a live span is stale.
+                        Editable curEd = edit.getText();
+                        if (curEd != null
+                                && BaseInputConnection.getComposingSpanStart(curEd) >= 0) {
+                            edit.clearComposingText();
+                        }
+                        if (changed) {
                             edit.setText(text);
                         }
                         Editable after = edit.getText();
@@ -310,22 +333,35 @@ public class EguiNativeActivity extends NativeActivity {
                         if (edit.getSelectionStart() != s || edit.getSelectionEnd() != e) {
                             edit.setSelection(s, e);
                         }
-                        if (TRACE) Log.i("EguiIme", "setImeState => " + imeStateDump());
-                        // Do not restartInput / showSoftInput here — that fights the IME and
-                        // causes show/hide flicker when Select All expands the selection.
+                        if (restart) {
+                            InputMethodManager imm =
+                                    (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                            imm.restartInput(edit);
+                        }
+                        if (TRACE) {
+                            Log.i("EguiIme", "setImeState restart=" + restart
+                                    + " => " + imeStateDump());
+                        }
                     } finally {
                         updatingFromNative = false;
                     }
                 });
     }
 
-    /** Move only the EditText caret (code-point offsets); optionally end composition first. */
+    /** Move only the EditText caret (code-point offsets); optionally end composition first.
+     * Skipped while undrained IC events exist — Rust's caret math predates them; a "Y" marker
+     * tells Rust to invalidate its mirror record and reseed. */
     public void setImeSelection(int start, int end, boolean clearComposing) {
         runOnUiThread(
                 () -> {
                     EditText edit = imeEdit;
                     Editable ed = edit != null ? edit.getText() : null;
                     if (edit == null || ed == null) {
+                        return;
+                    }
+                    if (!pending.isEmpty()) {
+                        pending.offer("Y\t");
+                        if (TRACE) Log.i("EguiIme", "setImeSelection skipped (pending IC events)");
                         return;
                     }
                     updatingFromNative = true;
@@ -407,6 +443,11 @@ public class EguiNativeActivity extends NativeActivity {
                     // edge lands a few frames later.
                     imeDismissed = false;
                     imeInsetVisible = false;
+                    // Rust stops draining once the session ends; leftovers would block the
+                    // next session's seed.
+                    pending.clear();
+                    batchDepth = 0;
+                    batchSawSelChange = false;
                     if (edit != null) {
                         imm.hideSoftInputFromWindow(edit.getWindowToken(), 0);
                         // Keep the view attached and focusable so the next showIme is reliable.

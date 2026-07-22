@@ -32,6 +32,8 @@ pub enum ImeEvent {
     /// `replaceText`: replace `[start, end)` with `text`, committed.
     Replace { start: usize, end: usize, text: String },
     Key(i32),
+    /// Java skipped an egui→EditText push (undrained events); the mirror record is a lie.
+    SyncDropped,
 }
 
 static LAST_SYNC: Mutex<Option<(String, i32, i32)>> = Mutex::new(None);
@@ -202,12 +204,20 @@ pub fn clear_preedit_tracking() {
 
 /// Push egui text + selection into the hidden EditText (no-op when unchanged).
 pub fn sync_to_ime(text: &str, sel_start: usize, sel_end: usize) {
+    sync_to_ime_inner(text, sel_start, sel_end, false);
+}
+
+/// `restart` additionally restarts the IME session when the pushed text differs from the
+/// EditText's — used when egui's buffer changed outside the IME.
+fn sync_to_ime_inner(text: &str, sel_start: usize, sel_end: usize, restart: bool) {
     let start = sel_start as i32;
     let end = sel_end as i32;
-    if let Ok(g) = LAST_SYNC.lock() {
-        if g.as_ref().is_some_and(|(t, s, e)| t == text && *s == start && *e == end) {
-            return;
-        }
+    // A restart push asserts the mirror is untrusted — a dedupe match is not redundancy then.
+    if !restart
+        && let Ok(g) = LAST_SYNC.lock()
+        && g.as_ref().is_some_and(|(t, s, e)| t == text && *s == start && *e == end)
+    {
+        return;
     }
     let synced = crate::host::with_native_activity(|env, activity| {
         if !is_egui_activity(env, activity)? {
@@ -217,8 +227,13 @@ pub fn sync_to_ime(text: &str, sel_start: usize, sel_end: usize) {
         env.call_method(
             activity,
             "setImeState",
-            "(Ljava/lang/String;II)V",
-            &[(&jtext).into(), JValue::Int(start), JValue::Int(end)],
+            "(Ljava/lang/String;IIZ)V",
+            &[
+                (&jtext).into(),
+                JValue::Int(start),
+                JValue::Int(end),
+                JValue::Bool(restart as u8),
+            ],
         )?;
         Ok(true)
     })
@@ -226,7 +241,7 @@ pub fn sync_to_ime(text: &str, sel_start: usize, sel_end: usize) {
     if synced {
         if TRACE {
             log::info!(
-                "egui-android ime: sync_to_ime len={} sel={start}..{end}",
+                "egui-android ime: sync_to_ime len={} sel={start}..{end} restart={restart}",
                 text.chars().count()
             );
         }
@@ -301,6 +316,17 @@ pub fn sync_caret_to_ime(start: usize, end: usize, user_tap: bool) {
                 g.clear();
             }
             sync_selection_to_ime(caret as usize, caret as usize, true);
+            // egui must also leave composition, or it never paints a caret again
+            // (cursor_purpose stays ImeComposition). Empty Preedit resets it; the buffer
+            // already holds the preedit text and the tap collapsed the selection.
+            if let Ok(mut g) = CARRY.lock() {
+                g.push(ImeEvent::Preedit(String::new()));
+            }
+            if let Ok(g) = WAKE_CTX.lock()
+                && let Some(ctx) = g.as_ref()
+            {
+                ctx.request_repaint();
+            }
         }
         return;
     }
@@ -373,8 +399,17 @@ fn parse_event(s: &str) -> Option<ImeEvent> {
             })
         }
         "K" => Some(ImeEvent::Key(rest.parse().ok()?)),
+        "Y" => Some(ImeEvent::SyncDropped),
         _ => None,
     }
+}
+
+/// A Java-side skipped push was reported; the next frame must reseed the EditText.
+static NEEDS_RESEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a dropped push requires a reseed. Clears the latch.
+pub fn take_needs_reseed() -> bool {
+    NEEDS_RESEED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Probe the latest undoer snapshot string without mutating the real undoer.
@@ -454,7 +489,13 @@ pub fn apply_pending(
     let mut last_sel: Option<(usize, usize)> = None;
     let mut had_mutate = false;
     let mut deferred: Vec<ImeEvent> = Vec::new();
+    // A stale absolute-offset event restarted the IME session; the rest of the batch belongs
+    // to the dead session and is dropped, not deferred.
+    let mut poisoned = false;
     for ev in events {
+        if poisoned {
+            continue;
+        }
         // Once one event defers, everything after it stays in order behind it.
         if !deferred.is_empty() {
             deferred.push(ev);
@@ -530,6 +571,19 @@ pub fn apply_pending(
                     deferred.push(ImeEvent::Region { start, end, text });
                     continue;
                 }
+                // Offsets from a drifted mirror would compose into unrelated text: when the
+                // settled buffer is readable and [start, end) does not hold the region text,
+                // drop the event and realign the mirror (restart ends the IME's composition).
+                if let Some(live) = settled_text(ctx, focus) {
+                    let slice: String =
+                        live.chars().skip(start).take(end.saturating_sub(start)).collect();
+                    if slice != text {
+                        log::warn!("egui-android ime: stale Region {start}..{end}, resyncing");
+                        resync_after_stale(ctx, focus, &live);
+                        poisoned = true;
+                        continue;
+                    }
+                }
                 had_mutate = true;
                 if let Ok(mut g) = LAST_PREEDIT.lock() {
                     g.clone_from(&text);
@@ -544,6 +598,16 @@ pub fn apply_pending(
                 if had_mutate {
                     deferred.push(ImeEvent::Replace { start, end, text });
                     continue;
+                }
+                // Bounds check only: the replaced span's old content is not carried, so a
+                // drifted mirror is detectable just when the span runs past the buffer.
+                if let Some(live) = settled_text(ctx, focus) {
+                    if end > live.chars().count() {
+                        log::warn!("egui-android ime: stale Replace {start}..{end}, resyncing");
+                        resync_after_stale(ctx, focus, &live);
+                        poisoned = true;
+                        continue;
+                    }
                 }
                 had_mutate = true;
                 if let Ok(mut g) = LAST_PREEDIT.lock() {
@@ -564,10 +628,33 @@ pub fn apply_pending(
                 };
                 if matches!(code, KEYCODE_DEL | KEYCODE_FORWARD_DEL) {
                     had_mutate = true;
+                    // Queued DEL with a live preedit: Java deleted the whole composing span;
+                    // an empty Preedit removes egui's (selected) preedit identically and
+                    // resets the composition state.
+                    let had_preedit = LAST_PREEDIT
+                        .lock()
+                        .map(|mut g| {
+                            let had = !g.is_empty();
+                            g.clear();
+                            had
+                        })
+                        .unwrap_or(false);
+                    if had_preedit {
+                        pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: String::new(),
+                            active_range_chars: None,
+                        }));
+                        continue;
+                    }
                 }
                 if let Some(k) = egui_key {
                     pending_events.push(key(k));
                 }
+            }
+            ImeEvent::SyncDropped => {
+                // The mirror record describes a push Java never applied; drop it and reseed.
+                invalidate_last_sync();
+                NEEDS_RESEED.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -581,7 +668,7 @@ pub fn apply_pending(
         ctx.request_repaint();
     }
     // Trackpad / explicit caret move only — not selection attached to a text mutation.
-    if !had_mutate {
+    if !had_mutate && !poisoned {
         if let Some((start, end)) = last_sel {
             let Some(id) = focus else {
                 return true;
@@ -609,6 +696,62 @@ fn key(k: egui::Key) -> egui::Event {
         repeat: false,
         modifiers: egui::Modifiers::NONE,
     }
+}
+
+/// The focused TextEdit's settled text: the undoer snapshot equals the live buffer when the
+/// undoer is not in flux; `None` mid-typing.
+fn settled_text(ctx: &egui::Context, focus: Option<egui::Id>) -> Option<String> {
+    let state = egui::text_edit::TextEditState::load(ctx, focus?)?;
+    if undoer_in_flux(&state) {
+        return None;
+    }
+    probe_undoer_text(&state)
+}
+
+/// Recovery from a stale absolute-offset event: end preedit tracking and push egui's settled
+/// text with an IME session restart, so the keyboard rebuilds from the real document.
+fn resync_after_stale(ctx: &egui::Context, focus: Option<egui::Id>, live: &str) {
+    if let Ok(mut g) = LAST_PREEDIT.lock() {
+        g.clear();
+    }
+    let caret = focus
+        .and_then(|id| egui::text_edit::TextEditState::load(ctx, id))
+        .map(|state| {
+            let (s, e) = selection_chars(&state);
+            if s == e { s } else { e }
+        })
+        .unwrap_or_else(|| live.chars().count());
+    sync_to_ime_inner(live, caret, caret, true);
+}
+
+/// Push egui's settled text to the EditText when it changed outside the IME (app edits,
+/// hardware keys), restarting the IME session so autocomplete re-reads the document.
+/// Returns `true` when a push happened.
+pub fn resync_out_of_band(ctx: &egui::Context, focus: Option<egui::Id>) -> bool {
+    if LAST_PREEDIT.lock().map(|g| !g.is_empty()).unwrap_or(true) {
+        return false;
+    }
+    let Some(text) = settled_text(ctx, focus) else {
+        return false;
+    };
+    let stale = match LAST_SYNC.lock() {
+        // Not seeded yet — sync_focused_text_edit owns the first push.
+        Ok(g) => g.as_ref().is_some_and(|(t, _, _)| *t != text),
+        Err(_) => false,
+    };
+    if !stale {
+        return false;
+    }
+    let Some(state) = focus.and_then(|id| egui::text_edit::TextEditState::load(ctx, id)) else {
+        return false;
+    };
+    let (s, e) = selection_chars(&state);
+    let caret = if s == e { s } else { e };
+    if TRACE {
+        log::info!("egui-android ime: out-of-band text change, resyncing");
+    }
+    sync_to_ime_inner(&text, caret, caret, true);
+    true
 }
 
 /// Sync focused `TextEdit` undoer text + cursor into the hidden EditText. Returns `true` once
