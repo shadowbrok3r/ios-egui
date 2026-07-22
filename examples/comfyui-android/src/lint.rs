@@ -106,12 +106,6 @@ fn paren_balance(text: &str) -> i32 {
     depth
 }
 
-/// Whether any chip tag repeats (case/underscore-insensitive) in `text`.
-fn has_duplicate(text: &str) -> bool {
-    let mut seen = std::collections::HashSet::new();
-    tags::parse_chips(text).iter().any(|c| !seen.insert(fold(&c.tag)))
-}
-
 /// A `N<noun>` count tag split into (number, lowercase noun), else `None`.
 fn parse_count(tag: &str) -> Option<(u32, String)> {
     let t = tag.trim();
@@ -165,7 +159,7 @@ pub fn lint(
             continue;
         }
         let name = entry.map(|e| e.display_name()).unwrap_or_else(|| file_basename(&al.file));
-        let mut lt = params.lora_triggers.clone();
+        let mut lt = params.active_lora_triggers().to_string();
         merge_triggers(&mut lt, &missing.join(", "), &params.positive);
         issues.push(LintIssue {
             severity: Severity::Warn,
@@ -198,12 +192,14 @@ pub fn lint(
         }
     }
 
-    // 3. Duplicate tags in the positive prompt.
-    if has_duplicate(&params.positive) {
+    // 3. Duplicate tags in the positive prompt — internal repeats, or a tag the LoRA-trigger
+    // field already carries (the trigger field is prepended, so a shared tag encodes twice).
+    let deduped = tags::dedupe_against(&params.positive, params.active_lora_triggers());
+    if deduped != params.positive {
         issues.push(LintIssue {
             severity: Severity::Info,
             msg: "Duplicate tags in the positive prompt".to_string(),
-            fix: Some(Fix::SetPositive(tags::dedupe(&params.positive))),
+            fix: Some(Fix::SetPositive(deduped)),
         });
     }
 
@@ -307,6 +303,28 @@ mod tests {
         let issues = lint(&params, None, &[]);
         assert!(issues.iter().any(|i| matches!(&i.fix,
             Some(Fix::SetPositive(s)) if s == "sky, tree")));
+    }
+
+    #[test]
+    fn positive_tags_already_in_lora_triggers_are_flagged() {
+        // "1girl" and "long hair" (fold of "long_hair") both duplicate the trigger field.
+        let params = Params {
+            positive: "1girl, standing, long_hair".into(),
+            lora_triggers: "1girl, long hair".into(),
+            ..Default::default()
+        };
+        let fix = lint(&params, None, &[]).into_iter().find_map(|i| match i.fix {
+            Some(Fix::SetPositive(s)) => Some(s),
+            _ => None,
+        });
+        assert_eq!(fix.as_deref(), Some("standing"));
+        // No overlap → no duplicate issue.
+        let clean = Params {
+            positive: "standing".into(),
+            lora_triggers: "1girl".into(),
+            ..Default::default()
+        };
+        assert!(!lint(&clean, None, &[]).iter().any(|i| i.msg.contains("Duplicate")));
     }
 
     #[test]

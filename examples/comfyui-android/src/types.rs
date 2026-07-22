@@ -75,6 +75,10 @@ pub struct VideoParams {
     pub loras_high: Vec<ActiveLora>,
     /// Model-only LoRAs chained onto the low-noise expert.
     pub loras_low: Vec<ActiveLora>,
+    /// Trigger words for the Wan LoRAs, prepended to the video positive. Separate from the image
+    /// `lora_triggers` so a Wan trigger never leaks into an image-mode prompt.
+    #[serde(default)]
+    pub lora_triggers: String,
     /// `ModelSamplingSD3.shift`.
     pub shift: f32,
     /// Total sampler steps shared by both experts.
@@ -126,6 +130,7 @@ impl Default for VideoParams {
                 model_lora("Wan/wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors", 1.0),
                 model_lora("Wan/SmoothMixAnimation_Low.safetensors", 0.6),
             ],
+            lora_triggers: String::new(),
             shift: 5.0,
             steps: 8,
             split_step: 4,
@@ -328,9 +333,15 @@ impl Params {
         self.video = d.video;
     }
 
+    /// The LoRA-trigger field feeding the current mode: the Wan stacks' own field in Video,
+    /// the image field otherwise.
+    pub fn active_lora_triggers(&self) -> &str {
+        if self.mode == Mode::Video { &self.video.lora_triggers } else { &self.lora_triggers }
+    }
+
     /// Positive CLIP text: LoRA triggers (if any) then the subject prompt.
     pub fn combined_positive(&self) -> String {
-        let triggers = self.lora_triggers.trim().trim_end_matches(',').trim();
+        let triggers = self.active_lora_triggers().trim().trim_end_matches(',').trim();
         let subject = self.positive.trim();
         match (triggers.is_empty(), subject.is_empty()) {
             (true, _) => subject.to_string(),
@@ -1110,11 +1121,20 @@ pub fn wan_version(path: &str) -> Option<(u8, u8)> {
             i += 1;
         }
         let Some(&major) = b.get(i).filter(|c| c.is_ascii_digit()) else { continue };
+        // No Wan 1.x generation exists — a leading `1` is a parameter count (14B, 1.3B), not a
+        // version. Retry the scan so a later real version token still wins.
+        if major == b'1' {
+            continue;
+        }
         i += 1;
         while i < b.len() && matches!(b[i], b' ' | b'_' | b'.' | b'-') {
             i += 1;
         }
         let Some(&minor) = b.get(i).filter(|c| c.is_ascii_digit()) else { continue };
+        // A digit run followed by `b` is a parameter count (`5b`, `14b`), not `major.minor`.
+        if matches!(b.get(i + 1), Some(b'b')) {
+            continue;
+        }
         return Some((major - b'0', minor - b'0'));
     }
     for marker in ["high_noise", "highnoise", "high-noise", "low_noise", "lownoise", "low-noise"] {
@@ -1162,19 +1182,16 @@ pub fn split_triggers(s: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `trigger` already appears as a chip token in any haystack. Folds case and underscores
+/// and peels attention weights, so `long_hair` / `(long hair:1.2)` count as the same token.
 fn trigger_present(haystacks: &[&str], trigger: &str) -> bool {
-    let needle = trigger.trim().to_lowercase();
+    let needle = crate::tags::fold(trigger);
     if needle.is_empty() {
         return true;
     }
-    for hay in haystacks {
-        for part in split_triggers(hay) {
-            if part.eq_ignore_ascii_case(&needle) {
-                return true;
-            }
-        }
-    }
-    false
+    haystacks
+        .iter()
+        .any(|hay| crate::tags::parse_chips(hay).iter().any(|c| crate::tags::fold(&c.tag) == needle))
 }
 
 /// Append only the trigger tokens not already present in `dest` / `also_check`.
@@ -1861,6 +1878,22 @@ fn unix_ymd(secs: i64) -> String {
 mod tests {
     use super::*;
 
+    /// merge_triggers folds underscores/case/weights, so a trigger already present in a different
+    /// spelling is not re-added as a duplicate.
+    #[test]
+    fn merge_triggers_folds_spelling_variants() {
+        // Already present as "long_hair" in the positive → not re-added.
+        let mut dest = String::new();
+        let added = merge_triggers(&mut dest, "long hair", "1girl, long_hair");
+        assert_eq!(added, "");
+        assert_eq!(dest, "");
+        // Weighted variant in dest counts as present too.
+        let mut dest = "(long hair:1.2)".to_string();
+        let added = merge_triggers(&mut dest, "long_hair, glow", "");
+        assert_eq!(added, "glow");
+        assert_eq!(dest, "(long hair:1.2), glow");
+    }
+
     /// Example-count lookup: exact name beats a basename collision, even when the collision has a
     /// higher count and sorts first (the gate returns facets count-descending).
     #[test]
@@ -1889,6 +1922,12 @@ mod tests {
         assert_eq!(wan_version("WanVideo_v2.2.safetensors"), None);
         // The two-expert split only exists in 2.2.
         assert_eq!(wan_version("Wan/SmoothMix_High_Noise.safetensors"), Some((2, 2)));
+        // Parameter counts (14B, 1.3B) next to the wan token are NOT versions.
+        assert_eq!(wan_version("Wan14Bi2vFusionX.safetensors"), None);
+        assert_eq!(wan_version("wan_14B_i2v_lora.safetensors"), None);
+        assert_eq!(wan_version("wan1.3b_vace.safetensors"), None);
+        // A real version token still wins over a later size token.
+        assert_eq!(wan_version("wan2.1_i2v_14B_fp8.safetensors"), Some((2, 1)));
         // Unversioned wan names stay unknown; unrelated names never match.
         assert_eq!(wan_version("Wan/wan_motion.safetensors"), None);
         assert_eq!(wan_version("SDXL/swan_2.2_style.safetensors"), None);

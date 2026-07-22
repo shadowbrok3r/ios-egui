@@ -469,8 +469,16 @@ pub fn push_chip(text: &str, tag: &str) -> String {
 
 /// Drop later duplicate tags (case/underscore-insensitive), keeping the first survivor verbatim.
 pub fn dedupe(text: &str) -> String {
+    dedupe_against(text, "")
+}
+
+/// Like [`dedupe`], but also drops any `text` chip whose tag already appears (folded) in
+/// `reserved`. Used to strip positive-prompt tags that a LoRA trigger already covers — the
+/// trigger field is prepended to the prompt, so a shared tag would otherwise encode twice.
+pub fn dedupe_against(text: &str, reserved: &str) -> String {
     let chips = parse_chips(text);
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> =
+        parse_chips(reserved).iter().map(|c| fold(&c.tag)).collect();
     let mut keep: Vec<Range<usize>> = Vec::new();
     for chip in &chips {
         if seen.insert(fold(&chip.tag)) {
@@ -633,6 +641,11 @@ mod tests {
             dedupe("(masterpiece:1.2), long_hair, masterpiece, LONG HAIR"),
             "(masterpiece:1.2), long_hair"
         );
+
+        // dedupe_against also drops tags carried by the reserved field (fold + weight peeled).
+        assert_eq!(dedupe_against("1girl, standing, long_hair", "1girl, long hair"), "standing");
+        assert_eq!(dedupe_against("standing, smile", "1girl"), "standing, smile");
+        assert_eq!(dedupe_against("(masterpiece:1.2), a cat", "masterpiece"), "a cat");
     }
 
     #[test]

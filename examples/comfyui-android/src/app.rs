@@ -4042,6 +4042,7 @@ impl ComfyApp {
         self.username = saved.username;
         self.session = saved.session;
         self.params = saved.params;
+        self.migrate_video_lora_triggers();
         // Picked device-photo bytes are session-only; fall back to the current result on restore.
         if self.params.img2img_source == Img2ImgSource::Picked {
             self.params.img2img_source = Img2ImgSource::CurrentOutput;
@@ -5490,7 +5491,7 @@ impl ComfyApp {
         key.push('\u{1}');
         key.push_str(&self.params.negative);
         key.push('\u{1}');
-        key.push_str(&self.params.lora_triggers);
+        key.push_str(self.params.active_lora_triggers());
         key.push('\u{1}');
         key.push_str(&model);
         for al in &active {
@@ -5557,12 +5558,18 @@ impl ComfyApp {
         }
     }
 
-    /// Apply a lint fix: one whole-field assignment.
+    /// Apply a lint fix: one whole-field assignment. Trigger fixes target the mode's active field.
     fn apply_fix(&mut self, fix: lint::Fix) {
         match fix {
             lint::Fix::SetPositive(s) => self.params.positive = s,
             lint::Fix::SetNegative(s) => self.params.negative = s,
-            lint::Fix::SetLoraTriggers(s) => self.params.lora_triggers = s,
+            lint::Fix::SetLoraTriggers(s) => {
+                if self.params.mode == Mode::Video {
+                    self.params.video.lora_triggers = s;
+                } else {
+                    self.params.lora_triggers = s;
+                }
+            }
         }
     }
 
@@ -5982,10 +5989,11 @@ impl ComfyApp {
                 .desired_width(f32::INFINITY)
                 .hint_text("what to avoid"),
         );
-        // Prepended to the positive at queue time (combined_positive), same as image mode.
+        // Prepended to the video positive at queue time (combined_positive). Kept separate from
+        // the image LoRA triggers so a Wan trigger never leaks into an image prompt.
         ui.label("LoRA triggers");
         ui.add(
-            egui::TextEdit::multiline(&mut self.params.lora_triggers)
+            egui::TextEdit::multiline(&mut self.params.video.lora_triggers)
                 .desired_rows(1)
                 .desired_width(f32::INFINITY)
                 .hint_text("trigger words from LoRAs (auto-filled on pick)"),
@@ -8756,10 +8764,16 @@ impl ComfyApp {
             self.installed_loras
                 .iter()
                 .filter(|file| {
-                    if let Some(e) = self.lora_catalog.entry(file)
-                        && (!e.bases.is_empty() || !e.checkpoints.is_empty())
-                    {
-                        return e.matches_checkpoint(unet, &model_bases);
+                    if let Some(e) = self.lora_catalog.entry(file) {
+                        // An explicit checkpoint listing is always authoritative.
+                        if !e.checkpoints.is_empty() && e.matches_checkpoint(unet, &model_bases) {
+                            return true;
+                        }
+                        // Base tags decide only when the unet's own bases are known; otherwise
+                        // fall through to the filename heuristic (same as an uncatalogued twin).
+                        if !e.bases.is_empty() && !model_bases.is_empty() {
+                            return e.matches_checkpoint(unet, &model_bases);
+                        }
                     }
                     if !crate::types::is_wan_related(file) {
                         return false;
@@ -8806,19 +8820,46 @@ impl ComfyApp {
                 }
             }
             VloraEvent::Removed(l) => {
-                strip_injected(&mut self.params.lora_triggers, &l.injected);
+                strip_injected(&mut self.params.video.lora_triggers, &l.injected);
             }
         }
         self.reconcile_video_lora_triggers();
     }
 
-    /// Re-derive both Wan stacks' trigger contributions: strip every slot's injected tokens,
-    /// then re-merge per slot — safe across file swaps and duplicates between the two stacks.
+    /// One-time upgrade from the shared-trigger build: Wan LoRA triggers used to be merged into
+    /// the image `lora_triggers`. Move each video slot's injected tokens off the shared field and
+    /// re-derive `video.lora_triggers`, so video keeps its triggers and image prompts stop
+    /// carrying orphaned Wan tokens. No-op once the video field is populated.
+    fn migrate_video_lora_triggers(&mut self) {
+        if !self.params.video.lora_triggers.trim().is_empty() {
+            return;
+        }
+        let injected: Vec<String> = self
+            .params
+            .video
+            .loras_high
+            .iter()
+            .chain(self.params.video.loras_low.iter())
+            .filter(|l| !l.injected.trim().is_empty())
+            .map(|l| l.injected.clone())
+            .collect();
+        if injected.is_empty() {
+            return;
+        }
+        for inj in &injected {
+            strip_injected(&mut self.params.lora_triggers, inj);
+        }
+        self.reconcile_video_lora_triggers();
+    }
+
+    /// Re-derive both Wan stacks' trigger contributions into `video.lora_triggers`: strip every
+    /// slot's injected tokens, then re-merge per slot — safe across file swaps and duplicates
+    /// between the two stacks.
     fn reconcile_video_lora_triggers(&mut self) {
         let mut high = std::mem::take(&mut self.params.video.loras_high);
         let mut low = std::mem::take(&mut self.params.video.loras_low);
         for l in high.iter_mut().chain(low.iter_mut()) {
-            strip_injected(&mut self.params.lora_triggers, &l.injected);
+            strip_injected(&mut self.params.video.lora_triggers, &l.injected);
             l.injected.clear();
         }
         for l in high.iter_mut().chain(low.iter_mut()) {
@@ -8830,8 +8871,11 @@ impl ComfyApp {
             if triggers.is_empty() {
                 continue;
             }
-            l.injected =
-                merge_triggers(&mut self.params.lora_triggers, &triggers, &self.params.positive);
+            l.injected = merge_triggers(
+                &mut self.params.video.lora_triggers,
+                &triggers,
+                &self.params.positive,
+            );
         }
         self.params.video.loras_high = high;
         self.params.video.loras_low = low;
@@ -17977,8 +18021,9 @@ fn preset_meta_body(ui: &mut egui::Ui, preset: &CreatePreset) {
         },
     );
     wrap_meta(ui, "Prompt", &p.positive);
-    if !p.lora_triggers.trim().is_empty() {
-        wrap_meta(ui, "LoRA triggers", &p.lora_triggers);
+    let preset_triggers = p.active_lora_triggers();
+    if !preset_triggers.trim().is_empty() {
+        wrap_meta(ui, "LoRA triggers", preset_triggers);
     }
     wrap_meta(ui, "Negative", &p.negative);
     wrap_meta(
