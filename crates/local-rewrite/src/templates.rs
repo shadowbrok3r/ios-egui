@@ -55,6 +55,22 @@ Example input: masterpiece, best quality, 1girl, solo, silver armor, cliff, suns
 Example output: A lone girl in silver armor stands on a cliff at sunset. 1girl, solo, silver \
 armor, cliff, sunset";
 
+/// System prompt: a guided-builder character sheet ("Title: chips, free text; …") -> one line of
+/// identity tags. The worked example doubles as the sheet-format spec: its labels are the app's
+/// literal trait titles and it mixes a prose clause into a trait line, because that is exactly
+/// what the wizard emits — the 0.5B model holds a format far better than a description of one.
+pub const SYS_COMPOSE_CHARACTER: &str = "\
+You turn a character sheet of chosen features into danbooru-style identity tags for an anime \
+character. Output a single comma-separated line of lowercase tags. Keep every chosen feature, \
+convert free-text descriptions into short tags, invent nothing else, no quality tags. Order: \
+subject count, hair, eyes, body, clothing, accessories, pose. Never repeat a tag. Output only \
+the tags.\n\
+Example input: Subject: 1girl; Hair color: silver hair; Hair style: long hair, braided like a \
+crown; Eye color: red eyes; Body: pale skin; Outfit: black dress, she wears an old silver \
+locket\n\
+Example output: 1girl, silver hair, long hair, crown braid, red eyes, pale skin, black dress, \
+silver locket";
+
 /// Which rewrite the model should perform; maps to a system prompt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RewriteKind {
@@ -63,6 +79,8 @@ pub enum RewriteKind {
     ToPony,
     ToIllustrious,
     ToAnima,
+    /// Guided character builder: compose a trait sheet into identity tags.
+    ComposeCharacter,
 }
 
 impl RewriteKind {
@@ -74,6 +92,7 @@ impl RewriteKind {
             RewriteKind::ToPony => SYS_FAMILY_TO_PONY,
             RewriteKind::ToIllustrious => SYS_FAMILY_TO_ILLUSTRIOUS,
             RewriteKind::ToAnima => SYS_FAMILY_TO_ANIMA,
+            RewriteKind::ComposeCharacter => SYS_COMPOSE_CHARACTER,
         }
     }
 
@@ -85,6 +104,7 @@ impl RewriteKind {
             RewriteKind::ToPony => "To Pony",
             RewriteKind::ToIllustrious => "To Illustrious",
             RewriteKind::ToAnima => "To Anima",
+            RewriteKind::ComposeCharacter => "Compose character",
         }
     }
 
@@ -201,12 +221,14 @@ mod tests {
         assert_eq!(RewriteKind::ToPony.system(), SYS_FAMILY_TO_PONY);
         assert_eq!(RewriteKind::ToIllustrious.system(), SYS_FAMILY_TO_ILLUSTRIOUS);
         assert_eq!(RewriteKind::ToAnima.system(), SYS_FAMILY_TO_ANIMA);
+        assert_eq!(RewriteKind::ComposeCharacter.system(), SYS_COMPOSE_CHARACTER);
         // Each system prompt is real guidance, not a placeholder.
         for k in [
             RewriteKind::TagsToVideo,
             RewriteKind::ProseToTags,
             RewriteKind::ToPony,
             RewriteKind::ToAnima,
+            RewriteKind::ComposeCharacter,
         ] {
             assert!(k.system().len() > 40);
         }
@@ -283,6 +305,7 @@ mod tests {
             RewriteKind::ToPony,
             RewriteKind::ToIllustrious,
             RewriteKind::ToAnima,
+            RewriteKind::ComposeCharacter,
         ] {
             assert!(k.dedupes_tags());
         }
@@ -298,6 +321,15 @@ mod tests {
         }
         assert!(SYS_FAMILY_TO_PONY.contains("Example output: score_9"));
         assert!(SYS_FAMILY_TO_ILLUSTRIOUS.contains("Example output: masterpiece"));
+        // The character composer's example must show the wizard's literal sheet labels with a
+        // prose clause folded into a trait line, and its tag output must stay quality-free.
+        assert!(SYS_COMPOSE_CHARACTER.contains("Example input: Subject:"));
+        assert!(SYS_COMPOSE_CHARACTER.contains("Hair color:"));
+        assert!(SYS_COMPOSE_CHARACTER.contains("she wears"));
+        let compose_out = SYS_COMPOSE_CHARACTER.split("Example output:").nth(1).unwrap();
+        assert!(compose_out.starts_with(" 1girl"));
+        assert!(!compose_out.contains("masterpiece"));
+        assert!(!compose_out.contains("score_"));
         // Anima's example must not smuggle a quality block back in.
         let example = SYS_FAMILY_TO_ANIMA.split("Example output:").nth(1).unwrap();
         assert!(!example.contains("masterpiece"));

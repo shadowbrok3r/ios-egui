@@ -4,11 +4,30 @@
 #
 # Usage:
 #   scripts/rewriter-fetch/fetch.sh [OUT_DIR]
+#   scripts/rewriter-fetch/fetch.sh --push [OUT_DIR]
+#   scripts/rewriter-fetch/fetch.sh --push --serial SERIAL [OUT_DIR]
 # Env overrides:
 #   GGUF_REPO  GGUF_FILE  TOK_REPO  TOK_FILE  HF_ENDPOINT
 set -euo pipefail
 
-OUT="${1:-./rewrite}"
+HERE="$(cd "$(dirname "$0")/../.." && pwd)"
+OUT="./rewrite"
+PUSH=0
+TCP=""
+SERIAL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --push) PUSH=1; shift ;;
+    --tcp) TCP="$2"; shift 2 ;;
+    --serial|-s) SERIAL="$2"; shift 2 ;;
+    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -*)
+      echo "unknown arg: $1" >&2
+      exit 1
+      ;;
+    *) OUT="$1"; shift ;;
+  esac
+done
 
 # Qwen ships the GGUF and the tokenizer in separate repos (the GGUF repo has no tokenizer.json).
 GGUF_REPO="${GGUF_REPO:-Qwen/Qwen2.5-0.5B-Instruct-GGUF}"
@@ -18,6 +37,7 @@ TOK_FILE="${TOK_FILE:-tokenizer.json}"
 HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
 
 mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 
 # Marker file identifies the pack (see crates/local-rewrite/src/pack.rs).
 : > "$OUT/RWTR"
@@ -42,5 +62,15 @@ fi
 echo "Pack ready: $OUT"
 ls -la "$OUT"
 echo
+
+ARGS=()
+[ -n "$TCP" ] && ARGS+=(--tcp "$TCP")
+[ -n "$SERIAL" ] && ARGS+=(--serial "$SERIAL")
+
+if [ "$PUSH" -eq 1 ]; then
+  exec "$HERE/scripts/qnn-push-model.sh" "${ARGS[@]}" --durable --subdir rewrite "$OUT"
+fi
+
 echo "Push it to the durable models root on device:"
-echo "  adb push $OUT /storage/emulated/0/ComfyUI/rewrite"
+echo "  $HERE/scripts/qnn-push-model.sh --durable --subdir rewrite $OUT"
+echo "Or: $0 --push $OUT"

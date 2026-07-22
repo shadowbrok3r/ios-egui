@@ -1,9 +1,10 @@
-//! The "mastertech" color scheme, ported from a desktop egui `Style` dump.
+//! AMOLED synthwave theme: a true-black page carrying two accents.
 //!
-//! egui here has no `serde` feature, so the `Style` can't be deserialized directly (and would be
-//! version-fragile if it could). The color values below are transcribed from
-//! `mastertech_color_scheme.json`: a near-black theme with purple hovers, magenta actives, cyan
-//! warnings and pink errors. Spacing stays touch-sized rather than the source's desktop density.
+//! Hot pink ([`PINK`]) is the primary — anything selected, pressed, or active — and aqua ([`AQUA`])
+//! is the secondary — hover feedback, links, and live/info markers. Everything else is near-black
+//! with cool near-white text, so the two accents stay signals rather than noise. The interaction
+//! grammar is: rest = restrained dark surface, hover = aqua edge, press/active/selected = pink.
+//! Spacing stays touch-sized rather than desktop density.
 
 use egui::containers::scroll_area::ScrollBarVisibility;
 use egui::{Color32, CornerRadius, FontFamily, FontId, Sense, Stroke, TextStyle};
@@ -18,6 +19,19 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
+// AMOLED synthwave palette: a pure-black page carries two accents — hot pink is the primary
+// (selection, pressed/active widgets, primary ink, progress) and aqua is the secondary (hover,
+// links, live/info markers). Kept to two so each one stays a signal instead of noise.
+
+/// Primary accent — hot pink. The loudest colour in the app; reserved for what's active or chosen.
+pub const PINK: Color32 = Color32::from_rgb(255, 61, 139);
+/// A lifted pink for ink/text/rings where the base pink reads a touch dim on pure black.
+pub const PINK_BRIGHT: Color32 = Color32::from_rgb(255, 110, 168);
+/// Secondary accent — aqua/cyan. Hover feedback, hyperlinks, and "live/active" indicators.
+pub const AQUA: Color32 = Color32::from_rgb(43, 226, 214);
+/// A lifted aqua for text where the base reads dim.
+pub const AQUA_BRIGHT: Color32 = Color32::from_rgb(120, 240, 232);
+
 /// Circular floating-action diameter (queue, create menu, lock, undo, inpaint tools).
 pub const FAB_SIZE: f32 = 40.0;
 /// Vertical/horizontal step between stacked FABs.
@@ -25,34 +39,74 @@ pub const FAB_STEP: f32 = FAB_SIZE + 8.0;
 /// Inset from a pane edge to the FAB's top-left (`FAB_SIZE` + 10).
 pub const FAB_EDGE: f32 = FAB_SIZE + 10.0;
 
-/// Hot-pink icon ink (`error_fg` from the mastertech dump).
+/// Hot-pink icon ink (matches `error_fg` / the primary accent).
 pub fn fab_icon() -> Color32 {
-    rgb(255, 73, 137)
+    PINK
 }
 
-/// Default translucent FAB disc.
+/// Default translucent FAB disc — faint aqua-tinted glass over the AMOLED page.
 pub fn fab_bg() -> Color32 {
-    rgba(8, 8, 11, 190)
+    rgba(7, 16, 18, 208)
 }
 
-/// Selected / open FAB disc (active magenta panel).
+/// Selected / open FAB disc (pink-tinted, the primary "active" wash).
 pub fn fab_bg_on() -> Color32 {
-    rgba(70, 34, 74, 220)
+    rgba(92, 22, 54, 225)
 }
 
-/// Queue-busy FAB disc.
+/// Queue-busy FAB disc — aqua, the "live" accent.
 pub fn fab_bg_ok() -> Color32 {
-    rgba(18, 48, 28, 210)
+    rgba(10, 46, 46, 216)
 }
 
-/// Cancel FAB disc.
+/// Cancel FAB disc — deep pink/red.
 pub fn fab_bg_danger() -> Color32 {
-    rgba(72, 20, 36, 210)
+    rgba(84, 18, 44, 216)
 }
 
 /// Circular icon FAB with CENTER_CENTER glyph paint (avoids button-padding left bias on emoji).
 pub fn fab(ui: &mut egui::Ui, icon: &str, fill: Color32) -> egui::Response {
     fab_with_sense(ui, icon, fill, Sense::click_and_drag())
+}
+
+/// Selectable button that always keeps a frame (egui hides it when unselected + inactive).
+pub fn selectable<'a>(selected: bool, atoms: impl egui::IntoAtoms<'a>) -> egui::Button<'a> {
+    egui::Button::selectable(selected, atoms).frame_when_inactive(true)
+}
+
+/// [`Ui::selectable_label`] with a persistent frame, plus a neon pink rim when selected — egui's
+/// `interact_selectable` leaves `bg_stroke` off for the selected state, so the pink edge (the same
+/// signal a pressed button shows) is painted here on top of the selection fill.
+pub fn selectable_label<'a>(
+    ui: &mut egui::Ui,
+    selected: bool,
+    text: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    let resp = ui.add(selectable(selected, text));
+    if selected {
+        ui.painter().rect_stroke(
+            resp.rect,
+            CornerRadius::same(5),
+            Stroke::new(1.6, PINK),
+            egui::StrokeKind::Inside,
+        );
+    }
+    resp
+}
+
+/// [`Ui::selectable_value`] with a persistent frame.
+pub fn selectable_value<'a, Value: PartialEq>(
+    ui: &mut egui::Ui,
+    current_value: &mut Value,
+    selected_value: Value,
+    text: impl egui::IntoAtoms<'a>,
+) -> egui::Response {
+    let mut response = selectable_label(ui, *current_value == selected_value, text);
+    if response.clicked() && *current_value != selected_value {
+        *current_value = selected_value;
+        response.mark_changed();
+    }
+    response
 }
 
 fn fab_with_sense(
@@ -69,7 +123,7 @@ fn fab_with_sense(
         if resp.is_pointer_button_down_on() {
             fill = fab_bg_on();
         } else if resp.hovered() {
-            fill = rgba(46, 42, 66, 220);
+            fill = rgba(10, 40, 42, 224);
         }
     } else {
         fill = Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), fill.a() / 2);
@@ -77,8 +131,9 @@ fn fab_with_sense(
     let center = rect.center();
     let r = FAB_SIZE * 0.5;
     ui.painter().circle_filled(center, r, fill);
-    ui.painter().circle_stroke(center, r, Stroke::new(1.0, rgba(104, 108, 148, 140)));
-    let ink = if enabled { fab_icon() } else { rgba(255, 73, 137, 110) };
+    // Neon aqua rim — the FAB's glass edge (pairs with the pink icon for the synthwave read).
+    ui.painter().circle_stroke(center, r, Stroke::new(1.0, rgba(43, 226, 214, 140)));
+    let ink = if enabled { fab_icon() } else { rgba(255, 61, 139, 110) };
     let icon_pt = if icon.chars().count() > 1 { 15.0 } else { 17.0 };
     ui.painter().text(
         center,
@@ -103,71 +158,94 @@ pub fn tag_category_fill(cat: u8) -> Option<Color32> {
     }
 }
 
-/// Apply the theme to a context: dark, near-black, purple/magenta accented.
+/// Apply the theme: a true-black AMOLED page with hot-pink primary and aqua secondary accents.
 pub fn apply(ctx: &egui::Context) {
-    let text = rgb(232, 232, 232);
+    let text = rgb(233, 233, 239);
+    let text_bright = rgb(248, 250, 252);
+    // Rounded-but-restrained corners read modern without going bubbly on dense touch rows.
+    let radius = CornerRadius::same(5);
     let mut v = egui::Visuals::dark();
 
     v.override_text_color = Some(text);
-    // The page stays near-black; windows/menus sit a step brighter so they read as raised.
-    v.panel_fill = rgb(8, 8, 11);
-    v.window_fill = rgb(26, 26, 32);
-    v.window_stroke = Stroke::new(1.0, rgba(70, 72, 96, 180));
-    v.faint_bg_color = rgb(20, 20, 26);
-    v.extreme_bg_color = rgb(13, 13, 18);
-    v.code_bg_color = rgb(6, 6, 6);
-    v.hyperlink_color = rgb(140, 128, 255);
-    v.warn_fg_color = rgb(76, 219, 255);
-    v.error_fg_color = rgb(255, 73, 137);
-    v.selection.bg_fill = rgba(120, 70, 150, 150);
-    v.selection.stroke = Stroke::new(1.0, rgba(150, 130, 220, 255));
+    // The page is pure black (AMOLED); windows/menus lift a few points so they read as raised
+    // panes, and text wells sink below the page. Separators come from the strokes below.
+    v.panel_fill = rgb(0, 0, 0);
+    // Menus / dropdowns / modals share window_fill: a cool, faintly teal-tinted glass panel that
+    // lifts off the black page, with a visible cool rim so the container itself reads as glass
+    // even before you touch an item (the accent hover/press then lights up individual rows).
+    v.window_fill = rgb(18, 21, 27);
+    v.window_stroke = Stroke::new(1.2, rgba(72, 146, 156, 190));
+    v.faint_bg_color = rgb(10, 10, 13); // striped-row alternate — barely there on black
+    v.extreme_bg_color = rgb(7, 7, 10); // TextEdit / deep wells sink below the page
+    v.code_bg_color = rgb(5, 5, 7);
+    v.hyperlink_color = AQUA;
+    v.warn_fg_color = AQUA_BRIGHT;
+    v.error_fg_color = PINK;
+    // Primary accent: everything selected/active/highlighted is pink. A saturated-but-still-glassy
+    // fill so a selected chip reads as hot pink rather than a matte maroon, paired with the neon
+    // rim painted in `selectable_label`. egui also uses this fill for progress bars.
+    v.selection.bg_fill = rgba(255, 61, 139, 140);
+    v.selection.stroke = Stroke::new(1.4, rgba(255, 110, 168, 255));
     v.window_shadow = egui::epaint::Shadow {
-        offset: [0, 0],
-        blur: 5,
-        spread: 7,
-        color: rgba(2, 2, 2, 164),
+        offset: [0, 2],
+        blur: 12,
+        spread: 2,
+        color: rgba(0, 0, 0, 200),
     };
     v.popup_shadow = egui::epaint::Shadow {
-        offset: [0, 0],
-        blur: 5,
-        spread: 5,
-        color: rgba(0, 0, 0, 96),
+        offset: [0, 2],
+        blur: 10,
+        spread: 1,
+        color: rgba(0, 0, 0, 170),
     };
-    v.window_corner_radius = CornerRadius::same(4);
-    v.menu_corner_radius = CornerRadius::same(6);
+    v.window_corner_radius = CornerRadius::same(8);
+    v.menu_corner_radius = CornerRadius::same(8);
 
-    // Interactive widgets carry a visible border so they stand out against the dark page.
     let w = &mut v.widgets;
-    w.noninteractive.bg_fill = rgb(20, 20, 26);
-    w.noninteractive.weak_bg_fill = rgb(20, 20, 26);
-    w.noninteractive.bg_stroke = Stroke::new(1.0, rgba(66, 68, 90, 160));
+    // Non-interactive frames/labels/separators AND the indent rail beside collapsing bodies: a
+    // faintly cool line so an open section's body reads as a bounded, subtly-tinted region.
+    w.noninteractive.bg_fill = rgb(11, 11, 14);
+    w.noninteractive.weak_bg_fill = rgb(8, 8, 11);
+    w.noninteractive.bg_stroke = Stroke::new(1.0, rgba(58, 84, 96, 165));
     w.noninteractive.fg_stroke = Stroke::new(1.0, text);
-    w.noninteractive.corner_radius = CornerRadius::same(3);
+    w.noninteractive.corner_radius = radius;
 
-    w.inactive.bg_fill = rgb(30, 30, 38);
-    w.inactive.weak_bg_fill = rgb(22, 22, 28);
-    w.inactive.bg_stroke = Stroke::new(1.0, rgba(104, 108, 148, 210));
+    // At rest — buttons and (framed) collapsing headers: a restrained dark-glass panel just above
+    // the page (nudged a touch lighter than the first pass) with a faint cool rim, so the neon
+    // accents on hover/press carry the interaction.
+    w.inactive.bg_fill = rgb(22, 22, 27);
+    w.inactive.weak_bg_fill = rgb(18, 18, 22);
+    w.inactive.bg_stroke = Stroke::new(1.0, rgba(66, 68, 88, 155));
     w.inactive.fg_stroke = Stroke::new(1.0, text);
-    w.inactive.corner_radius = CornerRadius::same(3);
+    w.inactive.corner_radius = radius;
 
-    w.hovered.bg_fill = rgb(46, 42, 66);
-    w.hovered.weak_bg_fill = rgb(46, 42, 66);
-    w.hovered.bg_stroke = Stroke::new(1.2, rgba(150, 140, 226, 255));
-    w.hovered.fg_stroke = Stroke::new(1.5, rgb(245, 245, 245));
-    w.hovered.corner_radius = CornerRadius::same(3);
+    // Hover — aqua tinted glass: a translucent aqua fill over the black page under a neon aqua rim.
+    w.hovered.bg_fill = rgba(43, 226, 214, 42);
+    w.hovered.weak_bg_fill = rgba(43, 226, 214, 42);
+    w.hovered.bg_stroke = Stroke::new(1.5, rgba(43, 226, 214, 240));
+    w.hovered.fg_stroke = Stroke::new(1.5, text_bright);
+    w.hovered.corner_radius = radius;
 
-    w.active.bg_fill = rgb(70, 34, 74);
-    w.active.weak_bg_fill = rgba(150, 46, 92, 200);
-    w.active.bg_stroke = Stroke::new(1.4, rgba(190, 120, 210, 255));
-    w.active.fg_stroke = Stroke::new(2.0, rgb(255, 255, 255));
-    w.active.corner_radius = CornerRadius::same(3);
+    // Active / pressed — pink tinted glass: a translucent pink fill under a vivid neon pink rim.
+    w.active.bg_fill = rgba(255, 61, 139, 54);
+    w.active.weak_bg_fill = rgba(255, 61, 139, 54);
+    w.active.bg_stroke = Stroke::new(1.7, rgba(255, 61, 139, 245));
+    w.active.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+    w.active.corner_radius = radius;
 
-    w.open.bg_fill = rgb(30, 30, 38);
-    w.open.weak_bg_fill = rgb(30, 30, 38);
-    w.open.bg_stroke = Stroke::new(1.0, rgba(120, 116, 160, 230));
-    w.open.corner_radius = CornerRadius::same(3);
+    // Open (expanded combo / menu source): the rest panel under a bright aqua "open" rim.
+    w.open.bg_fill = rgb(22, 22, 27);
+    w.open.weak_bg_fill = rgb(18, 18, 22);
+    w.open.bg_stroke = Stroke::new(1.3, rgba(43, 226, 214, 205));
+    w.open.fg_stroke = Stroke::new(1.0, text);
+    w.open.corner_radius = radius;
 
     v.striped = true;
+    // Full-width framed collapsing headers read as tappable section buttons.
+    v.collapsing_header_frame = true;
+    // A left rail down every indented region — chiefly collapsing-header bodies — so an open
+    // section's contents read as a bounded, faintly-tinted group rather than floating on black.
+    v.indent_has_left_vline = true;
     ctx.set_visuals(v);
 
     ctx.all_styles_mut(|s| {

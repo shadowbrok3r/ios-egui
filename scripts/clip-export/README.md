@@ -136,9 +136,9 @@ Push it next to the existing anima / sd / wd14 packs. The durable location the a
 `/storage/emulated/0/ComfyUI/clip` (survives uninstall); the app's external files dir works too:
 
 ```sh
-adb push ~/clip /storage/emulated/0/ComfyUI/clip
+scripts/qnn-push-model.sh --durable --subdir clip ~/clip
 # or the app-private files dir:
-adb push ~/clip /sdcard/Android/data/com.example.comfyui/files/clip
+scripts/qnn-push-model.sh --subdir clip ~/clip
 ```
 
 On device the app scans those dirs; a `CLIPV`-marked subdir enables CLIP embeddings (and the

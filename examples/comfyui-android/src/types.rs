@@ -207,6 +207,37 @@ pub struct Params {
     pub video: VideoParams,
 }
 
+/// Create Main mode picker: image vs Wan video, with t2v/i2v split for video.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GenMode {
+    Txt2Img,
+    Img2Img,
+    Txt2Video,
+    Img2Video,
+}
+
+impl GenMode {
+    pub const ALL: [GenMode; 4] =
+        [GenMode::Txt2Img, GenMode::Img2Img, GenMode::Txt2Video, GenMode::Img2Video];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GenMode::Txt2Img => "Text to Image",
+            GenMode::Img2Img => "Image to Image",
+            GenMode::Txt2Video => "Text to Video",
+            GenMode::Img2Video => "Image to Video",
+        }
+    }
+
+    pub fn is_video(self) -> bool {
+        matches!(self, GenMode::Txt2Video | GenMode::Img2Video)
+    }
+
+    pub fn is_image(self) -> bool {
+        matches!(self, GenMode::Txt2Img | GenMode::Img2Img)
+    }
+}
+
 /// One configured app in the Create tab's enhance chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppStep {
@@ -355,6 +386,32 @@ impl Params {
         match self.model_kind {
             ModelKind::Checkpoint => &self.checkpoint,
             ModelKind::Diffusion => &self.unet_name,
+        }
+    }
+
+    /// Create Main mode picker value derived from [`Self::mode`] + [`VideoParams::video_t2v`].
+    pub fn gen_mode(&self) -> GenMode {
+        match self.mode {
+            Mode::Txt2Img => GenMode::Txt2Img,
+            Mode::Img2Img => GenMode::Img2Img,
+            Mode::Video if self.video.video_t2v => GenMode::Txt2Video,
+            Mode::Video => GenMode::Img2Video,
+        }
+    }
+
+    /// Write Create Main mode bits (checkpoint / Wan UNET picks are the caller's job).
+    pub fn set_gen_mode(&mut self, mode: GenMode) {
+        match mode {
+            GenMode::Txt2Img => self.mode = Mode::Txt2Img,
+            GenMode::Img2Img => self.mode = Mode::Img2Img,
+            GenMode::Txt2Video => {
+                self.mode = Mode::Video;
+                self.video.video_t2v = true;
+            }
+            GenMode::Img2Video => {
+                self.mode = Mode::Video;
+                self.video.video_t2v = false;
+            }
         }
     }
 
@@ -1145,6 +1202,62 @@ pub fn wan_version(path: &str) -> Option<(u8, u8)> {
     None
 }
 
+/// Whether a path names a high-noise Wan expert.
+pub fn is_wan_high_noise(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    l.contains("high_noise") || l.contains("highnoise") || l.contains("high-noise")
+}
+
+/// Whether a path names a low-noise Wan expert.
+pub fn is_wan_low_noise(path: &str) -> bool {
+    let l = path.to_ascii_lowercase();
+    l.contains("low_noise") || l.contains("lownoise") || l.contains("low-noise")
+}
+
+/// Pick high/low Wan UNETs for t2v or i2v from `unets` (marker match first, then any Wan pair).
+pub fn pick_wan_unet_pair(unets: &[String], t2v: bool) -> (Option<String>, Option<String>) {
+    let marker = if t2v { "t2v" } else { "i2v" };
+    let pick = |require_marker: bool| -> (Option<String>, Option<String>) {
+        let mut high = None;
+        let mut low = None;
+        for u in unets {
+            if !is_wan_related(u) {
+                continue;
+            }
+            let l = u.to_ascii_lowercase();
+            if require_marker && !l.contains(marker) {
+                continue;
+            }
+            if high.is_none() && is_wan_high_noise(u) {
+                high = Some(u.clone());
+            } else if low.is_none() && is_wan_low_noise(u) {
+                low = Some(u.clone());
+            }
+            if high.is_some() && low.is_some() {
+                break;
+            }
+        }
+        (high, low)
+    };
+    let (mut high, mut low) = pick(true);
+    if high.is_none() || low.is_none() {
+        let (h2, l2) = pick(false);
+        high = high.or(h2);
+        low = low.or(l2);
+    }
+    if high.is_none() || low.is_none() {
+        let d = VideoParams::default();
+        if t2v {
+            high = high.or_else(|| Some(d.unet_high.replace("i2v", "t2v")));
+            low = low.or_else(|| Some(d.unet_low.replace("i2v", "t2v")));
+        } else {
+            high = high.or(Some(d.unet_high));
+            low = low.or(Some(d.unet_low));
+        }
+    }
+    (high, low)
+}
+
 /// Whether the path looks Wan-related: a `wan` token (followed by a non-letter or a known
 /// family suffix like wanvideo/wanimate/wanx2v), a `wan` directory, or the lightx2v
 /// speed-LoRA family. Generic video tokens (i2v/t2v) alone don't qualify — other video
@@ -1663,6 +1776,10 @@ pub struct Settings {
     /// Per-character accepted gallery keys; every approval sharpens the match centroid.
     #[serde(default)]
     pub character_approved: std::collections::BTreeMap<String, Vec<String>>,
+    /// User-added guided-wizard chips, keyed by trait title, so a tag typed into "Anything else"
+    /// resurfaces as a selectable chip on every future run of that step.
+    #[serde(default)]
+    pub wizard_custom_tags: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 pub fn default_server_output_root() -> String {
@@ -1932,6 +2049,23 @@ mod tests {
         assert_eq!(wan_version("Wan/wan_motion.safetensors"), None);
         assert_eq!(wan_version("SDXL/swan_2.2_style.safetensors"), None);
         assert_eq!(wan_version("detail_tweaker.safetensors"), None);
+    }
+
+    #[test]
+    fn pick_wan_unet_pair_prefers_marker_then_any_wan() {
+        let unets = vec![
+            "other.safetensors".into(),
+            "Wan/wan2.2_t2v_high_noise_14B.safetensors".into(),
+            "Wan/wan2.2_t2v_low_noise_14B.safetensors".into(),
+            "Wan/wan2.2_i2v_high_noise_14B.safetensors".into(),
+            "Wan/wan2.2_i2v_low_noise_14B.safetensors".into(),
+        ];
+        let (h, l) = pick_wan_unet_pair(&unets, false);
+        assert!(h.unwrap().contains("i2v"));
+        assert!(l.unwrap().contains("i2v"));
+        let (h, l) = pick_wan_unet_pair(&unets, true);
+        assert!(h.unwrap().contains("t2v"));
+        assert!(l.unwrap().contains("t2v"));
     }
 
     /// Wan-relatedness: wan token or directory, lightx2v family; generic video tokens don't count.

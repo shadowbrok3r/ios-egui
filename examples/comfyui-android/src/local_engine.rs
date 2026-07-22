@@ -445,7 +445,7 @@ fn run_sd15(
             image.height,
             png.len()
         ));
-        send(Msg::Result { image: ci, bytes: png });
+        send(Msg::Result { image: ci, bytes: png, label: "Local NPU".into() });
         Ok(())
     })();
 
@@ -580,7 +580,7 @@ fn run_anima(
             image.height,
             png.len()
         ));
-        send(Msg::Result { image: ci, bytes: png });
+        send(Msg::Result { image: ci, bytes: png, label: "Local Anima".into() });
         Ok(())
     })();
 
@@ -777,9 +777,21 @@ pub fn rewrite_prompt(
     kind: local_rewrite::RewriteKind,
     text: String,
 ) -> Result<String, String> {
+    rewrite_prompt_budget(pack_dir, kind, text, 256)
+}
+
+/// [`rewrite_prompt`] with an explicit output-token budget. The character composer passes a
+/// bigger one: a full eight-trait sheet can legitimately need more than the menu rewrites' 256.
+pub fn rewrite_prompt_budget(
+    pack_dir: PathBuf,
+    kind: local_rewrite::RewriteKind,
+    text: String,
+    max_tokens: usize,
+) -> Result<String, String> {
     let t = Instant::now();
     let rw = local_rewrite::Rewriter::open(&pack_dir).map_err(|e| format!("pack: {e}"))?;
-    let out = rw.rewrite(kind.system(), &text, 256).map_err(|e| format!("rewrite: {e}"))?;
+    let out =
+        rw.rewrite(kind.system(), &text, max_tokens).map_err(|e| format!("rewrite: {e}"))?;
     // Tag-shaped outputs never legitimately repeat a tag; drop echoes from a degenerate decode.
     let out =
         if kind.dedupes_tags() { local_rewrite::dedupe_comma_segments(&out) } else { out };

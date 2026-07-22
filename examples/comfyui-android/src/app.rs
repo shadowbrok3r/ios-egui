@@ -31,10 +31,10 @@ use crate::types::{
     CharacterPack, CheckpointCatalog, CheckpointSort,
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
-    GalleryItem, GalleryMedia, GallerySort, GalleryView, Img2ImgSource, LoraCatalog, LoraPack, Mode,
-    TrashItem,
-    ModelKind, Params, PromptHist, RatingFilter, SamplerPack, Settings, append_negatives,
-    checkpoint_family, fallback_vec, file_basename, merge_triggers, push_prompt_hist, strip_injected,
+    GalleryItem, GalleryMedia, GallerySort, GalleryView, GenMode, Img2ImgSource, LoraCatalog,
+    LoraPack, Mode, TrashItem, ModelKind, Params, PromptHist, RatingFilter, SamplerPack, Settings,
+    append_negatives, checkpoint_family, fallback_vec, file_basename, is_wan_related, merge_triggers,
+    pick_wan_unet_pair, push_prompt_hist, strip_injected,
 };
 #[cfg(feature = "local-npu")]
 use crate::types::LocalBackend;
@@ -85,6 +85,134 @@ struct CharacterDraft {
     /// The existing card's name being edited; `None` for a brand-new card.
     editing: Option<String>,
     card: CharacterCard,
+}
+
+/// The guided character builder's walk order: (title, hint, multi-select, preset tag chips).
+/// Chips are finished danbooru tags so the deterministic fallback composer can just join them;
+/// the free-text custom field is where the LLM composer earns its keep.
+const WIZ_TRAITS: &[(&str, &str, bool, &[&str])] = &[
+    ("Subject", "Who is this character?", false, &["1girl", "1boy", "1other", "2girls"]),
+    ("Hair color", "Pick one, or describe your own below.", false, &[
+        "blonde hair", "brown hair", "black hair", "red hair", "orange hair", "silver hair",
+        "white hair", "blue hair", "pink hair", "purple hair", "green hair", "aqua hair",
+    ]),
+    ("Hair style", "Pick any that apply.", true, &[
+        "long hair", "short hair", "medium hair", "ponytail", "twintails", "twin braids",
+        "braid", "bob cut", "hime cut", "messy hair", "wavy hair", "drill hair", "ahoge", "bangs",
+    ]),
+    ("Eye color", "Pick one, or describe your own below.", false, &[
+        "blue eyes", "red eyes", "green eyes", "brown eyes", "amber eyes", "purple eyes",
+        "aqua eyes", "grey eyes", "heterochromia",
+    ]),
+    ("Body", "Build, skin, and any non-human features.", true, &[
+        "petite", "tall", "curvy", "muscular", "pale skin", "dark skin", "tan", "freckles",
+        "pointy ears", "cat ears", "fox ears", "horns", "wings", "tail",
+    ]),
+    ("Outfit", "What do they usually wear?", true, &[
+        "school uniform", "maid outfit", "armor", "kimono", "dress", "sundress", "hoodie",
+        "suit", "gothic", "casual", "cape", "coat", "swimsuit", "sportswear",
+    ]),
+    ("Accessories", "Finishing touches.", true, &[
+        "glasses", "hair ribbon", "hairclip", "hat", "earrings", "necklace", "choker",
+        "scarf", "gloves", "thighhighs", "bag", "sword",
+    ]),
+    ("Pose & expression", "How do they carry themselves?", true, &[
+        "standing", "sitting", "arms crossed", "hands on hips", "looking at viewer", "smile",
+        "serious", "shy", "smirk", "angry", "closed eyes", "head tilt",
+    ]),
+];
+
+/// Per-category ceiling on user-saved wizard chips, so a paste of a huge list can't balloon the
+/// persisted settings file.
+const WIZ_CUSTOM_TAGS_CAP: usize = 40;
+
+/// One trait step's answer: the chips picked from [`WIZ_TRAITS`] plus a free-text extra.
+#[derive(Default, Clone)]
+struct TraitSel {
+    picked: Vec<String>,
+    custom: String,
+}
+
+/// Where the guided character builder is in its walk.
+#[derive(PartialEq, Clone, Copy)]
+enum WizStep {
+    /// Index into [`WIZ_TRAITS`].
+    Trait(usize),
+    /// Review / edit the composed identity prompt and name the character.
+    Review,
+    /// Pick a checkpoint — by hand, or by rating a blind taste test.
+    Checkpoint,
+}
+
+/// The guided "walk me through a character" builder. Session-only, like the drafts: half-built
+/// characters are cheap to redo, and the finished card goes through the normal editor to save.
+struct CharacterWizard {
+    step: WizStep,
+    name: String,
+    /// One answer slot per [`WIZ_TRAITS`] row.
+    sel: Vec<TraitSel>,
+    /// Composed identity tags, editable on the review step.
+    identity: String,
+    /// The composer LLM is running; the deterministic chip join stands in until it lands.
+    composing: bool,
+    /// Set once so re-entering the review step doesn't clobber the user's edits by recomposing.
+    composed_once: bool,
+    #[cfg(feature = "local-npu")]
+    compose_rx: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// A finished compose awaiting accept/discard, as `(original, composed)`. Shown as a diff
+    /// modal like the Create-page Rewrite button, so the model's edit is never a silent swap —
+    /// the user sees exactly what changed and keeps their own text or the AI's.
+    compose_review: Option<(String, String)>,
+    /// Chosen checkpoint file; empty = keep whatever model is current when the card applies.
+    checkpoint: String,
+    test: Option<TasteTest>,
+}
+
+impl CharacterWizard {
+    fn new() -> Self {
+        Self {
+            step: WizStep::Trait(0),
+            name: String::new(),
+            sel: vec![TraitSel::default(); WIZ_TRAITS.len()],
+            identity: String::new(),
+            composing: false,
+            composed_once: false,
+            #[cfg(feature = "local-npu")]
+            compose_rx: None,
+            compose_review: None,
+            checkpoint: String::new(),
+            test: None,
+        }
+    }
+}
+
+/// Hard ceiling on taste-test images; candidates × images-per is clamped under it.
+const TASTE_MAX_IMAGES: usize = 15;
+/// Hard ceiling on taste-test jobs, matching the multi-queue per-tap convention.
+const TASTE_MAX_JOBS: usize = 8;
+
+/// A running / finished checkpoint taste test: the same prompt and seed fanned out across
+/// several checkpoints, rated blind (models are only revealed after the user picks favorites).
+struct TasteTest {
+    /// Candidate checkpoint files (the labels below carry the index here).
+    candidates: Vec<String>,
+    /// The exact job label submitted per candidate. Results/Done route into the wizard by full
+    /// label match — a prefix scheme could be spoofed by a positive prompt that happens to
+    /// start with it (normal-run labels are elided positive prompts), and the label must not
+    /// name the model: it shows verbatim in the queue sheet mid-test, which would de-blind it.
+    labels: Vec<String>,
+    /// Images per checkpoint; `candidates × per` stays under [`TASTE_MAX_IMAGES`].
+    per: u32,
+    /// One shared fixed seed so every checkpoint draws the same latent — a fair comparison.
+    seed: u64,
+    /// Jobs still outstanding (decremented as their `Done` labels arrive).
+    pending: usize,
+    /// Arrived images as (candidate index, texture); arrival order is display order.
+    images: Vec<(usize, egui::TextureHandle)>,
+    /// Indices into `images` the user starred.
+    picks: HashSet<usize>,
+    /// A winner was chosen — reveal which checkpoint made each tile.
+    revealed: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -729,6 +857,11 @@ struct ComfyApp {
     active_character: Option<AppliedCharacter>,
     /// Open card editor, or `None` when showing the card list.
     character_draft: Option<CharacterDraft>,
+    /// Open guided character builder, or `None`; takes over the pane like the editor does.
+    character_wizard: Option<CharacterWizard>,
+    /// User-added guided-wizard chips, keyed by trait title, so a tag typed into "Anything else"
+    /// resurfaces as a selectable chip on every future run of that same step (persisted).
+    wizard_custom_tags: std::collections::BTreeMap<String, Vec<String>>,
     /// Per-character denied gallery keys (persisted), keyed by card name; never re-surfaced.
     character_denied: std::collections::BTreeMap<String, Vec<String>>,
     /// Per-character pending match suggestions (persisted, capped), keyed by card name.
@@ -1366,6 +1499,8 @@ impl ComfyApp {
             characters: Vec::new(),
             active_character: None,
             character_draft: None,
+            character_wizard: None,
+            wizard_custom_tags: std::collections::BTreeMap::new(),
             character_denied: std::collections::BTreeMap::new(),
             character_suggestions: std::collections::BTreeMap::new(),
             character_approved: std::collections::BTreeMap::new(),
@@ -2226,16 +2361,22 @@ impl ComfyApp {
             Msg::Preview(ci) => {
                 self.preview = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR));
             }
-            Msg::Result { image, bytes } => {
+            Msg::Result { image, bytes, label } => {
                 self.result_seq = self.result_seq.wrapping_add(1);
                 let name = format!("result-{}", self.result_seq);
                 let tex = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
-                self.result = Some(tex.clone());
-                self.result_bytes = Some(bytes.clone());
-                self.results.push((tex, bytes));
-                self.preview = None;
-                self.note.clear();
-                self.create_scroll_bottom = true;
+                // Taste-test images belong to the wizard's blind grid, not the results strip.
+                // If the wizard closed mid-run they fall through and show up like a normal run.
+                if self.wizard_take_test_image(&label, &tex) {
+                    self.preview = None;
+                } else {
+                    self.result = Some(tex.clone());
+                    self.result_bytes = Some(bytes.clone());
+                    self.results.push((tex, bytes));
+                    self.preview = None;
+                    self.note.clear();
+                    self.create_scroll_bottom = true;
+                }
             }
             Msg::NodeExecuting(node) => {
                 if let Some(n) = node {
@@ -2276,12 +2417,21 @@ impl ComfyApp {
                 }
             }
             Msg::Done(label) => {
+                let taste = self.wizard_is_test_label(&label);
+                self.wizard_test_done(&label);
                 self.jobs_left = self.jobs_left.saturating_sub(1);
                 self.progress = (0, 0);
                 self.executing = None;
                 if self.jobs_left == 0 {
+                    // Nothing local is in flight at all, so no taste job can still be pending —
+                    // heals a count skewed by unlabeled errors from concurrently queued runs.
+                    if let Some(t) = self.character_wizard.as_mut().and_then(|w| w.test.as_mut()) {
+                        t.pending = 0;
+                    }
                     self.running = false;
-                    self.status = if self.params.mode == Mode::Video {
+                    self.status = if taste {
+                        "Taste test done — tap the images you like".into()
+                    } else if self.params.mode == Mode::Video {
                         "Done — video saved to the Gallery".into()
                     } else {
                         "Done".into()
@@ -2290,21 +2440,40 @@ impl ComfyApp {
                         self.gallery_status = "Finished video saved to the Gallery".into();
                     }
                     host.haptic(Haptic::Success);
-                    // No image count here: `results` accumulates across mixed create/graph runs,
-                    // so any number would routinely be a lie.
-                    host.notify("ComfyUI", &format!("{} finished", elide(&label, 40)));
-                    // New outputs should show up without a manual refresh (retry once for index lag).
-                    if matches!(self.conn, Conn::Connected) {
-                        // Snapshot the pre-refresh listing to diff out the post-burst results.
-                        self.pre_burst_keys = self.gallery.iter().map(|it| it.key()).collect();
-                        self.pending_triage_n = self.results.len();
-                        self.triage_collect = 2;
-                        // Don't clear the listing out from under an open triage deck.
-                        if self.triage.is_some() {
-                            self.gallery_refresh_pending = true;
-                        } else {
-                            self.refresh_gallery();
-                            self.gallery_refresh_at = Some(ctx.input(|i| i.time) + 2.0);
+                    if taste {
+                        host.notify("ComfyUI", "Taste test finished — come rate the images");
+                        // Refresh so the outputs exist in the gallery view, but never arm the
+                        // triage sweep: a taste burst is throwaway comparisons, not keepers,
+                        // and collect_untriaged diffs the listing (n=0 wouldn't suppress it).
+                        if matches!(self.conn, Conn::Connected) {
+                            self.pre_burst_keys.clear();
+                            self.pending_triage_n = 0;
+                            self.triage_collect = 0;
+                            if self.triage.is_some() {
+                                self.gallery_refresh_pending = true;
+                            } else {
+                                self.refresh_gallery();
+                                self.gallery_refresh_at = Some(ctx.input(|i| i.time) + 2.0);
+                            }
+                        }
+                    } else {
+                        // No image count here: `results` accumulates across mixed create/graph
+                        // runs, so any number would routinely be a lie.
+                        host.notify("ComfyUI", &format!("{} finished", elide(&label, 40)));
+                        // New outputs should show up without a manual refresh (retry once for
+                        // index lag).
+                        if matches!(self.conn, Conn::Connected) {
+                            // Snapshot the pre-refresh listing to diff the post-burst results.
+                            self.pre_burst_keys = self.gallery.iter().map(|it| it.key()).collect();
+                            self.pending_triage_n = self.results.len();
+                            self.triage_collect = 2;
+                            // Don't clear the listing out from under an open triage deck.
+                            if self.triage.is_some() {
+                                self.gallery_refresh_pending = true;
+                            } else {
+                                self.refresh_gallery();
+                                self.gallery_refresh_at = Some(ctx.input(|i| i.time) + 2.0);
+                            }
                         }
                     }
                 } else {
@@ -2313,6 +2482,10 @@ impl ComfyApp {
                 }
             }
             Msg::Cancelled => {
+                // A cancel takes every outstanding taste-test job with it.
+                if let Some(t) = self.character_wizard.as_mut().and_then(|w| w.test.as_mut()) {
+                    t.pending = 0;
+                }
                 self.jobs_left = 0;
                 self.running = false;
                 self.progress = (0, 0);
@@ -2331,7 +2504,14 @@ impl ComfyApp {
                 };
             }
             Msg::GenError(e) => {
+                self.wizard_test_error();
                 self.jobs_left = self.jobs_left.saturating_sub(1);
+                // Same drained-queue heal as the Done arm, for an all-errors burst.
+                if self.jobs_left == 0
+                    && let Some(t) = self.character_wizard.as_mut().and_then(|w| w.test.as_mut())
+                {
+                    t.pending = 0;
+                }
                 self.progress = (0, 0);
                 self.executing = None;
                 // The failed prompt may never have reached the server (queue POST error) and
@@ -2586,11 +2766,7 @@ impl ComfyApp {
                     self.viewer_remix_pending = false;
                     match self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty())
                     {
-                        Some(meta) => {
-                            self.gallery_status.clear();
-                            self.open_remix_sheet(meta);
-                            host.haptic(Haptic::Light);
-                        }
+                        Some(meta) => self.begin_remix(meta, host),
                         None => self.gallery_status = "No workflow metadata to remix".into(),
                     }
                 }
@@ -2609,10 +2785,7 @@ impl ComfyApp {
                     // The workflow fetch is gone for good — the gate's quick summary (if any)
                     // is the best remix material this image will ever have.
                     match self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty()) {
-                        Some(meta) => {
-                            self.gallery_status.clear();
-                            self.open_remix_sheet(meta);
-                        }
+                        Some(meta) => self.begin_remix(meta, host),
                         None => self.gallery_status = "No workflow metadata to remix".into(),
                     }
                 }
@@ -4011,6 +4184,7 @@ impl ComfyApp {
             character_denied: self.character_denied.clone(),
             character_suggestions: self.character_suggestions.clone(),
             character_approved: self.character_approved.clone(),
+            wizard_custom_tags: self.wizard_custom_tags.clone(),
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -4066,6 +4240,7 @@ impl ComfyApp {
         self.character_denied = saved.character_denied;
         self.character_suggestions = saved.character_suggestions;
         self.character_approved = saved.character_approved;
+        self.wizard_custom_tags = saved.wizard_custom_tags;
         self.character_centroids.clear();
         self.checkpoint_sort = saved.checkpoint_sort;
         self.checkpoint_favorites = saved.checkpoint_favorites;
@@ -4330,8 +4505,8 @@ impl ComfyApp {
 
     fn settings_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.settings_pane, SettingsPane::Server, "Server");
-            ui.selectable_value(
+            crate::theme::selectable_value(ui, &mut self.settings_pane, SettingsPane::Server, "Server");
+            crate::theme::selectable_value(ui, 
                 &mut self.settings_pane,
                 SettingsPane::Logs,
                 format!("{} Logs", icons::LOGS),
@@ -4348,282 +4523,290 @@ impl ComfyApp {
         self.scroll_focus_into_view(ui);
         crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
-            ui.heading(format!("{} Server", icons::LINK));
-            ui.group(|ui| {
-                ui.label("URL");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.server_url)
-                        .hint_text("https://host/api  or  http://192.168.x.x:8188")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.weak("Include any path prefix the API is served under.");
-                ui.add_space(6.0);
-                ui.label(format!("{} API key", icons::KEY));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.api_key)
-                        .password(true)
-                        .hint_text("optional — sent as X-Api-Key / Bearer")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.add_space(6.0);
-                ui.label("Server output root");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.server_output_root)
-                        .hint_text("/data/output/")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.weak("Container path of ComfyUI's output dir — used to finish gallery videos.");
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let connecting = matches!(self.conn, Conn::Connecting);
-                    let label = match self.conn {
-                        Conn::Disconnected => "Connect",
-                        Conn::Connecting => "Connecting…",
-                        Conn::Connected => "Reconnect",
-                        Conn::Failed(_) => "Retry",
-                    };
-                    let enabled = !connecting && !self.server_url.trim().is_empty();
-                    let btn = egui::Button::new(label).min_size(egui::vec2(120.0, 32.0));
-                    if ui.add_enabled(enabled, btn).clicked() {
-                        self.connect_manual = true;
-                        self.connect(host);
-                    }
-                    self.conn_status(ui);
-                });
-            });
-
-            ui.add_space(12.0);
-            ui.heading(format!("{} Account", icons::USER));
-            ui.group(|ui| {
-                if self.session.is_empty() {
-                    ui.weak(
-                        "Sign in to use your own gallery and albums. An API key alone also works — \
-                         both authenticate as the same user.",
-                    );
-                    ui.add_space(4.0);
+            egui::CollapsingHeader::new(format!("{} Server", icons::LINK))
+                .id_salt("settings_server")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label("URL");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.username)
-                            .hint_text("username")
+                        egui::TextEdit::singleline(&mut self.server_url)
+                            .hint_text("https://host/api  or  http://192.168.x.x:8188")
                             .desired_width(f32::INFINITY),
                     );
-                    let pw = ui.add(
-                        egui::TextEdit::singleline(&mut self.password)
-                            .password(true)
-                            .hint_text("password")
-                            .desired_width(f32::INFINITY),
-                    );
-                    let submit = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.weak("Include any path prefix the API is served under.");
                     ui.add_space(6.0);
+                    ui.label(format!("{} API key", icons::KEY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.api_key)
+                            .password(true)
+                            .hint_text("optional — sent as X-Api-Key / Bearer")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.add_space(6.0);
+                    ui.label("Server output root");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.server_output_root)
+                            .hint_text("/data/output/")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.weak("Container path of ComfyUI's output dir — used to finish gallery videos.");
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        let ready = !self.signing_in
-                            && !self.server_url.trim().is_empty()
-                            && !self.username.trim().is_empty()
-                            && !self.password.is_empty();
-                        let btn = egui::Button::new("Sign in").min_size(egui::vec2(120.0, 32.0));
-                        if (ui.add_enabled(ready, btn).clicked() || (submit && ready))
+                        let connecting = matches!(self.conn, Conn::Connecting);
+                        let label = match self.conn {
+                            Conn::Disconnected => "Connect",
+                            Conn::Connecting => "Connecting…",
+                            Conn::Connected => "Reconnect",
+                            Conn::Failed(_) => "Retry",
+                        };
+                        let enabled = !connecting && !self.server_url.trim().is_empty();
+                        let btn = egui::Button::new(label).min_size(egui::vec2(120.0, 32.0));
+                        if ui.add_enabled(enabled, btn).clicked() {
+                            self.connect_manual = true;
+                            self.connect(host);
+                        }
+                        self.conn_status(ui);
+                    });
+                });
+
+            egui::CollapsingHeader::new(format!("{} Account", icons::USER))
+                .id_salt("settings_account")
+                .default_open(true)
+                .show(ui, |ui| {
+                    if self.session.is_empty() {
+                        ui.weak(
+                            "Sign in to use your own gallery and albums. An API key alone also works — \
+                             both authenticate as the same user.",
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.username)
+                                .hint_text("username")
+                                .desired_width(f32::INFINITY),
+                        );
+                        let pw = ui.add(
+                            egui::TextEdit::singleline(&mut self.password)
+                                .password(true)
+                                .hint_text("password")
+                                .desired_width(f32::INFINITY),
+                        );
+                        let submit = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            let ready = !self.signing_in
+                                && !self.server_url.trim().is_empty()
+                                && !self.username.trim().is_empty()
+                                && !self.password.is_empty();
+                            let btn = egui::Button::new("Sign in").min_size(egui::vec2(120.0, 32.0));
+                            if (ui.add_enabled(ready, btn).clicked() || (submit && ready))
+                                && let Some(engine) = self.engine.as_ref()
+                            {
+                                self.signing_in = true;
+                                self.auth_note = "Signing in…".into();
+                                engine.sign_in(
+                                    self.server_url.clone(),
+                                    self.username.trim().to_string(),
+                                    std::mem::take(&mut self.password),
+                                );
+                            }
+                            if self.signing_in {
+                                ui.spinner();
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} Signed in as", icons::USER));
+                            ui.strong(elide(&self.username, 40));
+                        });
+                        ui.add_space(6.0);
+                        if ui.button("Sign out").clicked()
                             && let Some(engine) = self.engine.as_ref()
                         {
-                            self.signing_in = true;
-                            self.auth_note = "Signing in…".into();
-                            engine.sign_in(
-                                self.server_url.clone(),
-                                self.username.trim().to_string(),
-                                std::mem::take(&mut self.password),
-                            );
+                            engine.sign_out(self.server_url.clone(), self.session.clone());
                         }
-                        if self.signing_in {
-                            ui.spinner();
-                        }
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{} Signed in as", icons::USER));
-                        ui.strong(elide(&self.username, 40));
-                    });
-                    ui.add_space(6.0);
-                    if ui.button("Sign out").clicked()
-                        && let Some(engine) = self.engine.as_ref()
-                    {
-                        engine.sign_out(self.server_url.clone(), self.session.clone());
                     }
-                }
-                if !self.auth_note.is_empty() {
-                    ui.add_space(4.0);
-                    let signed_in = !self.session.is_empty();
-                    ui.colored_label(
-                        if signed_in {
-                            egui::Color32::from_rgb(120, 220, 140)
-                        } else {
-                            egui::Color32::from_rgb(230, 180, 120)
-                        },
-                        elide(&self.auth_note, 160),
-                    );
-                }
-            });
+                    if !self.auth_note.is_empty() {
+                        ui.add_space(4.0);
+                        let signed_in = !self.session.is_empty();
+                        ui.colored_label(
+                            if signed_in {
+                                egui::Color32::from_rgb(120, 220, 140)
+                            } else {
+                                egui::Color32::from_rgb(230, 180, 120)
+                            },
+                            elide(&self.auth_note, 160),
+                        );
+                    }
+                });
             #[cfg(feature = "local-npu")]
             {
                 self.ensure_local_packs(host, false);
-                ui.add_space(12.0);
-                ui.heading("Local NPU");
-                ui.group(|ui| {
-                    ui.checkbox(&mut self.local_npu, "Local NPU features (experimental)");
-                    ui.weak(
-                        "Enables the on-device stack: auto-tag, CLIP embeds, Read tags and Rewrite. \
-                         Create generation runs on-device only when a local pack is the chosen \
-                         model; pick 'Server model' to generate on the server with these features \
-                         still on. SD1.5 packs are 512² (unet.bin / vae_decoder.bin / \
-                         tokenizer.json / clip.safetensors); Anima packs are 1024² with an ANIMA \
-                         marker file.",
-                    );
-                    ui.add_space(6.0);
-                    ui.weak("Pick the Create model (a pack or Server model), test it, or import a pack in Create -> Models.");
-                    ui.add_space(6.0);
-                    ui.checkbox(&mut self.auto_tag, "Auto-tag gallery (NPU)");
-                    ui.weak(
-                        "Tags the whole server gallery on-device while idle; results power the \
-                         gallery tag search, facet chips and rating filter. Pauses during \
-                         generation. Needs a wd14 pack.",
-                    );
-                    ui.add_space(4.0);
-                    if ui.button("Unload NPU cache").clicked() {
-                        crate::local_engine::drop_cache();
-                        self.log.info("local-npu: asset caches dropped");
-                    }
-                });
-                self.local_pack_status_panel(ui, host);
+                egui::CollapsingHeader::new("Local NPU")
+                    .id_salt("settings_local_npu")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.checkbox(&mut self.local_npu, "Local NPU features (experimental)");
+                        ui.weak(
+                            "Enables the on-device stack: auto-tag, CLIP embeds, Read tags and Rewrite. \
+                             Create generation runs on-device only when a local pack is the chosen \
+                             model; pick 'Server model' to generate on the server with these features \
+                             still on. SD1.5 packs are 512² (unet.bin / vae_decoder.bin / \
+                             tokenizer.json / clip.safetensors); Anima packs are 1024² with an ANIMA \
+                             marker file.",
+                        );
+                        ui.add_space(6.0);
+                        ui.weak("Pick the Create model (a pack or Server model), test it, or import a pack in Create -> Models.");
+                        ui.add_space(6.0);
+                        ui.checkbox(&mut self.auto_tag, "Auto-tag gallery (NPU)");
+                        ui.weak(
+                            "Tags the whole server gallery on-device while idle; results power the \
+                             gallery tag search, facet chips and rating filter. Pauses during \
+                             generation. Needs a wd14 pack.",
+                        );
+                        ui.add_space(4.0);
+                        if ui.button("Unload NPU cache").clicked() {
+                            crate::local_engine::drop_cache();
+                            self.log.info("local-npu: asset caches dropped");
+                        }
+                        self.local_pack_status_panel(ui, host);
+                    });
             }
 
-            ui.add_space(12.0);
-            ui.heading(format!("{} Gallery", icons::GALLERY));
-            ui.group(|ui| {
-                ui.label("Images per page");
-                ui.add(
-                    egui::Slider::new(&mut self.gallery_page, 20..=GALLERY_PAGE_MAX)
-                        .suffix(" images")
-                        .logarithmic(true),
-                );
-                ui.weak("How many rows Load more / preload fetches at once.");
-                ui.add_space(8.0);
-                self.gallery_cache_settings(ui, host);
-                ui.add_space(4.0);
-                ui.checkbox(&mut self.gallery_view.groups_open, "Open group headers by default");
-                ui.checkbox(
-                    &mut self.confirm_gallery_delete,
-                    "Confirm before deleting gallery images",
-                );
-            });
+            egui::CollapsingHeader::new(format!("{} Gallery", icons::GALLERY))
+                .id_salt("settings_gallery")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.label("Images per page");
+                    ui.add(
+                        egui::Slider::new(&mut self.gallery_page, 20..=GALLERY_PAGE_MAX)
+                            .suffix(" images")
+                            .logarithmic(true),
+                    );
+                    ui.weak("How many rows Load more / preload fetches at once.");
+                    ui.add_space(8.0);
+                    self.gallery_cache_settings(ui, host);
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.gallery_view.groups_open, "Open group headers by default");
+                    ui.checkbox(
+                        &mut self.confirm_gallery_delete,
+                        "Confirm before deleting gallery images",
+                    );
+                });
 
-            ui.add_space(12.0);
-            ui.heading("Text size");
-            ui.group(|ui| {
-                let mut changed = false;
-                ui.horizontal(|ui| {
-                    ui.label("Heading");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut self.fonts.heading).range(12.0..=36.0).speed(0.5))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Body");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut self.fonts.body).range(10.0..=28.0).speed(0.5))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Button");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut self.fonts.button).range(10.0..=28.0).speed(0.5))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Small");
-                    changed |= ui
-                        .add(egui::DragValue::new(&mut self.fonts.small).range(8.0..=20.0).speed(0.5))
-                        .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Mono");
-                    changed |= ui
-                        .add(
-                            egui::DragValue::new(&mut self.fonts.monospace)
-                                .range(9.0..=24.0)
-                                .speed(0.5),
-                        )
-                        .changed();
-                });
-                if changed {
-                    self.fonts.clamp();
-                    crate::theme::apply_fonts(ui.ctx(), &self.fonts);
-                }
-                if ui.button("Reset text sizes").clicked() {
-                    self.fonts = FontSizes::default();
-                    crate::theme::apply_fonts(ui.ctx(), &self.fonts);
-                }
-            });
-
-            ui.add_space(12.0);
-            ui.heading(format!("{} Graph", icons::GRAPH));
-            ui.group(|ui| {
-                ui.checkbox(&mut self.auto_follow, "Auto-follow executing node");
-                ui.checkbox(
-                    &mut self.auto_arrange,
-                    "Auto-arrange when you open a loaded workflow",
-                );
-                ui.weak("The open workflow is saved automatically and restored after connect.");
-            });
-
-            ui.add_space(12.0);
-            ui.heading(format!("{} Backup", icons::SAVE));
-            ui.group(|ui| {
-                ui.weak("Encrypts server URL, API key, session, characters, presets, and Create settings.");
-                ui.weak("Password is never included. Share the .comfybk file off-device before reinstall.");
-                ui.label("Export passphrase");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.backup_pass)
-                        .password(true)
-                        .hint_text("min 8 chars")
-                        .desired_width(f32::INFINITY),
-                );
-                ui.label("Confirm");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.backup_pass_confirm)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                );
-                ui.horizontal(|ui| {
-                    if ui.button("Export encrypted backup").clicked() {
-                        self.export_encrypted_backup(host);
+            egui::CollapsingHeader::new("Text size")
+                .id_salt("settings_text_size")
+                .default_open(false)
+                .show(ui, |ui| {
+                    let mut changed = false;
+                    ui.horizontal(|ui| {
+                        ui.label("Heading");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut self.fonts.heading).range(12.0..=36.0).speed(0.5))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Body");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut self.fonts.body).range(10.0..=28.0).speed(0.5))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Button");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut self.fonts.button).range(10.0..=28.0).speed(0.5))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Small");
+                        changed |= ui
+                            .add(egui::DragValue::new(&mut self.fonts.small).range(8.0..=20.0).speed(0.5))
+                            .changed();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Mono");
+                        changed |= ui
+                            .add(
+                                egui::DragValue::new(&mut self.fonts.monospace)
+                                    .range(9.0..=24.0)
+                                    .speed(0.5),
+                            )
+                            .changed();
+                    });
+                    if changed {
+                        self.fonts.clamp();
+                        crate::theme::apply_fonts(ui.ctx(), &self.fonts);
                     }
-                    if ui.button("Refresh list").clicked() {
-                        self.refresh_backup_list(host);
+                    if ui.button("Reset text sizes").clicked() {
+                        self.fonts = FontSizes::default();
+                        crate::theme::apply_fonts(ui.ctx(), &self.fonts);
                     }
                 });
-                ui.add_space(6.0);
-                ui.label("Import passphrase");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.import_pass)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                );
-                if self.backup_list.is_empty() {
-                    ui.weak("No .comfybk files in app files yet — export one, or adb push a backup here.");
-                } else {
-                    for (name, path) in self.backup_list.clone() {
-                        ui.horizontal(|ui| {
-                            ui.label(&name);
-                            if ui.button("Import").clicked() {
-                                self.import_encrypted_backup(host, &path);
-                            }
-                            if ui.button("Share").clicked() {
-                                host.share_file(path);
-                            }
-                        });
+
+            egui::CollapsingHeader::new(format!("{} Graph", icons::GRAPH))
+                .id_salt("settings_graph")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.checkbox(&mut self.auto_follow, "Auto-follow executing node");
+                    ui.checkbox(
+                        &mut self.auto_arrange,
+                        "Auto-arrange when you open a loaded workflow",
+                    );
+                    ui.weak("The open workflow is saved automatically and restored after connect.");
+                });
+
+            egui::CollapsingHeader::new(format!("{} Backup", icons::SAVE))
+                .id_salt("settings_backup")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.weak("Encrypts server URL, API key, session, characters, presets, and Create settings.");
+                    ui.weak("Password is never included. Share the .comfybk file off-device before reinstall.");
+                    ui.label("Export passphrase");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.backup_pass)
+                            .password(true)
+                            .hint_text("min 8 chars")
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.label("Confirm");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.backup_pass_confirm)
+                            .password(true)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Export encrypted backup").clicked() {
+                            self.export_encrypted_backup(host);
+                        }
+                        if ui.button("Refresh list").clicked() {
+                            self.refresh_backup_list(host);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label("Import passphrase");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.import_pass)
+                            .password(true)
+                            .desired_width(f32::INFINITY),
+                    );
+                    if self.backup_list.is_empty() {
+                        ui.weak("No .comfybk files in app files yet — export one, or adb push a backup here.");
+                    } else {
+                        for (name, path) in self.backup_list.clone() {
+                            ui.horizontal(|ui| {
+                                ui.label(&name);
+                                if ui.button("Import").clicked() {
+                                    self.import_encrypted_backup(host, &path);
+                                }
+                                if ui.button("Share").clicked() {
+                                    host.share_file(path);
+                                }
+                            });
+                        }
                     }
-                }
-                if !self.backup_note.is_empty() {
-                    ui.label(&self.backup_note);
-                }
-            });
+                    if !self.backup_note.is_empty() {
+                        ui.label(&self.backup_note);
+                    }
+                });
 
             ui.add_space(12.0);
             ui.weak("Server, key, account and generation settings save automatically.");
@@ -4726,7 +4909,7 @@ impl ComfyApp {
             for (pane, label, hover) in panes {
                 let selected = self.create_pane == pane;
                 if ui
-                    .add_sized(size, egui::Button::selectable(selected, label))
+                    .add_sized(size, crate::theme::selectable(selected, label))
                     .on_hover_text(hover)
                     .clicked()
                 {
@@ -5163,11 +5346,10 @@ impl ComfyApp {
         }
     }
 
-    /// Positive prompt: label + chip toggle, then the editor with the history gutter.
+    /// Positive prompt: label + chips + rewrite on one row, then the editor with the history gutter.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
-        self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
+        self.prompt_field_ui(ui, PromptField::Positive, "Prompt", Some(host));
         ui.horizontal(|ui| {
-            self.rewrite_menu_ui(ui, host);
             self.dup_fix_chip_ui(ui);
             if self.hist_stash.is_some() {
                 let total = self.prompt_history.len() + 1;
@@ -5246,12 +5428,18 @@ impl ComfyApp {
 
     /// Negative prompt: label + chip toggle, then the chip editor or text field.
     fn negative_prompt_ui(&mut self, ui: &mut egui::Ui) {
-        self.prompt_field_ui(ui, PromptField::Negative, "Negative");
+        self.prompt_field_ui(ui, PromptField::Negative, "Negative", None);
     }
 
-    /// One prompt field: a `label` + chip-view toggle, then the chip editor or the text field.
+    /// One prompt field: a `label` + chip-view toggle (+ rewrite on positive), then the editor.
     /// The positive field gets the vertical history gutter on the editor's left.
-    fn prompt_field_ui(&mut self, ui: &mut egui::Ui, field: PromptField, label: &str) {
+    fn prompt_field_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        field: PromptField,
+        label: &str,
+        host: Option<&Host>,
+    ) {
         ui.horizontal(|ui| {
             ui.label(label);
             let on = self.field_chips(field);
@@ -5261,6 +5449,11 @@ impl ComfyApp {
                 .clicked()
             {
                 self.set_field_chips(field, !on);
+            }
+            if field == PromptField::Positive
+                && let Some(host) = host
+            {
+                self.rewrite_menu_ui(ui, host);
             }
         });
         if field == PromptField::Positive && self.hist_gutter_prep() {
@@ -5576,34 +5769,16 @@ impl ComfyApp {
     fn create_main_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.ensure_tag_dict_warm(ui.ctx());
         self.ensure_cooc_warm(ui.ctx(), host);
+        let anima = self.anima_active();
         let model_file = self.params.model_file().to_string();
-        let ckpt_label = if model_file.is_empty() {
-            "no model".to_string()
-        } else {
-            self.checkpoint_catalog
-                .entry(&model_file)
-                .map(|e| e.display_name().to_string())
-                .unwrap_or_else(|| elide(&model_file, 40))
-        };
-        let preset_label = if self.selected_preset.is_empty() {
-            "custom".to_string()
-        } else {
-            elide(&self.selected_preset, 24)
-        };
-        let app_n = self.params.apps.iter().filter(|a| a.enabled).count();
-        let enhance_label = if app_n > 0 { format!(" · +{app_n} enhance") } else { String::new() };
-        #[cfg(feature = "local-npu")]
-        let local_badge = if self.route_local_gen() {
-            format!(" · Local · {}", self.local_backend.label())
-        } else {
-            String::new()
-        };
-        #[cfg(not(feature = "local-npu"))]
-        let local_badge = String::new();
-        ui.weak(sanitize_ui_text(
-            ui,
-            &format!("{ckpt_label} · {preset_label}{enhance_label}{local_badge}"),
-        ));
+        if let Some(hint) = self
+            .checkpoint_catalog
+            .entry(&model_file)
+            .and_then(|e| e.recommended.as_ref())
+            .and_then(|r| r.short_hint())
+        {
+            ui.weak(sanitize_ui_text(ui, &format!("rec: {hint}")));
+        }
         #[cfg(feature = "local-npu")]
         if self.route_local_gen() {
             self.ensure_local_packs(host, false);
@@ -5615,7 +5790,9 @@ impl ComfyApp {
                 (Some(p), LocalBackend::Sd15) => {
                     format!("Local NPU — SD1.5 '{p}' runs on-device (txt2img 512²)")
                 }
-                (None, b) => format!("Local NPU — no {} pack found (Settings -> Local NPU)", b.label()),
+                (None, b) => {
+                    format!("Local NPU — no {} pack found (Settings -> Local NPU)", b.label())
+                }
             };
             let colour = if pack.is_some() {
                 egui::Color32::from_rgb(120, 200, 230)
@@ -5623,42 +5800,6 @@ impl ComfyApp {
                 egui::Color32::from_rgb(230, 180, 120)
             };
             ui.colored_label(colour, sanitize_ui_text(ui, &line));
-        }
-        let anima = self.anima_active();
-        if let Some(hint) = self
-            .checkpoint_catalog
-            .entry(&model_file)
-            .and_then(|e| e.recommended.as_ref())
-            .and_then(|r| r.short_hint())
-        {
-            ui.weak(sanitize_ui_text(ui, &format!("rec: {hint}")));
-        }
-
-        let show_video = self.params.mode == Mode::Video
-            || self.schemas.as_ref().is_some_and(|s| s.has_node("WanImageToVideo"));
-        ui.horizontal(|ui| {
-            let mut mode_btn = |ui: &mut egui::Ui, m: Mode, label: &str| {
-                if ui.add(egui::Button::selectable(self.params.mode == m, label)).clicked() {
-                    self.params.mode = m;
-                }
-            };
-            mode_btn(ui, Mode::Txt2Img, "Text to Image");
-            ui.add_enabled_ui(!anima, |ui| {
-                mode_btn(ui, Mode::Img2Img, "Image to Image");
-            });
-            if show_video {
-                mode_btn(ui, Mode::Video, "Video");
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.reset_button(ui, host);
-            });
-        });
-        // Anima has no img2img, but its checkpoint is unrelated to Wan video.
-        if anima && self.params.mode == Mode::Img2Img {
-            self.params.mode = Mode::Txt2Img;
-        }
-        if anima && self.params.mode != Mode::Video {
-            ui.weak("Anima has no img2img yet — text to image only.");
         }
 
         if self.params.mode == Mode::Video {
@@ -5668,141 +5809,80 @@ impl ComfyApp {
         }
 
         let show_companions = self.params.model_kind == ModelKind::Diffusion;
-        let show_img_source = self.params.mode == Mode::Img2Img;
-        if show_companions || show_img_source {
+        if show_companions {
             let setup_open = self.create_companions_open;
-            let setup_title = match (show_companions, show_img_source, setup_open) {
-                (true, true, true) => "Companions & image source".into(),
-                (true, false, true) => "Text encoder / VAE".into(),
-                (false, true, true) => "Image source".into(),
-                (true, true, false) => "Companions & image source".into(),
-                (true, false, false) => {
-                    let clip = self
-                        .params
-                        .clip_names
-                        .first()
-                        .map(|s| file_basename(s).to_string())
-                        .unwrap_or_else(|| "no encoder".into());
-                    let vae = if self.params.vae_name.is_empty() {
-                        "no VAE".to_string()
-                    } else {
-                        file_basename(&self.params.vae_name).to_string()
-                    };
-                    // Header text never wraps; a long title pushes the whole pane off-screen.
-                    format!("Encoders · {}", elide(&format!("{clip} · {vae}"), 26))
-                }
-                (false, true, false) => match self.params.img2img_source {
-                    Img2ImgSource::CurrentOutput => "Image source · Current result".into(),
-                    Img2ImgSource::Url => "Image source · From URL".into(),
-                    Img2ImgSource::Picked => match self.picked_input.as_ref() {
-                        Some(p) => format!("Image source · {}", elide(&p.name, 20)),
-                        None => "Image source · Photo".into(),
-                    },
-                },
-                (false, false, _) => String::new(),
+            let setup_title = if setup_open {
+                "Text encoder / VAE".into()
+            } else {
+                let clip = self
+                    .params
+                    .clip_names
+                    .first()
+                    .map(|s| file_basename(s).to_string())
+                    .unwrap_or_else(|| "no encoder".into());
+                let vae = if self.params.vae_name.is_empty() {
+                    "no VAE".to_string()
+                } else {
+                    file_basename(&self.params.vae_name).to_string()
+                };
+                format!("Encoders · {}", elide(&format!("{clip} · {vae}"), 26))
             };
             let setup = egui::CollapsingHeader::new(setup_title)
-                .id_salt("create_t2i_i2i_setup")
+                .id_salt("create_t2i_i2i_companions")
                 .open(Some(setup_open))
                 .show(ui, |ui| {
-                    // Diffusion models ship without a text encoder or VAE; select_model seeds these.
-                    if show_companions {
-                        let clip_n = self.params.clip_names.len().max(1);
-                        for i in 0..clip_n {
-                            if self.params.clip_names.len() <= i {
-                                self.params.clip_names.push(String::new());
-                            }
-                            ui.horizontal(|ui| {
-                                ui.label(if i == 0 { "Text encoder" } else { "  + encoder" });
-                                if i > 0 && ui.small_button(icons::TRASH).clicked() {
-                                    self.params.clip_names.remove(i);
-                                }
-                            });
-                            if i < self.params.clip_names.len() {
-                                let mut val = self.params.clip_names[i].clone();
-                                combo_full(ui, &format!("clip_name_{i}"), &mut val, &self.clip_files);
-                                self.params.clip_names[i] = val;
-                            }
-                        }
-                        if self.params.clip_names.len() < 2 && ui.button("+ second encoder").clicked()
-                        {
+                    let clip_n = self.params.clip_names.len().max(1);
+                    for i in 0..clip_n {
+                        if self.params.clip_names.len() <= i {
                             self.params.clip_names.push(String::new());
                         }
-
-                        ui.label("VAE");
-                        combo_full(ui, "vae_name", &mut self.params.vae_name, &self.vaes);
-
-                        egui::CollapsingHeader::new("Advanced").id_salt("diffusion_adv").show(
-                            ui,
-                            |ui| {
-                                ui.label("Encoder type");
-                                let mut ty = self.params.effective_clip_type();
-                                combo_full(ui, "clip_type", &mut ty, &self.clip_types);
-                                self.params.clip_type = ty;
-                                ui.label("Weight dtype");
-                                combo_full(
-                                    ui,
-                                    "weight_dtype",
-                                    &mut self.params.weight_dtype,
-                                    &self.weight_dtypes,
-                                );
-                                if !self.clip_devices.is_empty() {
-                                    ui.label("Encoder device");
-                                    combo_full(
-                                        ui,
-                                        "clip_device",
-                                        &mut self.params.clip_device,
-                                        &self.clip_devices,
-                                    );
-                                }
-                            },
-                        );
-
-                        if let Some(missing) = self.params.missing_model_part() {
-                            ui.colored_label(ui.visuals().warn_fg_color, missing);
-                        }
-                    }
-
-                    if show_img_source {
-                        if show_companions {
-                            ui.add_space(4.0);
-                        }
-                        let prev_src = self.params.img2img_source;
-                        ui.horizontal_wrapped(|ui| {
-                            ui.selectable_value(
-                                &mut self.params.img2img_source,
-                                Img2ImgSource::CurrentOutput,
-                                "Current result",
-                            );
-                            ui.selectable_value(
-                                &mut self.params.img2img_source,
-                                Img2ImgSource::Url,
-                                "From URL",
-                            );
-                            ui.selectable_value(
-                                &mut self.params.img2img_source,
-                                Img2ImgSource::Picked,
-                                "Device photo",
-                            );
-                            if ui.selectable_label(false, "From gallery").clicked() {
-                                self.gallery_pick_open = true;
+                        ui.horizontal(|ui| {
+                            ui.label(if i == 0 { "Text encoder" } else { "  + encoder" });
+                            if i > 0 && ui.small_button(icons::TRASH).clicked() {
+                                self.params.clip_names.remove(i);
                             }
                         });
-                        // Leaving Picked drops the masked photo it applied to.
-                        if prev_src == Img2ImgSource::Picked
-                            && self.params.img2img_source != Img2ImgSource::Picked
-                        {
-                            self.params.inpaint_mask = false;
+                        if i < self.params.clip_names.len() {
+                            let mut val = self.params.clip_names[i].clone();
+                            combo_full(ui, &format!("clip_name_{i}"), &mut val, &self.clip_files);
+                            self.params.clip_names[i] = val;
                         }
-                        self.image_source_preview(ui, host);
-                        // Denoise at the bottom of the section, only relevant for img2img.
-                        ui.add_space(4.0);
-                        full_width_slider(ui, "Denoise", |ui, w| {
-                            ui.add_sized(
-                                [w, 24.0],
-                                egui::Slider::new(&mut self.params.denoise, 0.0..=1.0),
+                    }
+                    if self.params.clip_names.len() < 2 && ui.button("+ second encoder").clicked() {
+                        self.params.clip_names.push(String::new());
+                    }
+
+                    ui.label("VAE");
+                    combo_full(ui, "vae_name", &mut self.params.vae_name, &self.vaes);
+
+                    egui::CollapsingHeader::new("Advanced").id_salt("diffusion_adv").show(
+                        ui,
+                        |ui| {
+                            ui.label("Encoder type");
+                            let mut ty = self.params.effective_clip_type();
+                            combo_full(ui, "clip_type", &mut ty, &self.clip_types);
+                            self.params.clip_type = ty;
+                            ui.label("Weight dtype");
+                            combo_full(
+                                ui,
+                                "weight_dtype",
+                                &mut self.params.weight_dtype,
+                                &self.weight_dtypes,
                             );
-                        });
+                            if !self.clip_devices.is_empty() {
+                                ui.label("Encoder device");
+                                combo_full(
+                                    ui,
+                                    "clip_device",
+                                    &mut self.params.clip_device,
+                                    &self.clip_devices,
+                                );
+                            }
+                        },
+                    );
+
+                    if let Some(missing) = self.params.missing_model_part() {
+                        ui.colored_label(ui.visuals().warn_fg_color, missing);
                     }
                 });
             if setup.header_response.clicked() {
@@ -5810,20 +5890,74 @@ impl ComfyApp {
             }
         }
 
-        self.positive_prompt_ui(ui, host);
-        ui.label("LoRA triggers");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.lora_triggers)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .hint_text("trigger words from LoRAs (auto-filled on Add)"),
-        );
-        self.negative_prompt_ui(ui);
-        if anima {
-            ui.weak("Negative only applies when the pack's CFG is above 1.0.");
+        if self.params.mode == Mode::Img2Img {
+            let src_title = match self.params.img2img_source {
+                Img2ImgSource::CurrentOutput => "Image source · Current result".to_string(),
+                Img2ImgSource::Url => "Image source · From URL".to_string(),
+                Img2ImgSource::Picked => match self.picked_input.as_ref() {
+                    Some(p) => format!("Image source · {}", elide(&p.name, 20)),
+                    None => "Image source · Photo".into(),
+                },
+            };
+            egui::CollapsingHeader::new(src_title)
+                .id_salt("create_img_source")
+                .default_open(true)
+                .show(ui, |ui| {
+                    let prev_src = self.params.img2img_source;
+                    ui.horizontal_wrapped(|ui| {
+                        crate::theme::selectable_value(ui, 
+                            &mut self.params.img2img_source,
+                            Img2ImgSource::CurrentOutput,
+                            "Current result",
+                        );
+                        crate::theme::selectable_value(ui, 
+                            &mut self.params.img2img_source,
+                            Img2ImgSource::Url,
+                            "From URL",
+                        );
+                        crate::theme::selectable_value(ui, 
+                            &mut self.params.img2img_source,
+                            Img2ImgSource::Picked,
+                            "Device photo",
+                        );
+                        if crate::theme::selectable_label(ui, false, "From gallery").clicked() {
+                            self.gallery_pick_open = true;
+                        }
+                    });
+                    if prev_src == Img2ImgSource::Picked
+                        && self.params.img2img_source != Img2ImgSource::Picked
+                    {
+                        self.params.inpaint_mask = false;
+                    }
+                    self.image_source_preview(ui, host);
+                    ui.add_space(4.0);
+                    full_width_slider(ui, "Denoise", |ui, w| {
+                        ui.add_sized(
+                            [w, 24.0],
+                            egui::Slider::new(&mut self.params.denoise, 0.0..=1.0),
+                        );
+                    });
+                });
         }
 
-        self.lint_chips_ui(ui);
+        egui::CollapsingHeader::new("Prompts")
+            .id_salt("create_prompts")
+            .default_open(true)
+            .show(ui, |ui| {
+                self.positive_prompt_ui(ui, host);
+                ui.label("LoRA triggers");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.params.lora_triggers)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("trigger words from LoRAs (auto-filled on Add)"),
+                );
+                self.negative_prompt_ui(ui);
+                if anima {
+                    ui.weak("Negative only applies when the pack's CFG is above 1.0.");
+                }
+                self.lint_chips_ui(ui);
+            });
 
         ui.add_space(4.0);
         ui.columns(2, |cols| {
@@ -5850,8 +5984,6 @@ impl ComfyApp {
                 self.queue_variants = variants as usize;
             });
         });
-        // CLIP skip only exists for checkpoint text encoders; Pony/Illustrious conventionally
-        // run 2. Diffusion models (Anima/Flux) encode through qwen/t5 towers with no CLIP layers.
         if self.params.model_kind == ModelKind::Checkpoint {
             ui.add_space(4.0);
             ui.vertical_centered(|ui| {
@@ -5877,9 +6009,6 @@ impl ComfyApp {
         if anima {
             ui.vertical_centered(|ui| ui.weak("Anima renders 1024x1024 — size is fixed."));
         }
-        // An enabled step may render at a different size than the one above (hi-res fix works by
-        // generating small and scaling up). Show what it will actually do — the stored value is
-        // never touched, so this line simply disappears when the step is removed.
         self.param_override_note(ui);
 
         ui.add_space(4.0);
@@ -5924,7 +6053,6 @@ impl ComfyApp {
             ));
         }
 
-        // An enabled upscale or face fix is never invisible from the main flow.
         if !self.params.apps.is_empty() {
             ui.add_space(4.0);
             let names: Vec<String> = self
@@ -5946,11 +6074,10 @@ impl ComfyApp {
             }
         }
 
-        // Room for the stacked queue + menu FABs.
         ui.add_space(130.0);
     }
 
-    /// The Create Main body for [`Mode::Video`]: Wan 2.2 image-to-video.
+    /// The Create Main body for [`Mode::Video`]: Wan 2.2 image-to-video / text-to-video.
     fn create_video_body(&mut self, ui: &mut egui::Ui, host: &Host) {
         let has_wan = self.schemas.as_ref().is_some_and(|s| s.has_node("WanImageToVideo"));
         let has_vhs = self.schemas.as_ref().is_some_and(|s| s.has_node("VHS_VideoCombine"));
@@ -5969,68 +6096,78 @@ impl ComfyApp {
                 format!("Server is missing: {}", missing.join(", ")),
             );
         }
-        ui.weak("Wan 2.2 i2v — describe the motion; canned defaults do the rest.");
-
-        // Prompt + negative, with a one-tap canonical Wan negative.
-        self.positive_prompt_ui(ui, host);
-        ui.horizontal(|ui| {
-            ui.label("Negative");
-            if ui
-                .small_button("Wan negative")
-                .on_hover_text("Load the canonical Wan negative prompt")
-                .clicked()
-            {
-                self.params.negative = crate::types::WAN_NEGATIVE.to_string();
-            }
-        });
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.negative)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY)
-                .hint_text("what to avoid"),
-        );
-        // Prepended to the video positive at queue time (combined_positive). Kept separate from
-        // the image LoRA triggers so a Wan trigger never leaks into an image prompt.
-        ui.label("LoRA triggers");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.params.video.lora_triggers)
-                .desired_rows(1)
-                .desired_width(f32::INFINITY)
-                .hint_text("trigger words from LoRAs (auto-filled on pick)"),
-        );
-        self.lint_chips_ui(ui);
-
-        // Start image source, with a text-to-video option.
-        ui.add_space(6.0);
-        ui.label("Start image");
         let t2v = self.params.video.video_t2v;
-        ui.horizontal_wrapped(|ui| {
-            if ui.selectable_label(t2v, "None (text to video)").clicked() {
-                self.params.video.video_t2v = true;
-            }
-            for (src, label) in [
-                (Img2ImgSource::CurrentOutput, "Current result"),
-                (Img2ImgSource::Url, "From URL"),
-                (Img2ImgSource::Picked, "Device photo"),
-            ] {
-                let selected = !t2v && self.params.img2img_source == src;
-                if ui.selectable_label(selected, label).clicked() {
-                    self.params.img2img_source = src;
-                    self.params.video.video_t2v = false;
-                }
-            }
-            if ui.selectable_label(false, "From gallery").clicked() {
-                self.params.video.video_t2v = false;
-                self.gallery_pick_open = true;
-            }
-        });
-        if self.params.video.video_t2v {
-            ui.weak("No start image — Wan generates motion from the prompt alone.");
+        ui.weak(if t2v {
+            "Wan 2.2 t2v — describe the motion; canned defaults do the rest."
         } else {
-            self.image_source_preview(ui, host);
+            "Wan 2.2 i2v — describe the motion; canned defaults do the rest."
+        });
+
+        if !t2v {
+            let src_title = match self.params.img2img_source {
+                Img2ImgSource::CurrentOutput => "Start image · Current result".to_string(),
+                Img2ImgSource::Url => "Start image · URL".to_string(),
+                Img2ImgSource::Picked => match self.picked_input.as_ref() {
+                    Some(p) => format!("Start image · {}", elide(&p.name, 20)),
+                    None => "Start image · Device".into(),
+                },
+            };
+            egui::CollapsingHeader::new(src_title)
+                .id_salt("create_video_img_source")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        for (src, label) in [
+                            (Img2ImgSource::CurrentOutput, "Current result"),
+                            (Img2ImgSource::Url, "URL"),
+                            (Img2ImgSource::Picked, "Device"),
+                        ] {
+                            let selected = self.params.img2img_source == src;
+                            if crate::theme::selectable_label(ui, selected, label).clicked() {
+                                self.params.img2img_source = src;
+                                self.params.video.video_t2v = false;
+                            }
+                        }
+                        if crate::theme::selectable_label(ui, false, "gallery").clicked() {
+                            self.params.video.video_t2v = false;
+                            self.gallery_pick_open = true;
+                        }
+                    });
+                    self.image_source_preview(ui, host);
+                });
         }
 
-        // Size.
+        egui::CollapsingHeader::new("Prompts")
+            .id_salt("create_video_prompts")
+            .default_open(true)
+            .show(ui, |ui| {
+                self.positive_prompt_ui(ui, host);
+                ui.horizontal(|ui| {
+                    ui.label("Negative");
+                    if ui
+                        .small_button("Wan negative")
+                        .on_hover_text("Load the canonical Wan negative prompt")
+                        .clicked()
+                    {
+                        self.params.negative = crate::types::WAN_NEGATIVE.to_string();
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.params.negative)
+                        .desired_rows(2)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("what to avoid"),
+                );
+                ui.label("LoRA triggers");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.params.video.lora_triggers)
+                        .desired_rows(1)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("trigger words from LoRAs (auto-filled on pick)"),
+                );
+                self.lint_chips_ui(ui);
+            });
+
         ui.add_space(6.0);
         ui.columns(2, |cols| {
             cols[0].vertical_centered(|ui| {
@@ -6041,28 +6178,26 @@ impl ComfyApp {
             });
         });
 
-        // Length, snapped to Wan's 4n+1, shown in seconds at the 16fps base.
         ui.add_space(6.0);
         ui.vertical_centered(|ui| section_title(ui, "Length"));
         let mut len = self.params.video.length;
-        full_width_slider(ui, "frames", |ui, w| {
-            ui.add_sized([w, 24.0], egui::Slider::new(&mut len, 5..=161));
-        });
-        centered_row(ui, |ui| {
-            if ui.small_button("-4").clicked() {
-                len = len.saturating_sub(4);
-            }
-            if ui.small_button("+4").clicked() {
-                len = len.saturating_add(4);
-            }
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 110.0).max(80.0);
+            ui.add_sized([w, 48.0], egui::Slider::new(&mut len, 5..=161).text("frames"));
+            ui.vertical(|ui| {
+                if ui.small_button("-4").clicked() {
+                    len = len.saturating_sub(4);
+                }
+                if ui.small_button("+4").clicked() {
+                    len = len.saturating_add(4);
+                }
+            });
+            let snapped = crate::workflow::snap_wan_length(len);
+            ui.weak(format!("{snapped}f · {:.1}s · 16fps", snapped as f32 / 16.0));
         });
         let len = crate::workflow::snap_wan_length(len);
         self.params.video.length = len;
-        ui.vertical_centered(|ui| {
-            ui.weak(format!("{len}f ~ {:.1}s at 16fps", len as f32 / 16.0));
-        });
 
-        // Seed (shared with the image modes).
         ui.add_space(6.0);
         ui.label("Seed");
         ui.horizontal(|ui| {
@@ -6072,8 +6207,6 @@ impl ComfyApp {
             ui.checkbox(&mut self.params.randomize_seed, "random");
         });
 
-        // LoRA stacks per expert; strength 0 stays listed but inert. Combos offer Wan-matched
-        // files (catalog bases, else filename heuristic) unless the toggle bypasses the filter.
         ui.add_space(6.0);
         let hi_options =
             self.video_lora_options(&self.params.video.unet_high, &self.params.video.loras_high);
@@ -6081,27 +6214,33 @@ impl ComfyApp {
             self.video_lora_options(&self.params.video.unet_low, &self.params.video.loras_low);
         ui.checkbox(&mut self.video_lora_show_all, "Show all LoRAs")
             .on_hover_text("Skip the Wan filter (catalog bases + wan filename match)");
-        if let Some(ev) = video_lora_list(
-            ui,
-            "High noise LoRAs",
-            &mut self.params.video.loras_high,
-            &hi_options,
-            "vlora_hi",
-        ) {
-            self.on_video_lora_event(true, ev);
-        }
-        ui.add_space(4.0);
-        if let Some(ev) = video_lora_list(
-            ui,
-            "Low noise LoRAs",
-            &mut self.params.video.loras_low,
-            &lo_options,
-            "vlora_lo",
-        ) {
-            self.on_video_lora_event(false, ev);
-        }
+        egui::CollapsingHeader::new("High noise LoRAs")
+            .id_salt("vlora_hi_hdr")
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(ev) = video_lora_list(
+                    ui,
+                    &mut self.params.video.loras_high,
+                    &hi_options,
+                    "vlora_hi",
+                ) {
+                    self.on_video_lora_event(true, ev);
+                }
+            });
+        egui::CollapsingHeader::new("Low noise LoRAs")
+            .id_salt("vlora_lo_hdr")
+            .default_open(false)
+            .show(ui, |ui| {
+                if let Some(ev) = video_lora_list(
+                    ui,
+                    &mut self.params.video.loras_low,
+                    &lo_options,
+                    "vlora_lo",
+                ) {
+                    self.on_video_lora_event(false, ev);
+                }
+            });
 
-        // Advanced: models, sampler math, post-processing.
         ui.add_space(6.0);
         egui::CollapsingHeader::new("Advanced").id_salt("video_advanced").show(ui, |ui| {
             ui.label("High noise model");
@@ -6388,7 +6527,7 @@ impl ComfyApp {
         }
     }
 
-    /// On-device model list: packs installed in the app files dir, plus test and import.
+    /// On-device packs + import, shown under Models when Local is selected.
     #[cfg(feature = "local-npu")]
     fn local_models_section(&mut self, ui: &mut egui::Ui, host: &Host) {
         if !self.local_npu {
@@ -6397,86 +6536,75 @@ impl ComfyApp {
         self.ensure_local_packs(host, false);
         let warn = egui::Color32::from_rgb(230, 180, 120);
         let packs = self.local_packs.clone();
-        let use_server = self.local_use_server;
         let mut pick: Option<(String, LocalBackend)> = None;
-        let mut server_pick = false;
         let mut rescan = false;
         let mut test: Option<std::path::PathBuf> = None;
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
-                ui.strong("Create model");
-                if ui.small_button(icons::REFRESH).on_hover_text("Rescan the app files dir").clicked() {
-                    rescan = true;
-                }
-            });
-            ui.weak("A pack runs on the NPU; 'Server model' sends generation to the server while the NPU features stay on.");
-            ui.add_space(4.0);
-            let srv_label = if use_server {
-                format!("{} Server model", icons::CHECK)
-            } else {
-                "     Server model".to_string()
-            };
-            if ui.selectable_label(use_server, sanitize_ui_text(ui, &srv_label)).clicked() {
-                server_pick = true;
-            }
-            if packs.is_empty() {
-                ui.colored_label(warn, "No packs installed yet - import one below.");
-            }
-            for p in &packs {
-                let on = !use_server && p.name == self.local_pack && p.backend == self.local_backend;
-                let label = if on {
-                    format!("{} {}", icons::CHECK, p.label())
-                } else {
-                    format!("     {}", p.label())
-                };
-                if ui.selectable_label(on, sanitize_ui_text(ui, &label)).clicked() {
-                    pick = Some((p.name.clone(), p.backend));
-                }
-            }
-            if !use_server && let Some(sel) = self.selected_pack().cloned() {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    let can_test = sel.backend == LocalBackend::Anima && !self.d3_running;
+        egui::CollapsingHeader::new("Local Generation")
+            .id_salt("local_generation")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Create model");
                     if ui
-                        .add_enabled(can_test, egui::Button::new(format!("{} Test pack", icons::RUN)))
-                        .on_hover_text("Two-step render to prove this pack loads and produces an image")
+                        .small_button(icons::REFRESH)
+                        .on_hover_text("Rescan the app files dir")
                         .clicked()
                     {
-                        test = Some(sel.dir.clone());
-                    }
-                    if self.d3_running {
-                        ui.spinner();
-                        ui.weak("testing...");
-                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
-                    }
-                    if let Some(ok) = self.d3_ok {
-                        let (c, t) = if ok {
-                            (egui::Color32::from_rgb(120, 220, 140), "pack OK")
-                        } else {
-                            (egui::Color32::from_rgb(230, 120, 120), "pack FAILED")
-                        };
-                        ui.colored_label(c, t);
+                        rescan = true;
                     }
                 });
-                ui.weak(sanitize_ui_text(ui, &elide(&sel.dir.display().to_string(), 64)));
-            }
-        });
-        self.local_import_ui(ui, host, None);
-        ui.add_space(6.0);
-        let eff_server = if server_pick { true } else if pick.is_some() { false } else { use_server };
-        ui.weak(if eff_server {
-            "Server models (used — 'Server model' selected above)"
-        } else {
-            "Server models (not used — a local pack is selected above)"
-        });
-        ui.add_space(2.0);
+                ui.weak("A pack runs on the NPU. Switch to Remote in the top bar to use server models.");
+                ui.add_space(4.0);
+                if packs.is_empty() {
+                    ui.colored_label(warn, "No packs installed yet - import one below.");
+                }
+                for p in &packs {
+                    let on = p.name == self.local_pack && p.backend == self.local_backend;
+                    let label = if on {
+                        format!("{} {}", icons::CHECK, p.label())
+                    } else {
+                        format!("     {}", p.label())
+                    };
+                    if crate::theme::selectable_label(ui, on, sanitize_ui_text(ui, &label)).clicked() {
+                        pick = Some((p.name.clone(), p.backend));
+                    }
+                }
+                if let Some(sel) = self.selected_pack().cloned() {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let can_test = sel.backend == LocalBackend::Anima && !self.d3_running;
+                        if ui
+                            .add_enabled(
+                                can_test,
+                                egui::Button::new(format!("{} Test pack", icons::RUN)),
+                            )
+                            .on_hover_text(
+                                "Two-step render to prove this pack loads and produces an image",
+                            )
+                            .clicked()
+                        {
+                            test = Some(sel.dir.clone());
+                        }
+                        if self.d3_running {
+                            ui.spinner();
+                            ui.weak("testing...");
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(200));
+                        }
+                        if let Some(ok) = self.d3_ok {
+                            let (c, t) = if ok {
+                                (egui::Color32::from_rgb(120, 220, 140), "pack OK")
+                            } else {
+                                (egui::Color32::from_rgb(230, 120, 120), "pack FAILED")
+                            };
+                            ui.colored_label(c, t);
+                        }
+                    });
+                    ui.weak(sanitize_ui_text(ui, &elide(&sel.dir.display().to_string(), 64)));
+                }
+                self.local_import_ui(ui, host, None);
+            });
         if rescan {
             self.ensure_local_packs(host, true);
-        }
-        if server_pick && !self.local_use_server {
-            self.local_use_server = true;
-            crate::local_engine::drop_cache();
-            self.log.info("local-npu: Create model -> server (NPU features stay on)");
         }
         if let Some((name, backend)) = pick
             && (self.local_use_server || name != self.local_pack || backend != self.local_backend)
@@ -6502,26 +6630,33 @@ impl ComfyApp {
     fn local_models_section(&mut self, _ui: &mut egui::Ui, _host: &Host) {}
 
     fn create_models_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
-        self.local_models_section(ui, host);
+        #[cfg(feature = "local-npu")]
+        let show_local = self.local_npu && !self.local_use_server;
+        #[cfg(not(feature = "local-npu"))]
+        let show_local = false;
+        if show_local {
+            self.local_models_section(ui, host);
+            return;
+        }
         let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
         ui.set_max_width(list_w);
 
-        let catalog_n = self.checkpoint_catalog.checkpoints.len();
-        if catalog_n == 0 {
-            ui.weak("No checkpoint catalog yet — showing installed models.");
-        } else {
-            ui.weak(format!("Catalog: {catalog_n} entries · grouped by family"));
-        }
+        // let catalog_n = self.checkpoint_catalog.checkpoints.len();
+        // if catalog_n == 0 {
+        //     ui.weak("No checkpoint catalog yet");
+        // } else {
+        //     ui.weak(format!("Catalog: {catalog_n} entries"));
+        // }
 
         if !self.unets.is_empty() {
             ui.horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.models_kind_filter, None, "All");
-                ui.selectable_value(
+                crate::theme::selectable_value(ui, &mut self.models_kind_filter, None, "All");
+                crate::theme::selectable_value(ui, 
                     &mut self.models_kind_filter,
                     Some(ModelKind::Checkpoint),
                     format!("Checkpoints ({})", self.checkpoints.len()),
                 );
-                ui.selectable_value(
+                crate::theme::selectable_value(ui, 
                     &mut self.models_kind_filter,
                     Some(ModelKind::Diffusion),
                     format!("Diffusion ({})", self.unets.len()),
@@ -6529,17 +6664,30 @@ impl ComfyApp {
             });
         }
 
-        ui.add(
-            egui::TextEdit::singleline(&mut self.ckpt_filter)
-                .hint_text("filter models")
-                .desired_width(list_w - 8.0),
-        );
-
         ui.horizontal(|ui| {
-            ui.label(format!("{} Sort", icons::SORT));
-            for sort in [CheckpointSort::Name, CheckpointSort::Recent] {
-                ui.selectable_value(&mut self.checkpoint_sort, sort, sort.label());
-            }
+            let gap = ui.spacing().item_spacing.x;
+            let total = ui.available_width();
+            // Short filter field; sort combo fills the remaining row width.
+            let filter_w = (total * 0.55).clamp(120.0, 240.0);
+            let sort_w = (total - filter_w - gap).max(100.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ckpt_filter)
+                    .hint_text("filter models")
+                    .desired_width(filter_w),
+            );
+            egui::ComboBox::from_id_salt("ckpt_sort")
+                .selected_text(format!("{} {}", icons::SORT, self.checkpoint_sort.label()))
+                .width(sort_w)
+                .show_ui(ui, |ui| {
+                    for sort in [CheckpointSort::Name, CheckpointSort::Recent] {
+                        crate::theme::selectable_value(
+                            ui,
+                            &mut self.checkpoint_sort,
+                            sort,
+                            sort.label(),
+                        );
+                    }
+                });
         });
 
         type ModelRow = (String, ModelKind, Option<crate::types::CheckpointEntry>);
@@ -6959,8 +7107,14 @@ impl ComfyApp {
         let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
         ui.set_max_width(list_w);
 
+        // The wizard hands its finished card to the editor, so the editor check comes first —
+        // the frame it closes, the draft it planted takes over the pane.
         if self.character_draft.is_some() {
             self.character_editor(ui, host, list_w);
+            return;
+        }
+        if self.character_wizard.is_some() {
+            self.character_wizard_ui(ui, host, list_w);
             return;
         }
 
@@ -6972,6 +7126,13 @@ impl ComfyApp {
             {
                 self.character_draft =
                     Some(CharacterDraft { editing: None, card: CharacterCard::default() });
+            }
+            if ui
+                .button(format!("{} Guided", icons::GENERATE))
+                .on_hover_text("Build a character step by step")
+                .clicked()
+            {
+                self.character_wizard = Some(CharacterWizard::new());
             }
             if ui.button("Import").on_hover_text("Paste a shared character pack").clicked() {
                 self.import_character(host);
@@ -7197,11 +7358,11 @@ impl ComfyApp {
             .selected_text(cur_label)
             .width(w)
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut draft.card.checkpoint, String::new(), "none");
+                crate::theme::selectable_value(ui, &mut draft.card.checkpoint, String::new(), "none");
                 let target = &mut draft.card.checkpoint;
                 let mut row = |ui: &mut egui::Ui, file: &str| {
                     let base = elide(&sanitize_ui_text(ui, file_basename(file)), 44);
-                    ui.selectable_value(target, file.to_string(), base)
+                    crate::theme::selectable_value(ui, target, file.to_string(), base)
                         .on_hover_text(sanitize_ui_text(ui, file));
                 };
                 for f in self.checkpoints.iter().take(300) {
@@ -7303,6 +7464,1009 @@ impl ComfyApp {
         self.character_draft = Some(CharacterDraft { editing: None, card });
         self.status = "Character imported — review and save".into();
         host.haptic(Haptic::Light);
+    }
+
+    /// The character sheet the composer LLM reads: `Title: picks; Title: picks, custom` — the
+    /// exact shape [`local_rewrite::SYS_COMPOSE_CHARACTER`]'s worked example anchors on.
+    #[cfg(feature = "local-npu")]
+    fn wizard_sheet(sel: &[TraitSel]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for (i, (title, _, _, _)) in WIZ_TRAITS.iter().enumerate() {
+            let Some(s) = sel.get(i) else { continue };
+            let mut vals = s.picked.join(", ");
+            let custom = s.custom.trim();
+            if !custom.is_empty() {
+                if !vals.is_empty() {
+                    vals.push_str(", ");
+                }
+                vals.push_str(custom);
+            }
+            if !vals.is_empty() {
+                parts.push(format!("{title}: {vals}"));
+            }
+        }
+        parts.join("; ")
+    }
+
+    /// Deterministic composer: chips are already finished tags, so joining them in walk order is
+    /// a solid prompt on its own. Stands in until (or without) the LLM pass.
+    fn wizard_join_tags(sel: &[TraitSel]) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for s in sel {
+            parts.extend(s.picked.iter().cloned());
+            let custom = s.custom.trim();
+            if !custom.is_empty() {
+                parts.push(custom.to_string());
+            }
+        }
+        crate::tags::dedupe(&parts.join(", "))
+    }
+
+    /// Kick the composer LLM over the wizard's sheet; the result lands via `poll_wizard_compose`.
+    /// No-op without a rewrite pack — the deterministic join already filled `identity`.
+    #[cfg(feature = "local-npu")]
+    fn start_wizard_compose(&mut self, ctx: &egui::Context, wiz: &mut CharacterWizard) {
+        let Some(pack_dir) = self.rewrite_pack.clone() else { return };
+        if wiz.composing {
+            return;
+        }
+        let sheet = Self::wizard_sheet(&wiz.sel);
+        if sheet.is_empty() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        wiz.compose_rx = Some(rx);
+        wiz.composing = true;
+        self.status = "Composing character prompt on CPU…".into();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            // 512 tokens, not the menu rewrites' 256: a full eight-trait sheet runs long.
+            let result = crate::local_engine::rewrite_prompt_budget(
+                pack_dir,
+                local_rewrite::RewriteKind::ComposeCharacter,
+                sheet,
+                512,
+            );
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn start_wizard_compose(&mut self, _ctx: &egui::Context, _wiz: &mut CharacterWizard) {}
+
+    /// Abort any in-flight compose and drop a pending diff-review. Dropping the receiver orphans
+    /// the worker's result; nothing here touches the NPU, so there is no lock to release.
+    fn wizard_cancel_compose(wiz: &mut CharacterWizard) {
+        #[cfg(feature = "local-npu")]
+        {
+            wiz.compose_rx = None;
+        }
+        wiz.composing = false;
+        wiz.compose_review = None;
+    }
+
+    /// Drain a finished compose into the editable identity field. A failure keeps the
+    /// deterministic join — the wizard never blocks on the LLM.
+    #[cfg(feature = "local-npu")]
+    fn poll_wizard_compose(&mut self, wiz: &mut CharacterWizard) {
+        let Some(rx) = wiz.compose_rx.as_ref() else { return };
+        match rx.try_recv() {
+            Ok(Ok(text)) => {
+                wiz.compose_rx = None;
+                wiz.composing = false;
+                // Never swap silently: stash (current, composed) for the accept/discard diff
+                // modal so the user can see what the model did. An empty return keeps the join.
+                if text.trim().is_empty() {
+                    self.status = "Compose returned nothing — kept the plain tags".into();
+                } else {
+                    wiz.compose_review = Some((wiz.identity.clone(), text));
+                    self.status = "Composed — review the changes".into();
+                }
+            }
+            Ok(Err(e)) => {
+                wiz.compose_rx = None;
+                wiz.composing = false;
+                self.log.error(format!("char-wizard compose: {e}"));
+                self.status = format!("Compose failed (kept the plain tags): {}", elide(&e, 80));
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                wiz.compose_rx = None;
+                wiz.composing = false;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn poll_wizard_compose(&mut self, _wiz: &mut CharacterWizard) {}
+
+    /// Default taste-test lineup from the installed checkpoints: the current model, then starred
+    /// ones, then one per catalog family round-robin (the whole point is spanning dialects),
+    /// then recents — deduped, capped at `cap`. Diffusion models sit out: they need companion
+    /// CLIP/VAE picks and are the heavyweight video/edit models, not character checkpoints.
+    fn taste_candidates(&self, cap: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let push = |out: &mut Vec<String>, f: &str| {
+            if !f.is_empty() && !out.iter().any(|o| o == f) && self.checkpoints.iter().any(|c| c == f)
+            {
+                out.push(f.to_string());
+            }
+        };
+        if self.params.model_kind == ModelKind::Checkpoint {
+            push(&mut out, &self.params.checkpoint.clone());
+        }
+        for f in self.checkpoints.clone() {
+            if self.is_checkpoint_favorite(&f) {
+                push(&mut out, &f);
+            }
+        }
+        // One representative per family before a second of any: group, then take column-wise.
+        let mut families: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+        for f in &self.checkpoints {
+            let fam = checkpoint_family(self.checkpoint_catalog.entry(f));
+            families.entry(fam).or_default().push(f.clone());
+        }
+        let mut round = 0usize;
+        loop {
+            let mut any = false;
+            for members in families.values() {
+                if let Some(f) = members.get(round) {
+                    any = true;
+                    if out.len() < cap {
+                        push(&mut out, f);
+                    }
+                }
+            }
+            if !any || out.len() >= cap {
+                break;
+            }
+            round += 1;
+        }
+        out.truncate(cap);
+        out
+    }
+
+    /// The test prompt for one candidate: the identity tags behind the checkpoint family's
+    /// quality block (same table as the prompt lint), so a Pony model isn't judged on a
+    /// promptless dialect. Deliberately duplicated from lint.rs's private table — two rows.
+    fn taste_prompt(&self, identity: &str, file: &str) -> String {
+        let hay = self
+            .checkpoint_catalog
+            .entry(file)
+            .map(|e| {
+                format!(
+                    "{} {}",
+                    e.base_model.as_deref().unwrap_or(""),
+                    e.base_model_type.as_deref().unwrap_or("")
+                )
+                .to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        if hay.contains("pony") {
+            format!("score_9, score_8_up, score_7_up, {identity}")
+        } else if ["illustrious", "noobai", "sd1", "sd 1.5", "sd15"].iter().any(|b| hay.contains(b))
+        {
+            format!("masterpiece, best quality, {identity}")
+        } else {
+            identity.to_string()
+        }
+    }
+
+    /// Fan the wizard's prompt out across the candidate checkpoints: one job per candidate,
+    /// shared seed, each with its catalog-recommended settings, labeled for wizard routing.
+    /// Queues through `Engine::generate` directly — `start_generation` would reroute Txt2Img
+    /// into the linked graph and trip the duplicate guards.
+    fn start_taste_test(&mut self, host: &Host, wiz: &mut CharacterWizard) {
+        // Deliberately NOT can_queue_create(): that validates the user's current Create params
+        // (video models, img2img inputs, local-NPU routing…), none of which the test uses —
+        // every job here is server Txt2Img on its own checkpoint. Connected is the whole gate.
+        if !matches!(self.conn, Conn::Connected) {
+            self.status = "Connect to a server first".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        if self.running {
+            self.status = "Wait for the current run to finish first".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        if wiz.identity.trim().is_empty() {
+            self.status = "The character prompt is empty — go back a step".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let (candidates, labels, per, seed) = {
+            let Some(t) = wiz.test.as_mut() else { return };
+            t.candidates.truncate((TASTE_MAX_IMAGES / t.per.max(1) as usize).min(TASTE_MAX_JOBS));
+            if t.candidates.is_empty() {
+                self.status = "No checkpoints to test — add some below".into();
+                host.haptic(Haptic::Warning);
+                return;
+            }
+            t.seed = random_seed();
+            t.pending = t.candidates.len();
+            // Anonymous, human-readable job labels (they show in the queue sheet mid-test).
+            t.labels =
+                (0..t.candidates.len()).map(|i| format!("Blind taste test {}", i + 1)).collect();
+            t.images.clear();
+            t.picks.clear();
+            t.revealed = false;
+            (t.candidates.clone(), t.labels.clone(), t.per, t.seed)
+        };
+        let identity = wiz.identity.trim().to_string();
+        let orig = self.params.clone();
+        self.progress = (0, 0);
+        self.preview = None;
+        self.results.clear();
+        self.result_view = None;
+        // Submit in shuffled order: the setup screen just showed the lineup, and a FIFO server
+        // hands results back in submission order — an unshuffled grid would be readable, not
+        // blind. Candidate indices stay bound through the labels; only the order is scrambled.
+        let mut order: Vec<usize> = (0..candidates.len()).collect();
+        let mut s = seed | 1;
+        for i in (1..order.len()).rev() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (s >> 33) as usize % (i + 1);
+            order.swap(i, j);
+        }
+        for &i in &order {
+            let file = candidates[i].clone();
+            self.params = orig.clone();
+            self.params.mode = Mode::Txt2Img;
+            self.params.model_kind = ModelKind::Checkpoint;
+            self.params.checkpoint = file.clone();
+            // Per-candidate recommended steps/cfg/size/sampler: each model gets its best shot.
+            self.apply_recommended_settings(&file);
+            self.params.positive = self.taste_prompt(&identity, &file);
+            // A bare-identity test: no LoRA stack, no enhance chain, no injected triggers.
+            self.params.loras.clear();
+            self.params.apps.clear();
+            self.params.lora_triggers.clear();
+            // Full denoise — this is txt2img from an empty latent. Inheriting the Create tab's
+            // denoise (often <1 for img2img) half-denoises the latent into a faint blurry
+            // silhouette, which is exactly the failure the test images showed.
+            self.params.denoise = 1.0;
+            self.params.batch_size = per;
+            self.params.seed = seed;
+            self.params.randomize_seed = false;
+            self.running = true;
+            self.jobs_left += 1;
+            let gcx = self.gen_ctx();
+            self.engine.as_mut().unwrap().generate(
+                self.params.clone(),
+                None,
+                gcx,
+                None,
+                labels[i].clone(),
+            );
+        }
+        self.params = orig;
+        self.status = format!("Taste test: {} checkpoint(s) queued", candidates.len());
+        host.haptic(Haptic::Medium);
+    }
+
+    /// True when `label` is one of the open taste test's submitted job labels (exact match).
+    fn wizard_is_test_label(&self, label: &str) -> bool {
+        self.character_wizard
+            .as_ref()
+            .and_then(|w| w.test.as_ref())
+            .is_some_and(|t| t.labels.iter().any(|l| l == label))
+    }
+
+    /// Route one arrived taste-test image into the wizard grid. False = not a test job, or no
+    /// wizard/test is open (closed mid-run) — the caller shows it like a normal result then.
+    fn wizard_take_test_image(&mut self, label: &str, tex: &egui::TextureHandle) -> bool {
+        let Some(t) = self.character_wizard.as_mut().and_then(|w| w.test.as_mut()) else {
+            return false;
+        };
+        let Some(idx) = t.labels.iter().position(|l| l == label) else { return false };
+        t.images.push((idx, tex.clone()));
+        true
+    }
+
+    /// A taste-test job finished; when the last one lands, invite the rating.
+    fn wizard_test_done(&mut self, label: &str) {
+        if !self.wizard_is_test_label(label) {
+            return;
+        }
+        let Some(t) = self.character_wizard.as_mut().and_then(|w| w.test.as_mut()) else { return };
+        t.pending = t.pending.saturating_sub(1);
+        if t.pending == 0 {
+            self.status = "Taste test done — tap the images you like".into();
+        }
+    }
+
+    /// A generation errored while a taste test was outstanding. Errors carry no label, so only
+    /// attribute one to the test when every in-flight job IS a test job; a mixed queue (the
+    /// user kept generating during the test) heals via the jobs-drained sync in the Done arm.
+    fn wizard_test_error(&mut self) {
+        let jobs = self.jobs_left;
+        if let Some(t) = self.character_wizard.as_mut().and_then(|w| w.test.as_mut())
+            && jobs <= t.pending
+        {
+            t.pending = t.pending.saturating_sub(1);
+        }
+    }
+
+    /// A candidate's display name for reveals and the queue sheet: catalog name over filename.
+    fn taste_candidate_name(&self, file: &str) -> String {
+        self.checkpoint_catalog
+            .entry(file)
+            .map(|e| e.display_name().to_string())
+            .unwrap_or_else(|| model_label(file))
+    }
+
+    /// The guided builder pane: one screen per trait (chips + a free-text extra), then the
+    /// composed-prompt review, then the checkpoint pick with the optional blind taste test.
+    /// Same take/put-back shape as the editor; Finish hands the card to the editor to save.
+    fn character_wizard_ui(&mut self, ui: &mut egui::Ui, host: &Host, list_w: f32) {
+        let Some(mut wiz) = self.character_wizard.take() else { return };
+        self.poll_wizard_compose(&mut wiz);
+        let w = list_w - 8.0;
+        let mut close = false;
+
+        let total = WIZ_TRAITS.len() + 2;
+        let pos = match wiz.step {
+            WizStep::Trait(i) => i + 1,
+            WizStep::Review => WIZ_TRAITS.len() + 1,
+            WizStep::Checkpoint => total,
+        };
+        let test_pending = wiz.test.as_ref().map(|t| t.pending).unwrap_or(0);
+        ui.horizontal(|ui| {
+            ui.heading("Guided character");
+            ui.weak(format!("{pos}/{total}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.armed_button(ui, host, "char-wiz-cancel", "Cancel".into(), true) {
+                    // Discarding mid-test also cancels its jobs, else their images land in the
+                    // results strip long after the wizard that asked for them is gone.
+                    if test_pending > 0 {
+                        self.cancel_generation(host);
+                    }
+                    close = true;
+                    host.haptic(Haptic::Warning);
+                }
+            });
+        });
+        ui.add_space(2.0);
+
+        match wiz.step {
+            WizStep::Trait(i) => {
+                let (title, hint, multi, options) = WIZ_TRAITS[i];
+                ui.strong(title);
+                ui.weak(hint);
+                // Your own saved chips for this category, minus any that duplicate a built-in.
+                let saved: Vec<String> = self
+                    .wizard_custom_tags
+                    .get(title)
+                    .map(|v| {
+                        v.iter()
+                            .filter(|t| !options.iter().any(|o| o.eq_ignore_ascii_case(t)))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let sel = &mut wiz.sel[i];
+                // Chip picked -> unpick; else pick (replacing others in a single-select trait).
+                let toggle = |sel: &mut TraitSel, tag: &str| {
+                    if let Some(pos) = sel.picked.iter().position(|p| p == tag) {
+                        sel.picked.remove(pos);
+                    } else if multi {
+                        sel.picked.push(tag.to_string());
+                    } else {
+                        sel.picked = vec![tag.to_string()];
+                    }
+                };
+                let mut forget: Option<String> = None;
+                ui.horizontal_wrapped(|ui| {
+                    for &opt in options {
+                        let picked = sel.picked.iter().any(|p| p == opt);
+                        if crate::theme::selectable_label(ui, picked, opt).clicked() {
+                            toggle(sel, opt);
+                            host.haptic(Haptic::Light);
+                        }
+                    }
+                    // Saved chips carry a trailing ✖ to forget them; group so the pair wraps
+                    // together rather than the ✖ drifting onto the next line.
+                    for tag in &saved {
+                        ui.horizontal(|ui| {
+                            let picked = sel.picked.iter().any(|p| p == tag);
+                            let label = sanitize_ui_text(ui, tag);
+                            if crate::theme::selectable_label(ui, picked, label).clicked() {
+                                toggle(sel, tag);
+                                host.haptic(Haptic::Light);
+                            }
+                            if ui
+                                .small_button(icons::CLOSE)
+                                .on_hover_text("Forget this saved tag")
+                                .clicked()
+                            {
+                                forget = Some(tag.clone());
+                            }
+                        });
+                    }
+                });
+                if let Some(tag) = forget {
+                    if let Some(v) = self.wizard_custom_tags.get_mut(title) {
+                        v.retain(|t| t != &tag);
+                        if v.is_empty() {
+                            self.wizard_custom_tags.remove(title);
+                        }
+                    }
+                    sel.picked.retain(|p| p != &tag);
+                    host.haptic(Haptic::Light);
+                }
+                // "Anything else": free text folded into the prompt as-is; the ＋ Add button
+                // promotes its comma-split tokens into reusable saved chips for this category.
+                let has_custom = !sel.custom.trim().is_empty();
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut sel.custom)
+                            .hint_text("Anything else — your own words work")
+                            .desired_width((w - 72.0).max(80.0)),
+                    );
+                    let entered =
+                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let add = ui
+                        .add_enabled(has_custom, egui::Button::new(format!("{} Add", icons::ADD)))
+                        .on_hover_text("Save these as reusable chips");
+                    if add.clicked() || (entered && has_custom) {
+                        // Lowercase to the danbooru convention the chips already use, so a saved
+                        // tag matches built-ins and picked entries exactly (toggle/forget compare
+                        // by ==). Save each new token (deduped, capped); pick per select-mode.
+                        let entry = self.wizard_custom_tags.entry(title.to_string()).or_default();
+                        let mut promoted: Vec<String> = Vec::new();
+                        for raw in sel.custom.split(',') {
+                            let tok = raw.trim().to_ascii_lowercase();
+                            if tok.is_empty() {
+                                continue;
+                            }
+                            let dup_builtin = options.iter().any(|o| o.eq_ignore_ascii_case(&tok));
+                            if !dup_builtin
+                                && !entry.contains(&tok)
+                                && entry.len() < WIZ_CUSTOM_TAGS_CAP
+                            {
+                                entry.push(tok.clone());
+                            }
+                            promoted.push(tok);
+                        }
+                        if multi {
+                            for tok in promoted {
+                                if !sel.picked.contains(&tok) {
+                                    sel.picked.push(tok);
+                                }
+                            }
+                        } else if let Some(last) = promoted.pop() {
+                            // Single-select: the custom value replaces the chip, like a chip tap.
+                            sel.picked = vec![last];
+                        }
+                        sel.custom.clear();
+                        host.haptic(Haptic::Light);
+                    }
+                });
+                ui.add_space(6.0);
+                // Collect navigation in locals: applying it after the closure lets us take a
+                // whole-`wiz` borrow (to cancel a running compose) without fighting `sel`'s
+                // borrow of `wiz.sel[i]` inside the closure.
+                let mut nav: Option<WizStep> = None;
+                let mut sheet_changed = false;
+                ui.horizontal(|ui| {
+                    let bw = ((ui.available_width() - 6.0) / 2.0).max(64.0);
+                    if ui
+                        .add_enabled(
+                            i > 0,
+                            egui::Button::new(format!("{} Back", icons::BACK))
+                                .min_size(egui::vec2(bw, 30.0)),
+                        )
+                        .clicked()
+                    {
+                        nav = Some(WizStep::Trait(i - 1));
+                    }
+                    let skip = sel.picked.is_empty() && sel.custom.trim().is_empty();
+                    let next = if skip { "Skip" } else { "Next" };
+                    if ui.add_sized([bw, 30.0], egui::Button::new(next)).clicked() {
+                        sheet_changed = true;
+                        nav = Some(if i + 1 < WIZ_TRAITS.len() {
+                            WizStep::Trait(i + 1)
+                        } else {
+                            WizStep::Review
+                        });
+                        host.haptic(Haptic::Light);
+                    }
+                });
+                if let Some(step) = nav {
+                    if sheet_changed {
+                        // Selections changed the sheet: recompose fresh on Review, and abort any
+                        // compose still running for the old sheet so its stale result can't fire
+                        // a second compose or a modal for tags the user has since changed.
+                        wiz.composed_once = false;
+                        Self::wizard_cancel_compose(&mut wiz);
+                    }
+                    wiz.step = step;
+                }
+            }
+            WizStep::Review => {
+                if !wiz.composed_once && !wiz.composing {
+                    wiz.composed_once = true;
+                    wiz.identity = Self::wizard_join_tags(&wiz.sel);
+                    // With a rewrite pack the LLM refines the join (folding the free-text notes
+                    // into tags); without one the join above already is the review text.
+                    self.start_wizard_compose(ui.ctx(), &mut wiz);
+                }
+                #[cfg(feature = "local-npu")]
+                let can_llm = self.rewrite_pack.is_some();
+                #[cfg(not(feature = "local-npu"))]
+                let can_llm = false;
+                ui.strong("Character prompt");
+                if wiz.composing {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.weak("Composing with the on-device model…");
+                    });
+                }
+                ui.add(
+                    egui::TextEdit::multiline(&mut wiz.identity)
+                        .desired_rows(3)
+                        .desired_width(w)
+                        .hint_text("1girl, silver hair, red eyes, twin braids"),
+                );
+                ui.horizontal(|ui| {
+                    if can_llm
+                        && !wiz.composing
+                        && ui
+                            .small_button("Recompose")
+                            .on_hover_text("Run the on-device composer again")
+                            .clicked()
+                    {
+                        self.start_wizard_compose(ui.ctx(), &mut wiz);
+                    }
+                    if ui
+                        .small_button("Plain tags")
+                        .on_hover_text("Just join the picked chips, no AI")
+                        .clicked()
+                    {
+                        wiz.identity = Self::wizard_join_tags(&wiz.sel);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label("Name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut wiz.name)
+                        .hint_text("Character name")
+                        .desired_width(w),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let bw = ((ui.available_width() - 6.0) / 2.0).max(64.0);
+                    if ui
+                        .add_sized([bw, 30.0], egui::Button::new(format!("{} Back", icons::BACK)))
+                        .clicked()
+                    {
+                        wiz.step = WizStep::Trait(WIZ_TRAITS.len() - 1);
+                    }
+                    if ui.add_sized([bw, 30.0], egui::Button::new("Next")).clicked() {
+                        wiz.step = WizStep::Checkpoint;
+                        host.haptic(Haptic::Light);
+                    }
+                });
+            }
+            WizStep::Checkpoint => {
+                self.wizard_checkpoint_step(ui, host, &mut wiz, w, &mut close);
+            }
+        }
+
+        // A finished compose waits here as an accept/discard diff (drawn over the whole pane).
+        if !close {
+            self.wizard_compose_review(ui.ctx(), &mut wiz);
+        }
+
+        if close {
+            // Dropping the receiver mid-compose is fine, but the progress status it set would
+            // otherwise sit on screen forever — this pane's poll was the only thing clearing
+            // it. Only replace that exact message: Finish just set its own status.
+            if wiz.composing && self.status.starts_with("Composing character prompt") {
+                self.status = "Compose cancelled".into();
+            }
+        } else {
+            self.character_wizard = Some(wiz);
+        }
+    }
+
+    /// The compose accept/discard diff modal — the wizard's version of the Create-page Rewrite
+    /// review. Removed segments strike red, added green, unchanged weak; Keep AI applies the
+    /// composed prompt, Keep mine leaves the current text. No-op until a compose lands.
+    fn wizard_compose_review(&mut self, ctx: &egui::Context, wiz: &mut CharacterWizard) {
+        let Some((original, composed)) = wiz.compose_review.clone() else { return };
+        egui::Area::new(egui::Id::new("wiz-compose-scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
+            });
+        let mut act: Option<bool> = None;
+        let diff = tags::prompt_diff(&original, &composed);
+        let changed = diff.iter().any(|(op, _)| *op != 0);
+        let max_h = (ctx.content_rect().height() * 0.45).clamp(140.0, 360.0);
+        centered(ctx, egui::Window::new(format!("{} AI-composed prompt", icons::GENERATE)))
+            .collapsible(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                if changed {
+                    ui.weak("The on-device model rewrote your tags — keep its version?");
+                } else {
+                    ui.weak("The model returned the same tags; nothing to change.");
+                }
+                crate::theme::scroll_vertical().max_height(max_h).auto_shrink([false, true]).show(
+                    ui,
+                    |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (op, seg) in &diff {
+                                let text = sanitize_ui_text(ui, seg);
+                                match op {
+                                    -1 => ui.label(
+                                        egui::RichText::new(text)
+                                            .color(egui::Color32::from_rgb(225, 105, 105))
+                                            .strikethrough(),
+                                    ),
+                                    1 => ui.label(
+                                        egui::RichText::new(text)
+                                            .color(egui::Color32::from_rgb(110, 200, 120)),
+                                    ),
+                                    _ => ui.label(egui::RichText::new(text).weak()),
+                                };
+                            }
+                        });
+                    },
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let bw = ((ui.available_width() - 4.0) / 2.0).max(60.0);
+                    let size = egui::vec2(bw, 32.0);
+                    if ui
+                        .add_enabled(
+                            changed,
+                            egui::Button::new(format!("{} Keep AI", icons::CHECK)).min_size(size),
+                        )
+                        .clicked()
+                    {
+                        act = Some(true);
+                    }
+                    if ui
+                        .add_sized(size, egui::Button::new(format!("{} Keep mine", icons::CLOSE)))
+                        .clicked()
+                    {
+                        act = Some(false);
+                    }
+                });
+            });
+        match act {
+            Some(true) => {
+                wiz.identity = composed;
+                wiz.compose_review = None;
+                self.status = "Composed prompt applied".into();
+            }
+            Some(false) => {
+                wiz.compose_review = None;
+                self.status = "Kept your prompt".into();
+            }
+            None => {}
+        }
+    }
+
+    /// The wizard's last step: pick a checkpoint by hand, or run the blind taste test — the
+    /// same prompt and seed on several checkpoints, rate favorites, let the tally choose.
+    fn wizard_checkpoint_step(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &Host,
+        wiz: &mut CharacterWizard,
+        w: f32,
+        close: &mut bool,
+    ) {
+        ui.strong("Checkpoint");
+        ui.weak("The model this character generates with; skip to keep whatever's current.");
+        let sel_text = if wiz.checkpoint.is_empty() {
+            "Keep current model".to_string()
+        } else {
+            sanitize_ui_text(ui, &elide(&model_label(&wiz.checkpoint), 46))
+        };
+        egui::ComboBox::from_id_salt("wiz_ckpt").width(w).selected_text(sel_text).show_ui(
+            ui,
+            |ui| {
+                ui.set_min_width(w);
+                if crate::theme::selectable_label(ui, wiz.checkpoint.is_empty(), "Keep current model").clicked() {
+                    wiz.checkpoint.clear();
+                }
+                for f in self.checkpoints.iter().take(300) {
+                    let label = sanitize_ui_text(ui, &elide(&model_label(f), 46));
+                    if crate::theme::selectable_label(ui, wiz.checkpoint == *f, label).clicked() {
+                        wiz.checkpoint = f.clone();
+                    }
+                }
+            },
+        );
+
+        ui.add_space(8.0);
+        ui.strong("Taste test");
+        // Start/dismiss act on the whole wizard, so they defer past the borrow on `wiz.test`.
+        enum TestAct {
+            Start,
+            Dismiss,
+        }
+        let mut act: Option<TestAct> = None;
+        match &mut wiz.test {
+            None => {
+                ui.weak(
+                    "Not sure which model suits them? Generate this prompt on a few checkpoints \
+                     and tap the images you like — models stay hidden until you've picked.",
+                );
+                let ready = !self.checkpoints.is_empty();
+                if ui.add_enabled(ready, egui::Button::new("Set up test")).clicked() {
+                    wiz.test = Some(TasteTest {
+                        candidates: self.taste_candidates(6),
+                        labels: Vec::new(),
+                        per: 2,
+                        seed: 0,
+                        pending: 0,
+                        images: Vec::new(),
+                        picks: HashSet::new(),
+                        revealed: false,
+                    });
+                    host.haptic(Haptic::Light);
+                }
+                if !ready {
+                    ui.weak("Connect to a server with checkpoints first.");
+                }
+            }
+            Some(t) if t.pending == 0 && t.images.is_empty() => {
+                // Configured, not started (or every job failed): edit the lineup, then run.
+                ui.weak("Testing these checkpoints:");
+                let mut remove: Option<usize> = None;
+                for (i, f) in t.candidates.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button(icons::CLOSE).clicked() {
+                            remove = Some(i);
+                        }
+                        let fam = checkpoint_family(self.checkpoint_catalog.entry(f));
+                        ui.label(sanitize_ui_text(ui, &elide(&model_label(f), 40)));
+                        ui.weak(fam);
+                    });
+                }
+                if let Some(i) = remove {
+                    t.candidates.remove(i);
+                    host.haptic(Haptic::Light);
+                }
+                let max_c = (TASTE_MAX_IMAGES / t.per.max(1) as usize).min(TASTE_MAX_JOBS);
+                if t.candidates.len() < max_c {
+                    egui::ComboBox::from_id_salt("wiz_test_add")
+                        .width(w)
+                        .selected_text(format!("{} Add a checkpoint", icons::ADD))
+                        .show_ui(ui, |ui| {
+                            ui.set_min_width(w);
+                            for f in self.checkpoints.iter().take(300) {
+                                if t.candidates.iter().any(|c| c == f) {
+                                    continue;
+                                }
+                                let label = sanitize_ui_text(ui, &elide(&model_label(f), 46));
+                                if crate::theme::selectable_label(ui, false, label).clicked() {
+                                    t.candidates.push(f.clone());
+                                }
+                            }
+                        });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Images each:");
+                    for per in [1u32, 2] {
+                        if crate::theme::selectable_label(ui, t.per == per, format!("{per}")).clicked() {
+                            t.per = per;
+                            // Trim here, in view, so a coarser budget never silently drops a
+                            // lineup tail at start time.
+                            let cap = (TASTE_MAX_IMAGES / per as usize).min(TASTE_MAX_JOBS);
+                            t.candidates.truncate(cap);
+                        }
+                    }
+                    let total = t.candidates.len() as u32 * t.per;
+                    ui.weak(format!("{total} image(s), cap {TASTE_MAX_IMAGES}"));
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let start = !t.candidates.is_empty()
+                        && !self.running
+                        && matches!(self.conn, Conn::Connected);
+                    if ui
+                        .add_enabled(start, egui::Button::new(format!("{} Run test", icons::RUN)))
+                        .clicked()
+                    {
+                        act = Some(TestAct::Start);
+                    }
+                    if ui.small_button("Never mind").clicked() {
+                        act = Some(TestAct::Dismiss);
+                    }
+                });
+            }
+            Some(t) => {
+                let total = t.candidates.len() as u32 * t.per;
+                if t.pending > 0 {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.weak(format!(
+                            "Generating… {} of {total} image(s), {} job(s) left",
+                            t.images.len(),
+                            t.pending
+                        ));
+                    });
+                    let (v, m) = self.progress;
+                    if m > 0 {
+                        ui.add(
+                            egui::ProgressBar::new(v as f32 / m as f32)
+                                .desired_width(w)
+                                .desired_height(6.0),
+                        );
+                    }
+                    if ui.small_button(format!("{} Stop test", icons::STOP)).clicked() {
+                        self.cancel_generation(host);
+                        t.pending = 0;
+                    }
+                } else if !t.revealed {
+                    ui.weak("Tap the images you like, then let the tally pick the checkpoint.");
+                }
+                // The blind grid: models are only named (hover) after the reveal.
+                let cols = 3usize;
+                let gap = 4.0;
+                let tile = ((w - gap * (cols as f32 - 1.0)) / cols as f32).max(64.0);
+                let names: Vec<String> =
+                    t.candidates.iter().map(|f| self.taste_candidate_name(f)).collect();
+                let mut i = 0usize;
+                while i < t.images.len() {
+                    ui.horizontal(|ui| {
+                        for _ in 0..cols {
+                            let Some((cand, tex)) = t.images.get(i) else { break };
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
+                            let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                .fit_to_exact_size(egui::vec2(tile, tile))
+                                .sense(egui::Sense::click());
+                            let mut resp = ui.put(rect, img);
+                            if t.revealed
+                                && let Some(name) = names.get(*cand)
+                            {
+                                resp = resp.on_hover_text(sanitize_ui_text(ui, name));
+                            }
+                            if resp.clicked() {
+                                if !t.picks.remove(&i) {
+                                    t.picks.insert(i);
+                                }
+                                host.haptic(Haptic::Light);
+                            }
+                            selection_overlay(ui, rect, t.picks.contains(&i));
+                            // Once revealed, name each tile in-place — hover text is useless on a
+                            // touch screen, and this is how the user tells which model made a dud.
+                            if t.revealed
+                                && let Some(name) = names.get(*cand)
+                            {
+                                let label = sanitize_ui_text(ui, &elide(name, 16));
+                                let p = ui.painter();
+                                let strip = egui::Rect::from_min_max(
+                                    egui::pos2(rect.left(), rect.bottom() - 16.0),
+                                    rect.right_bottom(),
+                                );
+                                p.rect_filled(strip, 0.0, egui::Color32::from_black_alpha(200));
+                                p.text(
+                                    egui::pos2(strip.left() + 3.0, strip.center().y),
+                                    egui::Align2::LEFT_CENTER,
+                                    label,
+                                    egui::FontId::proportional(11.0),
+                                    crate::theme::AQUA_BRIGHT,
+                                );
+                            }
+                            i += 1;
+                        }
+                    });
+                }
+                if t.pending == 0 && !t.images.is_empty() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !t.picks.is_empty(),
+                                egui::Button::new(format!("{} Choose for me", icons::CHECK)),
+                            )
+                            .clicked()
+                        {
+                            let mut counts = vec![0usize; t.candidates.len()];
+                            for &p in &t.picks {
+                                if let Some((c, _)) = t.images.get(p) {
+                                    counts[*c] += 1;
+                                }
+                            }
+                            // Ties go to the earlier candidate — the lineup is priority-ordered
+                            // (current model, favorites, family spread), so earlier ≈ safer.
+                            if let Some(winner) = counts
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .filter(|(_, c)| **c > 0)
+                                .max_by_key(|(_, c)| **c)
+                                .map(|(i, _)| i)
+                            {
+                                wiz.checkpoint = t.candidates[winner].clone();
+                                t.revealed = true;
+                                self.status = format!(
+                                    "Taste test: {} wins with {} pick(s)",
+                                    names.get(winner).cloned().unwrap_or_default(),
+                                    counts[winner]
+                                );
+                                host.haptic(Haptic::Success);
+                            }
+                        }
+                        // Reveal which checkpoint made each image without having to pick a winner —
+                        // handy when some came out black/blurry and you want to know the culprit.
+                        if !t.revealed
+                            && ui
+                                .button(format!("{} Reveal", icons::SEARCH))
+                                .on_hover_text("Label each image with its checkpoint")
+                                .clicked()
+                        {
+                            t.revealed = true;
+                            host.haptic(Haptic::Light);
+                        }
+                        // Two-tap: this throws away the whole generated comparison set.
+                        if self.armed_button(ui, host, "char-test-rerun", "Re-run".into(), true) {
+                            t.images.clear();
+                            t.picks.clear();
+                            t.revealed = false;
+                            host.haptic(Haptic::Warning);
+                        }
+                    });
+                    if t.revealed && !wiz.checkpoint.is_empty() {
+                        ui.label(format!(
+                            "{} Chosen: {}",
+                            icons::MODEL,
+                            sanitize_ui_text(ui, &self.taste_candidate_name(&wiz.checkpoint))
+                        ));
+                    }
+                }
+            }
+        }
+        match act {
+            Some(TestAct::Start) => self.start_taste_test(host, wiz),
+            Some(TestAct::Dismiss) => wiz.test = None,
+            None => {}
+        }
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let bw = ((ui.available_width() - 6.0) / 2.0).max(64.0);
+            if ui
+                .add_sized([bw, 30.0], egui::Button::new(format!("{} Back", icons::BACK)))
+                .clicked()
+            {
+                wiz.step = WizStep::Review;
+            }
+            // Finishing mid-test would dump the stragglers into the results strip; wait or stop.
+            let pending = wiz.test.as_ref().map(|t| t.pending).unwrap_or(0);
+            if ui
+                .add_enabled(
+                    pending == 0,
+                    egui::Button::new(format!("{} Finish", icons::CHECK)).min_size(egui::vec2(bw, 30.0)),
+                )
+                .clicked()
+            {
+                let card = CharacterCard {
+                    name: wiz.name.trim().to_string(),
+                    identity: wiz.identity.trim().to_string(),
+                    checkpoint: wiz.checkpoint.clone(),
+                    switch_checkpoint: !wiz.checkpoint.is_empty(),
+                    ..Default::default()
+                };
+                self.character_draft = Some(CharacterDraft { editing: None, card });
+                self.status = "Character built — review and save".into();
+                host.haptic(Haptic::Success);
+                *close = true;
+            }
+        });
     }
 
     /// Which loader a model needs: the caller's hint, else the catalog's `directory`, else which
@@ -7485,6 +8649,86 @@ impl ComfyApp {
         self.checkpoint_recent.truncate(CHECKPOINT_RECENT_MAX);
     }
 
+    /// Display name for the Create top bars (Wan high-noise UNET while in video mode).
+    fn create_model_label(&self) -> String {
+        #[cfg(feature = "local-npu")]
+        if self.route_local_gen() {
+            if let Some(p) = self.selected_pack() {
+                return format!("Local · {}", p.label());
+            }
+            return format!("Local · {}", self.local_backend.label());
+        }
+        if self.params.mode == Mode::Video {
+            let u = self.params.video.unet_high.trim();
+            if !u.is_empty() {
+                return self
+                    .checkpoint_catalog
+                    .entry(u)
+                    .map(|e| e.display_name().to_string())
+                    .unwrap_or_else(|| elide(file_basename(u), 40));
+            }
+            return "no Wan model".into();
+        }
+        let model_file = self.params.model_file();
+        if model_file.is_empty() {
+            return "no model".into();
+        }
+        self.checkpoint_catalog
+            .entry(model_file)
+            .map(|e| e.display_name().to_string())
+            .unwrap_or_else(|| elide(model_file, 40))
+    }
+
+    /// Apply a Create Main mode change, swapping Wan / recent image checkpoints as needed.
+    fn apply_gen_mode(&mut self, next: GenMode) {
+        let prev = self.params.gen_mode();
+        if prev == next {
+            return;
+        }
+        if prev.is_image() {
+            let file = self.params.model_file().to_string();
+            if !file.is_empty() && !is_wan_related(&file) {
+                self.touch_checkpoint_recent(&file);
+            }
+        }
+        self.params.set_gen_mode(next);
+        if next.is_video() {
+            self.ensure_wan_models_for_mode(matches!(next, GenMode::Txt2Video));
+        } else if prev.is_video() {
+            self.restore_recent_image_checkpoint();
+        }
+    }
+
+    /// Seed video high/low UNETs for i2v or t2v from installed models (or defaults).
+    fn ensure_wan_models_for_mode(&mut self, t2v: bool) {
+        let (high, low) = pick_wan_unet_pair(&self.unets, t2v);
+        if let Some(h) = high {
+            self.params.video.unet_high = h;
+        }
+        if let Some(l) = low {
+            self.params.video.unet_low = l;
+        }
+    }
+
+    /// Restore the newest non-Wan MRU checkpoint after leaving video mode.
+    fn restore_recent_image_checkpoint(&mut self) {
+        let pick = self
+            .checkpoint_recent
+            .iter()
+            .find(|f| !is_wan_related(f))
+            .cloned()
+            .or_else(|| {
+                self.checkpoints
+                    .iter()
+                    .chain(self.unets.iter())
+                    .find(|f| !is_wan_related(f))
+                    .cloned()
+            });
+        if let Some(file) = pick {
+            self.select_model(&file, None);
+        }
+    }
+
     /// Catalog favorite or a local pin.
     fn is_checkpoint_favorite(&self, file: &str) -> bool {
         self.checkpoint_favorites.iter().any(|f| f == file)
@@ -7640,7 +8884,10 @@ impl ComfyApp {
                     ui.horizontal(|ui| {
                         let kill = ui
                             .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                let kill = ui.small_button("Remove").clicked();
+                                let kill = ui
+                                    .small_button(icons::TRASH)
+                                    .on_hover_text("Remove LoRA")
+                                    .clicked();
                                 ui.add_space(6.0);
                                 let max_w = (ui.available_width() - 4.0).max(32.0);
                                 let title = elide_width(ui, &sanitize_ui_text(ui, &title), max_w);
@@ -7652,9 +8899,6 @@ impl ComfyApp {
                             remove = Some(i);
                         }
                     });
-                    if let Some(meta) = meta.as_ref() {
-                        ui.weak(sanitize_ui_text(ui, &format!("rec: {}", meta.strength_hint())));
-                    }
                     if let Some(slot) = self.params.loras.get_mut(i) {
                         let (lo, hi) = meta
                             .as_ref()
@@ -7664,7 +8908,17 @@ impl ComfyApp {
                                 (lo.min(hi), lo.max(hi).max(lo + 0.01))
                             })
                             .unwrap_or((-2.0, 2.0));
-                        ui.add(egui::Slider::new(&mut slot.strength_model, lo..=hi).text("Model"));
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Slider::new(&mut slot.strength_model, lo..=hi).text("Model"),
+                            );
+                            if let Some(meta) = meta.as_ref() {
+                                ui.weak(sanitize_ui_text(
+                                    ui,
+                                    &format!("rec: {}", meta.strength_hint()),
+                                ));
+                            }
+                        });
                         if !slot.model_only {
                             ui.add(egui::Slider::new(&mut slot.strength_clip, lo..=hi).text("CLIP"));
                         }
@@ -9036,11 +10290,16 @@ impl ComfyApp {
     }
 
     fn apply_image_meta(&mut self, meta: &ImageMeta) {
-        self.apply_image_meta_sel(meta, RemixApply::ALL);
+        self.apply_image_meta_sel(meta, RemixApply::ALL, false);
     }
 
     /// Write only the `sel`-enabled fields of `meta` into Params; unchecked slots keep their value.
-    fn apply_image_meta_sel(&mut self, meta: &ImageMeta, sel: RemixApply) {
+    /// `is_video` routes a scraped video graph into the Video tab instead of image-mode Params.
+    fn apply_image_meta_sel(&mut self, meta: &ImageMeta, sel: RemixApply, is_video: bool) {
+        if is_video {
+            self.apply_video_meta_sel(meta, sel);
+            return;
+        }
         // A UNET in the graph means the diffusion topology; the image's own encoders and VAE beat
         // whatever select_model would have seeded.
         if sel.model {
@@ -9104,17 +10363,96 @@ impl ComfyApp {
         self.create_pane = CreatePane::Main;
     }
 
+    /// Remix a scraped VIDEO graph into the Video tab: route the model / encoders / LoRAs / sampler
+    /// into `params.video` and switch to `Mode::Video`. The flat scrape keeps one UNET and a merged
+    /// LoRA list, so the two-expert (high/low) split can't be reproduced faithfully — the high
+    /// expert takes the model and LoRAs, and the user copies them to the low expert if needed.
+    fn apply_video_meta_sel(&mut self, meta: &ImageMeta, sel: RemixApply) {
+        self.params.mode = Mode::Video;
+        // A gallery video carries no reproducible start frame, so reproduce it as text-to-video —
+        // otherwise the i2v path would silently seed from whatever stale input is currently set.
+        self.params.video.video_t2v = true;
+        if sel.model {
+            // Mirror the single scraped UNET onto both experts so the graph is valid to run.
+            if let Some(u) = meta.unet.clone().or_else(|| meta.models.first().cloned()) {
+                self.params.video.unet_high = u.clone();
+                self.params.video.unet_low = u;
+            }
+            if let Some(c) = meta.clips.first() {
+                self.params.video.clip_name = c.clone();
+            }
+            if let Some(t) = &meta.clip_type {
+                self.params.video.clip_type = t.clone();
+            }
+            if let Some(v) = &meta.vae {
+                self.params.video.vae_name = v.clone();
+            }
+            if let Some(d) = &meta.weight_dtype {
+                self.params.video.weight_dtype = d.clone();
+            }
+        }
+        // Positive / negative are shared across modes — build_video reads params.positive/negative.
+        if sel.positive {
+            if let Some(p) = &meta.positive {
+                self.params.positive = p.clone();
+            }
+        }
+        if sel.negative {
+            if let Some(n) = &meta.negative {
+                self.params.negative = n.clone();
+            }
+        }
+        if sel.sampler {
+            if let Some(s) = &meta.sampler {
+                self.params.video.sampler = s.clone();
+            }
+        }
+        if sel.scheduler {
+            if let Some(s) = &meta.scheduler {
+                self.params.video.scheduler = s.clone();
+            }
+        }
+        if sel.steps {
+            if let Some(st) = meta.steps {
+                self.params.video.steps = st as u32;
+            }
+        }
+        if sel.cfg {
+            if let Some(c) = meta.cfg {
+                // One scraped CFG feeds both experts.
+                self.params.video.cfg_high = c as f32;
+                self.params.video.cfg_low = c as f32;
+            }
+        }
+        if sel.loras {
+            self.params.video.lora_triggers.clear();
+            self.params.video.loras_high = gallery::meta_to_active_loras(&meta.loras);
+            // Clear the low expert rather than leave its defaults (e.g. a 4-step distill LoRA) to
+            // fight a non-distilled remixed schedule; the flat scrape can't tell high from low.
+            self.params.video.loras_low.clear();
+        }
+        if sel.seed {
+            // The video high-expert sampler reads params.seed (shared); see workflow.rs.
+            if let Some(v) = meta.seed {
+                self.params.seed = v as u64;
+                self.params.randomize_seed = false;
+            }
+        }
+        self.create_pane = CreatePane::Main;
+    }
+
     /// Load a gallery image's scraped meta into Create for an exact re-generation.
-    fn remix_from_meta(&mut self, meta: &ImageMeta) {
-        self.remix_from_meta_sel(meta, RemixApply::ALL);
+    fn remix_from_meta(&mut self, meta: &ImageMeta, is_video: bool) {
+        self.remix_from_meta_sel(meta, RemixApply::ALL, is_video);
     }
 
     /// Remix, applying only the `sel`-enabled fields, then repair companions and jump to Create.
-    fn remix_from_meta_sel(&mut self, meta: &ImageMeta, sel: RemixApply) {
-        self.apply_image_meta_sel(meta, sel);
+    fn remix_from_meta_sel(&mut self, meta: &ImageMeta, sel: RemixApply, is_video: bool) {
+        self.apply_image_meta_sel(meta, sel, is_video);
         // Repair a diffusion model's companions against this server's installed files; when the
-        // model row is unchecked this ports the prompt / LoRAs onto the current checkpoint.
-        if self.params.model_kind == ModelKind::Diffusion {
+        // model row is unchecked this ports the prompt / LoRAs onto the current checkpoint. Video
+        // carries its own encoders/VAE in params.video, so skip the image-companion repair.
+        if !is_video && self.params.model_kind == ModelKind::Diffusion {
             self.resolve_companions(Companions::Repair);
         }
         // Disable seed randomization so the seed reproduces.
@@ -9123,7 +10461,23 @@ impl ComfyApp {
         }
         self.selected_preset.clear();
         self.tab = Tab::Generate;
-        self.note = "Remixed into Create".into();
+        self.note = if is_video { "Remixed into the Video tab" } else { "Remixed into Create" }.into();
+    }
+
+    /// Enter remix for a viewer item: videos jump straight into Video-mode Create (the per-field
+    /// diff sheet compares against image params, so it isn't offered for video); images open the
+    /// per-field diff sheet. Shared by the Remix button and the workflow-scrape resolution.
+    fn begin_remix(&mut self, meta: ImageMeta, host: &Host) {
+        let is_video = self.viewer.as_ref().map(|v| v.item.is_video).unwrap_or(false);
+        if is_video {
+            self.remix_from_meta(&meta, true);
+            self.close_viewer();
+            host.haptic(Haptic::Medium);
+        } else {
+            self.gallery_status.clear();
+            self.open_remix_sheet(meta);
+            host.haptic(Haptic::Light);
+        }
     }
 
     /// Build the per-field remix diff sheet for `meta`, capturing the viewer image for img2img reuse.
@@ -9263,13 +10617,13 @@ impl ComfyApp {
                     ui.strong("Reference frame (colour-match)");
                     ui.horizontal(|ui| {
                         ui.add_enabled_ui(has_input, |ui| {
-                            ui.selectable_value(
+                            crate::theme::selectable_value(ui, 
                                 &mut ref_source,
                                 FinishRef::CurrentInput,
                                 "Current input image",
                             );
                         });
-                        ui.selectable_value(&mut ref_source, FinishRef::Pick, "Pick photo");
+                        crate::theme::selectable_value(ui, &mut ref_source, FinishRef::Pick, "Pick photo");
                     });
                     match ref_source {
                         FinishRef::CurrentInput if !has_input => {
@@ -9289,9 +10643,9 @@ impl ComfyApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.label("Scale");
-                    ui.selectable_value(&mut scale_by, 1.0, "1x");
-                    ui.selectable_value(&mut scale_by, 1.5, "1.5x");
-                    ui.selectable_value(&mut scale_by, 2.0, "2x");
+                    crate::theme::selectable_value(ui, &mut scale_by, 1.0, "1x");
+                    crate::theme::selectable_value(ui, &mut scale_by, 1.5, "1.5x");
+                    crate::theme::selectable_value(ui, &mut scale_by, 2.0, "2x");
                 });
                 ui.horizontal(|ui| {
                     ui.label("RIFE multiplier");
@@ -9519,7 +10873,8 @@ impl ComfyApp {
             Some(SAct::Apply) | Some(SAct::ApplyImg2Img) => {
                 let Some(sheet) = self.remix_sheet.take() else { return };
                 let sel = Self::remix_apply_from_sheet(&sheet);
-                self.remix_from_meta_sel(&sheet.meta, sel);
+                // The diff sheet is only opened for images; videos remix straight through.
+                self.remix_from_meta_sel(&sheet.meta, sel, false);
                 if matches!(act, Some(SAct::ApplyImg2Img)) {
                     self.remix_set_img2img(ctx, sheet.input);
                 }
@@ -10288,6 +11643,20 @@ impl ComfyApp {
             ui.add_space(2.0);
         });
 
+        match self.create_pane {
+            CreatePane::Main => {
+                egui::Panel::top("create-main-top").show(ui, |ui| {
+                    self.create_main_top_bar(ui, host);
+                });
+            }
+            CreatePane::Models => {
+                egui::Panel::top("create-models-top").show(ui, |ui| {
+                    self.create_models_top_bar(ui, host);
+                });
+            }
+            _ => {}
+        }
+
         let pane = ui.available_rect_before_wrap();
         self.scroll_focus_into_view(ui);
         crate::theme::scroll_vertical()
@@ -10306,9 +11675,30 @@ impl ComfyApp {
                     });
                     ui.separator();
                 }
-                // Results first so a new image is immediately visible without scrolling.
+                ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
+
+                // Results sit under the controls so prompts stay first; expand on new output.
+                let n = self.results.len();
+                let out_title = if n == 0 {
+                    if self.preview.is_some() {
+                        "Output · preview".to_string()
+                    } else {
+                        "Output".to_string()
+                    }
+                } else if n == 1 {
+                    "Output · 1 result".to_string()
+                } else {
+                    format!("Output · {n} results")
+                };
+                let force_open = self.create_scroll_bottom;
                 let results_top = ui.cursor().min;
-                self.output(ui, host);
+                egui::CollapsingHeader::new(out_title)
+                    .id_salt("create_output")
+                    .default_open(true)
+                    .open(if force_open { Some(true) } else { None })
+                    .show(ui, |ui| {
+                        self.output(ui, host);
+                    });
                 if self.create_scroll_bottom {
                     ui.scroll_to_rect(
                         egui::Rect::from_min_size(results_top, egui::vec2(1.0, 1.0)),
@@ -10316,12 +11706,88 @@ impl ComfyApp {
                     );
                     self.create_scroll_bottom = false;
                 }
-
-                ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
                 ui.add_space(12.0);
             });
         self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
         self.create_fab(ui.ctx(), host, pane);
+    }
+
+    /// Fixed Create Main strip: current model, generation mode, Reset.
+    fn create_main_top_bar(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let model = self.create_model_label();
+        let show_video = self.params.mode == Mode::Video
+            || self.schemas.as_ref().is_some_and(|s| s.has_node("WanImageToVideo"));
+        let anima = self.anima_active();
+        ui.horizontal(|ui| {
+            ui.strong(sanitize_ui_text(ui, &elide(&model, 28)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.reset_button(ui, host);
+                let mut mode = self.params.gen_mode();
+                let before = mode;
+                egui::ComboBox::from_id_salt("create_gen_mode")
+                    .selected_text(mode.label())
+                    .width(148.0)
+                    .show_ui(ui, |ui| {
+                        for m in GenMode::ALL {
+                            let enabled = match m {
+                                GenMode::Img2Img if anima => false,
+                                GenMode::Txt2Video | GenMode::Img2Video if !show_video => false,
+                                _ => true,
+                            };
+                            ui.add_enabled_ui(enabled, |ui| {
+                                crate::theme::selectable_value(ui, &mut mode, m, m.label());
+                            });
+                        }
+                    });
+                if mode != before {
+                    self.apply_gen_mode(mode);
+                }
+            });
+        });
+        if anima && self.params.mode == Mode::Img2Img {
+            self.apply_gen_mode(GenMode::Txt2Img);
+        }
+        if anima && self.params.mode != Mode::Video {
+            ui.weak("Anima has no img2img yet — text to image only.");
+        }
+    }
+
+    /// Fixed Models strip: current model + Local/Remote source combobox.
+    fn create_models_top_bar(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let model = self.create_model_label();
+        ui.horizontal(|ui| {
+            ui.strong(sanitize_ui_text(ui, &elide(&model, 32)));
+            #[cfg(feature = "local-npu")]
+            {
+                if self.local_npu {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut local = !self.local_use_server;
+                        let before = local;
+                        egui::ComboBox::from_id_salt("models_local_remote")
+                            .selected_text(if local { "Local" } else { "Remote" })
+                            .width(96.0)
+                            .show_ui(ui, |ui| {
+                                crate::theme::selectable_value(ui, &mut local, true, "Local");
+                                crate::theme::selectable_value(ui, &mut local, false, "Remote");
+                            });
+                        if local != before {
+                            self.local_use_server = !local;
+                            crate::local_engine::drop_cache();
+                            if local {
+                                self.ensure_local_packs(host, false);
+                                self.log.info("local-npu: Models -> Local");
+                            } else {
+                                self.log.info("local-npu: Models -> Remote");
+                            }
+                        }
+                    });
+                }
+            }
+            #[cfg(not(feature = "local-npu"))]
+            {
+                let _ = host;
+            }
+        });
     }
 
     /// Cancel the active generation: abort local awaiters, `POST /interrupt` the running server
@@ -10750,8 +12216,8 @@ impl ComfyApp {
             ui.horizontal_wrapped(|ui| {
                 self.graph_controls(ui, host);
                 ui.separator();
-                ui.selectable_value(&mut self.graph_pane, GraphPane::Canvas, "Canvas");
-                ui.selectable_value(
+                crate::theme::selectable_value(ui, &mut self.graph_pane, GraphPane::Canvas, "Canvas");
+                crate::theme::selectable_value(ui, 
                     &mut self.graph_pane,
                     GraphPane::Props,
                     format!("{} Properties", icons::PROPS),
@@ -10859,7 +12325,7 @@ impl ComfyApp {
                     if ui
                         .add_sized(
                             [label_w, ROW_H],
-                            egui::Button::selectable(i == self.active_graph, mark),
+                            crate::theme::selectable(i == self.active_graph, mark),
                         )
                         .clicked()
                     {
@@ -11466,8 +12932,7 @@ impl ComfyApp {
             } else {
                 "     Auto-follow: off".to_string()
             };
-            if ui
-                .selectable_label(self.auto_follow, follow)
+            if crate::theme::selectable_label(ui, self.auto_follow, follow)
                 .on_hover_text("Pan and zoom to the running node during a queue")
                 .clicked()
             {
@@ -11478,8 +12943,7 @@ impl ComfyApp {
             } else {
                 "     Auto-arrange: off".to_string()
             };
-            if ui
-                .selectable_label(self.auto_arrange, arrange)
+            if crate::theme::selectable_label(ui, self.auto_arrange, arrange)
                 .on_hover_text("Relayout nodes when you open the graph after a workflow loads")
                 .clicked()
             {
@@ -11595,7 +13059,7 @@ impl ComfyApp {
                         }
                         shown += 1;
                         let label = format!("{}  ({})", elide(title, 36), elide(&data.object.name, 24));
-                        if ui.selectable_label(props == Some(id), label).clicked() {
+                        if crate::theme::selectable_label(ui, props == Some(id), label).clicked() {
                             jump = Some((id, pos));
                         }
                     }
@@ -11714,8 +13178,8 @@ impl ComfyApp {
         ui.separator();
         ui.strong(format!("{} Choose image", icons::IMAGE));
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.img_pick_source, ImgPickSource::Server, "Server");
-            ui.selectable_value(&mut self.img_pick_source, ImgPickSource::Device, "Device");
+            crate::theme::selectable_value(ui, &mut self.img_pick_source, ImgPickSource::Server, "Server");
+            crate::theme::selectable_value(ui, &mut self.img_pick_source, ImgPickSource::Device, "Device");
         });
         match self.img_pick_source {
             ImgPickSource::Server => self.loadimage_server_grid(ui, node, input_idx, &options, &selected),
@@ -11797,7 +13261,7 @@ impl ComfyApp {
                         ui.painter().rect_stroke(
                             rect,
                             3.0,
-                            egui::Stroke::new(2.5, egui::Color32::from_rgb(150, 140, 226)),
+                            egui::Stroke::new(2.5, crate::theme::PINK),
                             egui::StrokeKind::Inside,
                         );
                     }
@@ -12004,7 +13468,7 @@ impl ComfyApp {
                                 for name in names {
                                     let leaf =
                                         name.rsplit_once('/').map(|(_, f)| f).unwrap_or(name);
-                                    if ui.selectable_label(false, elide(leaf, 52)).clicked() {
+                                    if crate::theme::selectable_label(ui, false, elide(leaf, 52)).clicked() {
                                         picked = Some((*name).clone());
                                     }
                                 }
@@ -12077,8 +13541,7 @@ impl ComfyApp {
                                 .default_open(!filter.is_empty())
                                 .show(ui, |ui| {
                                     for object in objects {
-                                        if ui
-                                            .selectable_label(false, elide(object.display_name(), 46))
+                                        if crate::theme::selectable_label(ui, false, elide(object.display_name(), 46))
                                             .clicked()
                                         {
                                             pick = Some((*object).clone());
@@ -12282,7 +13745,7 @@ impl ComfyApp {
             }
 
             if ui
-                .add_sized(egui::vec2(56.0, 28.0), egui::Button::selectable(self.tags_window_open, "Tags"))
+                .add_sized(egui::vec2(56.0, 28.0), crate::theme::selectable(self.tags_window_open, "Tags"))
                 .clicked()
             {
                 self.tags_window_open = !self.tags_window_open;
@@ -12335,8 +13798,7 @@ impl ComfyApp {
                     format!("{} Sort · {}", icons::SORT, self.gallery_view.sort.label()),
                     |ui| {
                         for s in GallerySort::ALL {
-                            changed |= ui
-                                .selectable_value(&mut self.gallery_view.sort, *s, s.label())
+                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.sort, *s, s.label())
                                 .clicked();
                         }
                     },
@@ -12344,8 +13806,7 @@ impl ComfyApp {
 
                 ui.menu_button(format!("Group · {}", self.gallery_view.group.label()), |ui| {
                     for g in GalleryGroup::ALL {
-                        changed |= ui
-                            .selectable_value(&mut self.gallery_view.group, *g, g.label())
+                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.group, *g, g.label())
                             .clicked();
                     }
                     if self.gallery_view.group != GalleryGroup::None {
@@ -12355,8 +13816,7 @@ impl ComfyApp {
                         } else {
                             "     Headers closed".to_string()
                         };
-                        if ui
-                            .selectable_label(self.gallery_view.groups_open, open_label)
+                        if crate::theme::selectable_label(ui, self.gallery_view.groups_open, open_label)
                             .on_hover_text("Default open/closed state for group headers")
                             .clicked()
                         {
@@ -12367,20 +13827,19 @@ impl ComfyApp {
 
                 ui.menu_button(format!("Rating · {}", self.gallery_view.rating.label()), |ui| {
                     for r in RatingFilter::ALL {
-                        ui.selectable_value(&mut self.gallery_view.rating, *r, r.label());
+                        crate::theme::selectable_value(ui, &mut self.gallery_view.rating, *r, r.label());
                     }
                     ui.separator();
                     ui.weak("Unindexed images count as Safe.");
                     ui.separator();
-                    ui.selectable_value(&mut self.index_filter, 0, "Indexed + not");
-                    ui.selectable_value(&mut self.index_filter, 1, "Indexed only");
-                    ui.selectable_value(&mut self.index_filter, 2, "Unindexed only");
+                    crate::theme::selectable_value(ui, &mut self.index_filter, 0, "Indexed + not");
+                    crate::theme::selectable_value(ui, &mut self.index_filter, 1, "Indexed only");
+                    crate::theme::selectable_value(ui, &mut self.index_filter, 2, "Unindexed only");
                 });
 
                 ui.menu_button(format!("Columns · {}", self.gallery_view.columns), |ui| {
                     for n in 1..=3usize {
-                        if ui
-                            .selectable_label(
+                        if crate::theme::selectable_label(ui, 
                                 self.gallery_view.columns == n,
                                 format!("{n} column{}", if n == 1 { "" } else { "s" }),
                             )
@@ -12398,8 +13857,7 @@ impl ComfyApp {
                 };
                 ui.menu_button(media_label, |ui| {
                     for m in GalleryMedia::ALL {
-                        changed |= ui
-                            .selectable_value(&mut self.gallery_view.media, *m, m.label())
+                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.media, *m, m.label())
                             .clicked();
                     }
                 });
@@ -12411,8 +13869,7 @@ impl ComfyApp {
                 };
                 ui.menu_button(model_label, |ui| {
                     crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(
+                        changed |= crate::theme::selectable_value(ui, 
                                 &mut self.gallery_view.model,
                                 String::new(),
                                 "All models",
@@ -12420,8 +13877,7 @@ impl ComfyApp {
                             .clicked();
                         for m in &self.facets.models {
                             let label = format!("{}  ({})", elide(&m.name, 40), m.count);
-                            changed |= ui
-                                .selectable_value(
+                            changed |= crate::theme::selectable_value(ui, 
                                     &mut self.gallery_view.model,
                                     m.name.clone(),
                                     label,
@@ -12443,13 +13899,11 @@ impl ComfyApp {
                 };
                 ui.menu_button(lora_label, |ui| {
                     crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(&mut self.gallery_view.lora, String::new(), "All LoRAs")
+                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, String::new(), "All LoRAs")
                             .clicked();
                         for l in &self.facets.loras {
                             let label = format!("{}  ({})", elide(file_basename(&l.name), 40), l.count);
-                            changed |= ui
-                                .selectable_value(&mut self.gallery_view.lora, l.name.clone(), label)
+                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, l.name.clone(), label)
                                 .clicked();
                         }
                         if self.facets.loras.is_empty() {
@@ -12469,14 +13923,12 @@ impl ComfyApp {
                 };
                 ui.menu_button(album_label, |ui| {
                     crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
-                        changed |= ui
-                            .selectable_value(&mut self.gallery_view.album, None, "All images")
+                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.album, None, "All images")
                             .clicked();
                         for a in &self.albums {
                             let label =
                                 format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
-                            changed |= ui
-                                .selectable_value(
+                            changed |= crate::theme::selectable_value(ui, 
                                     &mut self.gallery_view.album,
                                     Some(a.id),
                                     label,
@@ -12886,7 +14338,7 @@ impl ComfyApp {
                     |ui| {
                         for (tag, n) in all.iter().filter(|(t, _)| q.is_empty() || t.contains(&q)) {
                             let on = self.tag_facets.contains(tag);
-                            if ui.add(egui::Button::selectable(on, format!("{tag}  ({n})"))).clicked() {
+                            if ui.add(crate::theme::selectable(on, format!("{tag}  ({n})"))).clicked() {
                                 if on {
                                     self.tag_facets.retain(|f| f != tag);
                                 } else {
@@ -13000,7 +14452,7 @@ impl ComfyApp {
                     for (tag, count) in facets {
                         let on = self.tag_facets.iter().any(|f| f == tag);
                         if ui
-                            .add(egui::Button::selectable(on, format!("{tag} ({count})")))
+                            .add(crate::theme::selectable(on, format!("{tag} ({count})")))
                             .clicked()
                         {
                             if on {
@@ -13531,7 +14983,7 @@ impl ComfyApp {
                     }
                     for a in &self.albums {
                         let label = format!("{} {}", icons::ALBUM, elide(&a.name, 28));
-                        if ui.selectable_label(false, label).clicked() {
+                        if crate::theme::selectable_label(ui, false, label).clicked() {
                             add_to = Some(a.id);
                         }
                     }
@@ -14690,13 +16142,12 @@ impl ComfyApp {
                                 .map(|a| elide(&a.name, 20))
                                 .unwrap_or_else(|| "gallery only".into());
                             up_menu(ui, label, |ui| {
-                                if ui.selectable_label(album.is_none(), "Gallery only").clicked() {
+                                if crate::theme::selectable_label(ui, album.is_none(), "Gallery only").clicked() {
                                     act = Some(TA::SetAlbum(None));
                                     ui.close();
                                 }
                                 for a in &self.albums {
-                                    if ui
-                                        .selectable_label(album == Some(a.id), elide(&a.name, 28))
+                                    if crate::theme::selectable_label(ui, album == Some(a.id), elide(&a.name, 28))
                                         .clicked()
                                     {
                                         act = Some(TA::SetAlbum(Some(a.id)));
@@ -15132,7 +16583,7 @@ impl ComfyApp {
                                 } else {
                                     format!("     {}", elide(&a.name, 28))
                                 };
-                                if ui.selectable_label(is_in, label).clicked() {
+                                if crate::theme::selectable_label(ui, is_in, label).clicked() {
                                     act = Some(if is_in {
                                         Act::AlbumRemove(a.id)
                                     } else {
@@ -15290,15 +16741,15 @@ impl ComfyApp {
                     .and_then(|v| v.meta.clone())
                     .filter(|m| !m.is_empty())
                 {
-                    self.open_remix_sheet(meta);
-                    host.haptic(Haptic::Light);
+                    self.begin_remix(meta, host);
                 } else {
-                    // Workflow still fetching — open the sheet when Msg::ItemWorkflow lands.
+                    // Workflow still fetching — resolve when Msg::ItemWorkflow lands.
                     self.viewer_remix_pending = true;
                     self.gallery_status = "Loading workflow to remix…".into();
                 }
             }
             Some(Act::RemixInstant) => {
+                let is_video = self.viewer.as_ref().map(|v| v.item.is_video).unwrap_or(false);
                 if let Some(meta) = self
                     .viewer
                     .as_ref()
@@ -15306,7 +16757,7 @@ impl ComfyApp {
                     .and_then(|v| v.meta.clone())
                     .filter(|m| !m.is_empty())
                 {
-                    self.remix_from_meta(&meta);
+                    self.remix_from_meta(&meta, is_video);
                     self.close_viewer();
                     host.haptic(Haptic::Medium);
                 }
@@ -15314,6 +16765,7 @@ impl ComfyApp {
             Some(Act::SaveCharacter) => {
                 // Same partial-meta gate as Remix: a card baked from the gate summary would
                 // freeze whatever detail the workflow scrape was about to correct.
+                let is_video = self.viewer.as_ref().map(|v| v.item.is_video).unwrap_or(false);
                 if let Some(meta) = self
                     .viewer
                     .as_ref()
@@ -15321,10 +16773,15 @@ impl ComfyApp {
                     .and_then(|v| v.meta.clone())
                     .filter(|m| !m.is_empty())
                 {
-                    self.character_draft = Some(CharacterDraft {
-                        editing: None,
-                        card: Self::character_from_meta(&meta),
-                    });
+                    let mut card = Self::character_from_meta(&meta);
+                    // A video's model is a Wan UNET, not an image checkpoint — don't stash it in the
+                    // card's checkpoint slot where a later "switch on apply" would feed it to
+                    // select_model. The identity tags are the useful part of a video-derived card.
+                    if is_video {
+                        card.checkpoint.clear();
+                        card.switch_checkpoint = false;
+                    }
+                    self.character_draft = Some(CharacterDraft { editing: None, card });
                     self.viewer = None;
                     self.player = None;
                     self.viewer_swipe_origin = None;
@@ -16746,6 +18203,74 @@ impl EguiApp for ComfyApp {
             })
         {
             self.error_modal = None;
+        } else if self.character_wizard.is_some()
+            && self.tab == Tab::Generate
+            && self.create_pane == CreatePane::Characters
+            // Only when the wizard is the surface actually showing: the fullscreen result
+            // viewer (which owns Back itself) and the card editor both draw over it —
+            // consuming here would invisibly walk (and eventually discard) the hidden wizard.
+            && self.result_view.is_none()
+            && self.character_draft.is_none()
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            // The compose diff modal owns Back first — close it (keeping the user's text)
+            // rather than stepping the wizard behind it.
+            let modal_open = self
+                .character_wizard
+                .as_ref()
+                .is_some_and(|w| w.compose_review.is_some());
+            if modal_open {
+                if let Some(wiz) = self.character_wizard.as_mut() {
+                    wiz.compose_review = None;
+                }
+                self.status = "Kept your prompt".into();
+            } else {
+            // Back walks the wizard one step; from the first step it discards (nothing typed
+            // yet worth guarding — the Cancel button's two-tap covers the later steps).
+            let step = self.character_wizard.as_ref().map(|w| w.step);
+            match step {
+                Some(WizStep::Trait(0)) => {
+                    // Mirror the Cancel button: take any outstanding test jobs down too, else
+                    // their images land in the results strip with no wizard to catch them —
+                    // and clear a stuck compose-progress status the same way the pane close
+                    // does (this discard skips the pane's own close path entirely).
+                    let (pending, composing) = self
+                        .character_wizard
+                        .as_ref()
+                        .map(|w| {
+                            (w.test.as_ref().map(|t| t.pending).unwrap_or(0), w.composing)
+                        })
+                        .unwrap_or((0, false));
+                    if pending > 0 {
+                        self.cancel_generation(host);
+                    }
+                    if composing && self.status.starts_with("Composing character prompt") {
+                        self.status = "Compose cancelled".into();
+                    }
+                    self.character_wizard = None;
+                    host.haptic(Haptic::Warning);
+                }
+                Some(WizStep::Trait(i)) => {
+                    if let Some(wiz) = self.character_wizard.as_mut() {
+                        wiz.step = WizStep::Trait(i - 1);
+                    }
+                }
+                Some(WizStep::Review) => {
+                    if let Some(wiz) = self.character_wizard.as_mut() {
+                        wiz.step = WizStep::Trait(WIZ_TRAITS.len() - 1);
+                    }
+                }
+                Some(WizStep::Checkpoint) => {
+                    if let Some(wiz) = self.character_wizard.as_mut() {
+                        wiz.step = WizStep::Review;
+                    }
+                }
+                None => {}
+            }
+            }
         }
 
         // Inpaint takes over the whole screen, above the tabs, until closed.
@@ -17644,7 +19169,7 @@ impl ComfyApp {
             for (tab, icon, label) in Tab::BAR.iter().filter(|(_, _, l)| !l.is_empty()) {
                 let selected = self.tab == *tab;
                 let text = egui::RichText::new(format!("{icon} {label}")).size(12.0);
-                let btn = egui::Button::selectable(selected, text)
+                let btn = crate::theme::selectable(selected, text)
                     .wrap_mode(egui::TextWrapMode::Extend)
                     .min_size(egui::vec2(labeled_w, ROW_H));
                 if ui.add(btn).clicked() {
@@ -17662,7 +19187,7 @@ impl ComfyApp {
                 for (tab, icon, _) in Tab::BAR.iter().filter(|(_, _, l)| l.is_empty()) {
                     let selected = self.tab == *tab;
                     let text = egui::RichText::new(*icon).size(18.0);
-                    let btn = egui::Button::selectable(selected, text)
+                    let btn = crate::theme::selectable(selected, text)
                         .min_size(egui::vec2(ICON_BTN, ROW_H));
                     if ui.add(btn).clicked() {
                         self.tab = *tab;
@@ -17803,11 +19328,24 @@ fn video_badge(ui: &egui::Ui, rect: egui::Rect) {
     ));
 }
 
+/// A checkpoint/model file's clean display label: bare filename, directory prefix and the model
+/// extension stripped (nobody needs to read `.safetensors` in a picker).
+fn model_label(file: &str) -> String {
+    let base = file_basename(file);
+    let lower = base.to_ascii_lowercase();
+    for ext in [".safetensors", ".ckpt", ".gguf", ".sft", ".pth", ".pt", ".bin"] {
+        if lower.ends_with(ext) {
+            return base[..base.len() - ext.len()].to_string();
+        }
+    }
+    base.to_string()
+}
+
 /// Draw the multi-select overlay on a gallery tile: a tint plus a corner check badge.
 fn selection_overlay(ui: &egui::Ui, rect: egui::Rect, selected: bool) {
     let p = ui.painter();
     let (tint, ring) = if selected {
-        (egui::Color32::from_rgba_unmultiplied(120, 70, 150, 110), egui::Color32::from_rgb(180, 150, 230))
+        (egui::Color32::from_rgba_unmultiplied(255, 61, 139, 82), crate::theme::PINK_BRIGHT)
     } else {
         (egui::Color32::from_black_alpha(70), egui::Color32::from_gray(120))
     };
@@ -17817,7 +19355,7 @@ fn selection_overlay(ui: &egui::Ui, rect: egui::Rect, selected: bool) {
     p.circle_filled(
         center,
         10.0,
-        if selected { egui::Color32::from_rgb(150, 90, 190) } else { egui::Color32::from_black_alpha(130) },
+        if selected { crate::theme::PINK } else { egui::Color32::from_black_alpha(130) },
     );
     p.circle_stroke(center, 10.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
     if selected {
@@ -18180,7 +19718,7 @@ fn combo(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) 
         .selected_text(if current.is_empty() { "—".to_string() } else { elide(current, 40) })
         .show_ui(ui, |ui| {
             for opt in options.iter().take(300) {
-                ui.selectable_value(current, opt.clone(), elide(opt, 56));
+                crate::theme::selectable_value(ui, current, opt.clone(), elide(opt, 56));
             }
         });
 }
@@ -18195,12 +19733,10 @@ enum VloraEvent {
 
 fn video_lora_list(
     ui: &mut egui::Ui,
-    title: &str,
     list: &mut Vec<crate::types::ActiveLora>,
     installed: &[String],
     salt: &str,
 ) -> Option<VloraEvent> {
-    section_title(ui, title);
     let mut event = None;
     let mut remove: Option<usize> = None;
     for (i, lora) in list.iter_mut().enumerate() {
@@ -18212,7 +19748,11 @@ fn video_lora_list(
             }
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut lora.strength_model, 0.0..=2.0).text("Model"));
-                if ui.small_button("Remove").clicked() {
+                if ui
+                    .small_button(icons::TRASH)
+                    .on_hover_text("Remove LoRA")
+                    .clicked()
+                {
                     remove = Some(i);
                 }
             });
@@ -18248,7 +19788,7 @@ fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[Stri
         .width(w)
         .show_ui(ui, |ui| {
             for opt in options.iter().take(300) {
-                ui.selectable_value(current, opt.clone(), elide(&sanitize_ui_text(ui, opt), 56));
+                crate::theme::selectable_value(ui, current, opt.clone(), elide(&sanitize_ui_text(ui, opt), 56));
             }
         });
 }
@@ -18601,7 +20141,7 @@ fn size_preset_combo(ui: &mut egui::Ui, width: &mut u32, height: &mut u32) {
         .width(120.0)
         .show_ui(ui, |ui| {
             for (name, w, h) in SIZE_PRESETS {
-                if ui.selectable_label(*width == *w && *height == *h, *name).clicked() {
+                if crate::theme::selectable_label(ui, *width == *w && *height == *h, *name).clicked() {
                     *width = *w;
                     *height = *h;
                 }

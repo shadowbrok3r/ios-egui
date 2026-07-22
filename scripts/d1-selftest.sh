@@ -8,18 +8,20 @@
 # pass --tap "X Y" to inject the tap, or trigger it by hand on the device.
 #
 # Usage:
-#   scripts/d1-selftest.sh [--tcp HOST:PORT] [--pkg com.example.comfyui] [--tap "X Y"] [--no-launch]
+#   scripts/d1-selftest.sh [--tcp HOST:PORT] [--serial SERIAL] [--pkg com.example.comfyui] [--tap "X Y"] [--no-launch]
 #   scripts/d1-selftest.sh --tcp 100.89.76.57:36069
 set -euo pipefail
 
 PKG="com.example.comfyui"
 ACTIVITY="com.github.egui_mobile.EguiNativeActivity"
 TCP=""
+SERIAL=""
 TAP=""
 LAUNCH=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --tcp) TCP="$2"; shift 2 ;;
+    --serial|-s) SERIAL="$2"; shift 2 ;;
     --pkg) PKG="$2"; shift 2 ;;
     --tap) TAP="$2"; shift 2 ;;
     --no-launch) LAUNCH=0; shift ;;
@@ -28,17 +30,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
 SDK="${ANDROID_HOME:-$HOME/Android/Sdk}"
 ADB="$SDK/platform-tools/adb"; [ -x "$ADB" ] || ADB="adb"
-ADBS=("$ADB")
-if [ -n "$TCP" ]; then
-  case "$TCP" in *:*) : ;; *) TCP="$TCP:5555" ;; esac
-  echo "adb connect $TCP"
-  "$ADB" connect "$TCP" >/dev/null
-  ADBS=("$ADB" -s "$TCP")
-fi
+# shellcheck source=adb-target.sh
+source "$HERE/adb-target.sh"
+adb_resolve_target
 
-"${ADBS[@]}" get-state >/dev/null 2>&1 || { echo "device offline; check --tcp / wireless debugging" >&2; exit 1; }
+"${ADBS[@]}" get-state >/dev/null 2>&1 || { echo "device offline; check --tcp / --serial / wireless debugging" >&2; exit 1; }
 "${ADBS[@]}" logcat -c || true
 if [ "$LAUNCH" -eq 1 ]; then
   echo "launch $PKG/$ACTIVITY"

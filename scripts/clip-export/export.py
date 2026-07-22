@@ -472,7 +472,7 @@ def main() -> None:
             print(f"    {f:14} {p.stat().st_size} bytes")
         print(
             "\nPush next to the anima/sd/wd14 pack dirs on the device, e.g.:\n"
-            "  adb push %s /storage/emulated/0/ComfyUI/clip" % args.out
+            "  scripts/qnn-push-model.sh --durable --subdir clip %s" % args.out
         )
 
 

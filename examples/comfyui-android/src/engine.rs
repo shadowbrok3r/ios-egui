@@ -79,7 +79,10 @@ pub enum Msg {
     /// Per-job `GET /queue` snapshot: running + pending jobs in server order.
     QueueJobs { running: Vec<QueueJob>, pending: Vec<QueueJob> },
     Preview(egui::ColorImage),
-    Result { image: egui::ColorImage, bytes: Vec<u8> },
+    /// One finished output image. `label` is the submitting job's display label, so consumers
+    /// that fan several jobs out at once (the character taste test) can attribute each image
+    /// to its job — arrival order alone lies when the server runs jobs out of submission order.
+    Result { image: egui::ColorImage, bytes: Vec<u8>, label: String },
     /// A node started executing (`None` = prompt finished). WebSocket transport only today.
     NodeExecuting(Option<u32>),
     /// A node finished and produced images (raw encoded bytes, for graph-node display).
@@ -1812,7 +1815,7 @@ async fn stream_execution(
         send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone() });
         send!(Msg::Queued);
         let outcome =
-            reconcile_from_history(&client, &authed, &prompt_id, &tx, &ctx, &log).await;
+            reconcile_from_history(&client, &authed, &prompt_id, &label, &tx, &ctx, &log).await;
         *current_prompt.lock().unwrap() = None;
         match outcome {
             Ok(()) => send!(Msg::Done(label)),
@@ -1880,7 +1883,7 @@ async fn stream_execution(
                 send!(Msg::NodeExecuted { node: node.0, images: images.clone() });
                 for bytes in images {
                     if let Some(ci) = decode(&bytes) {
-                        send!(Msg::Result { image: ci, bytes });
+                        send!(Msg::Result { image: ci, bytes, label: label.clone() });
                     }
                 }
             }
@@ -1904,7 +1907,7 @@ async fn stream_execution(
     let outcome = match outcome {
         Some(o) => o,
         // Stream ended without a verdict: reconcile from the history endpoint.
-        None => reconcile_from_history(&client, &authed, &prompt_id, &tx, &ctx, &log).await,
+        None => reconcile_from_history(&client, &authed, &prompt_id, &label, &tx, &ctx, &log).await,
     };
     *current_prompt.lock().unwrap() = None;
     match outcome {
@@ -1921,6 +1924,7 @@ async fn reconcile_from_history(
     client: &Client,
     authed: &Option<(String, reqwest::Client)>,
     prompt_id: &str,
+    label: &str,
     tx: &Sender<Msg>,
     ctx: &egui::Context,
     log: &Logger,
@@ -1964,7 +1968,8 @@ async fn reconcile_from_history(
                     let _ = tx.send(Msg::NodeExecuted { node: node.0, images: images.clone() });
                     for bytes in images {
                         if let Some(ci) = decode(&bytes) {
-                            let _ = tx.send(Msg::Result { image: ci, bytes });
+                            let _ =
+                                tx.send(Msg::Result { image: ci, bytes, label: label.to_string() });
                         }
                     }
                     ctx.request_repaint();

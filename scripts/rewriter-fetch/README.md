@@ -19,6 +19,8 @@ Runs on the device CPU via candle; there is no HTP/NPU path for this crate.
 
 ```sh
 scripts/rewriter-fetch/fetch.sh ~/rewrite
+# or fetch + push in one step (picks the online adb device; ignores a stale ANDROID_SERIAL):
+scripts/rewriter-fetch/fetch.sh --push ~/rewrite
 ```
 
 Overrides (env vars): `GGUF_REPO`, `GGUF_FILE`, `TOK_REPO`, `TOK_FILE`, `HF_ENDPOINT`. To try a
@@ -44,7 +46,7 @@ Push the pack to the durable ComfyUI models root — the app scans it (alongside
 files dir) via `find_rewrite_pack_many`, the same discovery used for WD14/CLIP packs:
 
 ```sh
-adb push ~/rewrite /storage/emulated/0/ComfyUI/rewrite
+scripts/qnn-push-model.sh --durable --subdir rewrite ~/rewrite
 ```
 
 `/storage/emulated/0/ComfyUI` survives app uninstall (sideload; grant All files access). A

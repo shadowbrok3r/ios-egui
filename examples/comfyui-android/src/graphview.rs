@@ -5,7 +5,9 @@
 use std::collections::{HashMap, HashSet};
 
 use egui::emath::TSTransform;
-use egui_snarl::ui::{PinInfo, PinPlacement, SnarlStyle, SnarlViewer, SnarlWidget, WireStyle};
+use egui_snarl::ui::{
+    BackgroundPattern, PinInfo, PinPlacement, SnarlStyle, SnarlViewer, SnarlWidget, WireStyle,
+};
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, Snarl};
 use rucomfyui_node_graph::ComfyUiNodeGraph;
 use rucomfyui_node_graph::internal::{FlowInput, FlowNodeData, FlowValueType, FlowViewer};
@@ -701,13 +703,17 @@ enum DragKind {
 
 fn style() -> SnarlStyle {
     let mut s = SnarlStyle::new();
-    s.bg_frame = Some(egui::Frame::new().fill(egui::Color32::from_rgb(10, 10, 13)));
+    // AMOLED canvas; the faint aqua dot grid is drawn in `draw_background` (default grid off).
+    s.bg_frame = Some(egui::Frame::new().fill(egui::Color32::from_rgb(3, 3, 5)));
+    s.bg_pattern = Some(BackgroundPattern::NoPattern);
     s.min_scale = Some(MIN_SCALE);
     s.max_scale = Some(MAX_SCALE);
     s.centering = Some(true);
     // Orthogonal wires with rounded corners — a structured "network diagram" look instead of
     // droopy beziers, and easier to read where they run.
     s.wire_style = Some(WireStyle::AxisAligned { corner_radius: 8.0 });
+    // Bolder wires read as bright circuit traces against the black canvas.
+    s.wire_width = Some(2.6);
     // Pins sit just outside the node body: their dots stop overlapping the input/output labels,
     // and they become fat finger targets clear of the draggable node frame.
     s.pin_placement = Some(PinPlacement::Outside { margin: 3.0 });
@@ -715,8 +721,17 @@ fn style() -> SnarlStyle {
     s
 }
 
-/// A node body fill a step brighter than the canvas, so nodes read as raised.
-const NODE_FILL: egui::Color32 = egui::Color32::from_rgb(34, 34, 42);
+/// A node body: dark glass a step above the black canvas; the rim comes from [`Wrapper::node_frame`].
+const NODE_FILL: egui::Color32 = egui::Color32::from_rgb(17, 18, 23);
+/// Base spacing (graph units) of the canvas dot grid — anchored in graph space so it scales with
+/// the nodes; coarsened by powers of two when zoomed far out.
+const DOT_SPACING: f32 = 28.0;
+/// Dot radius in GRAPH units, so dots grow/shrink with the zoom exactly like the nodes do.
+const DOT_RADIUS: f32 = 1.7;
+/// Dim teal ink for the dot grid — reads as a faint field because the dots are small.
+const DOT_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 70, 74);
+/// Cool rim on a resting node — a subtle glass edge against the black canvas.
+const NODE_RIM: egui::Color32 = egui::Color32::from_rgb(54, 84, 92);
 
 /// Bounding box of all nodes in graph space (measured sizes where known).
 fn bounds(snarl: &Snarl<FlowNodeData>, sizes: &HashMap<NodeId, egui::Vec2>) -> Option<egui::Rect> {
@@ -973,16 +988,57 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         snarl: &Snarl<FlowNodeData>,
     ) -> egui::Frame {
         let mut frame = self.inner.node_frame(default, node, inputs, outputs, snarl).fill(NODE_FILL);
+        // The inner viewer paints a green 2px stroke on the executing node; anything below 2px is
+        // just its default hairline, so we only override our own rims when the width is < 2.
+        let inner_width = frame.stroke.width;
         if self.bypassed.contains(&node) {
-            // Dimmed fill + dashed-feel orange stroke marks a bypassed (mode-4) node.
+            // Dimmed fill + orange stroke marks a bypassed (mode-4) node.
             frame = frame
-                .fill(egui::Color32::from_rgb(55, 48, 40))
-                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(210, 140, 70)));
-        } else if self.focus == Some(node) && frame.stroke.width < 2.0 {
-            // The executing highlight (green stroke from the inner viewer) wins over focus.
-            frame = frame.stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(150, 140, 226)));
+                .fill(egui::Color32::from_rgb(38, 32, 24))
+                .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(214, 140, 70)));
+        } else if self.focus == Some(node) && inner_width < 2.0 {
+            // Selected / focused: a vivid pink rim (the primary accent).
+            frame = frame.stroke(egui::Stroke::new(2.0, crate::theme::PINK));
+        } else if inner_width < 2.0 {
+            // Resting node: a subtle cool glass rim so it reads as a raised pane on black.
+            frame = frame.stroke(egui::Stroke::new(1.0, NODE_RIM));
         }
         frame
+    }
+
+    fn draw_background(
+        &mut self,
+        _background: Option<&BackgroundPattern>,
+        viewport: &egui::Rect,
+        _snarl_style: &SnarlStyle,
+        _style: &egui::Style,
+        painter: &egui::Painter,
+        _snarl: &Snarl<FlowNodeData>,
+    ) {
+        // Dot grid drawn in graph space (the layer transform sizes it to screen). Spacing and
+        // radius are anchored in GRAPH units, so the grid scales 1:1 with the nodes as you zoom.
+        // When zoomed far out we coarsen the spacing by powers of two so the on-screen density and
+        // the dot count stay bounded, and dots shrink toward sub-pixel (like the nodes) so a very
+        // zoomed-out canvas isn't cluttered.
+        let scale = self.out_transform.scaling.max(0.001);
+        let mut spacing = DOT_SPACING;
+        while spacing * scale < 26.0 {
+            spacing *= 2.0;
+        }
+        let min_x = (viewport.min.x / spacing).floor() as i64;
+        let max_x = (viewport.max.x / spacing).ceil() as i64;
+        let min_y = (viewport.min.y / spacing).floor() as i64;
+        let max_y = (viewport.max.y / spacing).ceil() as i64;
+        // Backstop against a pathological transform.
+        if (max_x - min_x).saturating_mul(max_y - min_y) > 6500 {
+            return;
+        }
+        for xi in min_x..=max_x {
+            for yi in min_y..=max_y {
+                let p = egui::pos2(xi as f32 * spacing, yi as f32 * spacing);
+                painter.circle_filled(p, DOT_RADIUS, DOT_COLOR);
+            }
+        }
     }
 
     fn has_body(&mut self, node: &FlowNodeData) -> bool {
@@ -1599,7 +1655,7 @@ fn option_combo(ui: &mut egui::Ui, salt: egui::Id, selected: &mut String, option
                     break;
                 }
                 shown += 1;
-                ui.selectable_value(selected, opt.clone(), elide(&sanitize_ui_text(ui, opt), 48));
+                crate::theme::selectable_value(ui, selected, opt.clone(), elide(&sanitize_ui_text(ui, opt), 48));
             }
             if shown == 0 {
                 ui.weak("no matches");

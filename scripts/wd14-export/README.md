@@ -91,7 +91,9 @@ Stage 1 (`shape`) prints whether the graph's output is produced by a `Sigmoid`:
 Push it next to the existing anima / sd packs under the app's external files dir:
 
 ```sh
-adb push ~/wd14 /sdcard/Android/data/com.example.comfyui/files/wd14
+scripts/qnn-push-model.sh --subdir wd14 ~/wd14
+# or durable:
+# scripts/qnn-push-model.sh --durable --subdir wd14 ~/wd14
 ```
 
 On device the app scans that files dir; a `WD14`-marked subdir enables **Read tags** in

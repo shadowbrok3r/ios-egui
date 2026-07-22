@@ -3,7 +3,7 @@
 # Defaults point at a local QAIRT model tree + the HF SD1.5 text encoder.
 #
 # Usage:
-#   scripts/d2-push-assets.sh [--tcp HOST:PORT] [--pkg com.example.comfyui] [--durable]
+#   scripts/d2-push-assets.sh [--tcp HOST:PORT] [--serial SERIAL] [--pkg com.example.comfyui] [--durable]
 #   MODEL_DIR=... CLIP=... scripts/d2-push-assets.sh --tcp 100.89.76.57:36069
 set -euo pipefail
 
@@ -12,10 +12,12 @@ MODEL_DIR="${MODEL_DIR:-$HOME/Desktop/QNN/models/AnythingV5_8gen2/output_512/qnn
 CLIP="${CLIP:-$HOME/Desktop/QNN/models/clip-text-sd15/model.safetensors}"
 TCP=""
 PKG=""
+SERIAL=""
 EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --tcp) TCP="$2"; shift 2 ;;
+    --serial|-s) SERIAL="$2"; shift 2 ;;
     --pkg) PKG="$2"; shift 2 ;;
     --durable) EXTRA+=(--durable); shift ;;
     -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
@@ -33,6 +35,7 @@ cp -f "$CLIP" "$STAGED/clip.safetensors"
 
 ARGS=()
 [ -n "$TCP" ] && ARGS+=(--tcp "$TCP")
+[ -n "$SERIAL" ] && ARGS+=(--serial "$SERIAL")
 [ -n "$PKG" ] && ARGS+=(--pkg "$PKG")
 "$HERE/scripts/qnn-push-model.sh" "${ARGS[@]}" \
   "$MODEL_DIR/unet.bin" \
