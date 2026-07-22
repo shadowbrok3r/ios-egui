@@ -1094,6 +1094,65 @@ pub fn file_basename(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
+/// Wan generation parsed from a model/LoRA path: "wan2.2"/"wan22"/"wan_2-1" → `(2, 2)`/`(2, 1)`.
+/// A high/low-noise expert marker implies 2.2 (the two-expert split only exists there).
+pub fn wan_version(path: &str) -> Option<(u8, u8)> {
+    let lower = path.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("wan").map(|p| p + from) {
+        from = pos + 3;
+        if pos > 0 && b[pos - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let mut i = from;
+        while i < b.len() && matches!(b[i], b' ' | b'_' | b'.' | b'-' | b'v') {
+            i += 1;
+        }
+        let Some(&major) = b.get(i).filter(|c| c.is_ascii_digit()) else { continue };
+        i += 1;
+        while i < b.len() && matches!(b[i], b' ' | b'_' | b'.' | b'-') {
+            i += 1;
+        }
+        let Some(&minor) = b.get(i).filter(|c| c.is_ascii_digit()) else { continue };
+        return Some((major - b'0', minor - b'0'));
+    }
+    for marker in ["high_noise", "highnoise", "high-noise", "low_noise", "lownoise", "low-noise"] {
+        if lower.contains(marker) {
+            return Some((2, 2));
+        }
+    }
+    None
+}
+
+/// Whether the path looks Wan-related: a `wan` token (followed by a non-letter or a known
+/// family suffix like wanvideo/wanimate/wanx2v), a `wan` directory, or the lightx2v
+/// speed-LoRA family. Generic video tokens (i2v/t2v) alone don't qualify — other video
+/// families use them too.
+pub fn is_wan_related(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("lightx2v") {
+        return true;
+    }
+    let b = lower.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = lower[from..].find("wan").map(|p| p + from) {
+        from = pos + 3;
+        if pos > 0 && b[pos - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let rest = &lower[pos + 3..];
+        let right_ok = !rest.starts_with(|c: char| c.is_ascii_alphabetic())
+            || rest.starts_with("video")
+            || rest.starts_with("imate")
+            || rest.starts_with("x2");
+        if right_ok {
+            return true;
+        }
+    }
+    false
+}
+
 /// Split a comma-separated trigger list into trimmed tokens.
 pub fn split_triggers(s: &str) -> Vec<String> {
     s.split(',')
@@ -1816,6 +1875,38 @@ mod tests {
         // No exact match → basename fallback still resolves (bare picker name vs stored path).
         assert_eq!(f.model_example("detail.safetensors").map(|(_, c)| c), Some(10));
         assert_eq!(f.model_example("missing.safetensors"), None);
+    }
+
+    /// Wan version parsing across the separator/marker spellings seen in the wild.
+    #[test]
+    fn wan_version_parses_common_spellings() {
+        assert_eq!(wan_version("Wan/wan2.2_i2v_high_noise_14B_fp8_scaled.safetensors"), Some((2, 2)));
+        assert_eq!(wan_version("wan22_lora.safetensors"), Some((2, 2)));
+        assert_eq!(wan_version("Wan-2.1-t2v.safetensors"), Some((2, 1)));
+        assert_eq!(wan_version("wan_2_1/motion.safetensors"), Some((2, 1)));
+        // A version token detached from the wan word is as likely the LoRA's own revision
+        // ("..._lora_v1_..."), so it stays unknown — unknown shows under both unets.
+        assert_eq!(wan_version("WanVideo_v2.2.safetensors"), None);
+        // The two-expert split only exists in 2.2.
+        assert_eq!(wan_version("Wan/SmoothMix_High_Noise.safetensors"), Some((2, 2)));
+        // Unversioned wan names stay unknown; unrelated names never match.
+        assert_eq!(wan_version("Wan/wan_motion.safetensors"), None);
+        assert_eq!(wan_version("SDXL/swan_2.2_style.safetensors"), None);
+        assert_eq!(wan_version("detail_tweaker.safetensors"), None);
+    }
+
+    /// Wan-relatedness: wan token or directory, lightx2v family; generic video tokens don't count.
+    #[test]
+    fn is_wan_related_needs_a_wan_marker() {
+        assert!(is_wan_related("Wan/anything.safetensors"));
+        assert!(is_wan_related("wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"));
+        assert!(is_wan_related("lightx2v_distill.safetensors"));
+        assert!(is_wan_related("wanimate_style.safetensors"));
+        assert!(is_wan_related("WanVideo_style.safetensors"));
+        assert!(!is_wan_related("SDXL/swan_lake.safetensors"));
+        assert!(!is_wan_related("hunyuan_t2v_lora.safetensors"));
+        assert!(!is_wan_related("detail_tweaker_xl.safetensors"));
+        assert!(!is_wan_related("wand_of_magic.safetensors"));
     }
 
     /// The sweep-pairing counter: last all-digit `_` segment of the stem, or None.

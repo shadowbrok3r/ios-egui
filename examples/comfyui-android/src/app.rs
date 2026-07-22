@@ -984,6 +984,8 @@ struct ComfyApp {
     viewer_remix_long_fired: bool,
     /// How many separate Create jobs one Queue tap enqueues (1..=8).
     queue_variants: usize,
+    /// Bypass the Wan LoRA filter in the video pickers (session-only).
+    video_lora_show_all: bool,
     /// Long-press menu on empty graph canvas: `(graph_pos, screen_pos, armed)`.
     /// `armed` stays false until the opening press is released so that release doesn't dismiss.
     canvas_menu: Option<(egui::Pos2, egui::Pos2, bool)>,
@@ -1507,6 +1509,7 @@ impl ComfyApp {
             viewer_remix_press: None,
             viewer_remix_long_fired: false,
             queue_variants: 1,
+            video_lora_show_all: false,
             canvas_menu: None,
             node_menu: None,
             gallery_scroll_y: 0.0,
@@ -5470,6 +5473,18 @@ impl ComfyApp {
     /// Recompute the cached lint issues when the prompt/model/LoRA fingerprint changes.
     fn refresh_lint(&mut self) {
         let model = self.params.model_file().to_string();
+        // Video runs apply the Wan stacks, not the image LoRA list.
+        let active: Vec<&ActiveLora> = if self.params.mode == Mode::Video {
+            self.params
+                .video
+                .loras_high
+                .iter()
+                .chain(self.params.video.loras_low.iter())
+                .filter(|l| !l.file.trim().is_empty() && l.strength_model != 0.0)
+                .collect()
+        } else {
+            self.params.loras.iter().collect()
+        };
         let mut key = String::new();
         key.push_str(&self.params.positive);
         key.push('\u{1}');
@@ -5478,7 +5493,7 @@ impl ComfyApp {
         key.push_str(&self.params.lora_triggers);
         key.push('\u{1}');
         key.push_str(&model);
-        for al in &self.params.loras {
+        for al in &active {
             key.push('\u{1}');
             key.push_str(&al.file);
             key.push_str(&format!(":{}:{}", al.strength_model, al.strength_clip));
@@ -5493,7 +5508,7 @@ impl ComfyApp {
         let ckpt =
             (self.params.mode != Mode::Video).then(|| self.checkpoint_catalog.entry(&model)).flatten();
         let loras: Vec<_> =
-            self.params.loras.iter().map(|al| (al, self.lora_catalog.entry(&al.file))).collect();
+            active.iter().map(|al| (*al, self.lora_catalog.entry(&al.file))).collect();
         self.lint_issues = lint::lint(&self.params, ckpt, &loras);
     }
 
@@ -5967,6 +5982,14 @@ impl ComfyApp {
                 .desired_width(f32::INFINITY)
                 .hint_text("what to avoid"),
         );
+        // Prepended to the positive at queue time (combined_positive), same as image mode.
+        ui.label("LoRA triggers");
+        ui.add(
+            egui::TextEdit::multiline(&mut self.params.lora_triggers)
+                .desired_rows(1)
+                .desired_width(f32::INFINITY)
+                .hint_text("trigger words from LoRAs (auto-filled on pick)"),
+        );
         self.lint_chips_ui(ui);
 
         // Start image source, with a text-to-video option.
@@ -6041,12 +6064,34 @@ impl ComfyApp {
             ui.checkbox(&mut self.params.randomize_seed, "random");
         });
 
-        // LoRA stacks per expert; strength 0 stays listed but inert.
+        // LoRA stacks per expert; strength 0 stays listed but inert. Combos offer Wan-matched
+        // files (catalog bases, else filename heuristic) unless the toggle bypasses the filter.
         ui.add_space(6.0);
-        let loras = self.installed_loras.clone();
-        video_lora_list(ui, "High noise LoRAs", &mut self.params.video.loras_high, &loras, "vlora_hi");
+        let hi_options =
+            self.video_lora_options(&self.params.video.unet_high, &self.params.video.loras_high);
+        let lo_options =
+            self.video_lora_options(&self.params.video.unet_low, &self.params.video.loras_low);
+        ui.checkbox(&mut self.video_lora_show_all, "Show all LoRAs")
+            .on_hover_text("Skip the Wan filter (catalog bases + wan filename match)");
+        if let Some(ev) = video_lora_list(
+            ui,
+            "High noise LoRAs",
+            &mut self.params.video.loras_high,
+            &hi_options,
+            "vlora_hi",
+        ) {
+            self.on_video_lora_event(true, ev);
+        }
         ui.add_space(4.0);
-        video_lora_list(ui, "Low noise LoRAs", &mut self.params.video.loras_low, &loras, "vlora_lo");
+        if let Some(ev) = video_lora_list(
+            ui,
+            "Low noise LoRAs",
+            &mut self.params.video.loras_low,
+            &lo_options,
+            "vlora_lo",
+        ) {
+            self.on_video_lora_event(false, ev);
+        }
 
         // Advanced: models, sampler math, post-processing.
         ui.add_space(6.0);
@@ -8697,6 +8742,99 @@ impl ComfyApp {
             an.to_lowercase().cmp(&bn.to_lowercase())
         });
         out
+    }
+
+    /// LoRA files offered for a Wan expert combo. A catalog entry with base/checkpoint tags is
+    /// authoritative against the unet's bases; everything else goes through the wan filename
+    /// heuristic (family + version match). Current picks always stay listed.
+    fn video_lora_options(&self, unet: &str, current: &[ActiveLora]) -> Vec<String> {
+        let mut out: Vec<String> = if self.video_lora_show_all {
+            self.installed_loras.clone()
+        } else {
+            let model_bases = self.model_bases_for(unet);
+            let unet_ver = crate::types::wan_version(unet);
+            self.installed_loras
+                .iter()
+                .filter(|file| {
+                    if let Some(e) = self.lora_catalog.entry(file)
+                        && (!e.bases.is_empty() || !e.checkpoints.is_empty())
+                    {
+                        return e.matches_checkpoint(unet, &model_bases);
+                    }
+                    if !crate::types::is_wan_related(file) {
+                        return false;
+                    }
+                    match (crate::types::wan_version(file), unet_ver) {
+                        (Some(l), Some(u)) => l == u,
+                        _ => true,
+                    }
+                })
+                .cloned()
+                .collect()
+        };
+        for l in current {
+            if !l.file.is_empty() && !out.iter().any(|f| f == &l.file) {
+                out.push(l.file.clone());
+            }
+        }
+        out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        out
+    }
+
+    /// Apply catalog strengths/negatives for a picked Wan LoRA, then re-derive triggers.
+    fn on_video_lora_event(&mut self, high: bool, ev: VloraEvent) {
+        match ev {
+            VloraEvent::Picked(i) => {
+                let list =
+                    if high { &self.params.video.loras_high } else { &self.params.video.loras_low };
+                let Some(file) = list.get(i).map(|l| l.file.clone()) else { return };
+                let entry = self
+                    .lora_catalog
+                    .entry(&file)
+                    .map(|e| (e.add_strengths(), e.negative_text()));
+                if let Some(((sm, sc), neg)) = entry {
+                    let list = if high {
+                        &mut self.params.video.loras_high
+                    } else {
+                        &mut self.params.video.loras_low
+                    };
+                    if let Some(l) = list.get_mut(i) {
+                        l.strength_model = sm;
+                        l.strength_clip = sc;
+                    }
+                    append_negatives(&mut self.params.negative, &neg);
+                }
+            }
+            VloraEvent::Removed(l) => {
+                strip_injected(&mut self.params.lora_triggers, &l.injected);
+            }
+        }
+        self.reconcile_video_lora_triggers();
+    }
+
+    /// Re-derive both Wan stacks' trigger contributions: strip every slot's injected tokens,
+    /// then re-merge per slot — safe across file swaps and duplicates between the two stacks.
+    fn reconcile_video_lora_triggers(&mut self) {
+        let mut high = std::mem::take(&mut self.params.video.loras_high);
+        let mut low = std::mem::take(&mut self.params.video.loras_low);
+        for l in high.iter_mut().chain(low.iter_mut()) {
+            strip_injected(&mut self.params.lora_triggers, &l.injected);
+            l.injected.clear();
+        }
+        for l in high.iter_mut().chain(low.iter_mut()) {
+            if l.file.trim().is_empty() {
+                continue;
+            }
+            let triggers =
+                self.lora_catalog.entry(&l.file).map(|e| e.trigger_text()).unwrap_or_default();
+            if triggers.is_empty() {
+                continue;
+            }
+            l.injected =
+                merge_triggers(&mut self.params.lora_triggers, &triggers, &self.params.positive);
+        }
+        self.params.video.loras_high = high;
+        self.params.video.loras_low = low;
     }
 
     fn add_lora(&mut self, file: &str) {
@@ -18004,18 +18142,29 @@ fn combo(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) 
 
 /// A model-only LoRA stack for one Wan expert: file combo + strength per row, add / remove.
 /// Zero-strength rows stay listed (spare slots) but the graph builder skips them.
+/// A Wan-stack change that needs trigger/strength bookkeeping in the caller.
+enum VloraEvent {
+    Picked(usize),
+    Removed(crate::types::ActiveLora),
+}
+
 fn video_lora_list(
     ui: &mut egui::Ui,
     title: &str,
     list: &mut Vec<crate::types::ActiveLora>,
     installed: &[String],
     salt: &str,
-) {
+) -> Option<VloraEvent> {
     section_title(ui, title);
+    let mut event = None;
     let mut remove: Option<usize> = None;
     for (i, lora) in list.iter_mut().enumerate() {
         ui.group(|ui| {
+            let before = lora.file.clone();
             combo_full(ui, &format!("{salt}_{i}"), &mut lora.file, installed);
+            if lora.file != before {
+                event = Some(VloraEvent::Picked(i));
+            }
             ui.horizontal(|ui| {
                 ui.add(egui::Slider::new(&mut lora.strength_model, 0.0..=2.0).text("Model"));
                 if ui.small_button("Remove").clicked() {
@@ -18028,7 +18177,7 @@ fn video_lora_list(
         });
     }
     if let Some(i) = remove {
-        list.remove(i);
+        event = Some(VloraEvent::Removed(list.remove(i)));
     }
     if ui.button(format!("{} LoRA", icons::ADD)).clicked() {
         list.push(crate::types::ActiveLora {
@@ -18039,6 +18188,7 @@ fn video_lora_list(
             model_only: true,
         });
     }
+    event
 }
 
 fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[String]) {
