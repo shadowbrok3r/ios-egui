@@ -36,11 +36,13 @@ pub struct GenCtx {
     pub schemas: Arc<SchemaSet>,
 }
 
-/// One `GET /queue` entry (`queue_running` / `queue_pending`): the server's run number and prompt id.
+/// One `GET /queue` entry (`queue_running` / `queue_pending`): the server's run number, prompt id,
+/// and the prompt summary scraped from the entry's embedded graph (checkpoint, prompt, sampler, …).
 #[derive(Clone, Debug, PartialEq)]
 pub struct QueueJob {
     pub number: i64,
     pub prompt_id: String,
+    pub meta: Option<crate::gallery::ImageMeta>,
 }
 
 /// Every option list the Create tab's pickers offer, read off `/object_info` on connect.
@@ -2357,7 +2359,13 @@ fn parse_queue_entry(e: &Value) -> QueueJob {
         .unwrap_or(0);
     let prompt_id =
         e.get(1).and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| "?".into());
-    QueueJob { number, prompt_id }
+    // Index 2 is the prompt graph (API format). Scrape a summary so the queue sheet can show what
+    // each job is, not just an opaque id. Parsed straight from the value (no string round-trip).
+    let meta = e.get(2).and_then(|g| {
+        let m = crate::gallery::parse_workflow_meta_value(g);
+        (!m.is_empty()).then_some(m)
+    });
+    QueueJob { number, prompt_id, meta }
 }
 
 /// comfy-gate's session cookie name.
@@ -2488,13 +2496,13 @@ mod tests {
             ]
         });
         let (running, pending) = parse_queue(&body);
-        assert_eq!(running, vec![QueueJob { number: 7, prompt_id: "run-aaaa".into() }]);
+        assert_eq!(running, vec![QueueJob { number: 7, prompt_id: "run-aaaa".into(), meta: None }]);
         assert_eq!(
             pending,
             vec![
-                QueueJob { number: 8, prompt_id: "pend-bbbb".into() },
-                QueueJob { number: 9, prompt_id: "pend-cccc".into() },
-                QueueJob { number: 0, prompt_id: "?".into() },
+                QueueJob { number: 8, prompt_id: "pend-bbbb".into(), meta: None },
+                QueueJob { number: 9, prompt_id: "pend-cccc".into(), meta: None },
+                QueueJob { number: 0, prompt_id: "?".into(), meta: None },
             ]
         );
     }

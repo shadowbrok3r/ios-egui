@@ -549,6 +549,46 @@ impl LoraPack {
     }
 }
 
+/// What a [`CharacterLook`] contributes. `Look` is the original combined outfit/pose/scene overlay
+/// applied through the character system; the others are single-axis presets picked from the Create
+/// Main comboboxes (global or grouped by character).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LookKind {
+    #[default]
+    Look,
+    CameraAngle,
+    Environment,
+}
+
+impl LookKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Look => "Look",
+            Self::CameraAngle => "Camera angle",
+            Self::Environment => "Environment",
+        }
+    }
+
+    pub fn plural(self) -> &'static str {
+        match self {
+            Self::Look => "Looks",
+            Self::CameraAngle => "Camera angles",
+            Self::Environment => "Environments",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Look => "school uniform, hand on hip",
+            Self::CameraAngle => "low angle, from below, wide shot",
+            Self::Environment => "rainy neon street at night",
+        }
+    }
+
+    /// The single-axis kinds surfaced as Create-Main comboboxes (not the combined `Look`).
+    pub const MAIN: &'static [Self] = &[Self::CameraAngle, Self::Environment];
+}
+
 /// A swappable "look" for a character: a named prompt fragment (outfit, accessories, pose, scene)
 /// with an optional photo. The character's `identity` is the fixed person; a look layers on top at
 /// apply time and can be swapped without touching the identity.
@@ -561,6 +601,24 @@ pub struct CharacterLook {
     /// Gallery item key (`subfolder/filename`) of this look's photo; empty = none.
     #[serde(default)]
     pub portrait_key: String,
+    /// Which axis this look feeds. Defaults to the combined `Look` for cards from before categories.
+    #[serde(default)]
+    pub kind: LookKind,
+}
+
+/// The current Create-Main combobox selection for one single-axis [`LookKind`], with the undo record
+/// so swapping or clearing reverses its appended tokens exactly.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AppliedMainLook {
+    pub kind: LookKind,
+    /// The selected look's name (what the combobox shows).
+    pub name: String,
+    /// Originating character's name, or empty for a global look — the combobox grouping key.
+    #[serde(default)]
+    pub origin: String,
+    /// Tokens appended to `positive`, stripped on removal.
+    #[serde(default)]
+    pub injected: String,
 }
 
 /// A reusable recurring character: identity tags, its LoRA stack, trigger words, per-character
@@ -693,6 +751,17 @@ impl Params {
         applied.trig_injected = trig;
         applied.neg_injected = neg;
         applied
+    }
+
+    /// Append a single-axis look's tokens to the positive, returning what was injected so
+    /// [`Self::remove_main_look`] can strip it exactly.
+    pub fn apply_main_look(&mut self, prompt: &str) -> String {
+        merge_triggers(&mut self.positive, prompt, &self.lora_triggers)
+    }
+
+    /// Strip a previously applied single-axis look's tokens from the positive.
+    pub fn remove_main_look(&mut self, injected: &str) {
+        strip_injected(&mut self.positive, injected);
     }
 
     /// Reverse [`Self::apply_character`]'s prompt/LoRA edits. Checkpoint and face-detailer
@@ -1810,6 +1879,13 @@ pub struct Settings {
     /// resurfaces as a selectable chip on every future run of that step.
     #[serde(default)]
     pub wizard_custom_tags: std::collections::BTreeMap<String, Vec<String>>,
+    /// Global single-axis looks (camera angles / environments) not tied to any character, shown in
+    /// every Create-Main look combobox.
+    #[serde(default)]
+    pub global_looks: Vec<CharacterLook>,
+    /// Current Create-Main combobox selections (at most one per single-axis kind), with undo records.
+    #[serde(default)]
+    pub active_main_looks: Vec<AppliedMainLook>,
 }
 
 pub fn default_server_output_root() -> String {
@@ -2467,11 +2543,20 @@ mod tests {
             checkpoint: "novaAnime.safetensors".into(),
             switch_checkpoint: true,
             face_prompt: "close-up of Mia's face".into(),
-            looks: vec![CharacterLook {
-                name: "casual".into(),
-                prompt: "hoodie, jeans, standing".into(),
-                portrait_key: "user_x/Mia/casual.png".into(),
-            }],
+            looks: vec![
+                CharacterLook {
+                    name: "casual".into(),
+                    prompt: "hoodie, jeans, standing".into(),
+                    portrait_key: "user_x/Mia/casual.png".into(),
+                    kind: LookKind::Look,
+                },
+                CharacterLook {
+                    name: "from below".into(),
+                    prompt: "low angle, from below".into(),
+                    portrait_key: String::new(),
+                    kind: LookKind::CameraAngle,
+                },
+            ],
             portrait_key: "user_x/Mia/portrait.png".into(),
             album_id: 7,
         };
@@ -2500,6 +2585,35 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&card).unwrap()).unwrap();
         assert_eq!(back.portrait_key, "u/p.png");
         assert_eq!(back.album_id, 3);
+    }
+
+    /// Looks written before categories existed default to the combined `Look` kind; Settings without
+    /// the global-look fields load empty.
+    #[test]
+    fn look_kind_defaults_and_global_looks_backward_compat() {
+        let old = r#"{"name": "casual", "prompt": "hoodie"}"#;
+        let look: CharacterLook = serde_json::from_str(old).expect("old look must deserialize");
+        assert_eq!(look.kind, LookKind::Look);
+
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(s.global_looks.is_empty());
+        assert!(s.active_main_looks.is_empty());
+    }
+
+    #[test]
+    fn applying_then_removing_a_main_look_restores_the_positive() {
+        let mut p = Params {
+            positive: "1girl, silver hair".into(),
+            lora_triggers: "masterpiece".into(),
+            ..Default::default()
+        };
+        let before = p.positive.clone();
+        let injected = p.apply_main_look("low angle, from below");
+        assert!(p.positive.contains("low angle"));
+        p.remove_main_look(&injected);
+        assert_eq!(p.positive, before);
     }
 
     /// Settings written before the character denied / suggestions maps existed still load empty.

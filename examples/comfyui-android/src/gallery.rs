@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::types::{ActiveLora, CharacterCard, GalleryGroup, GalleryItem, Params, file_basename};
 
 /// One LoRA referenced by a gallery image's embedded workflow.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct LoraMeta {
     pub name: String,
     pub strength_model: f64,
@@ -19,7 +19,7 @@ pub struct LoraMeta {
 }
 
 /// Prompt / model summary scraped from an embedded workflow for the viewer header.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImageMeta {
     pub models: Vec<String>,
     /// `UNETLoader.unet_name` — set when the graph used the diffusion-model topology.
@@ -163,6 +163,19 @@ pub fn remix_diff_rows(meta: &ImageMeta, params: &Params) -> Vec<RemixDiffRow> {
 #[cfg_attr(target_os = "android", allow(dead_code))]
 pub fn parse_workflow_meta(raw: &str) -> ImageMeta {
     parse_workflow_meta_for(raw, None)
+}
+
+/// Like [`parse_workflow_meta`] but from an already-parsed JSON value (e.g. a `/queue` entry's
+/// embedded graph), skipping the string round-trip.
+pub fn parse_workflow_meta_value(value: &Value) -> ImageMeta {
+    let value = unwrap_workflow_root(value.clone());
+    if value.get("nodes").is_some() {
+        parse_ui_meta(&value, None)
+    } else if value.as_object().is_some() {
+        parse_api_meta(&value, None)
+    } else {
+        ImageMeta::default()
+    }
 }
 
 /// Like [`parse_workflow_meta`], but when `filename` is set, prefer the SaveImage column that
