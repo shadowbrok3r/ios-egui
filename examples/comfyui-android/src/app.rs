@@ -28,7 +28,7 @@ use crate::{clip_index, tag_index};
 use crate::{sysmon, uiwf};
 use crate::types::{
     ActiveLora, Album, AppPack, AppStep, AppliedCharacter, CHECKPOINT_RECENT_MAX, CharacterCard,
-    CharacterPack, CheckpointCatalog, CheckpointSort,
+    CharacterLook, CharacterPack, CheckpointCatalog, CheckpointSort,
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, GenMode, Img2ImgSource, LoraCatalog,
@@ -126,6 +126,11 @@ const WIZ_TRAITS: &[(&str, &str, bool, &[&str])] = &[
 /// persisted settings file.
 const WIZ_CUSTOM_TAGS_CAP: usize = 40;
 
+/// The first [`WIZ_TRAITS`] describe the persistent PERSON (subject, hair, eyes, body); the rest
+/// (outfit, accessories, pose) are situational and become the character's first swappable look
+/// rather than part of its fixed identity.
+const WIZ_PERSON_TRAITS: usize = 5;
+
 /// One trait step's answer: the chips picked from [`WIZ_TRAITS`] plus a free-text extra.
 #[derive(Default, Clone)]
 struct TraitSel {
@@ -151,8 +156,10 @@ struct CharacterWizard {
     name: String,
     /// One answer slot per [`WIZ_TRAITS`] row.
     sel: Vec<TraitSel>,
-    /// Composed identity tags, editable on the review step.
+    /// Composed identity tags (the person), editable on the review step.
     identity: String,
+    /// The situational tags (outfit / accessories / pose) that become the character's first look.
+    look_prompt: String,
     /// The composer LLM is running; the deterministic chip join stands in until it lands.
     composing: bool,
     /// Set once so re-entering the review step doesn't clobber the user's edits by recomposing.
@@ -175,6 +182,7 @@ impl CharacterWizard {
             name: String::new(),
             sel: vec![TraitSel::default(); WIZ_TRAITS.len()],
             identity: String::new(),
+            look_prompt: String::new(),
             composing: false,
             composed_once: false,
             #[cfg(feature = "local-npu")]
@@ -7160,7 +7168,7 @@ impl ComfyApp {
         }
 
         enum Act {
-            Apply(usize),
+            Apply(usize, Option<usize>),
             Remove,
             Edit(usize),
             Share(usize),
@@ -7169,6 +7177,7 @@ impl ComfyApp {
             Suggestions(usize),
         }
         let active = self.active_character.as_ref().map(|a| a.name.clone());
+        let active_look = self.active_character.as_ref().and_then(|a| a.look.clone());
         let mut act: Option<Act> = None;
         for (i, card) in self.characters.clone().iter().enumerate() {
             let is_active = active.as_deref() == Some(card.name.as_str());
@@ -7192,7 +7201,9 @@ impl ComfyApp {
                                 act = Some(Act::Remove);
                             }
                         } else if ui.small_button("Apply").clicked() {
-                            act = Some(Act::Apply(i));
+                            // Default to the first look for a complete character; identity-only
+                            // when the card has no looks. The chips below swap it.
+                            act = Some(Act::Apply(i, (!card.looks.is_empty()).then_some(0)));
                         }
                         ui.add_space(4.0);
                         let max_w = (ui.available_width() - 4.0).max(32.0);
@@ -7217,6 +7228,24 @@ impl ComfyApp {
                         act = Some(Act::Suggestions(i));
                     }
                 });
+                // Swappable looks: tap a photo chip to apply this character with that outfit/pose
+                // (or "Person" for identity only). The applied look wears a pink ring.
+                if !card.looks.is_empty() {
+                    ui.add_space(2.0);
+                    ui.horizontal_wrapped(|ui| {
+                        let person = CharacterLook { name: "Person".into(), ..Default::default() };
+                        if self.look_chip(ui, &person, is_active && active_look.is_none()) {
+                            act = Some(Act::Apply(i, None));
+                        }
+                        for (li, look) in card.looks.iter().enumerate() {
+                            let on =
+                                is_active && active_look.as_deref() == Some(look.name.as_str());
+                            if self.look_chip(ui, look, on) {
+                                act = Some(Act::Apply(i, Some(li)));
+                            }
+                        }
+                    });
+                }
                 egui::CollapsingHeader::new("Details")
                     .id_salt(("character_row", card.name.as_str()))
                     .default_open(false)
@@ -7248,8 +7277,8 @@ impl ComfyApp {
             });
         }
         match act {
-            Some(Act::Apply(i)) => {
-                self.apply_character(i);
+            Some(Act::Apply(i, look)) => {
+                self.apply_character(i, look);
                 host.haptic(Haptic::Light);
             }
             Some(Act::Remove) => {
@@ -7314,10 +7343,10 @@ impl ComfyApp {
         );
 
         ui.add_space(4.0);
-        ui.label("Identity tags");
+        ui.label("Identity — the person");
         ui.add(
             egui::TextEdit::multiline(&mut draft.card.identity)
-                .hint_text("1girl, silver hair, red eyes, twin braids")
+                .hint_text("1girl, silver hair, red eyes — no clothing; that goes in a look")
                 .desired_width(w)
                 .desired_rows(2),
         );
@@ -7345,6 +7374,76 @@ impl ComfyApp {
                 .hint_text("optional; fed to the Face fix app")
                 .desired_width(w),
         );
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label(format!("Looks ({})", draft.card.looks.len()));
+            if ui
+                .small_button(format!("{} Add look", icons::ADD))
+                .on_hover_text("A swappable outfit / pose / scene layered on the identity")
+                .clicked()
+            {
+                let name = unique_look_name(&draft.card.looks);
+                draft.card.looks.push(CharacterLook { name, ..Default::default() });
+            }
+            if ui
+                .small_button("Capture prompt")
+                .on_hover_text("Save the current Create prompt as a look (identity + quality tags stripped)")
+                .clicked()
+            {
+                // Strip the identity and this model's quality block so the captured look holds only
+                // its situational tags — otherwise it bakes in an identity that desyncs when the
+                // person is later edited, and re-adds the quality prefix on every apply.
+                let model = if draft.card.checkpoint.trim().is_empty() {
+                    self.params.model_file().to_string()
+                } else {
+                    draft.card.checkpoint.clone()
+                };
+                let (qpos, _) = self.family_quality(&model);
+                let reserved = join_comma(&draft.card.identity, qpos);
+                let prompt =
+                    crate::tags::dedupe_against(self.params.positive.trim(), &reserved);
+                draft.card.looks.push(CharacterLook {
+                    name: unique_look_name(&draft.card.looks),
+                    prompt,
+                    portrait_key: String::new(),
+                });
+            }
+        });
+        ui.weak(format!(
+            "Set a look's photo from a gallery image: open it, then {} Set as photo.",
+            icons::SETTINGS
+        ));
+        let mut drop_look: Option<usize> = None;
+        for (li, look) in draft.card.looks.iter_mut().enumerate() {
+            ui.group(|ui| {
+                ui.set_max_width(w - 8.0);
+                ui.horizontal(|ui| {
+                    if !look.portrait_key.is_empty() {
+                        self.portrait_thumb(ui, &look.portrait_key, 34.0);
+                        ui.add_space(4.0);
+                    }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut look.name)
+                            .hint_text("look name")
+                            .desired_width((w - 60.0).max(80.0)),
+                    );
+                    if ui.small_button(icons::CLOSE).clicked() {
+                        drop_look = Some(li);
+                    }
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut look.prompt)
+                        .hint_text("black dress, choker, thighhighs, standing")
+                        .desired_rows(2)
+                        .desired_width(w - 16.0),
+                );
+            });
+        }
+        if let Some(li) = drop_look {
+            draft.card.looks.remove(li);
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -7456,10 +7555,13 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         };
-        // Profile picture and album id reference the sharer's account; drop them on import.
+        // Profile picture, look photos, and album id reference the sharer's account; drop them.
         let mut card = pack.card;
         card.portrait_key.clear();
         card.album_id = 0;
+        for look in &mut card.looks {
+            look.portrait_key.clear();
+        }
         // Open the imported card in the editor for review before saving.
         self.character_draft = Some(CharacterDraft { editing: None, card });
         self.status = "Character imported — review and save".into();
@@ -7469,10 +7571,10 @@ impl ComfyApp {
     /// The character sheet the composer LLM reads: `Title: picks; Title: picks, custom` — the
     /// exact shape [`local_rewrite::SYS_COMPOSE_CHARACTER`]'s worked example anchors on.
     #[cfg(feature = "local-npu")]
-    fn wizard_sheet(sel: &[TraitSel]) -> String {
+    fn wizard_sheet(sel: &[TraitSel], range: std::ops::Range<usize>) -> String {
         let mut parts: Vec<String> = Vec::new();
-        for (i, (title, _, _, _)) in WIZ_TRAITS.iter().enumerate() {
-            let Some(s) = sel.get(i) else { continue };
+        for i in range {
+            let (Some((title, ..)), Some(s)) = (WIZ_TRAITS.get(i), sel.get(i)) else { continue };
             let mut vals = s.picked.join(", ");
             let custom = s.custom.trim();
             if !custom.is_empty() {
@@ -7488,11 +7590,11 @@ impl ComfyApp {
         parts.join("; ")
     }
 
-    /// Deterministic composer: chips are already finished tags, so joining them in walk order is
-    /// a solid prompt on its own. Stands in until (or without) the LLM pass.
-    fn wizard_join_tags(sel: &[TraitSel]) -> String {
+    /// Deterministic composer over a slice of the trait walk: chips are already finished tags, so
+    /// joining them in order is a solid prompt on its own. Stands in until (or without) the LLM.
+    fn wizard_join_tags(sel: &[TraitSel], range: std::ops::Range<usize>) -> String {
         let mut parts: Vec<String> = Vec::new();
-        for s in sel {
+        for s in sel.get(range).unwrap_or(&[]) {
             parts.extend(s.picked.iter().cloned());
             let custom = s.custom.trim();
             if !custom.is_empty() {
@@ -7510,7 +7612,7 @@ impl ComfyApp {
         if wiz.composing {
             return;
         }
-        let sheet = Self::wizard_sheet(&wiz.sel);
+        let sheet = Self::wizard_sheet(&wiz.sel, 0..WIZ_PERSON_TRAITS);
         if sheet.is_empty() {
             return;
         }
@@ -7627,10 +7729,11 @@ impl ComfyApp {
         out
     }
 
-    /// The test prompt for one candidate: the identity tags behind the checkpoint family's
-    /// quality block (same table as the prompt lint), so a Pony model isn't judged on a
-    /// promptless dialect. Deliberately duplicated from lint.rs's private table — two rows.
-    fn taste_prompt(&self, identity: &str, file: &str) -> String {
+    /// The `(positive quality prefix, negative quality tags)` for a checkpoint's model family —
+    /// the same table the prompt lint uses, so a Pony model gets score_ tags and an Illustrious
+    /// one masterpiece/quality tags. Empty positive for an unknown family; a generic safe negative.
+    /// Shared by the taste test and character apply so both set model-appropriate quality prompts.
+    fn family_quality(&self, file: &str) -> (&'static str, &'static str) {
         let hay = self
             .checkpoint_catalog
             .entry(file)
@@ -7644,13 +7747,23 @@ impl ComfyApp {
             })
             .unwrap_or_default();
         if hay.contains("pony") {
-            format!("score_9, score_8_up, score_7_up, {identity}")
-        } else if ["illustrious", "noobai", "sd1", "sd 1.5", "sd15"].iter().any(|b| hay.contains(b))
-        {
-            format!("masterpiece, best quality, {identity}")
+            (
+                "score_9, score_8_up, score_7_up, score_6_up, score_5_up, score_4_up",
+                "score_6, score_5, score_4, worst quality, low quality, blurry",
+            )
+        } else if ["illustrious", "noobai", "sd1", "sd 1.5", "sd15"].iter().any(|b| hay.contains(b)) {
+            (
+                "masterpiece, best quality, newest, absurdres, highres",
+                "worst quality, low quality, bad anatomy, bad hands, jpeg artifacts, blurry",
+            )
         } else {
-            identity.to_string()
+            ("", "text, watermark, worst quality, low quality, blurry")
         }
+    }
+
+    /// The positive test prompt for one candidate: the family quality block ahead of the identity.
+    fn taste_prompt(&self, identity: &str, file: &str) -> String {
+        join_comma(self.family_quality(file).0, identity)
     }
 
     /// Fan the wizard's prompt out across the candidate checkpoints: one job per candidate,
@@ -7694,7 +7807,9 @@ impl ComfyApp {
             t.revealed = false;
             (t.candidates.clone(), t.labels.clone(), t.per, t.seed)
         };
-        let identity = wiz.identity.trim().to_string();
+        // Test the full character — the person plus the default look — so the images show a
+        // dressed, posed subject rather than a bare identity.
+        let identity = join_comma(wiz.identity.trim(), wiz.look_prompt.trim());
         let orig = self.params.clone();
         self.progress = (0, 0);
         self.preview = None;
@@ -7719,6 +7834,9 @@ impl ComfyApp {
             // Per-candidate recommended steps/cfg/size/sampler: each model gets its best shot.
             self.apply_recommended_settings(&file);
             self.params.positive = self.taste_prompt(&identity, &file);
+            // A clean, model-appropriate negative — never the stale one from whatever workflow was
+            // loaded before the test (that leaked in and skewed every candidate identically).
+            self.params.negative = self.family_quality(&file).1.to_string();
             // A bare-identity test: no LoRA stack, no enhance chain, no injected triggers.
             self.params.loras.clear();
             self.params.apps.clear();
@@ -7988,16 +8106,19 @@ impl ComfyApp {
             WizStep::Review => {
                 if !wiz.composed_once && !wiz.composing {
                     wiz.composed_once = true;
-                    wiz.identity = Self::wizard_join_tags(&wiz.sel);
-                    // With a rewrite pack the LLM refines the join (folding the free-text notes
-                    // into tags); without one the join above already is the review text.
+                    // Person traits -> identity (LLM-refined when a pack is present); situational
+                    // traits -> the first look, kept as a plain tag join (outfits need no LLM).
+                    wiz.identity = Self::wizard_join_tags(&wiz.sel, 0..WIZ_PERSON_TRAITS);
+                    wiz.look_prompt =
+                        Self::wizard_join_tags(&wiz.sel, WIZ_PERSON_TRAITS..WIZ_TRAITS.len());
                     self.start_wizard_compose(ui.ctx(), &mut wiz);
                 }
                 #[cfg(feature = "local-npu")]
                 let can_llm = self.rewrite_pack.is_some();
                 #[cfg(not(feature = "local-npu"))]
                 let can_llm = false;
-                ui.strong("Character prompt");
+                ui.strong("Character — the person");
+                ui.weak("Reproduced every time; outfits and pose live in the look below.");
                 if wiz.composing {
                     ui.horizontal(|ui| {
                         ui.add(egui::Spinner::new());
@@ -8006,7 +8127,7 @@ impl ComfyApp {
                 }
                 ui.add(
                     egui::TextEdit::multiline(&mut wiz.identity)
-                        .desired_rows(3)
+                        .desired_rows(2)
                         .desired_width(w)
                         .hint_text("1girl, silver hair, red eyes, twin braids"),
                 );
@@ -8025,9 +8146,18 @@ impl ComfyApp {
                         .on_hover_text("Just join the picked chips, no AI")
                         .clicked()
                     {
-                        wiz.identity = Self::wizard_join_tags(&wiz.sel);
+                        wiz.identity = Self::wizard_join_tags(&wiz.sel, 0..WIZ_PERSON_TRAITS);
                     }
                 });
+                ui.add_space(6.0);
+                ui.strong("Default look");
+                ui.weak("Outfit, accessories, pose — swap or add more looks later.");
+                ui.add(
+                    egui::TextEdit::multiline(&mut wiz.look_prompt)
+                        .desired_rows(2)
+                        .desired_width(w)
+                        .hint_text("black dress, choker, thighhighs, standing"),
+                );
                 ui.add_space(4.0);
                 ui.label("Name");
                 ui.add(
@@ -8313,9 +8443,12 @@ impl ComfyApp {
                     ui.weak("Tap the images you like, then let the tally pick the checkpoint.");
                 }
                 // The blind grid: models are only named (hover) after the reveal.
-                let cols = 3usize;
-                let gap = 4.0;
-                let tile = ((w - gap * (cols as f32 - 1.0)) / cols as f32).max(64.0);
+                // Gutter-aware dims (shared with the gallery picker) so the tile size — and thus
+                // the grid's total height — stays put whether or not the scrollbar is showing.
+                // Deriving the tile from the live width instead made the two states flip-flop
+                // every frame (scrollbar appears → tiles shrink → height drops below the
+                // threshold → scrollbar hides → repeat), the jitter you saw.
+                let (cols, tile) = Self::picker_grid_dims(ui);
                 let names: Vec<String> =
                     t.candidates.iter().map(|f| self.taste_candidate_name(f)).collect();
                 let mut i = 0usize;
@@ -8454,9 +8587,19 @@ impl ComfyApp {
                 )
                 .clicked()
             {
+                // The situational tags become the character's first swappable look.
+                let mut looks = Vec::new();
+                if !wiz.look_prompt.trim().is_empty() {
+                    looks.push(CharacterLook {
+                        name: "Default".into(),
+                        prompt: wiz.look_prompt.trim().to_string(),
+                        portrait_key: String::new(),
+                    });
+                }
                 let card = CharacterCard {
                     name: wiz.name.trim().to_string(),
                     identity: wiz.identity.trim().to_string(),
+                    looks,
                     checkpoint: wiz.checkpoint.clone(),
                     switch_checkpoint: !wiz.checkpoint.is_empty(),
                     ..Default::default()
@@ -11093,67 +11236,124 @@ impl ComfyApp {
 
     /// Apply the character card at `idx`: identity tags, LoRAs, triggers, negatives, and (opt-in)
     /// checkpoint + face-detailer prompt. Reverses any already-active card first.
-    fn apply_character(&mut self, idx: usize) {
+    /// Apply a character as a clean reset: switch to its checkpoint, clear the previous workflow's
+    /// prompts / LoRA tags / LoRAs (image AND stale WAN video LoRAs), set the model's family
+    /// quality positives + negatives, then layer the character's identity / triggers / LoRAs on
+    /// top. `look_idx` picks a swappable look (outfit/pose) appended after the identity; `None`
+    /// applies the person only. The full pre-apply params are snapshotted so Remove restores them.
+    fn apply_character(&mut self, idx: usize, look_idx: Option<usize>) {
         let Some(card) = self.characters.get(idx).cloned() else { return };
+        // Undo any active character first (restores its pre-apply params) so the snapshot below is
+        // a clean base and re-applying is idempotent.
         self.remove_active_character();
+        let prev = self.params.clone();
 
-        // Catalog trigger/negative words for each of the card's LoRAs.
-        let words: HashMap<String, (String, String)> = card
-            .loras
-            .iter()
-            .map(|l| {
-                let pair = self
-                    .lora_catalog
-                    .entry(&l.file)
-                    .map(|e| (e.trigger_text(), e.negative_text()))
-                    .unwrap_or_default();
-                (l.file.clone(), pair)
-            })
-            .collect();
-
-        let mut applied =
-            self.params.apply_character(&card, |f| words.get(f).cloned().unwrap_or_default());
-
+        // Switch to the character's checkpoint first — select_model also pulls the model's
+        // recommended steps/cfg/size/sampler — so the family quality tags match what we render on.
         if card.switch_checkpoint && !card.checkpoint.trim().is_empty() {
-            applied.switched_checkpoint = true;
-            applied.prev_checkpoint = self.params.checkpoint.clone();
-            applied.prev_unet = self.params.unet_name.clone();
-            applied.prev_model_kind = Some(self.params.model_kind);
             self.select_model(&card.checkpoint, None);
         }
 
-        if !card.face_prompt.trim().is_empty() {
-            if let Some(step) =
-                self.params.apps.iter_mut().find(|a| a.app == "face.detailer" && a.enabled)
-            {
-                applied.face_touched = true;
-                applied.face_prev =
-                    step.values.get("face_prompt").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                step.values
-                    .insert("face_prompt".into(), serde_json::Value::String(card.face_prompt.clone()));
+        // A clean image slate: this character on this model, nothing carried over from before.
+        self.params.mode = Mode::Txt2Img;
+        self.params.loras.clear();
+        self.params.lora_triggers.clear();
+        // Stale WAN video LoRAs don't apply to txt2img and can't be edited from it — drop them.
+        self.params.video.loras_high.clear();
+        self.params.video.loras_low.clear();
+        self.params.video.lora_triggers.clear();
+
+        // Model-family quality block + the character's identity + the chosen look as the positive;
+        // the family's quality negatives + the character's negatives as the negative.
+        let file = self.params.model_file().to_string();
+        let (qpos, qneg) = self.family_quality(&file);
+        let look = look_idx.and_then(|li| card.looks.get(li));
+        let mut positive = join_comma(qpos, card.identity.trim());
+        if let Some(l) = look {
+            positive = join_comma(&positive, l.prompt.trim());
+        }
+        self.params.positive = positive;
+        self.params.negative = join_comma(qneg, card.negatives.trim());
+
+        // The character's LoRA stack, folding each LoRA's catalog trigger/negative words in.
+        let mut triggers = card.triggers.trim().to_string();
+        for lora in &card.loras {
+            let (t, n) = self
+                .lora_catalog
+                .entry(&lora.file)
+                .map(|e| (e.trigger_text(), e.negative_text()))
+                .unwrap_or_default();
+            triggers = join_comma(&triggers, &t);
+            if !n.trim().is_empty() {
+                let neg = std::mem::take(&mut self.params.negative);
+                self.params.negative = join_comma(&neg, n.trim());
             }
+            self.params.loras.push(ActiveLora {
+                file: lora.file.clone(),
+                strength_model: lora.strength_model,
+                strength_clip: lora.strength_clip,
+                injected: String::new(),
+                model_only: lora.model_only,
+            });
+        }
+        // Drop trigger words already present in the positive so combined_positive() (which
+        // prepends lora_triggers to positive) doesn't encode a shared tag like `1girl` twice.
+        self.params.lora_triggers = crate::tags::dedupe_against(&triggers, &self.params.positive);
+
+        // Face-detailer wildcard prompt (restored via `prev` on removal, like everything else).
+        if !card.face_prompt.trim().is_empty()
+            && let Some(step) =
+                self.params.apps.iter_mut().find(|a| a.app == "face.detailer" && a.enabled)
+        {
+            step.values
+                .insert("face_prompt".into(), serde_json::Value::String(card.face_prompt.clone()));
         }
 
-        self.active_character = Some(applied);
+        self.active_character = Some(AppliedCharacter {
+            name: card.name.clone(),
+            prev: Some(prev),
+            look: look.map(|l| l.name.clone()),
+            ..Default::default()
+        });
         self.selected_preset.clear();
     }
 
-    /// Reverse the active character: strip its tokens, drop its LoRAs, restore any switched
-    /// checkpoint and face-detailer prompt.
+    /// Remove the active character by restoring the params snapshot taken when it was applied.
     fn remove_active_character(&mut self) {
         let Some(applied) = self.active_character.take() else { return };
-        self.params.remove_character(&applied);
-        if applied.switched_checkpoint {
-            self.params.checkpoint = applied.prev_checkpoint.clone();
-            self.params.unet_name = applied.prev_unet.clone();
-            if let Some(k) = applied.prev_model_kind {
-                self.params.model_kind = k;
+        match applied.prev {
+            Some(prev) => {
+                self.params = prev;
+                // A snapshot may carry Img2Img+Picked, but the picked bytes are session-only; if
+                // they're gone (e.g. the snapshot survived a restart), fall back the same way the
+                // settings-load path does rather than revive a sourceless img2img state.
+                if self.params.img2img_source == Img2ImgSource::Picked && self.picked_input.is_none()
+                {
+                    self.params.img2img_source = Img2ImgSource::CurrentOutput;
+                    self.params.inpaint_mask = false;
+                }
             }
-        }
-        if applied.face_touched {
-            if let Some(step) = self.params.apps.iter_mut().find(|a| a.app == "face.detailer") {
-                step.values
-                    .insert("face_prompt".into(), serde_json::Value::String(applied.face_prev.clone()));
+            None => {
+                // A character applied by an older build recorded token-level injections instead of
+                // a full snapshot — reverse those (the legacy fields survive on the card) so an
+                // upgrade-window Remove still strips its tags / LoRAs / switched checkpoint.
+                self.params.remove_character(&applied);
+                if applied.switched_checkpoint {
+                    self.params.checkpoint = applied.prev_checkpoint.clone();
+                    self.params.unet_name = applied.prev_unet.clone();
+                    if let Some(k) = applied.prev_model_kind {
+                        self.params.model_kind = k;
+                    }
+                }
+                if applied.face_touched
+                    && let Some(step) =
+                        self.params.apps.iter_mut().find(|a| a.app == "face.detailer")
+                {
+                    step.values.insert(
+                        "face_prompt".into(),
+                        serde_json::Value::String(applied.face_prev.clone()),
+                    );
+                }
             }
         }
         self.selected_preset.clear();
@@ -11163,6 +11363,8 @@ impl ComfyApp {
     /// reverse the old application and reapply the saved version.
     fn save_character(&mut self, editing: Option<String>, card: CharacterCard) {
         let active = self.active_character.as_ref().map(|a| a.name.clone());
+        // Preserve the applied look across a re-apply of the edited card.
+        let active_look = self.active_character.as_ref().and_then(|a| a.look.clone());
         let reapply = match (&editing, &active) {
             (Some(old), Some(act)) => old == act,
             (None, Some(act)) => act == &card.name,
@@ -11189,7 +11391,11 @@ impl ComfyApp {
         if reapply {
             self.remove_active_character();
             if let Some(i) = self.characters.iter().position(|c| c.name == card.name) {
-                self.apply_character(i);
+                // Re-select the same-named look in the saved card, if it still exists.
+                let look = active_look
+                    .as_ref()
+                    .and_then(|n| self.characters[i].looks.iter().position(|l| &l.name == n));
+                self.apply_character(i, look);
             }
         }
     }
@@ -11218,9 +11424,15 @@ impl ComfyApp {
     /// A small square gallery thumbnail for `key` at `edge` px, fetched on demand and served from
     /// the same thumb cache the gallery tiles use.
     fn portrait_thumb(&mut self, ui: &mut egui::Ui, key: &str, edge: f32) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
+        self.portrait_thumb_rect(ui, key, rect);
+    }
+
+    /// Draw a gallery thumbnail for `key` into `rect` (fetch on demand, thumb-cache served);
+    /// the caller owns rect allocation and any interaction.
+    fn portrait_thumb_rect(&mut self, ui: &mut egui::Ui, key: &str, rect: egui::Rect) {
         let size = 96u32;
         let thumb_key = format!("{key}#{size}");
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(edge, edge), egui::Sense::hover());
         match self.thumbs.get(&thumb_key) {
             Some(tex) => {
                 let sized = egui::load::SizedTexture::from_handle(tex);
@@ -11246,6 +11458,46 @@ impl ComfyApp {
                 ui.painter().rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
             }
         }
+    }
+
+    /// A tappable look chip: the look's photo (or a placeholder icon), its name below, a pink ring
+    /// when it's the applied look. Returns true when tapped.
+    fn look_chip(&mut self, ui: &mut egui::Ui, look: &CharacterLook, active: bool) -> bool {
+        let img = 46.0;
+        let (rect, resp) =
+            ui.allocate_exact_size(egui::vec2(img, img + 15.0), egui::Sense::click());
+        let img_rect = egui::Rect::from_min_size(rect.min, egui::vec2(img, img));
+        if look.portrait_key.is_empty() {
+            ui.painter().rect_filled(img_rect, 4.0, ui.visuals().extreme_bg_color);
+            ui.painter().text(
+                img_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                icons::USER,
+                egui::FontId::proportional(18.0),
+                ui.visuals().weak_text_color(),
+            );
+        } else {
+            self.portrait_thumb_rect(ui, &look.portrait_key, img_rect);
+        }
+        if active {
+            ui.painter().rect_stroke(
+                img_rect,
+                4.0,
+                egui::Stroke::new(2.0, crate::theme::PINK),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let name = sanitize_ui_text(ui, &elide(&look.name, 9));
+        let color =
+            if active { crate::theme::PINK_BRIGHT } else { ui.visuals().text_color() };
+        ui.painter().text(
+            egui::pos2(rect.center().x, img_rect.bottom() + 2.0),
+            egui::Align2::CENTER_TOP,
+            name,
+            egui::FontId::proportional(10.0),
+            color,
+        );
+        resp.clicked()
     }
 
     /// Confirmed-set keys for a character's CLIP centroid, strongest signal first: members of the
@@ -16301,6 +16553,7 @@ impl ComfyApp {
             AlbumRemove(i64),
             AlbumCreate,
             SetPortrait(String),
+            SetLookPhoto(String, usize),
             Delete,
             Show(usize),
             #[cfg(feature = "local-npu")]
@@ -16495,13 +16748,13 @@ impl ComfyApp {
                             act = Some(Act::SaveCharacter);
                             ui.close();
                         }
-                        // Set this image as a character's profile picture.
+                        // Set this image as a character's profile picture or one of its look photos.
                         if self.characters.is_empty() {
-                            ui.add_enabled(false, egui::Button::new(format!("{} Set as profile", icons::USER)))
+                            ui.add_enabled(false, egui::Button::new(format!("{} Set as photo", icons::USER)))
                                 .on_hover_text("Create a character card first");
                         } else {
                             let active = self.active_character.as_ref().map(|a| a.name.clone());
-                            ui.menu_button(format!("{} Set as profile", icons::USER), |ui| {
+                            ui.menu_button(format!("{} Set as photo", icons::USER), |ui| {
                                 for c in &self.characters {
                                     let is_active = active.as_deref() == Some(c.name.as_str());
                                     let label = if is_active {
@@ -16509,9 +16762,25 @@ impl ComfyApp {
                                     } else {
                                         elide(&c.name, 30)
                                     };
-                                    if ui.button(label).clicked() {
-                                        act = Some(Act::SetPortrait(c.name.clone()));
-                                        ui.close();
+                                    if c.looks.is_empty() {
+                                        if ui.button(label).clicked() {
+                                            act = Some(Act::SetPortrait(c.name.clone()));
+                                            ui.close();
+                                        }
+                                    } else {
+                                        ui.menu_button(label, |ui| {
+                                            if ui.button(format!("{} Profile", icons::USER)).clicked() {
+                                                act = Some(Act::SetPortrait(c.name.clone()));
+                                                ui.close();
+                                            }
+                                            for (li, look) in c.looks.iter().enumerate() {
+                                                let ll = sanitize_ui_text(ui, &elide(&look.name, 24));
+                                                if ui.button(ll).clicked() {
+                                                    act = Some(Act::SetLookPhoto(c.name.clone(), li));
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
                                     }
                                 }
                             });
@@ -16716,6 +16985,17 @@ impl ComfyApp {
                 {
                     c.portrait_key = key;
                     self.gallery_status = format!("Profile set for {}", elide(&name, 24));
+                    host.haptic(Haptic::Light);
+                }
+            }
+            Some(Act::SetLookPhoto(name, li)) => {
+                let key = self.viewer.as_ref().map(|v| v.item.key());
+                if let Some(key) = key
+                    && let Some(c) = self.characters.iter_mut().find(|c| c.name == name)
+                    && let Some(look) = c.looks.get_mut(li)
+                {
+                    look.portrait_key = key;
+                    self.gallery_status = format!("Look photo set for {}", elide(&name, 20));
                     host.haptic(Haptic::Light);
                 }
             }
@@ -19328,6 +19608,27 @@ fn video_badge(ui: &egui::Ui, rect: egui::Rect) {
     ));
 }
 
+/// A "Look N" name not already used by `looks`, so the auto-namer can't recycle a number after a
+/// removal and collide (name is the key for reapply + the active-look highlight).
+fn unique_look_name(looks: &[CharacterLook]) -> String {
+    (1..)
+        .map(|n| format!("Look {n}"))
+        .find(|name| !looks.iter().any(|l| &l.name == name))
+        .unwrap_or_else(|| "Look".into())
+}
+
+/// Join two comma-tag lists, skipping blanks and dropping duplicate tags.
+fn join_comma(a: &str, b: &str) -> String {
+    let a = a.trim();
+    let b = b.trim();
+    match (a.is_empty(), b.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => a.to_string(),
+        (true, false) => b.to_string(),
+        (false, false) => crate::tags::dedupe(&format!("{a}, {b}")),
+    }
+}
+
 /// A checkpoint/model file's clean display label: bare filename, directory prefix and the model
 /// extension stripped (nobody needs to read `.safetensors` in a picker).
 fn model_label(file: &str) -> String {
@@ -19581,6 +19882,10 @@ fn preset_meta_body(ui: &mut egui::Ui, preset: &CreatePreset) {
 /// Wrapped character-card fields for a collapsing details body.
 fn character_meta_body(ui: &mut egui::Ui, card: &CharacterCard) {
     wrap_meta(ui, "Identity", &card.identity);
+    if !card.looks.is_empty() {
+        let names: Vec<&str> = card.looks.iter().map(|l| l.name.as_str()).collect();
+        wrap_meta(ui, "Looks", &names.join(", "));
+    }
     if !card.triggers.trim().is_empty() {
         wrap_meta(ui, "Triggers", &card.triggers);
     }

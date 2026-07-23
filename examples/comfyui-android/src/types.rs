@@ -549,6 +549,20 @@ impl LoraPack {
     }
 }
 
+/// A swappable "look" for a character: a named prompt fragment (outfit, accessories, pose, scene)
+/// with an optional photo. The character's `identity` is the fixed person; a look layers on top at
+/// apply time and can be swapped without touching the identity.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CharacterLook {
+    pub name: String,
+    /// Situational tags appended after the identity (clothing, accessories, pose, scene).
+    #[serde(default)]
+    pub prompt: String,
+    /// Gallery item key (`subfolder/filename`) of this look's photo; empty = none.
+    #[serde(default)]
+    pub portrait_key: String,
+}
+
 /// A reusable recurring character: identity tags, its LoRA stack, trigger words, per-character
 /// negatives, an optional preferred checkpoint, and an optional face-detailer prompt.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -575,6 +589,10 @@ pub struct CharacterCard {
     /// Face-detailer wildcard prompt, piped into the `face.detailer` app when enabled.
     #[serde(default)]
     pub face_prompt: String,
+    /// Swappable looks (outfit / accessories / pose / scene) layered on the identity at apply time.
+    /// Empty for cards from before looks existed — they simply apply identity-only.
+    #[serde(default)]
+    pub looks: Vec<CharacterLook>,
     /// Gallery item key (`subfolder/filename`) of the card's profile picture; empty = none.
     #[serde(default)]
     pub portrait_key: String,
@@ -583,10 +601,22 @@ pub struct CharacterCard {
     pub album_id: i64,
 }
 
-/// Exactly what applying a [`CharacterCard`] changed, so removal reverses it token-for-token.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Bookkeeping for the currently-applied character. Applying a character is a clean reset (clear
+/// prompts / LoRAs, apply the model's quality tags, layer the character on), so removal restores
+/// [`Self::prev`] verbatim rather than reversing token-by-token. The token fields below are legacy,
+/// still produced/consumed by [`Params::apply_character`]/[`Params::remove_character`] and their
+/// tests, but the app no longer uses them.
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AppliedCharacter {
     pub name: String,
+    /// Full Create params snapshotted just before this character was applied, restored on removal.
+    /// `None` for a character applied by an older build (its Remove just clears the marker).
+    #[serde(default)]
+    pub prev: Option<Params>,
+    /// Which look (by name) is currently applied, if any — so the swap UI can highlight it and a
+    /// re-apply can preserve it across an edit.
+    #[serde(default)]
+    pub look: Option<String>,
     /// Tokens added to `positive`.
     #[serde(default)]
     pub pos_injected: String,
@@ -2437,6 +2467,11 @@ mod tests {
             checkpoint: "novaAnime.safetensors".into(),
             switch_checkpoint: true,
             face_prompt: "close-up of Mia's face".into(),
+            looks: vec![CharacterLook {
+                name: "casual".into(),
+                prompt: "hoodie, jeans, standing".into(),
+                portrait_key: "user_x/Mia/casual.png".into(),
+            }],
             portrait_key: "user_x/Mia/portrait.png".into(),
             album_id: 7,
         };
