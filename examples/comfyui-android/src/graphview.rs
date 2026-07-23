@@ -8,7 +8,7 @@ use egui::emath::TSTransform;
 use egui_snarl::ui::{
     BackgroundPattern, PinInfo, PinPlacement, SnarlStyle, SnarlViewer, SnarlWidget, WireStyle,
 };
-use egui_snarl::{InPin, InPinId, NodeId, OutPin, Snarl};
+use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
 use rucomfyui_node_graph::ComfyUiNodeGraph;
 use rucomfyui_node_graph::internal::{FlowInput, FlowNodeData, FlowValueType, FlowViewer};
 
@@ -70,6 +70,8 @@ pub struct GraphView {
     long_press: Option<LongPress>,
     /// `lora_name` picks this frame (recommended strengths applied by the app).
     lora_picks: Vec<LoraPick>,
+    /// Screen-space pan queued for the next `show` to lift a focused node field above the keyboard.
+    pending_pan: egui::Vec2,
 }
 
 /// Whether this input is a ComfyUI seed widget that carries `control_after_generate`.
@@ -206,6 +208,7 @@ impl GraphView {
             long_fired: false,
             long_press: None,
             lora_picks: Vec::new(),
+            pending_pan: egui::Vec2::ZERO,
         }
     }
 
@@ -222,6 +225,7 @@ impl GraphView {
         self.long_fired = false;
         self.long_press = None;
         self.lora_picks.clear();
+        self.pending_pan = egui::Vec2::ZERO;
     }
 
     pub fn request_fit(&mut self) {
@@ -274,6 +278,23 @@ impl GraphView {
         // arrange. A nominal-size pre-arrange here spread nodes so wide that off-screen ones
         // never got measured and the refine settled on placeholder sizes.
         self.request_arrange();
+    }
+
+    /// Pan the scene up so a focused in-node TextEdit clears the keyboard. `avoid_bottom` is the
+    /// screen y below which content is hidden; queues a one-frame pan applied by the next `show`.
+    pub fn keep_focus_above(&mut self, ctx: &egui::Context, avoid_bottom: f32) {
+        if let Some(id) = ctx.memory(|m| m.focused())
+            && let Some(resp) = ctx.read_response(id)
+        {
+            // Node widgets live in the snarl Scene's local space; map to screen before comparing,
+            // and clamp so a stale rect can never fling the canvas off-screen.
+            let screen = self.to_global * resp.rect;
+            let over = (screen.bottom() - avoid_bottom).min(600.0);
+            if over > 0.0 {
+                self.pending_pan.y -= over;
+                ctx.request_repaint();
+            }
+        }
     }
 
     /// Center the view on a node position (graph space).
@@ -362,6 +383,7 @@ impl GraphView {
         // start on a title bar. Snapshot the positions to restore after show() (same mechanism as
         // lock). Snapshot after arrange so a fresh layout is never undone.
         let (pan, veto_move) = self.drag_gate(ui.ctx(), &g.snarl);
+        let pan = pan + std::mem::take(&mut self.pending_pan);
         let saved: Option<Vec<(NodeId, egui::Pos2)>> = (self.locked || veto_move)
             .then(|| g.snarl.nodes_pos_ids().map(|(id, pos, _)| (id, pos)).collect());
         let cmd = if self.view_rect.width() > 0.0 { self.cmd.take() } else { None };
@@ -871,24 +893,67 @@ pub fn arrange(
     }
 
     let size_of = |id: NodeId| sizes.get(&id).copied().unwrap_or(NOMINAL_NODE);
-    let mut rects = Vec::new();
+    // Column x offsets from the widest node in each column.
+    let mut col_x = Vec::with_capacity(columns.len());
     let mut x = 0.0f32;
-    for column in columns {
-        if column.is_empty() {
-            continue;
+    for column in &columns {
+        col_x.push(x);
+        if !column.is_empty() {
+            let w = column.iter().map(|&id| size_of(id).x).fold(1.0f32, f32::max);
+            x += w + H_GAP;
         }
-        let col_width = column.iter().map(|&id| size_of(id).x).fold(1.0f32, f32::max);
-        let total_height: f32 = column.iter().map(|&id| size_of(id).y + V_GAP).sum::<f32>() - V_GAP;
-        let mut y = -total_height / 2.0;
-        for id in column {
+    }
+    // Seed each node's center-y from a per-column centered stack (a non-overlapping start).
+    let mut cy: HashMap<NodeId, f32> = HashMap::new();
+    for column in &columns {
+        let total: f32 = column.iter().map(|&id| size_of(id).y + V_GAP).sum::<f32>() - V_GAP;
+        let mut top = -total / 2.0;
+        for &id in column {
+            let h = size_of(id).y;
+            cy.insert(id, top + h / 2.0);
+            top += h + V_GAP;
+        }
+    }
+    // Push each node down to keep V_GAP from the one above while preserving column order.
+    let resolve = |column: &[NodeId], cy: &mut HashMap<NodeId, f32>| {
+        for w in 1..column.len() {
+            let prev = column[w - 1];
+            let cur = column[w];
+            let min_c = cy[&prev] + size_of(prev).y / 2.0 + V_GAP + size_of(cur).y / 2.0;
+            if cy[&cur] < min_c {
+                cy.insert(cur, min_c);
+            }
+        }
+    };
+    // Relax each node toward its neighbours' mean center-y, then restore spacing within columns.
+    for _ in 0..8 {
+        for neighbors in [&predecessors, &successors] {
+            for column in &columns {
+                for &id in column {
+                    if let Some(ns) = neighbors.get(&id)
+                        && !ns.is_empty()
+                    {
+                        let avg = ns.iter().filter_map(|n| cy.get(n)).sum::<f32>() / ns.len() as f32;
+                        cy.insert(id, avg);
+                    }
+                }
+            }
+            for column in &columns {
+                resolve(column, &mut cy);
+            }
+        }
+    }
+    let mut rects = Vec::new();
+    for (d, column) in columns.iter().enumerate() {
+        let x = col_x[d];
+        for &id in column {
             let size = size_of(id);
+            let y = cy[&id] - size.y / 2.0;
             if let Some(info) = snarl.get_node_info_mut(id) {
                 info.pos = egui::pos2(x, y);
             }
             rects.push(egui::Rect::from_min_size(egui::pos2(x, y), size));
-            y += size.y + V_GAP;
         }
-        x += col_width + H_GAP;
     }
     rects
 }
@@ -908,6 +973,45 @@ pub fn first_node_pos(snarl: &Snarl<FlowNodeData>) -> Option<egui::Pos2> {
         }
     }
     root.or(leftmost)
+}
+
+/// Delete `nid`, first bridging its MODEL/CLIP inputs to the matching outputs so a loader chain
+/// stays connected: the predecessor feeding each rail's input is wired to every successor the
+/// rail's output fed. Rails with no predecessor or no successor are dropped with the node.
+pub fn bridge_and_remove(snarl: &mut Snarl<FlowNodeData>, nid: NodeId) {
+    use rucomfyui::object_info::ObjectType;
+    let rails: [(&str, ObjectType, &str); 2] =
+        [("model", ObjectType::Model, "MODEL"), ("clip", ObjectType::Clip, "CLIP")];
+    let mut plan: Vec<(OutPinId, Vec<InPinId>)> = Vec::new();
+    if let Some(data) = snarl.get_node(nid) {
+        for (in_name, out_type, out_name) in rails {
+            let Some(in_idx) = data.inputs.iter().position(|i| i.name.eq_ignore_ascii_case(in_name))
+            else {
+                continue;
+            };
+            let Some(out_idx) = data
+                .outputs
+                .iter()
+                .position(|o| o.typ == out_type || o.name.eq_ignore_ascii_case(out_name))
+            else {
+                continue;
+            };
+            let pred = snarl.in_pin(InPinId { node: nid, input: in_idx }).remotes.first().copied();
+            let succs: Vec<InPinId> =
+                snarl.out_pin(OutPinId { node: nid, output: out_idx }).remotes.clone();
+            if let Some(pred) = pred
+                && !succs.is_empty()
+            {
+                plan.push((pred, succs));
+            }
+        }
+    }
+    for (pred, succs) in plan {
+        for succ in succs {
+            snarl.connect(pred, succ);
+        }
+    }
+    snarl.remove_node(nid);
 }
 
 /// Delegates to [`FlowViewer`], gating all mutations when locked, measuring node sizes for the
@@ -1110,12 +1214,22 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
     fn show_node_menu(
         &mut self,
         node_id: NodeId,
-        inputs: &[InPin],
-        outputs: &[OutPin],
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
         ui: &mut egui::Ui,
         snarl: &mut Snarl<FlowNodeData>,
     ) {
-        self.inner.show_node_menu(node_id, inputs, outputs, ui, snarl);
+        if self.locked {
+            return;
+        }
+        let label = snarl.get_node(node_id).map(|n| self.inner.title(n)).unwrap_or_default();
+        ui.label(sanitize_ui_text(ui, &label));
+        ui.separator();
+        // Delete, bridging any MODEL/CLIP chain so the loader run stays connected.
+        if ui.button("Delete").clicked() {
+            bridge_and_remove(snarl, node_id);
+            ui.close();
+        }
     }
 
     fn current_transform(&mut self, to_global: &mut TSTransform, _snarl: &mut Snarl<FlowNodeData>) {

@@ -1080,8 +1080,8 @@ struct ComfyApp {
     delete_confirm: Option<(Vec<(String, String)>, bool)>,
     /// After a viewer delete, reopen this `(subfolder, filename)` once the list refreshes.
     viewer_after_delete: Option<(String, String)>,
-    /// Scroll the Create tab to the result strip after a new image lands.
-    create_scroll_bottom: bool,
+    /// The Create-tab Output bottom panel is expanded; auto-set when a new image lands.
+    output_expanded: bool,
     /// Soft keyboard was visible last frame; used to detect the open edge.
     kb_was_open: bool,
     /// The soft keyboard opened this frame; scroll the focused field into the shrunk viewport.
@@ -1636,7 +1636,7 @@ impl ComfyApp {
             confirm_gallery_delete: true,
             delete_confirm: None,
             viewer_after_delete: None,
-            create_scroll_bottom: false,
+            output_expanded: false,
             kb_was_open: false,
             kb_open_edge: false,
             sel_press: None,
@@ -2382,6 +2382,7 @@ impl ComfyApp {
             Msg::Status(s) => self.status = s,
             Msg::Preview(ci) => {
                 self.preview = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR));
+                self.output_expanded = true;
             }
             Msg::Result { image, bytes, label } => {
                 self.result_seq = self.result_seq.wrapping_add(1);
@@ -2397,7 +2398,7 @@ impl ComfyApp {
                     self.results.push((tex, bytes));
                     self.preview = None;
                     self.note.clear();
-                    self.create_scroll_bottom = true;
+                    self.output_expanded = true;
                 }
             }
             Msg::NodeExecuting(node) => {
@@ -5580,20 +5581,15 @@ impl ComfyApp {
         let cursor_byte =
             text.char_indices().nth(cursor_char).map(|(b, _)| b).unwrap_or(text.len());
         let (range, tok) = tags::token_at(&text, cursor_byte);
-        // Co-oc runs on the positive field only; present = the field's already-typed tags.
-        let present: Vec<String> = if field == PromptField::Positive {
-            tags::parse_chips(&text).into_iter().map(|c| c.tag).collect()
-        } else {
-            Vec::new()
-        };
+        // present = the field's own already-typed tags, so co-oc seeds both prompts (not just positive).
+        let present: Vec<String> =
+            tags::parse_chips(&text).into_iter().map(|c| c.tag).collect();
         let sugg = if tok.chars().count() < 2 {
             // Empty cursor token: co-oc next-tag suggestions from the present set.
             self.cooc_suggestions(&present, 8)
         } else {
             let mut m = self.tag_suggestions(tok, 8);
-            if field == PromptField::Positive {
-                cooc::blend_rank(&mut m, |name| self.cooc.rerank_boost(&present, name));
-            }
+            cooc::blend_rank(&mut m, |name| self.cooc.rerank_boost(&present, name));
             m
         };
         if sugg.is_empty() {
@@ -12170,7 +12166,8 @@ impl ComfyApp {
         }
     }
 
-    /// When the soft keyboard opens, scroll the focused field into the shrunk viewport.
+    /// When the soft keyboard opens, scroll the focused field well clear of the keyboard + bottom
+    /// bars. Growing the target downward lifts the field a full clearance above the viewport bottom.
     fn scroll_focus_into_view(&self, ui: &egui::Ui) {
         if !self.kb_open_edge {
             return;
@@ -12178,7 +12175,8 @@ impl ComfyApp {
         if let Some(id) = ui.ctx().memory(|m| m.focused())
             && let Some(resp) = ui.ctx().read_response(id)
         {
-            resp.scroll_to_me(None);
+            // Pin the focused field near the top of the scroll viewport, well clear of the keyboard.
+            ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
         }
     }
 
@@ -12201,6 +12199,63 @@ impl ComfyApp {
             self.create_pane_bar(ui);
             ui.add_space(2.0);
         });
+
+        // Output bottom sheet above the pane bar: drag its top edge to resize, the header button
+        // hides/shows it, and it auto-expands when a new generation lands.
+        {
+            let n = self.results.len();
+            let out_title = if n == 0 {
+                if self.preview.is_some() {
+                    "Output · preview".to_string()
+                } else {
+                    "Output".to_string()
+                }
+            } else if n == 1 {
+                "Output · 1 result".to_string()
+            } else {
+                format!("Output · {n} results")
+            };
+            let mut expanded = self.output_expanded;
+            let collapsed =
+                egui::Panel::bottom("create-output-collapsed").resizable(true).exact_size(34.0);
+            let expanded_panel = egui::Panel::bottom("create-output-expanded")
+                .resizable(true)
+                .default_size(280.0)
+                .min_size(120.0)
+                .max_size(680.0);
+            let toggled = egui::Panel::show_switched(
+                ui,
+                &mut expanded,
+                collapsed,
+                expanded_panel,
+                |ui, is_exp| {
+                    let mut toggle = false;
+                    ui.horizontal(|ui| {
+                        ui.strong(sanitize_ui_text(ui, &out_title));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let (lbl, hint) = if is_exp {
+                                (icons::CLOSE, "Hide output")
+                            } else {
+                                (icons::IMAGE, "Show output")
+                            };
+                            toggle = ui.small_button(lbl).on_hover_text(hint).clicked();
+                        });
+                    });
+                    if is_exp {
+                        crate::theme::scroll_vertical()
+                            .id_salt("create-output-scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.output(ui, host));
+                    }
+                    toggle
+                },
+            )
+            .inner;
+            if toggled {
+                expanded = !expanded;
+            }
+            self.output_expanded = expanded;
+        }
 
         match self.create_pane {
             CreatePane::Main => {
@@ -12235,36 +12290,6 @@ impl ComfyApp {
                     ui.separator();
                 }
                 ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
-
-                // Results sit under the controls so prompts stay first; expand on new output.
-                let n = self.results.len();
-                let out_title = if n == 0 {
-                    if self.preview.is_some() {
-                        "Output · preview".to_string()
-                    } else {
-                        "Output".to_string()
-                    }
-                } else if n == 1 {
-                    "Output · 1 result".to_string()
-                } else {
-                    format!("Output · {n} results")
-                };
-                let force_open = self.create_scroll_bottom;
-                let results_top = ui.cursor().min;
-                egui::CollapsingHeader::new(out_title)
-                    .id_salt("create_output")
-                    .default_open(true)
-                    .open(if force_open { Some(true) } else { None })
-                    .show(ui, |ui| {
-                        self.output(ui, host);
-                    });
-                if self.create_scroll_bottom {
-                    ui.scroll_to_rect(
-                        egui::Rect::from_min_size(results_top, egui::vec2(1.0, 1.0)),
-                        Some(egui::Align::TOP),
-                    );
-                    self.create_scroll_bottom = false;
-                }
                 ui.add_space(12.0);
             });
         self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
@@ -12942,6 +12967,7 @@ impl ComfyApp {
 
     fn graph_canvas(&mut self, ui: &mut egui::Ui, host: &Host) {
         let fallback_pane = ui.available_rect_before_wrap();
+        let kb_edge = self.kb_open_edge;
 
         let preview = self
             .running
@@ -12958,6 +12984,11 @@ impl ComfyApp {
             let Some(doc) = self.active_doc_mut() else { return };
             let props = doc.props_node;
             doc.graph.set_live_execution(executing, progress, preview);
+            if kb_edge {
+                // Pull a focused in-node field up to clear the graph-controls bar and keyboard.
+                let avoid = ui.max_rect().bottom() - 96.0;
+                doc.view.keep_focus_above(ui.ctx(), avoid);
+            }
             if let Some(tapped) =
                 doc.view.show(
                     ui,
@@ -13149,6 +13180,7 @@ impl ComfyApp {
         let mut toggle_bypass = false;
         let mut auto_wire = false;
         let mut duplicate = false;
+        let mut delete = false;
         let resp = egui::Area::new(egui::Id::new("graph-node-menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen)
@@ -13176,6 +13208,13 @@ impl ComfyApp {
                         .clicked()
                     {
                         auto_wire = true;
+                    }
+                    if ui
+                        .button(format!("{} Delete", icons::TRASH))
+                        .on_hover_text("Delete node, bridging the MODEL/CLIP chain")
+                        .clicked()
+                    {
+                        delete = true;
                     }
                     if !class.is_empty() {
                         ui.weak(elide(&class, 36));
@@ -13205,6 +13244,10 @@ impl ComfyApp {
         }
         if auto_wire {
             self.auto_wire_node(nid, host);
+            close = true;
+        }
+        if delete {
+            self.delete_node(nid, host);
             close = true;
         }
         if close {
@@ -13372,6 +13415,26 @@ impl ComfyApp {
             self.graph_status = format!("Auto-wired {class} ({wired} link(s))");
             host.haptic(Haptic::Success);
         }
+    }
+
+    /// Delete a node, bridging its MODEL/CLIP chain so a loader run stays connected.
+    fn delete_node(&mut self, nid: NodeId, host: &Host) {
+        if self.active_doc().is_some_and(|d| d.view.locked) {
+            self.graph_status = "Graph is locked — unlock to delete".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let Some(doc) = self.active_doc_mut() else { return };
+        let class =
+            doc.graph.snarl.get_node(nid).map(|d| d.object.name.clone()).unwrap_or_default();
+        graphview::bridge_and_remove(&mut doc.graph.snarl, nid);
+        doc.bypassed.remove(&nid);
+        doc.seed_randomize.retain(|(n, _), _| *n != nid);
+        if doc.props_node == Some(nid) {
+            doc.props_node = None;
+        }
+        self.graph_status = format!("Deleted {class}");
+        host.haptic(Haptic::Success);
     }
 
     fn graph_controls(&mut self, ui: &mut egui::Ui, _host: &Host) {
@@ -14310,13 +14373,14 @@ impl ComfyApp {
                 self.tags_window_open = !self.tags_window_open;
             }
 
-            up_menu_sized(ui, format!("{} View", icons::GALLERY), egui::vec2(68.0, 28.0), |ui| {
+            up_menu_sized(ui, format!("{} View", icons::GALLERY), egui::vec2(68.0, 28.0), egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                 if ui
                     .button(format!("{} Select", icons::CHECK))
                     .on_hover_text("Multi-select — or long-press a photo")
                     .clicked()
                 {
                     self.select_mode = true;
+                    ui.close();
                 }
                 if ui
                     .button(format!("{} Trash", icons::TRASH))
@@ -14327,6 +14391,7 @@ impl ComfyApp {
                     self.trash_loading = true;
                     self.trash_items.clear();
                     self.engine.as_ref().unwrap().trash_list(0, 200);
+                    ui.close();
                 }
                 if ui
                     .button(format!("{} Grade visible", icons::STAR))
@@ -14339,6 +14404,7 @@ impl ComfyApp {
                         .filter_map(|i| self.gallery.get(i).map(|it| it.key()))
                         .collect();
                     self.open_triage_keys(keys, host);
+                    ui.close();
                 }
                 ui.separator();
 
@@ -14353,17 +14419,16 @@ impl ComfyApp {
                     }
                 }
 
-                ui.menu_button(
-                    format!("{} Sort · {}", icons::SORT, self.gallery_view.sort.label()),
-                    |ui| {
+                egui::CollapsingHeader::new(format!("{} Sort · {}", icons::SORT, self.gallery_view.sort.label()))
+                    .id_salt("gv_sort")
+                    .show(ui, |ui| {
                         for s in GallerySort::ALL {
                             changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.sort, *s, s.label())
                                 .clicked();
                         }
-                    },
-                );
+                    });
 
-                ui.menu_button(format!("Group · {}", self.gallery_view.group.label()), |ui| {
+                egui::CollapsingHeader::new(format!("Group · {}", self.gallery_view.group.label())).id_salt("gv_group").show(ui, |ui| {
                     for g in GalleryGroup::ALL {
                         changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.group, *g, g.label())
                             .clicked();
@@ -14384,7 +14449,7 @@ impl ComfyApp {
                     }
                 });
 
-                ui.menu_button(format!("Rating · {}", self.gallery_view.rating.label()), |ui| {
+                egui::CollapsingHeader::new(format!("Rating · {}", self.gallery_view.rating.label())).id_salt("gv_rating").show(ui, |ui| {
                     for r in RatingFilter::ALL {
                         crate::theme::selectable_value(ui, &mut self.gallery_view.rating, *r, r.label());
                     }
@@ -14396,7 +14461,7 @@ impl ComfyApp {
                     crate::theme::selectable_value(ui, &mut self.index_filter, 2, "Unindexed only");
                 });
 
-                ui.menu_button(format!("Columns · {}", self.gallery_view.columns), |ui| {
+                egui::CollapsingHeader::new(format!("Columns · {}", self.gallery_view.columns)).id_salt("gv_columns").show(ui, |ui| {
                     for n in 1..=3usize {
                         if crate::theme::selectable_label(ui, 
                                 self.gallery_view.columns == n,
@@ -14414,7 +14479,7 @@ impl ComfyApp {
                     GalleryMedia::Images => format!("{} Media · Images", icons::IMAGE),
                     GalleryMedia::Videos => format!("{} Media · Videos", icons::RUN),
                 };
-                ui.menu_button(media_label, |ui| {
+                egui::CollapsingHeader::new(media_label).id_salt("gv_media").show(ui, |ui| {
                     for m in GalleryMedia::ALL {
                         changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.media, *m, m.label())
                             .clicked();
@@ -14426,9 +14491,9 @@ impl ComfyApp {
                 } else {
                     format!("{} Model · {}", icons::MODEL, elide(&self.gallery_view.model, 18))
                 };
-                ui.menu_button(model_label, |ui| {
-                    crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
-                        changed |= crate::theme::selectable_value(ui, 
+                egui::CollapsingHeader::new(model_label).id_salt("gv_model").show(ui, |ui| {
+                    crate::theme::scroll_vertical().max_height(280.0).id_salt("gv_model_scroll").show(ui, |ui| {
+                        changed |= crate::theme::selectable_value(ui,
                                 &mut self.gallery_view.model,
                                 String::new(),
                                 "All models",
@@ -14456,8 +14521,8 @@ impl ComfyApp {
                 } else {
                     format!("{} LoRA · {}", icons::MODEL, elide(file_basename(&self.gallery_view.lora), 18))
                 };
-                ui.menu_button(lora_label, |ui| {
-                    crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
+                egui::CollapsingHeader::new(lora_label).id_salt("gv_lora").show(ui, |ui| {
+                    crate::theme::scroll_vertical().max_height(280.0).id_salt("gv_lora_scroll").show(ui, |ui| {
                         changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, String::new(), "All LoRAs")
                             .clicked();
                         for l in &self.facets.loras {
@@ -14480,14 +14545,14 @@ impl ComfyApp {
                         .map(|a| format!("{} Album · {}", icons::ALBUM, elide(&a.name, 18)))
                         .unwrap_or_else(|| format!("{} Album", icons::ALBUM)),
                 };
-                ui.menu_button(album_label, |ui| {
-                    crate::theme::scroll_vertical().max_height(280.0).show(ui, |ui| {
+                egui::CollapsingHeader::new(album_label).id_salt("gv_album").show(ui, |ui| {
+                    crate::theme::scroll_vertical().max_height(280.0).id_salt("gv_album_scroll").show(ui, |ui| {
                         changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.album, None, "All images")
                             .clicked();
                         for a in &self.albums {
                             let label =
                                 format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
-                            changed |= crate::theme::selectable_value(ui, 
+                            changed |= crate::theme::selectable_value(ui,
                                     &mut self.gallery_view.album,
                                     Some(a.id),
                                     label,
@@ -14497,6 +14562,7 @@ impl ComfyApp {
                         ui.separator();
                         if ui.button(format!("{} Manage albums…", icons::FOLDER)).clicked() {
                             self.album_manage_open = true;
+                            ui.close();
                         }
                     });
                 });
@@ -14511,6 +14577,7 @@ impl ComfyApp {
                 {
                     self.reset_gallery_filters();
                     changed = true;
+                    ui.close();
                 }
             });
         });
@@ -14519,6 +14586,22 @@ impl ComfyApp {
 
     /// Clear every gallery filter and search, restoring the default sort and grouping. Layout
     /// preferences (columns, header-open state) are left alone.
+    /// Any active filter/search/sort that Back should clear (grouping is excluded so the reset
+    /// converges — a reset leaves group = None, which must not re-arm this).
+    fn gallery_filters_active(&self) -> bool {
+        !self.gallery_view.model.is_empty()
+            || !self.gallery_view.lora.is_empty()
+            || self.gallery_view.album.is_some()
+            || self.gallery_view.media != GalleryMedia::All
+            || self.gallery_view.rating != RatingFilter::All
+            || self.index_filter != 0
+            || !self.gallery_q.trim().is_empty()
+            || !self.tag_q.trim().is_empty()
+            || !self.tag_facets.is_empty()
+            || self.ranked.is_some()
+            || self.gallery_view.sort != GallerySort::Newest
+    }
+
     fn reset_gallery_filters(&mut self) {
         self.gallery_view.model.clear();
         self.gallery_view.lora.clear();
@@ -14543,6 +14626,9 @@ impl ComfyApp {
             return;
         }
         let mut open = true;
+        if modal_shield(ctx, "album-manage-scrim") {
+            open = false;
+        }
         centered(ctx, egui::Window::new("Manage albums"))
             .collapsible(false)
             .open(&mut open)
@@ -14885,17 +14971,8 @@ impl ComfyApp {
             return;
         }
         let mut open = true;
-        // Dimming click-catcher below the window: blocks the gallery, tap outside closes.
-        let scrim = egui::Area::new(egui::Id::new("tags-scrim"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::Pos2::ZERO)
-            .show(ctx, |ui| {
-                let rect = ctx.content_rect();
-                let resp = ui.allocate_rect(rect, egui::Sense::click());
-                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
-                resp
-            });
-        if scrim.inner.clicked() {
+        // Dimming modal catcher below the window: blocks the gallery, tap outside closes.
+        if modal_shield(ctx, "tags-scrim") {
             open = false;
         }
         centered(ctx, egui::Window::new(format!("{} Tags", icons::SEARCH)))
@@ -15172,6 +15249,21 @@ impl ComfyApp {
         {
             self.exit_select_mode();
         }
+        // Back while filtering clears the gallery to defaults (and ungroups) instead of leaving.
+        else if self.gallery_filters_active()
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            self.reset_gallery_filters();
+            self.gallery_view.group = GalleryGroup::None;
+            let connected = matches!(self.conn, Conn::Connected)
+                || self.engine.as_ref().unwrap().is_connected();
+            if connected {
+                self.refresh_gallery_commit_query();
+            }
+        }
 
         let mut open_triage = false;
         ui.horizontal(|ui| {
@@ -15349,7 +15441,7 @@ impl ComfyApp {
         let mut scroll = crate::theme::scroll_vertical()
             .id_salt("gallery_list")
             .auto_shrink([false, false]);
-        let menu_open = ui.ctx().any_popup_open();
+        let menu_open = overlay_blocking(ui.ctx());
         if self.sel_painting || menu_open {
             use egui::containers::scroll_area::{DragScroll, ScrollSource};
             scroll = scroll.scroll_source(ScrollSource { drag: DragScroll::Never, ..Default::default() });
@@ -15464,7 +15556,7 @@ impl ComfyApp {
 
     /// Pull-down at the top of the gallery list → refresh. Returns true when a refresh should run.
     fn gallery_pull_to_refresh(&mut self, ui: &egui::Ui) -> bool {
-        if self.sel_painting || ui.ctx().any_popup_open() {
+        if self.sel_painting || overlay_blocking(ui.ctx()) {
             self.gallery_pull = 0.0;
             self.gallery_pull_tracking = false;
             return false;
@@ -15558,7 +15650,7 @@ impl ComfyApp {
             });
             ui.add_enabled_ui(n > 0, |ui| {
                 let album_label = format!("{}{}", icons::ALBUM, icons::ADD);
-                up_menu_sized(ui, album_label, egui::vec2(ICON + 8.0, ICON), |ui| {
+                up_menu_sized(ui, album_label, egui::vec2(ICON + 8.0, ICON), egui::PopupCloseBehavior::CloseOnClick, |ui| {
                     if ui
                         .button(format!("{} New album…", icons::ADD))
                         .on_hover_text("Create an album and add the selection")
@@ -15769,6 +15861,9 @@ impl ComfyApp {
         let mut open = true;
         let mut create = false;
         let mut cancel = false;
+        if modal_shield(ctx, "album-create-scrim") {
+            open = false;
+        }
         centered(ctx, egui::Window::new("New album"))
             .collapsible(false)
             .open(&mut open)
@@ -15815,6 +15910,9 @@ impl ComfyApp {
         let mut open = true;
         let mut confirm = false;
         let mut cancel = false;
+        if modal_shield(ctx, "delete-confirm-scrim") {
+            open = false;
+        }
         centered(ctx, egui::Window::new("Delete images?"))
             .collapsible(false)
             .open(&mut open)
@@ -15864,9 +15962,9 @@ impl ComfyApp {
     /// lifting then selects every tile it passes over (scroll is suppressed for that gesture). A
     /// drag that moves before the hold completes is a normal scroll and never paints.
     fn handle_gallery_gesture(&mut self, ui: &egui::Ui, host: &Host) {
-        // Menus sit above the grid but this handler reads raw pointer pos — ignore while any
-        // popup is open so Model/Album lists and hold-on-item don't paint-select tiles behind.
-        if ui.ctx().any_popup_open() {
+        // Menus/windows sit above the grid but this handler reads raw pointer pos — ignore while any
+        // overlay is open so lists, the Tags window and hold-on-item don't paint-select tiles behind.
+        if overlay_blocking(ui.ctx()) {
             self.sel_press = None;
             self.sel_long_fired = false;
             self.sel_painting = false;
@@ -15888,10 +15986,10 @@ impl ComfyApp {
             None => self.sel_press = Some((time, pos, false)),
             Some((start, origin, cancelled)) => {
                 if !cancelled && !self.sel_painting {
-                    if (origin - pos).length() > 18.0 {
+                    if (origin - pos).length() > 10.0 {
                         // Moved before the hold completed: it's a scroll, not a selection.
                         self.sel_press = Some((start, origin, true));
-                    } else if time - start > 0.4 {
+                    } else if time - start > 0.6 {
                         if let Some(idx) = tile_at(origin, &self.tile_hits) {
                             self.select_mode = true;
                             self.sel_long_fired = true;
@@ -16006,12 +16104,12 @@ impl ComfyApp {
                     // Clip to the viewport so a straddling tile can't catch presses under the nav bar.
                     self.tile_hits.push((rect.intersect(clip), idx));
                     let selected = self.selected.contains(&item_key);
-                    let clicked = match self.thumbs.get(&thumb_key) {
+                    let resp = match self.thumbs.get(&thumb_key) {
                         Some(tex) => {
                             let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                                 .fit_to_exact_size(alloc)
                                 .sense(egui::Sense::click());
-                            ui.put(rect, img).clicked()
+                            ui.put(rect, img)
                         }
                         None => {
                             if claim_budget == 0 {
@@ -16032,7 +16130,7 @@ impl ComfyApp {
                                     self.full_cache_root.clone(),
                                 );
                             }
-                            ui.put(rect, egui::Button::new(elide(&item_key, 14)).wrap()).clicked()
+                            ui.put(rect, egui::Button::new(elide(&item_key, 14)).wrap())
                         }
                     };
                     // Videos (which the server may not thumbnail) get a play badge so they're
@@ -16048,15 +16146,19 @@ impl ComfyApp {
                     if select_mode {
                         selection_overlay(ui, rect, selected);
                     }
-                    // Skip tile taps while a menu is open (same frame as an outside-dismiss).
-                    if clicked && !suppress_click && !ui.ctx().any_popup_open() {
+                    // Skip tile taps while an overlay is open (same frame as an outside-dismiss).
+                    // Select mode toggles on a single tap; browse mode opens on a double tap so a
+                    // scroll can't accidentally open a photo.
+                    if !suppress_click && !overlay_blocking(ui.ctx()) {
                         if select_mode {
-                            if selected {
-                                self.selected.remove(&item_key);
-                            } else {
-                                self.selected.insert(item_key);
+                            if resp.clicked() {
+                                if selected {
+                                    self.selected.remove(&item_key);
+                                } else {
+                                    self.selected.insert(item_key);
+                                }
                             }
-                        } else {
+                        } else if resp.double_clicked() {
                             open = Some(idx);
                         }
                     }
@@ -17077,7 +17179,7 @@ impl ComfyApp {
                     {
                         act = Some(Act::Delete);
                     }
-                    up_menu_sized(ui, icons::MENU, size, |ui| {
+                    up_menu_sized(ui, icons::MENU, size, egui::PopupCloseBehavior::CloseOnClick, |ui| {
                         if ui
                             .add_enabled(can_remix, egui::Button::new(format!("{} Save as character", icons::USER)))
                             .on_hover_text("Save this image's tags + LoRAs as a character card")
@@ -17168,38 +17270,40 @@ impl ComfyApp {
                             ui.close();
                         }
                         ui.separator();
-                        ui.weak(format!("{} Albums", icons::ALBUM));
-                        if ui
-                            .button(format!("{} New album…", icons::ADD))
-                            .on_hover_text("Create an album and add this image")
-                            .clicked()
-                        {
-                            act = Some(Act::AlbumCreate);
-                            ui.close();
-                        }
-                        if !albums_known {
-                            ui.weak("loading…");
-                        } else if self.albums.is_empty() {
-                            ui.weak("No albums yet.");
-                        } else {
-                            let member = self.viewer.as_ref().unwrap().albums.as_ref().unwrap();
-                            for a in &self.albums {
-                                let is_in = member.contains(&a.id);
-                                let label = if is_in {
-                                    format!("{} {}", icons::CHECK, elide(&a.name, 28))
-                                } else {
-                                    format!("     {}", elide(&a.name, 28))
-                                };
-                                if crate::theme::selectable_label(ui, is_in, label).clicked() {
-                                    act = Some(if is_in {
-                                        Act::AlbumRemove(a.id)
+                        ui.menu_button(format!("{} Add to album", icons::ALBUM), |ui| {
+                            if ui
+                                .button(format!("{} New album…", icons::ADD))
+                                .on_hover_text("Create an album and add this image")
+                                .clicked()
+                            {
+                                act = Some(Act::AlbumCreate);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if !albums_known {
+                                ui.weak("loading…");
+                            } else if self.albums.is_empty() {
+                                ui.weak("No albums yet.");
+                            } else {
+                                let member = self.viewer.as_ref().unwrap().albums.as_ref().unwrap();
+                                for a in &self.albums {
+                                    let is_in = member.contains(&a.id);
+                                    let label = if is_in {
+                                        format!("{} {}", icons::CHECK, elide(&a.name, 28))
                                     } else {
-                                        Act::AlbumAdd(a.id)
-                                    });
-                                    ui.close();
+                                        format!("     {}", elide(&a.name, 28))
+                                    };
+                                    if crate::theme::selectable_label(ui, is_in, label).clicked() {
+                                        act = Some(if is_in {
+                                            Act::AlbumRemove(a.id)
+                                        } else {
+                                            Act::AlbumAdd(a.id)
+                                        });
+                                        ui.close();
+                                    }
                                 }
                             }
-                        }
+                        });
                     })
                     .on_hover_text("More");
                 });
@@ -18694,6 +18798,11 @@ impl EguiApp for ComfyApp {
             self.loaded = true;
             // The framework never calls EguiApp::theme, so apply the color scheme here.
             crate::theme::apply(ui.ctx());
+            // Touch double-taps are slower and less precise than a mouse; widen egui's window.
+            ui.ctx().options_mut(|o| {
+                o.input_options.max_double_click_delay = 0.5;
+                o.input_options.max_click_dist = 12.0;
+            });
             egui_extras::install_image_loaders(ui.ctx());
             self.load_settings(host);
             crate::theme::apply_fonts(ui.ctx(), &self.fonts);
@@ -18791,10 +18900,19 @@ impl EguiApp for ComfyApp {
             }
         }
 
+        // An open popup menu (View, comboboxes, bar menus) owns Back first: close it.
+        if ui.ctx().any_popup_open()
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            egui::Popup::close_all(ui.ctx());
+        }
         // Open blocking dialogs own the back key: consumed here, before any other handler runs
         // (else Back falls through to the fullscreen-exit / app-background handlers while a modal —
         // including a destructive confirm — is still up). Cancel is the Android Back convention.
-        if self.confirm.is_some()
+        else if self.confirm.is_some()
             || self.dup_run.is_some()
             || self.dup_create
             || self.preflight_problems.is_some()
@@ -18821,6 +18939,26 @@ impl EguiApp for ComfyApp {
             })
         {
             self.error_modal = None;
+        } else if (self.tags_window_open
+            || self.album_manage_open
+            || self.album_create_draft.is_some()
+            || self.delete_confirm.is_some())
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            // Close the innermost open gallery overlay window.
+            if self.album_create_draft.is_some() {
+                self.album_create_draft = None;
+            } else if self.delete_confirm.is_some() {
+                self.delete_confirm = None;
+                self.viewer_after_delete = None;
+            } else if self.album_manage_open {
+                self.album_manage_open = false;
+            } else {
+                self.tags_window_open = false;
+            }
         } else if self.character_wizard.is_some()
             && self.tab == Tab::Generate
             && self.create_pane == CreatePane::Characters
@@ -18888,6 +19026,23 @@ impl EguiApp for ComfyApp {
                 }
                 None => {}
             }
+            }
+        } else if self.tab == Tab::Generate
+            && self.create_pane != CreatePane::Main
+            && self.result_view.is_none()
+            && self.character_wizard.is_none()
+            && self.inpaint.is_none()
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            // Back on a Create sub-pane returns to Main; on Characters a first Back closes the
+            // open card editor, a second returns to Main.
+            if self.create_pane == CreatePane::Characters && self.character_draft.is_some() {
+                self.character_draft = None;
+            } else {
+                self.create_pane = CreatePane::Main;
             }
         }
 
@@ -19857,15 +20012,17 @@ fn up_menu<R>(
         None,
         egui::RectAlign::TOP_START,
         &[egui::RectAlign::TOP_END, egui::RectAlign::BOTTOM_START],
+        egui::PopupCloseBehavior::CloseOnClick,
         content,
     );
 }
 
-/// [`up_menu`] with a fixed button size (viewer action icons).
+/// [`up_menu`] with a fixed button size (viewer action icons) and a chosen popup close behavior.
 fn up_menu_sized<R>(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
     min_size: egui::Vec2,
+    close_behavior: egui::PopupCloseBehavior,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::Response {
     menu_popup(
@@ -19874,6 +20031,7 @@ fn up_menu_sized<R>(
         Some(min_size),
         egui::RectAlign::TOP_START,
         &[egui::RectAlign::TOP_END, egui::RectAlign::BOTTOM_START],
+        close_behavior,
         content,
     )
 }
@@ -19890,6 +20048,7 @@ fn down_menu<R>(
         None,
         egui::RectAlign::BOTTOM_END,
         &[egui::RectAlign::BOTTOM_START, egui::RectAlign::TOP_END],
+        egui::PopupCloseBehavior::CloseOnClick,
         content,
     );
 }
@@ -19900,6 +20059,7 @@ fn menu_popup<R>(
     min_size: Option<egui::Vec2>,
     align: egui::RectAlign,
     alternatives: &'static [egui::RectAlign],
+    close_behavior: egui::PopupCloseBehavior,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::Response {
     use egui::containers::menu::MenuConfig;
@@ -19908,7 +20068,9 @@ fn menu_popup<R>(
     } else {
         ui.add(egui::Button::new(label.into()))
     };
-    let config = MenuConfig::default();
+    let config = MenuConfig::default().close_behavior(close_behavior);
+    // Grow with the screen so a full menu fits without an inner scrollbar.
+    let cap = (ui.ctx().content_rect().height() - 96.0).clamp(240.0, 640.0);
     egui::Popup::menu(&response)
         .align(align)
         .align_alternatives(alternatives)
@@ -19921,7 +20083,7 @@ fn menu_popup<R>(
         )
         .show(|ui| {
             crate::theme::scroll_vertical()
-                .max_height(320.0)
+                .max_height(cap)
                 .show(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     content(ui)
@@ -19937,6 +20099,29 @@ fn menu_popup<R>(
 /// A top-anchored `egui::Window` can push its title bar above the app's content area — up under
 /// the status-bar icons. Centering keeps every window fully inside the usable area, and it
 /// re-centers above the keyboard when the content shrinks for the IME.
+/// True while any popup or modal-shielded window is open — raw-pointer gallery gestures must bail
+/// so they never act on content behind an overlay.
+fn overlay_blocking(ctx: &egui::Context) -> bool {
+    ctx.any_popup_open() || ctx.memory(|m| m.top_modal_layer().is_some())
+}
+
+/// Full-screen dimming catcher below a centered window: absorbs clicks AND drags so nothing reaches
+/// the content behind, and registers the modal layer so egui blocks every lower layer. Returns
+/// true when the scrim itself was tapped (tap-outside-to-close).
+fn modal_shield(ctx: &egui::Context, id: &str) -> bool {
+    let scrim = egui::Area::new(egui::Id::new(id))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let rect = ctx.content_rect();
+            let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+            ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
+            resp
+        });
+    ctx.memory_mut(|m| m.set_modal_layer(scrim.response.layer_id));
+    scrim.inner.clicked()
+}
+
 fn centered<'a>(ctx: &egui::Context, window: egui::Window<'a>) -> egui::Window<'a> {
     // Long values (paths, prompts, model names) otherwise grow a window past the viewport.
     let cap = (ctx.content_rect().width() - 24.0).max(240.0);
