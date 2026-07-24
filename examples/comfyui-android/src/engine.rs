@@ -73,7 +73,13 @@ pub enum Msg {
     /// The server assigned this prompt id to a job we submitted (server transport only).
     /// Carries the job's display label so it can never be attributed to the wrong submission
     /// (a FIFO pop on the UI side mislabels when concurrent queue POSTs answer out of order).
-    PromptId { id: String, label: String },
+    /// `expanded` is the gate's queue-time prompt rewrite (`cg_expanded`, node id -> text) when
+    /// it happened; `None` when the text ran verbatim or the queue POST couldn't report it.
+    PromptId {
+        id: String,
+        label: String,
+        expanded: Option<std::collections::BTreeMap<String, String>>,
+    },
     Progress { value: u32, max: u32 },
     Status(String),
     /// Server-wide queue depth from the WS `status` broadcast (includes jobs from other clients).
@@ -170,6 +176,16 @@ pub enum Msg {
     },
 }
 
+/// One event from a streaming `/api/expand` request (see [`Engine::expand_prompt`]).
+pub enum ExpandMsg {
+    /// A token delta to append to the prompt being rewritten.
+    Delta(String),
+    /// The stream reached `[DONE]` (or closed cleanly) — no more deltas.
+    Done,
+    /// The request failed or the expander is down/disabled; the caller keeps the original text.
+    Error(String),
+}
+
 pub struct Engine {
     rt: tokio::runtime::Runtime,
     ctx: egui::Context,
@@ -178,6 +194,10 @@ pub struct Engine {
     rx: Receiver<Msg>,
     client: Option<Client>,
     http: Option<reqwest::Client>,
+    /// Authed client with a long read timeout, for endpoints the gate holds open a while: the
+    /// queue-time expander stalls `POST /prompt` up to ~90 s, and a cold `/api/expand` can be slow
+    /// to first token. Separate from `http` so ordinary browsing keeps its snappy 30 s wedge detect.
+    queue_http: Option<reqwest::Client>,
     base: String,
     /// In-flight generate / graph-run tasks (more than one when Create Queue is used).
     jobs: Vec<tokio::task::JoinHandle<()>>,
@@ -206,6 +226,7 @@ impl Engine {
             rx,
             client: None,
             http: None,
+            queue_http: None,
             base: String::new(),
             jobs: Vec::new(),
             inflight: Arc::new(AtomicUsize::new(0)),
@@ -252,7 +273,7 @@ impl Engine {
         let key_note = if api_key.trim().is_empty() { "no API key" } else { "with API key" };
         let sess_note = if session.trim().is_empty() { "" } else { " + signed-in session" };
         log.info(format!("connect: {base} ({key_note}{sess_note})"));
-        let http = match apply_auth(tls_builder(), &api_key, &session).build() {
+        let http = match apply_auth(tls_builder(READ_TIMEOUT), &api_key, &session).build() {
             Ok(c) => c,
             Err(e) => {
                 log.error(format!("HTTP client build failed: {e}"));
@@ -261,6 +282,9 @@ impl Engine {
                 return;
             }
         };
+        // Same auth, a long read timeout: the gate holds POST /prompt and /api/expand open well
+        // past the 30 s browsing timeout. A build failure here only loses the long-hold headroom.
+        self.queue_http = apply_auth(tls_builder(QUEUE_READ_TIMEOUT), &api_key, &session).build().ok();
         let client = Client::new_with_client(base.clone(), http.clone());
         // The ws MUST use the same clientId the client queues prompts with — ComfyUI routes
         // executing/progress events only to the socket whose clientId matches the prompt's, so a
@@ -362,12 +386,13 @@ impl Engine {
         ));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
         let authed = self.http.clone().map(|h| (self.base.clone(), h));
+        let queue_authed = self.queue_http.clone().map(|h| (self.base.clone(), h));
         let current_prompt = self.current_prompt.clone();
         let inflight = self.inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
-            run_generate(client, params, current, gcx, ui_workflow, label, current_prompt, authed, tx, ctx, log).await;
+            run_generate(client, params, current, gcx, ui_workflow, label, current_prompt, authed, queue_authed, tx, ctx, log).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
@@ -382,12 +407,14 @@ impl Engine {
         self.log.info(format!("queue graph workflow: {} nodes", wf.0.len()));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
         let authed = self.http.clone().map(|h| (self.base.clone(), h));
+        let queue_authed = self.queue_http.clone().map(|h| (self.base.clone(), h));
         let current = self.current_prompt.clone();
         let inflight = self.inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
-            stream_execution(client, wf, ui_workflow, authed, label, tx, ctx, log, current).await;
+            // Graph-editor jobs always carry a UI workflow, so the direct-POST path is taken anyway.
+            stream_execution(client, wf, ui_workflow, authed, queue_authed, false, label, tx, ctx, log, current).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
@@ -413,6 +440,7 @@ impl Engine {
         ));
         let (tx, ctx, log) = (self.tx.clone(), self.ctx.clone(), self.log.clone());
         let authed = self.http.clone().map(|h| (self.base.clone(), h));
+        let queue_authed = self.queue_http.clone().map(|h| (self.base.clone(), h));
         let current = self.current_prompt.clone();
         let inflight = self.inflight.clone();
         inflight.fetch_add(1, Ordering::SeqCst);
@@ -420,11 +448,36 @@ impl Engine {
         self.jobs.push(self.rt.spawn(async move {
             run_finish_job(
                 client, video_path, reference, scale_by, rife_multiplier, output_fps, schemas,
-                authed, label, tx, ctx, log, current,
+                authed, queue_authed, label, tx, ctx, log, current,
             )
             .await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
+    }
+
+    /// Stream the gate's `POST /api/expand` rewrite of `text`, forwarding token deltas over the
+    /// returned channel. Uses [`Self::queue_http`] for its long read timeout so a cold expander's
+    /// first token can't trip the browsing timeout. `cancel` aborts the request between chunks
+    /// (set it when the user dismisses the review). A non-200 or missing connection arrives as a
+    /// single [`ExpandMsg::Error`], and the caller falls back to submitting the original text.
+    pub fn expand_prompt(
+        &self,
+        text: String,
+        cancel: Arc<AtomicBool>,
+    ) -> Receiver<ExpandMsg> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        match self.queue_http.clone() {
+            Some(http) => {
+                let (base, ctx, log) = (self.base.clone(), self.ctx.clone(), self.log.clone());
+                self.rt.spawn(async move {
+                    stream_expand(http, base, text, cancel, tx, ctx, log).await;
+                });
+            }
+            None => {
+                let _ = tx.send(ExpandMsg::Error("Not connected".into()));
+            }
+        }
+        rx
     }
 
     /// Abort all local generate/graph jobs (the server may keep finishing queued prompts).
@@ -803,7 +856,7 @@ impl Engine {
     pub fn sign_in(&self, url: String, username: String, password: String) {
         let base = normalize_url(&url);
         let (tx, ctx, log) = self.emitters();
-        let builder = tls_builder().redirect(reqwest::redirect::Policy::none());
+        let builder = tls_builder(READ_TIMEOUT).redirect(reqwest::redirect::Policy::none());
         let http = match builder.build() {
             Ok(c) => c,
             Err(e) => {
@@ -859,7 +912,7 @@ impl Engine {
     pub fn sign_out(&self, url: String, session: String) {
         let base = normalize_url(&url);
         let (tx, ctx, log) = self.emitters();
-        let http = apply_auth(tls_builder().redirect(reqwest::redirect::Policy::none()), "", &session)
+        let http = apply_auth(tls_builder(READ_TIMEOUT).redirect(reqwest::redirect::Policy::none()), "", &session)
             .build();
         self.rt.spawn(async move {
             if let Ok(http) = http {
@@ -1624,6 +1677,7 @@ async fn get_ok_bytes(http: &reqwest::Client, url: reqwest::Url) -> Result<Vec<u
     resp.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_generate(
     client: Client,
     params: Params,
@@ -1633,6 +1687,7 @@ async fn run_generate(
     label: String,
     current_prompt: CurrentPrompt,
     authed: Option<(String, reqwest::Client)>,
+    queue_authed: Option<(String, reqwest::Client)>,
     tx: Sender<Msg>,
     ctx: egui::Context,
     log: Logger,
@@ -1697,7 +1752,10 @@ async fn run_generate(
         log.info(format!("enhance: {note}"));
         let _ = tx.send(Msg::EnhanceNote(note));
     }
-    stream_execution(client, wf, ui_workflow, authed, label, tx, ctx, log, current_prompt).await;
+    // Video POSTs need the long queue timeout even with no linked graph (the gate holds the
+    // request open while expanding); image jobs keep the faster streaming path.
+    let force_queue_post = params.mode == Mode::Video;
+    stream_execution(client, wf, ui_workflow, authed, queue_authed, force_queue_post, label, tx, ctx, log, current_prompt).await;
 }
 
 /// Upload the colour-match reference (when any), build the finish graph, and stream it. Mirrors
@@ -1712,6 +1770,7 @@ async fn run_finish_job(
     output_fps: u32,
     schemas: Arc<SchemaSet>,
     authed: Option<(String, reqwest::Client)>,
+    queue_authed: Option<(String, reqwest::Client)>,
     label: String,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -1753,21 +1812,26 @@ async fn run_finish_job(
         log.info(format!("finish: {note}"));
         let _ = tx.send(Msg::EnhanceNote(note));
     }
-    stream_execution(client, wf, None, authed, label, tx, ctx, log, current_prompt).await;
+    // The finish graph carries no positive prompt, so no queue-time expansion holds the request.
+    stream_execution(client, wf, None, authed, queue_authed, false, label, tx, ctx, log, current_prompt).await;
 }
 
+/// The gate's queue-time expansion of the positive prompt: node id -> expanded text.
+type CgExpanded = std::collections::BTreeMap<String, String>;
+
 /// POST `/prompt` with `extra_pnginfo.workflow` so `SaveImage` embeds the UI JSON in the PNG.
+///
+/// When `queue_authed` is present the POST goes through it directly (long read timeout, so the
+/// gate's up-to-90 s queue-time expander can't trip the browsing timeout) and the full response is
+/// read so the `cg_expanded` rewrite can be surfaced. Without it, falls back to rucomfyui's
+/// `post_json` (browsing timeout, no `cg_expanded`) — the case where no connection was live.
 async fn queue_prompt_with_workflow_meta(
     client: &Client,
+    queue_authed: Option<&(String, reqwest::Client)>,
     wf: &Workflow,
     ui_workflow: Option<&Value>,
     log: &Logger,
-) -> Result<String, String> {
-    #[derive(serde::Deserialize)]
-    struct QueueResult {
-        prompt_id: String,
-    }
-
+) -> Result<(String, Option<CgExpanded>), String> {
     let body = serde_json::json!({
         "prompt": wf,
         "client_id": client.client_id(),
@@ -1777,22 +1841,174 @@ async fn queue_prompt_with_workflow_meta(
             }
         }
     });
-    let result: QueueResult = client
-        .post_json("prompt", &body)
+    let Some((base, http)) = queue_authed else {
+        #[derive(serde::Deserialize)]
+        struct QueueResult {
+            prompt_id: String,
+        }
+        let result: QueueResult = client
+            .post_json("prompt", &body)
+            .await
+            .map_err(|e| format!("queue failed: {e}"))?;
+        log.info(format!("queued with workflow meta: {}", result.prompt_id));
+        return Ok((result.prompt_id, None));
+    };
+
+    let resp = http
+        .post(format!("{base}/prompt"))
+        .json(&body)
+        .send()
         .await
         .map_err(|e| format!("queue failed: {e}"))?;
-    log.info(format!("queued with workflow meta: {}", result.prompt_id));
-    Ok(result.prompt_id)
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| format!("queue read failed: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("queue failed: HTTP {status}: {}", head(&text, 200)));
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|e| format!("queue: bad JSON ({e}): {}", head(&text, 200)))?;
+    let prompt_id = value
+        .get("prompt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("queue: no prompt_id in {}", head(&text, 200)))?
+        .to_string();
+    let expanded = value
+        .get("cg_expanded")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<CgExpanded>()
+        })
+        .filter(|m| !m.is_empty());
+    log.info(format!(
+        "queued with workflow meta: {prompt_id}{}",
+        if expanded.is_some() { " (prompt expanded)" } else { "" }
+    ));
+    Ok((prompt_id, expanded))
+}
+
+/// Pull `choices[0].delta.content` out of one SSE `data:` payload (OpenAI streaming shape).
+fn parse_sse_delta(data: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(data).ok()?;
+    let content = v.get("choices")?.get(0)?.get("delta")?.get("content")?.as_str()?;
+    (!content.is_empty()).then(|| content.to_string())
+}
+
+/// Resolve once `cancel` is set, so a blocking read can be raced against it in `select!`.
+async fn wait_cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Parse one SSE line and forward its token. Returns true on the terminal `data: [DONE]`.
+fn handle_sse_line(line: &[u8], tx: &Sender<ExpandMsg>, ctx: &egui::Context) -> bool {
+    let line = String::from_utf8_lossy(line);
+    let Some(data) = line.trim().strip_prefix("data:") else { return false };
+    let data = data.trim();
+    if data == "[DONE]" {
+        let _ = tx.send(ExpandMsg::Done);
+        ctx.request_repaint();
+        return true;
+    }
+    if let Some(tok) = parse_sse_delta(data) {
+        let _ = tx.send(ExpandMsg::Delta(tok));
+        ctx.request_repaint();
+    }
+    false
+}
+
+/// Stream `POST /api/expand`, forwarding each `choices[].delta.content` token as
+/// [`ExpandMsg::Delta`] until `data: [DONE]` (or the stream closes cleanly). Parses OpenAI-style
+/// SSE a line at a time. A non-200 (502/503/504 = expander down/disabled/timed out) or transport
+/// error arrives as a single [`ExpandMsg::Error`]; the caller then submits the original text
+/// unchanged. `cancel` (set when the user dismisses the review) stops between chunks — dropping the
+/// response future aborts the in-flight request.
+async fn stream_expand(
+    http: reqwest::Client,
+    base: String,
+    text: String,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<ExpandMsg>,
+    ctx: egui::Context,
+    log: Logger,
+) {
+    macro_rules! send {
+        ($m:expr) => {{
+            let _ = tx.send($m);
+            ctx.request_repaint();
+        }};
+    }
+    let body = serde_json::json!({ "text": text });
+    let resp = match http.post(format!("{base}/api/expand")).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log.warn(format!("expand request failed: {e}"));
+            send!(ExpandMsg::Error(format!("expand: {e}")));
+            return;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        log.warn(format!("expand unavailable: HTTP {status}"));
+        send!(ExpandMsg::Error(format!("expand unavailable (HTTP {status})")));
+        return;
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        // Race the read against the cancel flag so a dismiss aborts even during a long idle wait for
+        // the first token (a cold expander), not only between chunks. Dropping `resp` on return
+        // closes the request.
+        let chunk = tokio::select! {
+            biased;
+            _ = wait_cancelled(&cancel) => return,
+            c = resp.chunk() => c,
+        };
+        match chunk {
+            Ok(Some(bytes)) => {
+                buf.extend_from_slice(&bytes);
+                // Drain whole lines; a partial trailing line stays buffered for the next chunk.
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=nl).collect();
+                    if handle_sse_line(&line, &tx, &ctx) {
+                        return;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                if cancel.load(Ordering::SeqCst) {
+                    return;
+                }
+                log.warn(format!("expand stream error: {e}"));
+                send!(ExpandMsg::Error(format!("expand stream: {e}")));
+                return;
+            }
+        }
+    }
+    // Flush a final line the server left un-terminated before closing the stream.
+    let done_in_flush = !buf.is_empty() && handle_sse_line(&buf, &tx, &ctx);
+    if !done_in_flush {
+        send!(ExpandMsg::Done);
+    }
 }
 
 /// Queue a workflow and forward its event stream to the UI. Shared by the Generate tab and the
 /// graph editor. A dropped event stream (one failed poll kills rucomfyui's whole stream) falls
 /// back to patiently reconciling results from the history endpoint instead of failing the run.
+#[allow(clippy::too_many_arguments)]
 async fn stream_execution(
     client: Client,
     wf: Workflow,
     ui_workflow: Option<Value>,
     authed: Option<(String, reqwest::Client)>,
+    queue_authed: Option<(String, reqwest::Client)>,
+    // Force the direct-POST path even with no UI workflow, so the long queue timeout covers video
+    // jobs (the gate holds POST /prompt open while its queue-time expander runs). Image jobs leave
+    // this false so plain txt2img keeps rucomfyui's lower-latency streaming transport.
+    force_queue_post: bool,
     label: String,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -1807,20 +2023,29 @@ async fn stream_execution(
         }};
     }
 
-    // When we have UI workflow metadata to embed, queue via a custom POST that includes
-    // extra_pnginfo, then rely on the persistent ws_listener for progress and
-    // reconcile_from_history for final images. Otherwise use the standard execute() path.
-    if let Some(ui) = ui_workflow.as_ref() {
-        let prompt_id = match queue_prompt_with_workflow_meta(&client, &wf, Some(ui), &log).await {
-            Ok(id) => id,
+    // Queue via our own POST when there is UI metadata to embed, or when a video job needs the long
+    // queue timeout — then rely on the persistent ws_listener for progress and reconcile_from_history
+    // for final images. A bare image job with nothing to embed falls through to execute()'s
+    // lower-latency streaming transport instead.
+    if ui_workflow.is_some() || force_queue_post {
+        let (prompt_id, expanded) = match queue_prompt_with_workflow_meta(
+            &client,
+            queue_authed.as_ref(),
+            &wf,
+            ui_workflow.as_ref(),
+            &log,
+        )
+        .await
+        {
+            Ok(v) => v,
             Err(e) => {
-                log.error(format!("queueing workflow with metadata failed: {e}"));
+                log.error(format!("queueing workflow failed: {e}"));
                 send!(Msg::GenError(e.to_string()));
                 return;
             }
         };
         *current_prompt.lock().unwrap() = Some(prompt_id.clone());
-        send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone() });
+        send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone(), expanded });
         send!(Msg::Queued);
         let outcome =
             reconcile_from_history(&client, &authed, &prompt_id, &label, &tx, &ctx, &log).await;
@@ -1843,7 +2068,7 @@ async fn stream_execution(
     let prompt_id = execution.prompt_id().to_string();
     log.info(format!("queued prompt {prompt_id}"));
     *current_prompt.lock().unwrap() = Some(prompt_id.clone());
-    send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone() });
+    send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone(), expanded: None });
     send!(Msg::Queued);
 
     let mut outcome = None;
@@ -2273,7 +2498,7 @@ async fn fetch_bytes(
     log.info(format!("GET {url}"));
     let client = match authed {
         Some((base, http)) if url.starts_with(base.as_str()) => http.clone(),
-        _ => tls_builder().build().map_err(|e| e.to_string())?,
+        _ => tls_builder(READ_TIMEOUT).build().map_err(|e| e.to_string())?,
     };
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -2406,8 +2631,16 @@ fn session_from_set_cookie<'a>(values: impl Iterator<Item = &'a str>) -> Option<
 /// the bundled webpki-roots CA set (ring provider) — no Android platform trust store, no JNI, so it
 /// can't hit the rustls-platform-verifier "not initialized" panic. Without the feature, https is
 /// unsupported (http on LAN / Tailscale only).
+/// Idle-read timeout for ordinary requests: a wedged server surfaces an error instead of hanging a
+/// request (and its spinner) forever.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle-read timeout for [`Engine::queue_http`]: the gate holds `POST /prompt` open up to ~90 s
+/// while its queue-time expander runs, and a cold `/api/expand` can be slow to the first token —
+/// both need headroom past the 30 s browsing timeout.
+const QUEUE_READ_TIMEOUT: Duration = Duration::from_secs(150);
+
 #[cfg(feature = "tls")]
-fn tls_builder() -> reqwest::ClientBuilder {
+fn tls_builder(read_timeout: Duration) -> reqwest::ClientBuilder {
     use std::sync::Once;
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -2418,18 +2651,18 @@ fn tls_builder() -> reqwest::ClientBuilder {
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    with_timeouts(reqwest::Client::builder().use_preconfigured_tls(config))
+    with_timeouts(reqwest::Client::builder().use_preconfigured_tls(config), read_timeout)
 }
 
 #[cfg(not(feature = "tls"))]
-fn tls_builder() -> reqwest::ClientBuilder {
-    with_timeouts(reqwest::Client::builder())
+fn tls_builder(read_timeout: Duration) -> reqwest::ClientBuilder {
+    with_timeouts(reqwest::Client::builder(), read_timeout)
 }
 
 /// Connect and idle-read timeouts so a wedged server surfaces an error instead of hanging a
-/// request (and its spinner) forever. No total timeout: big-but-flowing downloads are fine.
-fn with_timeouts(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
-    builder.connect_timeout(Duration::from_secs(10)).read_timeout(Duration::from_secs(30))
+/// request forever. No total timeout: big-but-flowing downloads are fine.
+fn with_timeouts(builder: reqwest::ClientBuilder, read_timeout: Duration) -> reqwest::ClientBuilder {
+    builder.connect_timeout(Duration::from_secs(10)).read_timeout(read_timeout)
 }
 
 /// Trim, drop a trailing slash, and default to http:// when no scheme is given.

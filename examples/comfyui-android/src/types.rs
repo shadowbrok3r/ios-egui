@@ -205,6 +205,10 @@ pub struct Params {
     /// Wan i2v settings used when `mode` is [`Mode::Video`].
     #[serde(default)]
     pub video: VideoParams,
+    /// Submit the positive verbatim: prepends the gate's `raw:` marker so its queue-time prompt
+    /// expander leaves the text alone (set after accepting a streamed `/api/expand` rewrite).
+    #[serde(default)]
+    pub raw_prompt: bool,
 }
 
 /// Create Main mode picker: image vs Wan video, with t2v/i2v split for video.
@@ -332,6 +336,7 @@ impl Default for Params {
             loras: Vec::new(),
             apps: Vec::new(),
             video: VideoParams::default(),
+            raw_prompt: false,
         }
     }
 }
@@ -362,6 +367,7 @@ impl Params {
         self.loras = d.loras;
         self.apps = d.apps;
         self.video = d.video;
+        self.raw_prompt = d.raw_prompt;
     }
 
     /// The LoRA-trigger field feeding the current mode: the Wan stacks' own field in Video,
@@ -378,6 +384,19 @@ impl Params {
             (true, _) => subject.to_string(),
             (_, true) => triggers.to_string(),
             _ => format!("{triggers}, {subject}"),
+        }
+    }
+
+    /// Positive CLIP text for a comfy-gate submission: [`Self::combined_positive`], prefixed with
+    /// the `raw:` marker when the user opted out of the gate's queue-time expander. Only video
+    /// prompts are ever expanded server-side, so the marker is added for video alone; the gate
+    /// strips it and queues the text verbatim.
+    pub fn server_positive(&self) -> String {
+        let base = self.combined_positive();
+        if self.raw_prompt && self.mode == Mode::Video && !base.is_empty() {
+            format!("raw:{base}")
+        } else {
+            base
         }
     }
 
@@ -556,6 +575,8 @@ impl LoraPack {
 pub enum LookKind {
     #[default]
     Look,
+    Outfit,
+    Pose,
     CameraAngle,
     Environment,
 }
@@ -564,6 +585,8 @@ impl LookKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Look => "Look",
+            Self::Outfit => "Outfit",
+            Self::Pose => "Pose",
             Self::CameraAngle => "Camera angle",
             Self::Environment => "Environment",
         }
@@ -572,6 +595,8 @@ impl LookKind {
     pub fn plural(self) -> &'static str {
         match self {
             Self::Look => "Looks",
+            Self::Outfit => "Outfits",
+            Self::Pose => "Poses",
             Self::CameraAngle => "Camera angles",
             Self::Environment => "Environments",
         }
@@ -580,13 +605,15 @@ impl LookKind {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Look => "school uniform, hand on hip",
+            Self::Outfit => "school uniform, thigh-highs",
+            Self::Pose => "hand on hip, looking back",
             Self::CameraAngle => "low angle, from below, wide shot",
             Self::Environment => "rainy neon street at night",
         }
     }
 
     /// The single-axis kinds surfaced as Create-Main comboboxes (not the combined `Look`).
-    pub const MAIN: &'static [Self] = &[Self::CameraAngle, Self::Environment];
+    pub const MAIN: &'static [Self] = &[Self::Outfit, Self::Pose, Self::CameraAngle, Self::Environment];
 }
 
 /// A swappable "look" for a character: a named prompt fragment (outfit, accessories, pose, scene)
@@ -619,6 +646,163 @@ pub struct AppliedMainLook {
     /// Tokens appended to `positive`, stripped on removal.
     #[serde(default)]
     pub injected: String,
+}
+
+/// Baked-in single-axis look presets (danbooru-style tags), always available in the Create-Main
+/// comboboxes on top of any the user creates. Names must stay unique within a kind.
+pub fn builtin_looks() -> Vec<CharacterLook> {
+    const DATA: &[(LookKind, &str, &str)] = &[
+        // ---- Outfits ----
+        (LookKind::Outfit, "School uniform", "school uniform, pleated skirt, necktie"),
+        (LookKind::Outfit, "Sailor uniform", "serafuku, sailor collar, pleated skirt"),
+        (LookKind::Outfit, "Gym clothes", "gym uniform, buruma, white shirt"),
+        (LookKind::Outfit, "Business suit", "business suit, blazer, pencil skirt, necktie"),
+        (LookKind::Outfit, "Office lady", "office lady, white blouse, pencil skirt, pantyhose"),
+        (LookKind::Outfit, "Casual", "casual, t-shirt, jeans"),
+        (LookKind::Outfit, "Hoodie & jeans", "hoodie, denim, jeans, sneakers"),
+        (LookKind::Outfit, "Overalls", "overalls, denim, t-shirt"),
+        (LookKind::Outfit, "Summer dress", "sundress, sun hat, sandals"),
+        (LookKind::Outfit, "Evening gown", "evening gown, elegant dress, jewelry"),
+        (LookKind::Outfit, "Cocktail dress", "cocktail dress, bare shoulders, high heels"),
+        (LookKind::Outfit, "Wedding dress", "wedding dress, veil, bridal gown"),
+        (LookKind::Outfit, "Kimono", "kimono, obi, floral print"),
+        (LookKind::Outfit, "Yukata", "yukata, obi, summer festival"),
+        (LookKind::Outfit, "Hanbok", "hanbok, korean clothes"),
+        (LookKind::Outfit, "China dress", "china dress, side slit, mandarin collar"),
+        (LookKind::Outfit, "Maid outfit", "maid, maid apron, frilled dress, maid headdress"),
+        (LookKind::Outfit, "Nurse", "nurse, nurse cap, white dress"),
+        (LookKind::Outfit, "Miko", "miko, red hakama, white kimono, ribbon-trimmed sleeves"),
+        (LookKind::Outfit, "Gothic lolita", "gothic lolita, frilled dress, ribbon, bonnet"),
+        (LookKind::Outfit, "Goth", "goth fashion, black dress, choker, dark makeup"),
+        (LookKind::Outfit, "Punk", "punk, studded belt, fishnets, ripped clothes"),
+        (LookKind::Outfit, "Sportswear", "sportswear, track jacket, athletic shorts"),
+        (LookKind::Outfit, "Tracksuit", "tracksuit, hoodie, athletic wear"),
+        (LookKind::Outfit, "Cozy sweater", "sweater, turtleneck sweater, skirt, thighhighs"),
+        (LookKind::Outfit, "Winter coat", "winter coat, scarf, gloves, earmuffs"),
+        (LookKind::Outfit, "Leather jacket", "leather jacket, ripped jeans, boots"),
+        (LookKind::Outfit, "Swimsuit", "one-piece swimsuit"),
+        (LookKind::Outfit, "Bikini", "bikini, swimsuit"),
+        (LookKind::Outfit, "Lingerie", "lingerie, lace, garter belt"),
+        (LookKind::Outfit, "Pajamas", "pajamas, sleepwear"),
+        (LookKind::Outfit, "Military uniform", "military uniform, epaulettes, peaked cap"),
+        (LookKind::Outfit, "Police uniform", "police, police uniform, cap"),
+        (LookKind::Outfit, "Witch", "witch, witch hat, robe"),
+        (LookKind::Outfit, "Fantasy armor", "armor, breastplate, pauldrons, fantasy"),
+        (LookKind::Outfit, "Knight", "plate armor, knight, gauntlets"),
+        (LookKind::Outfit, "Cyberpunk", "cyberpunk, techwear, neon trim, bodysuit"),
+        (LookKind::Outfit, "Bodysuit", "bodysuit, skin tight, zipper"),
+        (LookKind::Outfit, "Steampunk", "steampunk, corset, goggles, gears"),
+        (LookKind::Outfit, "Idol costume", "idol, frilled stage costume, gloves"),
+        (LookKind::Outfit, "Bunny suit", "playboy bunny, rabbit ears, detached collar, pantyhose"),
+        (LookKind::Outfit, "Cheerleader", "cheerleader, crop top, pleated skirt, pom poms"),
+        (LookKind::Outfit, "Cowgirl", "cowboy hat, western, denim, boots"),
+        // ---- Poses ----
+        (LookKind::Pose, "Standing", "standing"),
+        (LookKind::Pose, "Contrapposto", "standing, contrapposto"),
+        (LookKind::Pose, "Hand on hip", "hand on hip, standing"),
+        (LookKind::Pose, "Arms crossed", "crossed arms, standing"),
+        (LookKind::Pose, "Hands behind back", "arms behind back, standing"),
+        (LookKind::Pose, "Hands behind head", "arms behind head"),
+        (LookKind::Pose, "Hands in pockets", "hands in pockets, casual"),
+        (LookKind::Pose, "Sitting", "sitting"),
+        (LookKind::Pose, "Sitting on floor", "sitting on floor, hugging own legs"),
+        (LookKind::Pose, "Cross-legged", "sitting, crossed legs"),
+        (LookKind::Pose, "Seiza", "seiza, kneeling"),
+        (LookKind::Pose, "Kneeling", "kneeling"),
+        (LookKind::Pose, "Crouching", "squatting, crouching"),
+        (LookKind::Pose, "Lying on back", "lying, on back"),
+        (LookKind::Pose, "Lying on stomach", "lying, on stomach, feet up"),
+        (LookKind::Pose, "Lying on side", "lying, on side, head rest"),
+        (LookKind::Pose, "Walking", "walking"),
+        (LookKind::Pose, "Running", "running, dynamic pose"),
+        (LookKind::Pose, "Jumping", "jumping, mid-air"),
+        (LookKind::Pose, "Dancing", "dancing, dynamic pose"),
+        (LookKind::Pose, "Twirling", "twirling, dress flip, dynamic pose"),
+        (LookKind::Pose, "Stretching", "stretching, arms up"),
+        (LookKind::Pose, "Leaning forward", "leaning forward, hands on own knees"),
+        (LookKind::Pose, "Leaning back", "leaning back, relaxed"),
+        (LookKind::Pose, "Looking back", "looking back, from behind"),
+        (LookKind::Pose, "Over the shoulder", "looking over shoulder"),
+        (LookKind::Pose, "Hand on cheek", "hand on own cheek, head tilt"),
+        (LookKind::Pose, "Hugging self", "hugging own body"),
+        (LookKind::Pose, "Waving", "waving, one arm up"),
+        (LookKind::Pose, "Peace sign", "peace sign, v, smile"),
+        (LookKind::Pose, "Pointing", "pointing at viewer"),
+        (LookKind::Pose, "Reaching out", "reaching towards viewer, outstretched arm"),
+        (LookKind::Pose, "Blowing a kiss", "blowing kiss, hand to own mouth"),
+        (LookKind::Pose, "Arms up", "arms up, cheering"),
+        (LookKind::Pose, "Holding skirt", "skirt hold, curtsy"),
+        (LookKind::Pose, "Salute", "salute"),
+        // ---- Camera angles ----
+        (LookKind::CameraAngle, "Eye level", "eye level, straight-on"),
+        (LookKind::CameraAngle, "From below", "from below, low angle"),
+        (LookKind::CameraAngle, "From above", "from above, high angle"),
+        (LookKind::CameraAngle, "Bird's-eye view", "from above, bird's-eye view"),
+        (LookKind::CameraAngle, "Worm's-eye view", "from below, worm's-eye view"),
+        (LookKind::CameraAngle, "Dutch angle", "dutch angle, tilted"),
+        (LookKind::CameraAngle, "Close-up", "close-up, face focus"),
+        (LookKind::CameraAngle, "Extreme close-up", "extreme close-up, eye focus"),
+        (LookKind::CameraAngle, "Portrait", "portrait, upper body"),
+        (LookKind::CameraAngle, "Upper body", "upper body"),
+        (LookKind::CameraAngle, "Cowboy shot", "cowboy shot"),
+        (LookKind::CameraAngle, "Full body", "full body"),
+        (LookKind::CameraAngle, "Wide shot", "wide shot, scenery"),
+        (LookKind::CameraAngle, "POV", "pov"),
+        (LookKind::CameraAngle, "Over-the-shoulder", "over the shoulder, from behind"),
+        (LookKind::CameraAngle, "Profile", "from side, profile"),
+        (LookKind::CameraAngle, "From behind", "from behind, back view"),
+        (LookKind::CameraAngle, "Front view", "front view, facing viewer"),
+        (LookKind::CameraAngle, "Three-quarter view", "three-quarter view"),
+        (LookKind::CameraAngle, "Selfie", "selfie, arm at own side extended"),
+        (LookKind::CameraAngle, "Fisheye", "fisheye, wide-angle lens"),
+        (LookKind::CameraAngle, "Bokeh", "depth of field, bokeh, blurry background"),
+        (LookKind::CameraAngle, "Foreshortening", "foreshortening, dynamic angle"),
+        // ---- Environments ----
+        (LookKind::Environment, "Neon city night", "neon lights, city street, night, rain, reflections"),
+        (LookKind::Environment, "Cyberpunk alley", "cyberpunk, alley, neon signs, rain, night"),
+        (LookKind::Environment, "Cherry blossoms", "cherry blossoms, falling petals, spring, park"),
+        (LookKind::Environment, "Beach sunset", "beach, ocean, sunset, palm trees"),
+        (LookKind::Environment, "Snowy mountain", "snow, mountains, winter, overcast"),
+        (LookKind::Environment, "Forest", "forest, trees, dappled sunlight, nature"),
+        (LookKind::Environment, "Bamboo forest", "bamboo forest, green, serene"),
+        (LookKind::Environment, "Foggy forest", "fog, mist, forest, eerie atmosphere"),
+        (LookKind::Environment, "Flower field", "flower field, meadow, blue sky"),
+        (LookKind::Environment, "Autumn park", "autumn leaves, maple, park, orange tones"),
+        (LookKind::Environment, "Sunset field", "grassland, sunset, golden hour, warm light"),
+        (LookKind::Environment, "Starry night", "starry sky, night, milky way, outdoors"),
+        (LookKind::Environment, "Rainy street", "rain, wet street, umbrella, reflections"),
+        (LookKind::Environment, "Snowfall city", "snowing, city, winter, street lights"),
+        (LookKind::Environment, "City rooftop", "rooftop, city skyline, evening"),
+        (LookKind::Environment, "Rooftop garden", "rooftop garden, plants, city view"),
+        (LookKind::Environment, "Cozy bedroom", "bedroom, bed, indoors, warm lighting"),
+        (LookKind::Environment, "Classroom", "classroom, desks, window light, school"),
+        (LookKind::Environment, "Library", "library, bookshelves, indoors"),
+        (LookKind::Environment, "Coffee shop", "cafe, coffee shop, indoors, cozy"),
+        (LookKind::Environment, "Night market", "night market, food stalls, lanterns, crowd"),
+        (LookKind::Environment, "Japanese room", "tatami, japanese-style room, shoji, indoors"),
+        (LookKind::Environment, "Shrine", "shrine, torii, stone path"),
+        (LookKind::Environment, "Onsen", "onsen, hot spring, steam, rocks"),
+        (LookKind::Environment, "Cathedral", "cathedral, stained glass, gothic architecture"),
+        (LookKind::Environment, "Ancient ruins", "ancient ruins, overgrown, moss, stone"),
+        (LookKind::Environment, "Medieval castle", "castle, medieval, stone walls, banners"),
+        (LookKind::Environment, "Futuristic city", "futuristic city, skyscrapers, sci-fi, holograms"),
+        (LookKind::Environment, "Spaceship interior", "spaceship interior, sci-fi, control panels"),
+        (LookKind::Environment, "Outer space", "outer space, stars, nebula, galaxy"),
+        (LookKind::Environment, "Underwater", "underwater, bubbles, sunlight rays, ocean"),
+        (LookKind::Environment, "Desert", "desert, sand dunes, clear sky"),
+        (LookKind::Environment, "Waterfall", "waterfall, river, rocks, mist"),
+        (LookKind::Environment, "Fantasy landscape", "fantasy landscape, floating islands, epic scale"),
+        (LookKind::Environment, "Amusement park", "amusement park, ferris wheel, festive"),
+        (LookKind::Environment, "Train interior", "train interior, seats, window, city passing by"),
+    ];
+    DATA.iter()
+        .map(|&(kind, name, prompt)| CharacterLook {
+            name: name.to_string(),
+            prompt: prompt.to_string(),
+            portrait_key: String::new(),
+            kind,
+        })
+        .collect()
 }
 
 /// A reusable recurring character: identity tags, its LoRA stack, trigger words, per-character

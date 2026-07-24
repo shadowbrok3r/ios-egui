@@ -5,7 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use egui_mobile::{CreateContext, EguiApp, Haptic, Host, HostExt, ScreenOrientation, device_orientation_deg, app, egui};
@@ -15,7 +15,7 @@ use rucomfyui::workflow::WorkflowNodeId;
 use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
 
 use crate::apps::{AppDef, AppSet, KnobTy, Status};
-use crate::engine::{Engine, GenCtx, Msg, QueueJob};
+use crate::engine::{Engine, ExpandMsg, GenCtx, Msg, QueueJob};
 use crate::gallery::{self, ImageMeta, RemixDiffRow, RemixField, ThumbCache};
 use crate::graphview::{self, GraphView, LongPress, LoraPick, elide, elide_width, sanitize_ui_text};
 use crate::icons;
@@ -43,6 +43,8 @@ use crate::types::LocalBackend;
 const GALLERY_LOAD_ALL_CAP: u64 = 5000;
 /// comfy-gate clamps `/gallery/api/list` `limit` at this.
 const GALLERY_PAGE_MAX: u64 = 500;
+/// `AppliedMainLook::origin` sentinel marking a baked-in preset (vs "" global or a character name).
+const BUILTIN_ORIGIN: &str = "@builtin";
 /// Window for the second Create Reset tap to confirm.
 const RESET_CONFIRM_SECS: f64 = 4.0;
 
@@ -665,6 +667,19 @@ struct MyPrompt {
     id: String,
     label: String,
     added: f64,
+    /// The gate's queue-time rewrite of the positive (`cg_expanded`), joined across nodes; `None`
+    /// when the text ran verbatim (raw, over the 500-char cap, or the expander was down).
+    expanded: Option<String>,
+}
+
+/// A streaming `/api/expand` rewrite awaiting review: the original prompt and the text streamed in
+/// so far, rendered as a live diff. `done` flips when the stream ends; `error` holds a failure to
+/// show before falling back to the original text.
+struct ExpandReview {
+    original: String,
+    streamed: String,
+    done: bool,
+    error: Option<String>,
 }
 
 /// Rolling per-frame CPU timing, mirrored to logcat (`adb logcat -s comfyui`) so on-device
@@ -886,6 +901,8 @@ struct ComfyApp {
     wizard_custom_tags: std::collections::BTreeMap<String, Vec<String>>,
     /// Global single-axis looks (camera angles / environments) not tied to any character (persisted).
     global_looks: Vec<CharacterLook>,
+    /// Baked-in single-axis look presets, always offered on top of `global_looks` (not persisted).
+    builtin_looks: Vec<CharacterLook>,
     /// Current Create-Main look-combobox selections, with undo records (at most one per kind).
     active_main_looks: Vec<AppliedMainLook>,
     /// Open global-look manager window, filtered to this kind (from a combobox's Manage entry).
@@ -943,6 +960,15 @@ struct ComfyApp {
     queue_jobs: (Vec<QueueJob>, Vec<QueueJob>),
     /// Prompts this app submitted (id, short label, added time) for "Yours" rows + our-pending cancel.
     my_prompts: Vec<MyPrompt>,
+    /// The gate's queue-time prompt rewrites (`cg_expanded`), keyed by prompt id, for the job card.
+    /// Pruned alongside `my_prompts` so it can't grow unbounded across a session.
+    expanded_prompts: HashMap<String, String>,
+    /// A streaming `/api/expand` rewrite awaiting review (the prompt diff modal).
+    expand_review: Option<ExpandReview>,
+    /// Live token stream feeding `expand_review`.
+    expand_rx: Option<std::sync::mpsc::Receiver<ExpandMsg>>,
+    /// Abort flag for the in-flight `/api/expand` request (set when the review is dismissed).
+    expand_cancel: Option<Arc<AtomicBool>>,
     /// The pending-jobs queue sheet is open.
     queue_sheet_open: bool,
     /// Two-tap arm state for the sheet's "Clear pending" button.
@@ -1105,6 +1131,10 @@ struct ComfyApp {
     kb_was_open: bool,
     /// The soft keyboard opened this frame; scroll the focused field into the shrunk viewport.
     kb_open_edge: bool,
+    /// Soft keyboard height (pt) this frame; trailing scroll padding so a low field can clear it.
+    kb_height: f32,
+    /// Focused widget the last time the keyboard-avoidance scroll ran; re-scrolls when it changes.
+    kb_last_focus: Option<egui::Id>,
     /// Last gallery tile tapped and when — the app's own double-tap rule (see `DOUBLE_TAP_SECS`).
     tile_tap: Option<(String, f64)>,
     /// Long-press-to-paint gesture: (press start time, screen origin, cancelled-as-a-scroll).
@@ -1415,7 +1445,7 @@ impl PromptField {
 
     fn hint(self) -> &'static str {
         match self {
-            Self::Positive => "what you want to see",
+            Self::Positive => "triggers, then a short description",
             Self::Negative => "what to avoid",
         }
     }
@@ -1541,6 +1571,7 @@ impl ComfyApp {
             character_wizard: None,
             wizard_custom_tags: std::collections::BTreeMap::new(),
             global_looks: Vec::new(),
+            builtin_looks: crate::types::builtin_looks(),
             active_main_looks: Vec::new(),
             looks_window: None,
             character_denied: std::collections::BTreeMap::new(),
@@ -1569,6 +1600,10 @@ impl ComfyApp {
             queue_remaining: 0,
             last_queue_poll: 0.0,
             queue_jobs: (Vec::new(), Vec::new()),
+            expanded_prompts: HashMap::new(),
+            expand_review: None,
+            expand_rx: None,
+            expand_cancel: None,
             my_prompts: Vec::new(),
             queue_sheet_open: false,
             queue_clear_arm: false,
@@ -1662,6 +1697,8 @@ impl ComfyApp {
             output_open: false,
             kb_was_open: false,
             kb_open_edge: false,
+            kb_height: 0.0,
+            kb_last_focus: None,
             tile_tap: None,
             sel_press: None,
             sel_long_fired: false,
@@ -2371,10 +2408,23 @@ impl ComfyApp {
                 host.haptic(Haptic::Error);
             }
             Msg::EnhanceNote(note) => self.enhance_note = note,
-            Msg::Queued => self.status = "Queued".into(),
-            Msg::PromptId { id, label } => {
+            Msg::Queued => {
+                // PromptId arrives just before Queued, so the freshest prompt reflects this job;
+                // surface an expansion here since a status set in the PromptId arm is overwritten.
+                self.status = if self.my_prompts.last().is_some_and(|p| p.expanded.is_some()) {
+                    "Queued · prompt expanded (open Queue to review)".into()
+                } else {
+                    "Queued".into()
+                };
+            }
+            Msg::PromptId { id, label, expanded } => {
                 let added = ctx.input(|i| i.time);
-                self.my_prompts.push(MyPrompt { id, label, added });
+                // Node id -> text, joined into one block (there is usually a single positive node).
+                let joined = expanded.map(|m| m.into_values().collect::<Vec<_>>().join("\n\n"));
+                if let Some(text) = &joined {
+                    self.expanded_prompts.insert(id.clone(), text.clone());
+                }
+                self.my_prompts.push(MyPrompt { id, label, added, expanded: joined });
             }
             Msg::QueueJobs { running, pending } => {
                 let now = ctx.input(|i| i.time);
@@ -2385,6 +2435,14 @@ impl ComfyApp {
                     .collect();
                 // Drop finished prompts, keeping just-submitted ids not yet in a snapshot.
                 self.my_prompts.retain(|p| live.contains(p.id.as_str()) || now - p.added < 6.0);
+                // Prune expansions whose job is gone from both the queue and our tracked prompts.
+                let keep: HashSet<String> = self
+                    .my_prompts
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .chain(live.iter().map(|s| s.to_string()))
+                    .collect();
+                self.expanded_prompts.retain(|id, _| keep.contains(id));
                 self.queue_jobs = (running, pending);
             }
             Msg::Progress { value, max } => {
@@ -3439,7 +3497,7 @@ impl ComfyApp {
         let input = wants_input.then(|| crate::engine::INPUT_IMAGE_NAME.to_string());
         let placeholder = input.is_some();
         let (wf, _, report) =
-            crate::workflow::build_dispatch(&self.params, input, &self.apps, &schemas);
+            crate::workflow::build_dispatch(&self.graph_build_params(), input, &self.apps, &schemas);
         self.enhance_note = report.note();
         self.executing = None;
 
@@ -3511,6 +3569,15 @@ impl ComfyApp {
     }
 
     /// Rebuild the Create-linked graph from current params (no tab switch).
+    /// Params for building a reusable UI graph (linked-graph sync, Create-as-graph): the `raw:`
+    /// submission marker must never bake into a graph node or the embedded pnginfo — it would show
+    /// verbatim in the editor and, once remixed back, double-prepend. It rides only the API workflow.
+    fn graph_build_params(&self) -> Params {
+        let mut p = self.params.clone();
+        p.raw_prompt = false;
+        p
+    }
+
     fn push_create_to_linked_graph(&mut self) {
         let Some(id) = self.create_graph_id else { return };
         let Some(idx) = self.graph_tabs.iter().position(|d| d.id == id) else {
@@ -3522,7 +3589,7 @@ impl ComfyApp {
             || (self.params.mode == Mode::Video && !self.params.video.video_t2v);
         let input = wants_input.then(|| crate::engine::INPUT_IMAGE_NAME.to_string());
         let (wf, _, report) =
-            crate::workflow::build_dispatch(&self.params, input, &self.apps, &schemas);
+            crate::workflow::build_dispatch(&self.graph_build_params(), input, &self.apps, &schemas);
         self.enhance_note = report.note();
         if self
             .replace_workflow_in_tab_with_seeds(
@@ -4207,11 +4274,19 @@ impl ComfyApp {
         Some(format!("/storage/emulated/0/Android/data/{pkg}/files/comfyui_settings.json"))
     }
 
-    /// Internal file first, then the external mirror.
+    /// Durable copy under the public models dir; survives an app uninstall/clear (unlike the two
+    /// app-data paths), so toggles like Local NPU / Auto-tag come back after a reinstall.
+    fn settings_durable_path() -> String {
+        format!("{}/comfyui_settings.json", Self::durable_models_dir())
+    }
+
+    /// Internal file first, then the external mirror, then the durable public copy (load falls
+    /// through to it after an app-data wipe; autosave writes all three to keep them in sync).
     fn settings_candidates(host: &Host) -> Vec<String> {
         [Self::settings_path(host), Self::settings_backup_path(host)]
             .into_iter()
             .flatten()
+            .chain(std::iter::once(Self::settings_durable_path()))
             .collect()
     }
 
@@ -4615,7 +4690,6 @@ impl ComfyApp {
     }
 
     fn settings_server_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
-        self.scroll_focus_into_view(ui);
         crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
             egui::CollapsingHeader::new(format!("{} Server", icons::LINK))
@@ -4740,7 +4814,10 @@ impl ComfyApp {
                     .id_salt("settings_local_npu")
                     .default_open(false)
                     .show(ui, |ui| {
-                        ui.checkbox(&mut self.local_npu, "Local NPU features (experimental)");
+                        if ui.checkbox(&mut self.local_npu, "Local NPU features (experimental)").changed() {
+                            // Flush now so a quit/kill right after the toggle can't lose it.
+                            self.autosave_settings_now(host);
+                        }
                         ui.weak(
                             "Enables the on-device stack: auto-tag, CLIP embeds, Read tags and Rewrite. \
                              Create generation runs on-device only when a local pack is the chosen \
@@ -4752,7 +4829,9 @@ impl ComfyApp {
                         ui.add_space(6.0);
                         ui.weak("Pick the Create model (a pack or Server model), test it, or import a pack in Create -> Models.");
                         ui.add_space(6.0);
-                        ui.checkbox(&mut self.auto_tag, "Auto-tag gallery (NPU)");
+                        if ui.checkbox(&mut self.auto_tag, "Auto-tag gallery (NPU)").changed() {
+                            self.autosave_settings_now(host);
+                        }
                         ui.weak(
                             "Tags the whole server gallery on-device while idle; results power the \
                              gallery tag search, facet chips and rating filter. Pauses during \
@@ -4915,7 +4994,8 @@ impl ComfyApp {
                     self.last_saved = None;
                 }
             }
-            ui.add_space(12.0);
+            ui.add_space(if self.kb_was_open { self.kb_height.max(160.0) } else { 12.0 });
+            self.scroll_focus_into_view(ui);
         });
     }
 
@@ -5451,6 +5531,229 @@ impl ComfyApp {
                 ui.weak(format!("history {}/{total}", self.hist_slider.clamp(1, total)));
             }
         });
+        // Video is the only mode the gate expands, so the Expand/Raw controls live under video.
+        if self.params.mode == Mode::Video {
+            self.video_expand_controls(ui, host);
+        }
+    }
+
+    /// Under the video positive field: stream the gate's `/api/expand` rewrite into a review modal
+    /// (Expand), toggle the queue-time expander off (Raw), and hint the terse-prompt contract.
+    fn video_expand_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let connected = matches!(self.conn, Conn::Connected)
+            || self.engine.as_ref().is_some_and(|e| e.is_connected());
+        let busy = self.expand_review.as_ref().is_some_and(|r| !r.done);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    connected && !busy,
+                    egui::Button::new(format!("{} Expand", icons::GENERATE)),
+                )
+                .on_hover_text("Rewrite this terse prompt into full video prose on the server")
+                .clicked()
+            {
+                self.start_expand(ui.ctx(), host);
+            }
+            if busy {
+                ui.add(egui::Spinner::new());
+            }
+            ui.checkbox(&mut self.params.raw_prompt, "Raw")
+                .on_hover_text("Submit verbatim — skip the server's automatic prompt expander");
+        });
+        ui.weak(
+            "Auto-expanded at queue time. Keep it terse: triggers, then 2-3 short action phrases. \
+             Over 500 chars or Raw skips it.",
+        );
+    }
+
+    /// Start a streaming `/api/expand` of the current positive prompt into the review modal.
+    fn start_expand(&mut self, ctx: &egui::Context, host: &Host) {
+        let text = self.params.positive.trim().to_string();
+        if text.is_empty() {
+            self.status = "Expand: the prompt is empty".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else {
+            self.status = "Expand: not connected".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.expand_rx = Some(engine.expand_prompt(text.clone(), cancel.clone()));
+        self.expand_cancel = Some(cancel);
+        self.expand_review =
+            Some(ExpandReview { original: text, streamed: String::new(), done: false, error: None });
+        self.status = "Expanding on server…".into();
+        host.haptic(Haptic::Medium);
+        ctx.request_repaint();
+    }
+
+    /// Drain streamed `/api/expand` tokens into `expand_review` (the worker repaints on each).
+    fn poll_expand(&mut self) {
+        let Some(rx) = self.expand_rx.as_ref() else { return };
+        let mut ended = false;
+        loop {
+            match rx.try_recv() {
+                Ok(ExpandMsg::Delta(tok)) => {
+                    if let Some(r) = self.expand_review.as_mut() {
+                        r.streamed.push_str(&tok);
+                    }
+                }
+                Ok(ExpandMsg::Done) => {
+                    if let Some(r) = self.expand_review.as_mut() {
+                        r.done = true;
+                    }
+                    ended = true;
+                    break;
+                }
+                Ok(ExpandMsg::Error(e)) => {
+                    if let Some(r) = self.expand_review.as_mut() {
+                        r.done = true;
+                        r.error = Some(e);
+                    }
+                    ended = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // A clean Done clears expand_rx first, so reaching here means the worker
+                    // vanished without a terminal message (aborted/panicked): mark it a failure so
+                    // a truncated rewrite can't be Accepted as if it finished.
+                    if let Some(r) = self.expand_review.as_mut() {
+                        if r.error.is_none() {
+                            r.error = Some("expansion interrupted".into());
+                        }
+                        r.done = true;
+                    }
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if ended {
+            self.expand_rx = None;
+        }
+    }
+
+    /// The streaming expand review modal: original vs streamed rewrite as a live comma-segment
+    /// diff. Accept applies the rewrite and turns Raw on (so the queue-time expander leaves it
+    /// alone); Cancel/Discard aborts the stream and keeps the original. On error it shows the
+    /// failure and only Discard is offered — the caller can just submit the original text.
+    fn expand_review_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(review) = self.expand_review.as_ref() else { return };
+        let original = review.original.clone();
+        let streamed = review.streamed.clone();
+        let done = review.done;
+        let error = review.error.clone();
+
+        egui::Area::new(egui::Id::new("expand-scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
+            });
+
+        enum EAct {
+            Accept,
+            Discard,
+        }
+        let mut act: Option<EAct> = None;
+        let streaming = !done;
+        let diff = tags::prompt_diff(&original, &streamed);
+        let has_text = !streamed.trim().is_empty();
+        let max_h = (ctx.content_rect().height() * 0.45).clamp(140.0, 360.0);
+        centered(ctx, egui::Window::new("Expand prompt"))
+            .collapsible(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                if let Some(e) = &error {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(225, 105, 105),
+                        sanitize_ui_text(ui, e),
+                    );
+                    ui.weak("Submit as-is and the server expands it at queue time instead.");
+                } else {
+                    ui.horizontal(|ui| {
+                        if streaming {
+                            ui.add(egui::Spinner::new());
+                            ui.weak("Expanding…");
+                        } else {
+                            ui.weak("Review the rewrite, then accept or discard.");
+                        }
+                    });
+                }
+                crate::theme::scroll_vertical()
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (op, seg) in &diff {
+                                let text = sanitize_ui_text(ui, seg);
+                                match op {
+                                    -1 => ui.label(
+                                        egui::RichText::new(text)
+                                            .color(egui::Color32::from_rgb(225, 105, 105))
+                                            .strikethrough(),
+                                    ),
+                                    1 => ui.label(
+                                        egui::RichText::new(text)
+                                            .color(egui::Color32::from_rgb(110, 200, 120)),
+                                    ),
+                                    _ => ui.label(egui::RichText::new(text).weak()),
+                                };
+                            }
+                        });
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let w = ((ui.available_width() - 4.0) / 2.0).max(60.0);
+                    let size = egui::vec2(w, 32.0);
+                    let can_accept = error.is_none() && done && has_text;
+                    if ui
+                        .add_enabled(
+                            can_accept,
+                            egui::Button::new(format!("{} Accept", icons::CHECK)).min_size(size),
+                        )
+                        .clicked()
+                    {
+                        act = Some(EAct::Accept);
+                    }
+                    let discard = if streaming { "Cancel" } else { "Discard" };
+                    if ui
+                        .add_sized(size, egui::Button::new(format!("{} {discard}", icons::CLOSE)))
+                        .clicked()
+                    {
+                        act = Some(EAct::Discard);
+                    }
+                });
+            });
+
+        match act {
+            Some(EAct::Accept) => {
+                self.params.positive = streamed.trim().to_string();
+                self.params.raw_prompt = true;
+                self.expand_review = None;
+                self.expand_rx = None;
+                if let Some(c) = self.expand_cancel.take() {
+                    c.store(true, Ordering::SeqCst);
+                }
+                self.status = "Expanded prompt applied — Raw is on".into();
+                host.haptic(Haptic::Light);
+            }
+            Some(EAct::Discard) => {
+                self.expand_review = None;
+                self.expand_rx = None;
+                if let Some(c) = self.expand_cancel.take() {
+                    c.store(true, Ordering::SeqCst);
+                }
+                self.status = if streaming { "Expand cancelled".into() } else { "Expand discarded".into() };
+                host.haptic(Haptic::Light);
+            }
+            None => {}
+        }
     }
 
     /// Maintain scrub state; false hides the history gutter (empty history).
@@ -5586,6 +5889,12 @@ impl ComfyApp {
             .desired_width(f32::INFINITY)
             .hint_text(field.hint())
             .show(ui);
+        // A manual edit to the positive invalidates a prior "already expanded" (raw) marker, so
+        // later terse prompts auto-expand again instead of silently submitting verbatim. A direct
+        // assignment (Accept / Use-as-prompt) does not set `changed()`, so it survives that.
+        if field == PromptField::Positive && out.response.changed() && self.params.raw_prompt {
+            self.params.raw_prompt = false;
+        }
         // Tapping anything steals focus at press; collapsing the row mid-press shifts the
         // layout under the finger, so neither a suggestion nor the widget below can complete
         // its click. Hold the row from press through release whenever it was visible when the
@@ -5630,6 +5939,20 @@ impl ComfyApp {
             let mut m = self.tag_suggestions(tok, 8);
             cooc::blend_rank(&mut m, |name| self.cooc.rerank_boost(&present, name));
             m
+        };
+        // Freeze the row the instant a press starts: a focus/cursor flip on press-down would
+        // otherwise recompute (and reorder) it under the finger, inserting whatever slid into
+        // that slot. While a press is in flight, reuse the snapshot taken just before it.
+        let frozen_id = egui::Id::new(("tag_suggest_frozen", field.disc()));
+        let (range, sugg) = if press_in_flight {
+            ui.ctx()
+                .data(|d| {
+                    d.get_temp::<(std::ops::Range<usize>, Vec<(String, u32, u8)>)>(frozen_id)
+                })
+                .unwrap_or((range, sugg))
+        } else {
+            ui.ctx().data_mut(|d| d.insert_temp(frozen_id, (range.clone(), sugg.clone())));
+            (range, sugg)
         };
         if sugg.is_empty() {
             set_alive(ui.ctx(), false);
@@ -7531,17 +7854,15 @@ impl ComfyApp {
                     egui::ComboBox::from_id_salt(("look_kind", li))
                         .selected_text(look.kind.label())
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut look.kind, LookKind::Look, "Look (outfit/pose)");
-                            ui.selectable_value(
-                                &mut look.kind,
+                            ui.selectable_value(&mut look.kind, LookKind::Look, "Look (combined)");
+                            for k in [
+                                LookKind::Outfit,
+                                LookKind::Pose,
                                 LookKind::CameraAngle,
-                                LookKind::CameraAngle.label(),
-                            );
-                            ui.selectable_value(
-                                &mut look.kind,
                                 LookKind::Environment,
-                                LookKind::Environment.label(),
-                            );
+                            ] {
+                                ui.selectable_value(&mut look.kind, k, k.label());
+                            }
                         });
                 });
                 ui.add(
@@ -11195,6 +11516,7 @@ impl ComfyApp {
             Interrupt,
             Delete(String),
             Clear,
+            UsePrompt(String),
         }
         let mut open = true;
         let mut act: Option<QAct> = None;
@@ -11202,6 +11524,9 @@ impl ComfyApp {
         let (running, pending) = &self.queue_jobs;
         let labels: HashMap<&str, &str> =
             self.my_prompts.iter().map(|p| (p.id.as_str(), p.label.as_str())).collect();
+        // Queue-time rewrites (`cg_expanded`) to show under each job that got one.
+        let expanded: HashMap<&str, &str> =
+            self.expanded_prompts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let row_label = |job: &QueueJob| -> String {
             match labels.get(job.prompt_id.as_str()) {
                 Some(l) => format!("Yours · {l}"),
@@ -11270,6 +11595,23 @@ impl ComfyApp {
                                             ui.weak("No embedded metadata for this job.");
                                         }
                                     }
+                                    if let Some(text) = expanded.get(job.prompt_id.as_str()) {
+                                        ui.add_space(4.0);
+                                        egui::CollapsingHeader::new("Expanded prompt")
+                                            .id_salt(("queue_expanded", job.prompt_id.as_str()))
+                                            .default_open(false)
+                                            .show(ui, |ui| {
+                                                ui.weak("The server rewrote your prompt for this job.");
+                                                ui.label(sanitize_ui_text(ui, text));
+                                                if ui
+                                                    .small_button("Use as prompt")
+                                                    .on_hover_text("Copy this into the prompt field (submits verbatim)")
+                                                    .clicked()
+                                                {
+                                                    act = Some(QAct::UsePrompt((*text).to_string()));
+                                                }
+                                            });
+                                    }
                                 });
                         }
                     });
@@ -11325,6 +11667,15 @@ impl ComfyApp {
                 self.status = "Cleared the pending queue".into();
                 host.haptic(Haptic::Warning);
                 self.last_queue_poll = 0.0;
+            }
+            // Copy the server's expanded text back into the prompt; mark Raw so re-submitting it
+            // doesn't feed the already-expanded prose through the queue-time expander again.
+            Some(QAct::UsePrompt(text)) => {
+                self.params.positive = text;
+                self.params.raw_prompt = true;
+                self.queue_sheet_open = false;
+                self.status = "Expanded prompt copied — Raw is on".into();
+                host.haptic(Haptic::Light);
             }
             None => {}
         }
@@ -11782,13 +12133,14 @@ impl ComfyApp {
 
     /// The prompt for a single-axis look by kind + name + origin (empty origin = global).
     fn main_look_prompt(&self, kind: LookKind, name: &str, origin: &str) -> Option<String> {
-        let look = if origin.is_empty() {
-            self.global_looks.iter().find(|l| l.kind == kind && l.name == name)
-        } else {
-            self.characters
+        let look = match origin {
+            "" => self.global_looks.iter().find(|l| l.kind == kind && l.name == name),
+            BUILTIN_ORIGIN => self.builtin_looks.iter().find(|l| l.kind == kind && l.name == name),
+            _ => self
+                .characters
                 .iter()
                 .find(|c| c.name == origin)
-                .and_then(|c| c.looks.iter().find(|l| l.kind == kind && l.name == name))
+                .and_then(|c| c.looks.iter().find(|l| l.kind == kind && l.name == name)),
         }?;
         Some(look.prompt.clone())
     }
@@ -11817,17 +12169,12 @@ impl ComfyApp {
         }
     }
 
-    /// The Create-Main single-axis look section: one combobox per [`LookKind::MAIN`]. Starts
-    /// collapsed until there is something to pick (a preset exists, or one is applied).
+    /// The Create-Main single-axis look section: one combobox per [`LookKind::MAIN`]. Opens by
+    /// default once a look is applied (baked-in presets are always present regardless).
     fn main_look_combos(&mut self, ui: &mut egui::Ui) {
-        let has_any = !self.active_main_looks.is_empty()
-            || LookKind::MAIN.iter().any(|&k| {
-                self.global_looks.iter().any(|l| l.kind == k)
-                    || self.characters.iter().any(|c| c.looks.iter().any(|l| l.kind == k))
-            });
-        egui::CollapsingHeader::new("Camera & environment")
+        egui::CollapsingHeader::new("Outfit, pose, camera & scene")
             .id_salt("create_main_looks")
-            .default_open(has_any)
+            .default_open(!self.active_main_looks.is_empty())
             .show(ui, |ui| {
                 for &kind in LookKind::MAIN {
                     self.main_look_combo(ui, kind);
@@ -11859,6 +12206,23 @@ impl ComfyApp {
                     if ui.selectable_label(cur.is_none(), "None").clicked() {
                         pick = Some(None);
                     }
+                    crate::theme::scroll_vertical()
+                        .max_height(320.0)
+                        .id_salt(("main_look_scroll", kind))
+                        .show(ui, |ui| {
+                    let mut first_builtin = true;
+                    for l in self.builtin_looks.iter().filter(|l| l.kind == kind) {
+                        if first_builtin {
+                            ui.weak("Presets");
+                            first_builtin = false;
+                        }
+                        let is_sel =
+                            cur.as_ref().is_some_and(|(n, o)| o == BUILTIN_ORIGIN && n == &l.name);
+                        let label = sanitize_ui_text(ui, &elide(&l.name, 30));
+                        if ui.selectable_label(is_sel, label).clicked() {
+                            pick = Some(Some((l.name.clone(), BUILTIN_ORIGIN.to_string())));
+                        }
+                    }
                     let mut first_global = true;
                     for l in self.global_looks.iter().filter(|l| l.kind == kind) {
                         if first_global {
@@ -11888,6 +12252,7 @@ impl ComfyApp {
                             }
                         }
                     }
+                        });
                     ui.separator();
                     if ui
                         .button(format!("{} Manage {}", icons::STYLUS, kind.plural().to_lowercase()))
@@ -12205,16 +12570,24 @@ impl ComfyApp {
         }
     }
 
-    /// When the soft keyboard opens, scroll the focused field well clear of the keyboard + bottom
-    /// bars. Growing the target downward lifts the field a full clearance above the viewport bottom.
-    fn scroll_focus_into_view(&self, ui: &egui::Ui) {
-        if !self.kb_open_edge {
+    /// While the soft keyboard is open, pin the focused field near the top of the scroll viewport,
+    /// clear of the keyboard. Fires on the keyboard's open edge and whenever focus moves to another
+    /// field (switching prompts). MUST be called from inside the scroll area, after the fields, so
+    /// this target wins over the TextEdit's own caret-follow.
+    fn scroll_focus_into_view(&mut self, ui: &egui::Ui) {
+        if !self.kb_was_open {
+            self.kb_last_focus = None;
             return;
         }
-        if let Some(id) = ui.ctx().memory(|m| m.focused())
+        let focused = ui.ctx().memory(|m| m.focused());
+        let moved = focused != self.kb_last_focus;
+        self.kb_last_focus = focused;
+        if !(self.kb_open_edge || moved) {
+            return;
+        }
+        if let Some(id) = focused
             && let Some(resp) = ui.ctx().read_response(id)
         {
-            // Pin the focused field near the top of the scroll viewport, well clear of the keyboard.
             ui.scroll_to_rect(resp.rect, Some(egui::Align::TOP));
         }
     }
@@ -12224,6 +12597,7 @@ impl ComfyApp {
         let _ = self.ensure_full_cache_root(host);
         #[cfg(feature = "local-npu")]
         self.rewrite_review_window(ui.ctx());
+        self.expand_review_window(ui.ctx(), host);
         if self.result_view.is_some() {
             let pane = ui.available_rect_before_wrap();
             self.result_viewer(ui, host);
@@ -12279,7 +12653,6 @@ impl ComfyApp {
         }
 
         let pane = ui.available_rect_before_wrap();
-        self.scroll_focus_into_view(ui);
         crate::theme::scroll_vertical()
             .id_salt("create-main-scroll")
             .auto_shrink([false, false])
@@ -12297,7 +12670,10 @@ impl ComfyApp {
                     ui.separator();
                 }
                 ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
-                ui.add_space(12.0);
+                // Trailing space so a field low in the list can still scroll clear of the keyboard,
+                // then scroll AFTER the fields so this target beats the TextEdit's own caret-follow.
+                ui.add_space(if self.kb_was_open { self.kb_height.max(160.0) } else { 12.0 });
+                self.scroll_focus_into_view(ui);
             });
         self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
         self.create_fab(ui.ctx(), host, pane);
@@ -19217,6 +19593,7 @@ impl EguiApp for ComfyApp {
         // Rising edge of the soft keyboard; the shrunk viewport can drop the focused field below
         // the fold, so scroll it back into view (egui only auto-scrolls to the cursor on edits).
         let kb_open = host.keyboard_height() > 1.0;
+        self.kb_height = host.keyboard_height();
         self.kb_open_edge = kb_open && !self.kb_was_open;
         self.kb_was_open = kb_open;
 
@@ -19246,6 +19623,7 @@ impl EguiApp for ComfyApp {
                 p.auto_paused = false;
             }
         }
+        self.poll_expand();
         #[cfg(feature = "local-npu")]
         {
             self.poll_d3_anima();

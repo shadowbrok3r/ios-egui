@@ -143,7 +143,7 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
         clip
     };
 
-    let positive = g.add(CLIPTextEncode::new(p.combined_positive(), clip.clone()));
+    let positive = g.add(CLIPTextEncode::new(p.server_positive(), clip.clone()));
     let negative = g.add(CLIPTextEncode::new(p.negative.clone(), clip.clone()));
     let samples = g.add(KSampler {
         model,
@@ -254,7 +254,7 @@ pub fn build_video(
     let device = (!v.clip_device.trim().is_empty()).then(|| v.clip_device.clone());
     let clip = g.add(CLIPLoader::new(v.clip_name.clone(), v.clip_type.clone(), device));
     let vae = g.add(VAELoader::new(v.vae_name.clone()));
-    let positive = g.add(CLIPTextEncode::new(p.combined_positive(), clip.clone()));
+    let positive = g.add(CLIPTextEncode::new(p.server_positive(), clip.clone()));
     let negative = g.add(CLIPTextEncode::new(p.negative.clone(), clip));
 
     let length = snap_wan_length(v.length);
