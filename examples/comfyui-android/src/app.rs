@@ -686,6 +686,12 @@ struct ExpandReview {
     streamed: String,
     done: bool,
     error: Option<String>,
+    /// Family the rewrite was asked for, for the modal header ("Writing Illustrious tags") — the
+    /// dialect is a guess from the selected model, so the user gets to see which one it was.
+    dialect_label: String,
+    /// Accepting also turns Raw on. Only video is rewritten again at queue time, so only video
+    /// needs the `raw:` opt-out marker; image families are preview-only server-side.
+    raw_on_accept: bool,
 }
 
 /// Rolling per-frame CPU timing, mirrored to logcat (`adb logcat -s comfyui`) so on-device
@@ -5594,25 +5600,32 @@ impl ComfyApp {
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.prompt_field_ui(ui, PromptField::Positive, "Prompt", Some(host));
         ui.horizontal(|ui| self.dup_fix_chip_ui(ui));
-        // Video is the only mode the gate expands, so the Expand/Raw controls live under video.
-        if self.params.mode == Mode::Video {
-            self.video_expand_controls(ui, host);
-        }
+        self.expand_controls(ui, host);
     }
 
-    /// Under the video positive field: stream the gate's `/api/expand` rewrite into a review modal
-    /// (Expand), toggle the queue-time expander off (Raw), and hint the terse-prompt contract.
-    fn video_expand_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
+    /// Under the positive field: stream the gate's `/api/expand` rewrite into a review modal
+    /// (Expand), and — video only — toggle the queue-time expander off (Raw). Video is auto-expanded
+    /// at queue time, so its hint is about staying terse; image families are preview-only
+    /// server-side (a wrong tag rewrite is invisible until the image lands), so Expand is the only
+    /// way an image prompt is ever rewritten.
+    fn expand_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let video = self.params.mode == Mode::Video;
         let connected = matches!(self.conn, Conn::Connected)
             || self.engine.as_ref().is_some_and(|e| e.is_connected());
         let busy = self.expand_review.as_ref().is_some_and(|r| !r.done);
+        let (_, label) = self.expand_dialect();
+        let hover = if video {
+            "Rewrite this terse prompt into full video prose on the server".to_string()
+        } else {
+            format!("Rewrite this terse prompt for {label} on the server")
+        };
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
                     connected && !busy,
                     egui::Button::new(format!("{} Expand", icons::GENERATE)),
                 )
-                .on_hover_text("Rewrite this terse prompt into full video prose on the server")
+                .on_hover_text(hover)
                 .clicked()
             {
                 self.start_expand(ui.ctx(), host);
@@ -5620,13 +5633,49 @@ impl ComfyApp {
             if busy {
                 ui.add(egui::Spinner::new());
             }
-            ui.checkbox(&mut self.params.raw_prompt, "Raw")
-                .on_hover_text("Submit verbatim — skip the server's automatic prompt expander");
+            if video {
+                ui.checkbox(&mut self.params.raw_prompt, "Raw")
+                    .on_hover_text("Submit verbatim — skip the server's automatic prompt expander");
+            }
         });
-        ui.weak(
-            "Auto-expanded at queue time. Keep it terse: triggers, then 2-3 short action phrases. \
-             Over 500 chars or Raw skips it.",
-        );
+        if video {
+            ui.weak(
+                "Auto-expanded at queue time. Keep it terse: triggers, then 2-3 short action \
+                 phrases. Over 500 chars or Raw skips it.",
+            );
+        } else {
+            ui.weak(format!(
+                "Image prompts are never rewritten at queue time. Expand rewrites a terse idea \
+                 for {label} — accept it or discard it."
+            ));
+        }
+    }
+
+    /// What to send as `/api/expand`'s `dialect`, plus a human label for the button/modal.
+    ///
+    /// Video knows its own modality, which no filename reliably carries, so it names the dialect
+    /// key outright. Image prefers the catalog family (Civitai `base_model`) and otherwise hands
+    /// the gate the loader filename to classify — the folder-prefixed names the picker uses
+    /// (`Illustrious/JANKU_v777.safetensors`) are exactly what its classifier reads. An unknown
+    /// value is never an error server-side; it just falls back to the generic prompt.
+    fn expand_dialect(&self) -> (String, String) {
+        if self.params.mode == Mode::Video {
+            return if self.params.video.video_t2v {
+                ("wan-t2v".into(), "Wan text-to-video".into())
+            } else {
+                ("wan-i2v".into(), "Wan image-to-video".into())
+            };
+        }
+        let model = self.params.model_file();
+        let family = crate::types::checkpoint_family(self.checkpoint_catalog.entry(model));
+        match crate::types::expand_dialect_key(&family) {
+            Some(key) => (key.into(), family),
+            // Nothing selected yet: no hint at all, and the gate writes its generic prompt.
+            None if model.trim().is_empty() => (String::new(), "the default dialect".into()),
+            // No catalog entry (or a family the gate has no dialect for): let the gate classify
+            // the filename. We can't name the family, so the label stays vague.
+            None => (model.to_string(), "this model".into()),
+        }
     }
 
     /// Start a streaming `/api/expand` of the current positive prompt into the review modal.
@@ -5642,11 +5691,18 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         };
+        let (dialect, dialect_label) = self.expand_dialect();
         let cancel = Arc::new(AtomicBool::new(false));
-        self.expand_rx = Some(engine.expand_prompt(text.clone(), cancel.clone()));
+        self.expand_rx = Some(engine.expand_prompt(text.clone(), dialect, cancel.clone()));
         self.expand_cancel = Some(cancel);
-        self.expand_review =
-            Some(ExpandReview { original: text, streamed: String::new(), done: false, error: None });
+        self.expand_review = Some(ExpandReview {
+            original: text,
+            streamed: String::new(),
+            done: false,
+            error: None,
+            dialect_label,
+            raw_on_accept: self.params.mode == Mode::Video,
+        });
         self.status = "Expanding on server…".into();
         host.haptic(Haptic::Medium);
         ctx.request_repaint();
@@ -5700,15 +5756,18 @@ impl ComfyApp {
     }
 
     /// The streaming expand review modal: original vs streamed rewrite as a live comma-segment
-    /// diff. Accept applies the rewrite and turns Raw on (so the queue-time expander leaves it
-    /// alone); Cancel/Discard aborts the stream and keeps the original. On error it shows the
-    /// failure and only Discard is offered — the caller can just submit the original text.
+    /// diff. Accept applies the rewrite, and for video also turns Raw on so the queue-time expander
+    /// leaves the accepted text alone; Cancel/Discard aborts the stream and keeps the original. On
+    /// error it shows the failure and only Discard is offered — the caller can just submit the
+    /// original text.
     fn expand_review_window(&mut self, ctx: &egui::Context, host: &Host) {
         let Some(review) = self.expand_review.as_ref() else { return };
         let original = review.original.clone();
         let streamed = review.streamed.clone();
         let done = review.done;
         let error = review.error.clone();
+        let dialect_label = review.dialect_label.clone();
+        let raw_on_accept = review.raw_on_accept;
 
         egui::Area::new(egui::Id::new("expand-scrim"))
             .order(egui::Order::Foreground)
@@ -5737,14 +5796,20 @@ impl ComfyApp {
                         egui::Color32::from_rgb(225, 105, 105),
                         sanitize_ui_text(ui, e),
                     );
-                    ui.weak("Submit as-is and the server expands it at queue time instead.");
+                    ui.weak(if raw_on_accept {
+                        "Submit as-is and the server expands it at queue time instead."
+                    } else {
+                        "Submit as-is — image prompts run exactly as written."
+                    });
                 } else {
                     ui.horizontal(|ui| {
                         if streaming {
                             ui.add(egui::Spinner::new());
-                            ui.weak("Expanding…");
+                            ui.weak(format!("Writing for {dialect_label}…"));
                         } else {
-                            ui.weak("Review the rewrite, then accept or discard.");
+                            ui.weak(format!(
+                                "Written for {dialect_label}. Review it, then accept or discard."
+                            ));
                         }
                     });
                 }
@@ -5797,13 +5862,19 @@ impl ComfyApp {
         match act {
             Some(EAct::Accept) => {
                 self.params.positive = streamed.trim().to_string();
-                self.params.raw_prompt = true;
+                if raw_on_accept {
+                    self.params.raw_prompt = true;
+                }
                 self.expand_review = None;
                 self.expand_rx = None;
                 if let Some(c) = self.expand_cancel.take() {
                     c.store(true, Ordering::SeqCst);
                 }
-                self.status = "Expanded prompt applied — Raw is on".into();
+                self.status = if raw_on_accept {
+                    "Expanded prompt applied — Raw is on".into()
+                } else {
+                    "Expanded prompt applied".into()
+                };
                 host.haptic(Haptic::Light);
             }
             Some(EAct::Discard) => {

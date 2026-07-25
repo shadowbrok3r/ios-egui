@@ -476,9 +476,15 @@ impl Engine {
     /// first token can't trip the browsing timeout. `cancel` aborts the request between chunks
     /// (set it when the user dismisses the review). A non-200 or missing connection arrives as a
     /// single [`ExpandMsg::Error`], and the caller falls back to submitting the original text.
+    ///
+    /// `dialect` tells the gate which model family to write for — either a dialect key
+    /// (`wan-i2v`, `illustrious`, `flux`, …) or just the loader filename, which the gate
+    /// classifies itself. This endpoint gets no graph, so without the hint every family falls back
+    /// to one generic prompt; see [`crate::types::expand_dialect_key`]. Empty omits the field.
     pub fn expand_prompt(
         &self,
         text: String,
+        dialect: String,
         cancel: Arc<AtomicBool>,
     ) -> Receiver<ExpandMsg> {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -486,7 +492,7 @@ impl Engine {
             Some(http) => {
                 let (base, ctx, log) = (self.base.clone(), self.ctx.clone(), self.log.clone());
                 self.rt.spawn(async move {
-                    stream_expand(http, base, text, cancel, tx, ctx, log).await;
+                    stream_expand(http, base, text, dialect, cancel, tx, ctx, log).await;
                 });
             }
             None => {
@@ -2058,16 +2064,48 @@ fn handle_sse_line(line: &[u8], tx: &Sender<ExpandMsg>, ctx: &egui::Context) -> 
     false
 }
 
+/// `POST /api/expand`'s request body. `dialect` is a family key (`wan-i2v`, `illustrious`, …) or
+/// the workflow's loader filename for the gate to classify; it's omitted when empty rather than
+/// sent blank, so an app that can't name a family gets the gate's generic prompt. Older gates
+/// ignore the field, and a value they don't know falls back to that same generic prompt — a
+/// dialect hint is never an error.
+fn expand_body(text: &str, dialect: &str) -> serde_json::Value {
+    let mut body = serde_json::json!({ "text": text });
+    let dialect = dialect.trim();
+    if !dialect.is_empty() {
+        body["dialect"] = serde_json::Value::String(dialect.to_string());
+    }
+    body
+}
+
+/// Why `/api/expand` said no, in words worth showing in the review modal. The gate documents 400
+/// (no text), 502 (expander unreachable), 503 (expansion disabled) and 504 (expander timed out);
+/// a 404 means the server has no expander at all — a plain ComfyUI, or a gate older than the
+/// endpoint — which is worth saying differently from a broken one.
+fn expand_status_hint(status: u16) -> String {
+    match status {
+        400 => "The server rejected this prompt".into(),
+        401 | 403 => "Not signed in — sign in and try again".into(),
+        404 => "This server has no prompt expander".into(),
+        502 => "The prompt expander is unreachable".into(),
+        503 => "Prompt expansion is switched off on the server".into(),
+        504 => "The prompt expander timed out".into(),
+        other => format!("Expand unavailable (HTTP {other})"),
+    }
+}
+
 /// Stream `POST /api/expand`, forwarding each `choices[].delta.content` token as
 /// [`ExpandMsg::Delta`] until `data: [DONE]` (or the stream closes cleanly). Parses OpenAI-style
 /// SSE a line at a time. A non-200 (502/503/504 = expander down/disabled/timed out) or transport
 /// error arrives as a single [`ExpandMsg::Error`]; the caller then submits the original text
 /// unchanged. `cancel` (set when the user dismisses the review) stops between chunks — dropping the
 /// response future aborts the in-flight request.
+#[allow(clippy::too_many_arguments)]
 async fn stream_expand(
     http: reqwest::Client,
     base: String,
     text: String,
+    dialect: String,
     cancel: Arc<AtomicBool>,
     tx: Sender<ExpandMsg>,
     ctx: egui::Context,
@@ -2079,7 +2117,7 @@ async fn stream_expand(
             ctx.request_repaint();
         }};
     }
-    let body = serde_json::json!({ "text": text });
+    let body = expand_body(&text, &dialect);
     let resp = match http.post(format!("{base}/api/expand")).json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -2091,7 +2129,7 @@ async fn stream_expand(
     let status = resp.status();
     if !status.is_success() {
         log.warn(format!("expand unavailable: HTTP {status}"));
-        send!(ExpandMsg::Error(format!("expand unavailable (HTTP {status})")));
+        send!(ExpandMsg::Error(expand_status_hint(status.as_u16())));
         return;
     }
     let mut resp = resp;
@@ -2856,6 +2894,40 @@ mod tests {
 
     fn current(id: Option<&str>) -> CurrentPrompt {
         Arc::new(Mutex::new(id.map(str::to_string)))
+    }
+
+    /// The gate has no graph to read the family from on this endpoint, so a present-but-blank
+    /// `dialect` would be worse than none: the field is omitted unless we can say something.
+    #[test]
+    fn expand_body_only_carries_a_dialect_when_there_is_one() {
+        let terse = "girl on a windowsill at night";
+        assert_eq!(expand_body(terse, ""), serde_json::json!({ "text": terse }));
+        assert_eq!(expand_body(terse, "   "), serde_json::json!({ "text": terse }));
+        assert_eq!(
+            expand_body(terse, " illustrious "),
+            serde_json::json!({ "text": terse, "dialect": "illustrious" })
+        );
+        // A loader filename is a legal dialect too — the gate classifies it into a family.
+        assert_eq!(
+            expand_body(terse, "Illustrious/JANKU_v777.safetensors"),
+            serde_json::json!({ "text": terse, "dialect": "Illustrious/JANKU_v777.safetensors" })
+        );
+    }
+
+    /// Every documented expander failure reads as a sentence, and an undocumented one still says
+    /// which status came back rather than swallowing it.
+    #[test]
+    fn expand_status_hint_names_the_documented_failures() {
+        for (status, want) in [
+            (503u16, "switched off"),
+            (502, "unreachable"),
+            (504, "timed out"),
+            (404, "no prompt expander"),
+        ] {
+            let hint = expand_status_hint(status);
+            assert!(hint.contains(want), "HTTP {status} said {hint:?}");
+        }
+        assert!(expand_status_hint(418).contains("418"));
     }
 
     /// Sign-in hinges entirely on spotting this cookie: comfy-gate answers a wrong password with

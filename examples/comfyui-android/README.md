@@ -22,6 +22,14 @@ sign-in, per-user gallery + albums, server-side model filtering).
 - **Generate tab** — Text → Image and Image → Image (current result or an image URL as input,
   denoise slider), checkpoint/sampler/scheduler menus, steps, CFG, size, seed with random toggle,
   progress + preview, Save to `<app files>/comfyui/`.
+- **Prompt expansion** (comfy-gate) — **Expand** under the positive prompt streams
+  `POST /api/expand` and renders the rewrite as a live diff to accept or discard. The request
+  carries a `dialect` so the rewrite comes back in the family's own idiom: `wan-i2v` / `wan-t2v`
+  for video, and for images the catalog family (Illustrious, Pony, Flux…) or, failing that, the
+  loader filename for the gate to classify. Video prompts are *also* rewritten automatically at
+  queue time, so accepting one turns **Raw** on (a `raw:` marker) to stop the server rewriting it
+  twice; image prompts are never touched at queue time, and this preview is the only way they get
+  rewritten.
 - **Graph tab** — a full node editor (`rucomfyui_node_graph`, egui-snarl) over the server's real
   node catalog:
   - **Workflows** lists the server's saved workflows (`/userdata?dir=workflows`); tap one to open

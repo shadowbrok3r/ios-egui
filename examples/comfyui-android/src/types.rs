@@ -1275,6 +1275,33 @@ pub fn checkpoint_family(entry: Option<&CheckpointEntry>) -> String {
     entry.map(|e| e.family_label()).unwrap_or_else(|| "Other".into())
 }
 
+/// Map a catalog family label ([`checkpoint_family`] / [`pretty_model_family`]) onto a comfy-gate
+/// `POST /api/expand` dialect key, so the rewrite is written in the tag dialect that family wants.
+/// `None` for families the gate has no dialect for (or `"Other"`, i.e. no catalog entry) — the
+/// caller then sends the loader filename instead and lets the gate classify it.
+///
+/// Catalog metadata beats the filename when we have it: `family_label` comes from Civitai's
+/// `base_model`, so a checkpoint filed under a non-obvious name still lands on the right dialect.
+pub fn expand_dialect_key(family: &str) -> Option<&'static str> {
+    let key = family.to_ascii_lowercase().replace([' ', '_', '-', '.'], "");
+    Some(match key.as_str() {
+        // NoobAI is Illustrious-derived and shares its danbooru dialect (as `lint::FAMILY_QUALITY`
+        // already groups them).
+        "illustrious" | "illustriousxl" | "noobai" | "noobaixl" => "illustrious",
+        "pony" | "ponydiffusion" | "ponyxl" => "pony",
+        "anima" => "anima",
+        "fluxkontext" | "flux1kontext" => "flux-kontext",
+        "flux" | "flux1" | "fluxdev" | "flux1dev" | "flux1d" | "fluxschnell" | "flux1schnell"
+        | "flux1s" => "flux",
+        "hunyuan" | "hunyuandit" | "hunyuanvideo" => "hunyuan",
+        "sdxl" | "sdxl10" | "sdxlturbo" | "stablediffusionxl" => "sdxl",
+        "sd15" | "stablediffusion15" => "sd15",
+        "ltxv" | "ltx" => "ltxv",
+        "zimage" => "zimage",
+        _ => return None,
+    })
+}
+
 impl CheckpointCatalog {
     pub fn entry(&self, file: &str) -> Option<&CheckpointEntry> {
         let base = file_basename(file);
@@ -2973,6 +3000,27 @@ mod tests {
         ));
         assert!(!entry.matches_checkpoint("flux1-dev.safetensors", &["flux".into()]));
         assert!(!entry.matches_checkpoint("unknown.safetensors", &[]));
+    }
+
+    /// Only families comfy-gate actually has a dialect for may map; anything else must return
+    /// `None` so the caller falls back to sending the loader filename for the gate to classify.
+    #[test]
+    fn expand_dialect_key_maps_catalog_families_and_rejects_unknowns() {
+        assert_eq!(expand_dialect_key("Illustrious"), Some("illustrious"));
+        assert_eq!(expand_dialect_key("NoobAI"), Some("illustrious"));
+        assert_eq!(expand_dialect_key("Pony"), Some("pony"));
+        assert_eq!(expand_dialect_key("Anima"), Some("anima"));
+        assert_eq!(expand_dialect_key("Flux Schnell"), Some("flux"));
+        assert_eq!(expand_dialect_key("SDXL Turbo"), Some("sdxl"));
+        assert_eq!(expand_dialect_key("SD 1.5"), Some("sd15"));
+        // Labels come out of `pretty_model_family`, so its exact spellings must round-trip.
+        for fam in ["Illustrious", "Pony", "Flux", "SDXL", "SD 1.5", "Hunyuan", "Anima"] {
+            assert_eq!(expand_dialect_key(&pretty_model_family(fam)), expand_dialect_key(fam));
+        }
+        assert_eq!(expand_dialect_key("Other"), None);
+        assert_eq!(expand_dialect_key(""), None);
+        assert_eq!(expand_dialect_key("Qwen"), None);
+        assert_eq!(expand_dialect_key("Chroma"), None);
     }
 
     #[test]
