@@ -69,6 +69,9 @@ pub enum Msg {
     ConnectError(String),
     /// Enhance-chain steps that were skipped or inputs dropped while building the prompt.
     EnhanceNote(String),
+    /// The server took the prompt but will not run all of its output nodes, so the run finishes
+    /// having written nothing. Surfaced on both the Create and Graph tabs.
+    OutputsDropped(String),
     Queued,
     /// The server assigned this prompt id to a job we submitted (server transport only).
     /// Carries the job's display label so it can never be attributed to the wrong submission
@@ -108,6 +111,8 @@ pub enum Msg {
         warnings: Vec<String>,
         /// UI node id → seed input → randomize, from `control_after_generate`.
         seed_randomize: std::collections::BTreeMap<(u64, String), bool>,
+        /// UI node id → input → value, for widgets `/object_info` doesn't declare.
+        extra_widgets: std::collections::BTreeMap<(u64, String), Value>,
     },
     /// A workflow file written to the server.
     WorkflowSaved(String),
@@ -239,6 +244,11 @@ impl Engine {
 
     pub fn inflight(&self) -> usize {
         self.inflight.load(Ordering::SeqCst)
+    }
+
+    /// The prompt id of the most recent job we queued, while it is still in flight.
+    pub fn current_prompt_id(&self) -> Option<String> {
+        self.current_prompt.lock().unwrap().clone()
     }
 
     pub fn is_connected(&self) -> bool {
@@ -399,7 +409,13 @@ impl Engine {
 
     /// Queue an arbitrary API-format workflow (from the graph editor).
     /// `ui_workflow` is the UI-format JSON to embed in the PNG via `extra_pnginfo`.
-    pub fn run_workflow(&mut self, wf: Workflow, ui_workflow: Option<Value>, label: String) {
+    pub fn run_workflow(
+        &mut self,
+        wf: Workflow,
+        ui_workflow: Option<Value>,
+        schemas: Arc<SchemaSet>,
+        label: String,
+    ) {
         let Some(client) = self.client.clone() else {
             let _ = self.tx.send(Msg::GenError("Not connected".into()));
             return;
@@ -414,7 +430,7 @@ impl Engine {
         self.reap_jobs();
         self.jobs.push(self.rt.spawn(async move {
             // Graph-editor jobs always carry a UI workflow, so the direct-POST path is taken anyway.
-            stream_execution(client, wf, ui_workflow, authed, queue_authed, false, label, tx, ctx, log, current).await;
+            stream_execution(client, wf, ui_workflow, schemas, authed, queue_authed, false, label, tx, ctx, log, current).await;
             inflight.fetch_sub(1, Ordering::SeqCst);
         }));
     }
@@ -530,13 +546,22 @@ impl Engine {
         });
     }
 
-    /// Interrupt the currently-executing prompt on the server (`POST /interrupt`, no body).
-    pub fn interrupt(&self) {
+    /// Interrupt one prompt (`POST /interrupt {"prompt_id": …}`), defaulting to our own in-flight
+    /// one. ComfyUI's targeted path only fires while that prompt is still the running one, so it
+    /// cannot land on a job that started in the meantime. With no id to name it sends nothing at
+    /// all: a bodyless interrupt is a process-global kill, and on a shared server the only job it
+    /// could reach in that window belongs to someone else.
+    pub fn interrupt(&self, prompt_id: Option<String>) {
+        let Some(id) = prompt_id.or_else(|| self.current_prompt.lock().unwrap().clone()) else {
+            self.log.warn("interrupt skipped — no prompt of ours is running");
+            return;
+        };
         let Some((http, url)) = self.authed_url("/interrupt", &[]) else { return };
         let log = self.log.clone();
+        let body = serde_json::json!({ "prompt_id": id });
         self.rt.spawn(async move {
-            log.info("POST /interrupt");
-            match http.post(url).send().await {
+            log.info(format!("POST /interrupt {body}"));
+            match http.post(url).json(&body).send().await {
                 Ok(r) => log.info(format!("-> {}", r.status())),
                 Err(e) => log.warn(format!("interrupt failed: {e}")),
             }
@@ -1583,10 +1608,13 @@ fn workflow_msg(name: &str, body: &str, schemas: &SchemaSet, log: &Logger) -> Ms
         uiwf::convert(&value, schemas)
     } else {
         serde_json::from_value::<Workflow>(value)
+            // Numeric COMBOs survive as numbers here; the editor-load path retypes them for the
+            // dropdown, and the queue path retypes them back.
             .map(|workflow| uiwf::Converted {
                 workflow,
                 warnings: Vec::new(),
                 seed_randomize: Default::default(),
+                extra_widgets: Default::default(),
             })
             .map_err(|e| format!("neither UI- nor API-format workflow: {e}"))
     };
@@ -1605,6 +1633,7 @@ fn workflow_msg(name: &str, body: &str, schemas: &SchemaSet, log: &Logger) -> Ms
                 workflow: Box::new(c.workflow),
                 warnings: c.warnings,
                 seed_randomize: c.seed_randomize,
+                extra_widgets: c.extra_widgets,
             }
         }
         Err(e) => {
@@ -1755,7 +1784,7 @@ async fn run_generate(
     // Video POSTs need the long queue timeout even with no linked graph (the gate holds the
     // request open while expanding); image jobs keep the faster streaming path.
     let force_queue_post = params.mode == Mode::Video;
-    stream_execution(client, wf, ui_workflow, authed, queue_authed, force_queue_post, label, tx, ctx, log, current_prompt).await;
+    stream_execution(client, wf, ui_workflow, gcx.schemas, authed, queue_authed, force_queue_post, label, tx, ctx, log, current_prompt).await;
 }
 
 /// Upload the colour-match reference (when any), build the finish graph, and stream it. Mirrors
@@ -1813,11 +1842,63 @@ async fn run_finish_job(
         let _ = tx.send(Msg::EnhanceNote(note));
     }
     // The finish graph carries no positive prompt, so no queue-time expansion holds the request.
-    stream_execution(client, wf, None, authed, queue_authed, false, label, tx, ctx, log, current_prompt).await;
+    stream_execution(client, wf, None, schemas, authed, queue_authed, false, label, tx, ctx, log, current_prompt).await;
 }
 
 /// The gate's queue-time expansion of the positive prompt: node id -> expanded text.
 type CgExpanded = std::collections::BTreeMap<String, String>;
+
+/// What `POST /prompt` answered: the assigned id, the gate's queue-time prompt rewrite, and the
+/// per-node validation failures ComfyUI reports on an otherwise-accepted prompt.
+struct Queued {
+    prompt_id: String,
+    expanded: Option<CgExpanded>,
+    node_errors: Vec<String>,
+}
+
+/// One line per node ComfyUI refused, from a `node_errors` map. A 200 response carrying these has
+/// dropped those output branches and will run the rest.
+fn node_error_lines(v: &Value) -> Vec<String> {
+    let Some(map) = v.get("node_errors").and_then(Value::as_object) else { return Vec::new() };
+    map.iter()
+        .map(|(id, e)| {
+            let class = e.get("class_type").and_then(Value::as_str).unwrap_or("?");
+            let why: Vec<String> = e
+                .get("errors")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|x| {
+                    let msg = x.get("message").and_then(Value::as_str).unwrap_or("invalid");
+                    match x.get("details").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+                        Some(d) => format!("{msg} ({d})"),
+                        None => msg.to_string(),
+                    }
+                })
+                .collect();
+            format!("{class} (node {id}): {}", why.join(", "))
+        })
+        .collect()
+}
+
+/// Read the shared fields out of a `POST /prompt` body.
+fn parse_queue_response(value: &Value, text: &str) -> Result<Queued, String> {
+    let prompt_id = value
+        .get("prompt_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("queue: no prompt_id in {}", head(text, 200)))?
+        .to_string();
+    let expanded = value
+        .get("cg_expanded")
+        .and_then(Value::as_object)
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect::<CgExpanded>()
+        })
+        .filter(|m| !m.is_empty());
+    Ok(Queued { prompt_id, expanded, node_errors: node_error_lines(value) })
+}
 
 /// POST `/prompt` with `extra_pnginfo.workflow` so `SaveImage` embeds the UI JSON in the PNG.
 ///
@@ -1831,7 +1912,7 @@ async fn queue_prompt_with_workflow_meta(
     wf: &Workflow,
     ui_workflow: Option<&Value>,
     log: &Logger,
-) -> Result<(String, Option<CgExpanded>), String> {
+) -> Result<Queued, String> {
     let body = serde_json::json!({
         "prompt": wf,
         "client_id": client.client_id(),
@@ -1842,16 +1923,13 @@ async fn queue_prompt_with_workflow_meta(
         }
     });
     let Some((base, http)) = queue_authed else {
-        #[derive(serde::Deserialize)]
-        struct QueueResult {
-            prompt_id: String,
-        }
-        let result: QueueResult = client
+        let value: Value = client
             .post_json("prompt", &body)
             .await
             .map_err(|e| format!("queue failed: {e}"))?;
-        log.info(format!("queued with workflow meta: {}", result.prompt_id));
-        return Ok((result.prompt_id, None));
+        let queued = parse_queue_response(&value, &value.to_string())?;
+        log.info(format!("queued with workflow meta: {}", queued.prompt_id));
+        return Ok(queued);
     };
 
     let resp = http
@@ -1867,25 +1945,86 @@ async fn queue_prompt_with_workflow_meta(
     }
     let value: Value =
         serde_json::from_str(&text).map_err(|e| format!("queue: bad JSON ({e}): {}", head(&text, 200)))?;
-    let prompt_id = value
-        .get("prompt_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("queue: no prompt_id in {}", head(&text, 200)))?
-        .to_string();
-    let expanded = value
-        .get("cg_expanded")
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect::<CgExpanded>()
-        })
-        .filter(|m| !m.is_empty());
+    let queued = parse_queue_response(&value, &text)?;
     log.info(format!(
-        "queued with workflow meta: {prompt_id}{}",
-        if expanded.is_some() { " (prompt expanded)" } else { "" }
+        "queued with workflow meta: {}{}",
+        queued.prompt_id,
+        if queued.expanded.is_some() { " (prompt expanded)" } else { "" }
     ));
-    Ok((prompt_id, expanded))
+    Ok(queued)
+}
+
+/// The ids of every node in `wf` the server treats as an output (`SaveImage`, `VHS_VideoCombine`,
+/// and the utility nodes that also declare `output_node`).
+fn output_node_ids(wf: &Workflow, schemas: &SchemaSet) -> Vec<u32> {
+    wf.0.iter()
+        .filter(|(_, n)| schemas.nodes.get(&n.class_type).is_some_and(|s| s.output_node))
+        .map(|(id, _)| id.0)
+        .collect()
+}
+
+/// The queued outputs of `wants` the server did NOT schedule, or `None` when the prompt's queue
+/// entry could not be read (it already finished, or `/queue` is unavailable). Queue entries are
+/// `[number, prompt_id, prompt, extra_data, outputs_to_execute]`.
+async fn unscheduled_outputs(
+    authed: &Option<(String, reqwest::Client)>,
+    prompt_id: &str,
+    wants: &[u32],
+) -> Option<Vec<u32>> {
+    let (base, http) = authed.as_ref()?;
+    let resp = http.get(format!("{base}/queue")).send().await.ok()?;
+    let v: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
+    let entry = ["queue_running", "queue_pending"]
+        .iter()
+        .filter_map(|k| v.get(*k)?.as_array())
+        .flatten()
+        .find(|e| e.get(1).and_then(Value::as_str) == Some(prompt_id))?;
+    let scheduled: Vec<String> = entry
+        .get(4)?
+        .as_array()?
+        .iter()
+        .map(|o| o.as_str().map(str::to_string).unwrap_or_else(|| o.to_string()))
+        .collect();
+    Some(wants.iter().copied().filter(|id| !scheduled.contains(&id.to_string())).collect())
+}
+
+/// Say so, loudly, when the server accepted a prompt but will not run all of its outputs. ComfyUI
+/// validates per output node: with only some of them valid it answers 200, drops the rest, and
+/// executes the remainder — a job that holds the GPU for twenty minutes and writes no file.
+///
+/// Detached, because it costs a `/queue` round trip and the caller has an event stream to read.
+fn warn_dropped_outputs(
+    authed: Option<(String, reqwest::Client)>,
+    prompt_id: String,
+    wants: Vec<u32>,
+    node_errors: Vec<String>,
+    tx: Sender<Msg>,
+    ctx: egui::Context,
+    log: Logger,
+) {
+    if wants.is_empty() && node_errors.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let missing = unscheduled_outputs(&authed, &prompt_id, &wants).await.unwrap_or_default();
+        if missing.is_empty() && node_errors.is_empty() {
+            return;
+        }
+        let why = if node_errors.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", node_errors.join("; "))
+        };
+        let note = if missing.is_empty() {
+            format!("Server rejected part of this graph{why}")
+        } else {
+            let ids: Vec<String> = missing.iter().map(u32::to_string).collect();
+            format!("Output node(s) {} will not run — this job saves nothing{why}", ids.join(", "))
+        };
+        log.error(format!("queued but incomplete: {note}"));
+        let _ = tx.send(Msg::OutputsDropped(note));
+        ctx.request_repaint();
+    });
 }
 
 /// Pull `choices[0].delta.content` out of one SSE `data:` payload (OpenAI streaming shape).
@@ -2001,8 +2140,9 @@ async fn stream_expand(
 #[allow(clippy::too_many_arguments)]
 async fn stream_execution(
     client: Client,
-    wf: Workflow,
+    mut wf: Workflow,
     ui_workflow: Option<Value>,
+    schemas: Arc<SchemaSet>,
     authed: Option<(String, reqwest::Client)>,
     queue_authed: Option<(String, reqwest::Client)>,
     // Force the direct-POST path even with no UI workflow, so the long queue timeout covers video
@@ -2023,12 +2163,19 @@ async fn stream_execution(
         }};
     }
 
+    // Last stop before the wire: every producer (Create builder, graph editor, finish pass) carries
+    // COMBO selections as display text, and ComfyUI membership-tests them without coercion.
+    for n in crate::preflight::retype_combo_values(&mut wf, &schemas) {
+        log.info(format!("retype: {n}"));
+    }
+    let wants_outputs = output_node_ids(&wf, &schemas);
+
     // Queue via our own POST when there is UI metadata to embed, or when a video job needs the long
     // queue timeout — then rely on the persistent ws_listener for progress and reconcile_from_history
     // for final images. A bare image job with nothing to embed falls through to execute()'s
     // lower-latency streaming transport instead.
     if ui_workflow.is_some() || force_queue_post {
-        let (prompt_id, expanded) = match queue_prompt_with_workflow_meta(
+        let queued = match queue_prompt_with_workflow_meta(
             &client,
             queue_authed.as_ref(),
             &wf,
@@ -2044,9 +2191,19 @@ async fn stream_execution(
                 return;
             }
         };
+        let Queued { prompt_id, expanded, node_errors } = queued;
         *current_prompt.lock().unwrap() = Some(prompt_id.clone());
         send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone(), expanded });
         send!(Msg::Queued);
+        warn_dropped_outputs(
+            authed.clone(),
+            prompt_id.clone(),
+            wants_outputs,
+            node_errors,
+            tx.clone(),
+            ctx.clone(),
+            log.clone(),
+        );
         let outcome =
             reconcile_from_history(&client, &authed, &prompt_id, &label, &tx, &ctx, &log).await;
         *current_prompt.lock().unwrap() = None;
@@ -2070,6 +2227,16 @@ async fn stream_execution(
     *current_prompt.lock().unwrap() = Some(prompt_id.clone());
     send!(Msg::PromptId { id: prompt_id.clone(), label: label.clone(), expanded: None });
     send!(Msg::Queued);
+    // No response body on this transport, so the queue entry is the only source of truth.
+    warn_dropped_outputs(
+        authed.clone(),
+        prompt_id.clone(),
+        wants_outputs,
+        Vec::new(),
+        tx.clone(),
+        ctx.clone(),
+        log.clone(),
+    );
 
     let mut outcome = None;
     while let Some(event) = execution.next().await {

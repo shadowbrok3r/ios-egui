@@ -16,6 +16,8 @@ use crate::schema::{InputKind, InputSchema, NodeSchema, SchemaSet};
 const VIRTUAL: &[&str] = &["Reroute", "Note", "MarkdownNote", "PrimitiveNode", "SetNode", "GetNode"];
 /// The phantom widget value the frontend stores after a seed widget.
 const SEED_CONTROLS: &[&str] = &["fixed", "increment", "decrement", "randomize"];
+/// Dict-form `widgets_values` keys that are frontend state, not node inputs.
+const UI_ONLY_WIDGETS: &[&str] = &["videopreview", "control_after_generate"];
 /// Bypassed nodes (frontend splices matching-type links straight through them).
 const MODE_BYPASS: u64 = 4;
 /// Muted nodes (produce nothing).
@@ -26,6 +28,9 @@ pub struct Converted {
     pub warnings: Vec<String>,
     /// UI/API node id → seed input name → randomize (`control_after_generate == "randomize"`).
     pub seed_randomize: BTreeMap<(u64, String), bool>,
+    /// UI/API node id → input name → value, for widgets `/object_info` doesn't declare. The editor
+    /// builds its widgets from the schema, so these have to ride alongside it to reach the wire.
+    pub extra_widgets: BTreeMap<(u64, String), Value>,
 }
 
 /// Where a link's value ultimately comes from after skipping virtual/bypassed nodes.
@@ -54,6 +59,7 @@ pub fn convert(ui: &Value, schemas: &SchemaSet) -> Result<Converted, String> {
 
     let mut out: BTreeMap<WorkflowNodeId, WorkflowNode> = BTreeMap::new();
     let mut seed_randomize: BTreeMap<(u64, String), bool> = BTreeMap::new();
+    let mut extra_widgets: BTreeMap<(u64, String), Value> = BTreeMap::new();
 
     for (&id, node) in &by_id {
         let ty = node_type(node);
@@ -99,6 +105,17 @@ pub fn convert(ui: &Value, schemas: &SchemaSet) -> Result<Converted, String> {
         }
         if let Some(extra) = values.leftover() {
             warnings.push(format!("{ty} (id {id}): {extra} unused widget value(s)"));
+        }
+        // The VideoHelperSuite family stores widgets by name and carries format-dependent widgets
+        // (crf, pix_fmt, save_metadata) that `/object_info` never declares. Reconstructing the node
+        // from known keys alone drops those, and it silently re-encodes at its own defaults.
+        for (name, v) in values.undeclared(schema) {
+            if !wnode.inputs.contains_key(name)
+                && let Some(wi) = crate::preflight::input_of(v)
+            {
+                wnode.add_input(name.clone(), wi);
+                extra_widgets.insert((id, name.clone()), v.clone());
+            }
         }
 
         // Connected inputs.
@@ -166,6 +183,7 @@ pub fn convert(ui: &Value, schemas: &SchemaSet) -> Result<Converted, String> {
         workflow: Workflow::new(out),
         warnings,
         seed_randomize,
+        extra_widgets,
     })
 }
 
@@ -362,6 +380,18 @@ impl<'a> WidgetValues<'a> {
             _ => None,
         }
     }
+
+    /// Dict-form entries the schema doesn't declare, minus frontend-only state. Empty for array
+    /// form, whose trailing extras have no names to forward under.
+    fn undeclared(&self, schema: &NodeSchema) -> Vec<(&'a String, &'a Value)> {
+        let Self::Dict(map) = self else { return Vec::new() };
+        map.iter()
+            .filter(|(k, _)| {
+                !UI_ONLY_WIDGETS.contains(&k.as_str())
+                    && !schema.inputs.iter().any(|i| i.name == **k)
+            })
+            .collect()
+    }
 }
 
 /// Coerce a widget JSON value into a [`WorkflowInput`] matching the schema kind.
@@ -409,7 +439,7 @@ fn coerce_or_text(kind: &InputKind, v: &Value) -> Option<WorkflowInput> {
 /// still queue.
 fn default_input(kind: &InputKind) -> Option<WorkflowInput> {
     match kind {
-        InputKind::Enum { options, default } => default
+        InputKind::Enum { options, default, .. } => default
             .clone()
             .or_else(|| options.first().cloned())
             .map(WorkflowInput::String),
@@ -990,6 +1020,85 @@ mod tests {
         // Missing widget values fall back to schema defaults.
         assert_eq!(ks.inputs["cfg"], WorkflowInput::F64(8.0));
         assert_eq!(ks.inputs["scheduler"], WorkflowInput::String("normal".into()));
+    }
+
+    /// The VideoHelperSuite family stores widgets by name and adds format-dependent ones the
+    /// server never declares. Dropping them re-encodes at the node's own defaults, silently
+    /// changing quality and pixel format.
+    #[test]
+    fn undeclared_dict_widget_keys_are_forwarded() {
+        let schemas = schema::parse(
+            &serde_json::from_str(
+                r#"{"VHS_VideoCombine": {"input": {"required": {
+                    "images": ["IMAGE"],
+                    "frame_rate": ["FLOAT", {"default": 8.0}],
+                    "filename_prefix": ["STRING", {"default": "AnimateDiff"}],
+                    "format": [["video/h264-mp4"]]
+                }}, "output": [], "output_name": [], "output_is_list": []}}"#,
+            )
+            .unwrap(),
+        );
+        let ui = serde_json::json!({
+            "nodes": [{"id": 1, "type": "VHS_VideoCombine", "mode": 0, "widgets_values": {
+                "frame_rate": 32,
+                "format": "video/h264-mp4",
+                "crf": 19,
+                "pix_fmt": "yuv420p",
+                "save_metadata": true,
+                "trim_to_audio": false,
+                "control_after_generate": "randomize",
+                "videopreview": {"hidden": false, "params": {"filename": "x.mp4"}}
+            }}],
+            "links": []
+        });
+        let n = &convert(&ui, &schemas).unwrap().workflow.0[&WorkflowNodeId(1)];
+        // The four undeclared encoder settings survive with their own JSON types.
+        assert_eq!(n.inputs["crf"], WorkflowInput::I64(19));
+        assert_eq!(n.inputs["pix_fmt"], WorkflowInput::String("yuv420p".into()));
+        assert_eq!(n.inputs["save_metadata"], WorkflowInput::Boolean(true));
+        assert_eq!(n.inputs["trim_to_audio"], WorkflowInput::Boolean(false));
+        // Frontend state is not an input.
+        assert!(!n.inputs.contains_key("videopreview"));
+        assert!(!n.inputs.contains_key("control_after_generate"));
+        // Declared keys still come from the schema pass, not the forwarding one.
+        assert_eq!(n.inputs["frame_rate"], WorkflowInput::F64(32.0));
+        assert_eq!(n.inputs["filename_prefix"], WorkflowInput::String("AnimateDiff".into()));
+    }
+
+    /// The `RIFE VFI.scale_factor` chain end to end: whatever spelling the workflow file used, the
+    /// queued prompt must carry the number the server's option list holds — never `options[0]`,
+    /// and never a string.
+    #[test]
+    fn a_numeric_combo_survives_conversion_as_a_number() {
+        let schemas = schema::parse(
+            &serde_json::from_str(
+                r#"{"RIFE VFI": {"input": {"required": {
+                    "frames": ["IMAGE"],
+                    "ckpt_name": [["rife49.pth"]],
+                    "clear_cache_after_n_frames": ["INT", {"default": 10}],
+                    "multiplier": ["INT", {"default": 2}],
+                    "fast_mode": ["BOOLEAN", {"default": true}],
+                    "ensemble": ["BOOLEAN", {"default": true}],
+                    "scale_factor": [[0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0}]
+                }}, "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        );
+        // The integer spelling is the one that used to become "0.25".
+        for stored in [serde_json::json!(1), serde_json::json!(1.0), serde_json::json!("1.0")] {
+            let ui = serde_json::json!({
+                "nodes": [{"id": 25, "type": "RIFE VFI", "mode": 0,
+                    "widgets_values": ["rife49.pth", 10, 2, false, true, stored]}],
+                "links": []
+            });
+            let mut wf = convert(&ui, &schemas).unwrap().workflow;
+            crate::preflight::retype_combo_values(&mut wf, &schemas);
+            assert_eq!(
+                wf.0[&WorkflowNodeId(25)].inputs["scale_factor"],
+                WorkflowInput::F64(1.0),
+                "stored as {stored}"
+            );
+        }
     }
 
     /// Real server workflows: set WORKFLOW_UI_JSON to a colon-separated list of UI-format files

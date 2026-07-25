@@ -2,10 +2,11 @@
 //! failures ComfyUI rejects a prompt for — a required typed socket with no source, and an enum
 //! widget whose value isn't installed — so the user gets a clear message instead of an opaque
 //! server error after the network round trip. Also snaps file-path/case mismatches to the one
-//! installed file they obviously mean. Pure.
+//! installed file they obviously mean, and restores the JSON type of numeric COMBO values. Pure.
 
 use rucomfyui::Workflow;
 use rucomfyui::workflow::WorkflowInput;
+use serde_json::Value;
 
 use crate::schema::{InputKind, SchemaSet};
 
@@ -86,6 +87,78 @@ pub fn snap_installed_enums(wf: &mut Workflow, schemas: &SchemaSet) -> Vec<Strin
         }
     }
     notes
+}
+
+/// Restore the JSON type of COMBO values whose options are not strings (`RIFE VFI.scale_factor`
+/// offers `[0.25, 0.5, 1.0, 2.0, 4.0]`). ComfyUI membership-tests a COMBO value with no coercion,
+/// so `"1.0"` fails a list of numbers, while the editor and the UI-workflow converter both carry
+/// every selection as display text. All-string option lists are left alone, as is a value naming
+/// no option. Returns repair notes.
+pub fn retype_combo_values(wf: &mut Workflow, schemas: &SchemaSet) -> Vec<String> {
+    let mut notes = Vec::new();
+    for node in wf.0.values_mut() {
+        let Some(schema) = schemas.nodes.get(&node.class_type) else { continue };
+        for input in &schema.inputs {
+            let Some(text) = node.inputs.get(&input.name).and_then(scalar_text) else { continue };
+            let Some(typed) = input.kind.enum_typed_value(&text) else { continue };
+            let Some(want) = input_of(typed) else { continue };
+            if node.inputs.get(&input.name) == Some(&want) {
+                continue;
+            }
+            notes.push(format!("{}: {} '{text}' -> {typed}", node.class_type, input.name));
+            node.inputs.insert(input.name.clone(), want);
+        }
+    }
+    notes
+}
+
+/// The inverse of [`retype_combo_values`], for a workflow on its way INTO the graph editor: render
+/// a numeric COMBO value as the display text the schema lists it under. The editor's dropdown only
+/// binds to a string, so an API-format workflow's `scale_factor: 1.0` otherwise collapses the
+/// widget to an empty text box, losing the option list and the value with it. Returns repair notes.
+pub fn display_combo_values(wf: &mut Workflow, schemas: &SchemaSet) -> Vec<String> {
+    let mut notes = Vec::new();
+    for node in wf.0.values_mut() {
+        let Some(schema) = schemas.nodes.get(&node.class_type) else { continue };
+        for input in &schema.inputs {
+            if !matches!(input.kind, InputKind::Enum { .. }) {
+                continue;
+            }
+            let Some(cur) = node.inputs.get(&input.name) else { continue };
+            if matches!(cur, WorkflowInput::String(_) | WorkflowInput::Slot(..)) {
+                continue;
+            }
+            let Some(text) = scalar_text(cur) else { continue };
+            let named = input.kind.enum_option_text(&text).unwrap_or(&text).to_string();
+            notes.push(format!("{}: {} {text} -> '{named}'", node.class_type, input.name));
+            node.inputs.insert(input.name.clone(), WorkflowInput::String(named));
+        }
+    }
+    notes
+}
+
+/// The display text of a literal input; `None` for a connected socket.
+fn scalar_text(v: &WorkflowInput) -> Option<String> {
+    match v {
+        WorkflowInput::String(s) => Some(s.clone()),
+        WorkflowInput::I64(i) => Some(i.to_string()),
+        WorkflowInput::U64(u) => Some(u.to_string()),
+        WorkflowInput::F64(f) => Some(f.to_string()),
+        WorkflowInput::Boolean(b) => Some(b.to_string()),
+        WorkflowInput::Slot(..) => None,
+    }
+}
+
+/// A scalar JSON value as the [`WorkflowInput`] that serializes back to it.
+pub fn input_of(v: &Value) -> Option<WorkflowInput> {
+    Some(match v {
+        Value::String(s) => WorkflowInput::String(s.clone()),
+        Value::Bool(b) => WorkflowInput::Boolean(*b),
+        Value::Number(n) if n.is_i64() => WorkflowInput::I64(n.as_i64()?),
+        Value::Number(n) if n.is_u64() => WorkflowInput::U64(n.as_u64()?),
+        Value::Number(n) => WorkflowInput::F64(n.as_f64()?),
+        Value::Null | Value::Array(_) | Value::Object(_) => return None,
+    })
 }
 
 /// Validate `wf` against `schemas`. Nodes whose class the schema doesn't know are skipped (custom
@@ -169,6 +242,22 @@ mod tests {
         Workflow::new([(WorkflowNodeId(id), node(class, inputs))])
     }
 
+    /// `RIFE VFI` as ComfyUI-Frame-Interpolation declares it: a COMBO of strings, one of floats,
+    /// and one of bools.
+    fn combo_schemas() -> SchemaSet {
+        crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"RIFE VFI": {"input": {"required": {
+                "frames": ["IMAGE"],
+                "ckpt_name": [["rife49.pth", "rife47.pth"]],
+                "scale_factor": [[0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0}],
+                "fast_mode": [[false, true], {"default": false}]
+            }}, "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        )
+    }
+
     #[test]
     fn flags_missing_required_socket() {
         let wf = wf_of(5, "VAEEncode", &[("vae", WorkflowInput::slot(WorkflowNodeId(2), 0))]);
@@ -226,6 +315,103 @@ mod tests {
         // A primitive feeding ckpt_name arrives as a Slot, not a literal; the server resolves it.
         let wf = wf_of(1, "CheckpointLoaderSimple", &[("ckpt_name", WorkflowInput::slot(WorkflowNodeId(9), 0))]);
         assert!(validate(&wf, &schemas()).is_empty());
+    }
+
+    /// `RIFE VFI.scale_factor` offers JSON numbers, and ComfyUI membership-tests a COMBO value
+    /// without coercion — `"1.0"` is rejected where `1.0` passes. Every spelling the app might
+    /// carry has to land on the option's own JSON.
+    #[test]
+    fn a_numeric_combo_leaves_as_a_number_however_it_arrived() {
+        for arrived in [
+            WorkflowInput::String("1.0".into()),
+            WorkflowInput::String("1".into()),
+            WorkflowInput::I64(1),
+            WorkflowInput::U64(1),
+            WorkflowInput::F64(1.0),
+        ] {
+            let mut wf = wf_of(25, "RIFE VFI", &[("scale_factor", arrived.clone())]);
+            retype_combo_values(&mut wf, &combo_schemas());
+            assert_eq!(
+                wf.0[&WorkflowNodeId(25)].inputs["scale_factor"],
+                WorkflowInput::F64(1.0),
+                "arrived as {arrived:?}"
+            );
+        }
+        // And it serializes as a JSON number, which is what the server actually reads.
+        let mut wf = wf_of(25, "RIFE VFI", &[("scale_factor", WorkflowInput::String("1.0".into()))]);
+        retype_combo_values(&mut wf, &combo_schemas());
+        assert!(serde_json::to_string(&wf).unwrap().contains(r#""scale_factor":1.0"#));
+    }
+
+    /// The blast radius is COMBOs whose options are not strings; everything else is already right
+    /// and must not be touched.
+    #[test]
+    fn retype_leaves_string_combos_sockets_and_unknown_values_alone() {
+        let schemas = combo_schemas();
+        let untouched: &[(&str, WorkflowInput)] = &[
+            // A COMBO of strings: already correct.
+            ("ckpt_name", WorkflowInput::String("rife49.pth".into())),
+            // Names no option — the user's value survives rather than being reinterpreted.
+            ("scale_factor", WorkflowInput::String("8.0".into())),
+        ];
+        for (name, v) in untouched {
+            let mut wf = wf_of(1, "RIFE VFI", &[(name, v.clone())]);
+            assert!(retype_combo_values(&mut wf, &schemas).is_empty(), "{name} was rewritten");
+            assert_eq!(wf.0[&WorkflowNodeId(1)].inputs[*name], *v);
+        }
+        // A connected socket carries no literal to retype.
+        let mut wf = wf_of(1, "RIFE VFI", &[("scale_factor", WorkflowInput::slot(WorkflowNodeId(9), 0))]);
+        assert!(retype_combo_values(&mut wf, &schemas).is_empty());
+        // An unknown class is left whole — we cannot judge a node we have no schema for.
+        let mut wf = wf_of(1, "SomeCustomNode", &[("x", WorkflowInput::String("1.0".into()))]);
+        assert!(retype_combo_values(&mut wf, &schemas).is_empty());
+    }
+
+    /// Bool COMBOs have the same defect: `"true"` is not `True` to Python's `in`.
+    #[test]
+    fn a_bool_combo_leaves_as_a_bool() {
+        let mut wf = wf_of(3, "RIFE VFI", &[("fast_mode", WorkflowInput::String("true".into()))]);
+        let notes = retype_combo_values(&mut wf, &combo_schemas());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(wf.0[&WorkflowNodeId(3)].inputs["fast_mode"], WorkflowInput::Boolean(true));
+    }
+
+    /// Loading the other way: the editor's dropdown binds to the schema's display text, so a
+    /// number coming out of an API-format workflow has to be rendered as that text.
+    #[test]
+    fn display_renders_a_numeric_combo_as_its_option_text() {
+        let schemas = combo_schemas();
+        for (arrived, want) in [
+            (WorkflowInput::F64(1.0), "1.0"),
+            (WorkflowInput::I64(1), "1.0"),
+            (WorkflowInput::F64(0.25), "0.25"),
+            // Names no option: kept verbatim rather than snapped to something else.
+            (WorkflowInput::F64(8.0), "8"),
+        ] {
+            let mut wf = wf_of(4, "RIFE VFI", &[("scale_factor", arrived.clone())]);
+            display_combo_values(&mut wf, &schemas);
+            assert_eq!(
+                wf.0[&WorkflowNodeId(4)].inputs["scale_factor"],
+                WorkflowInput::String(want.into()),
+                "arrived as {arrived:?}"
+            );
+        }
+        // A value already in display form, and a socket, are both left alone.
+        let mut wf = wf_of(4, "RIFE VFI", &[
+            ("scale_factor", WorkflowInput::String("2.0".into())),
+            ("frames", WorkflowInput::slot(WorkflowNodeId(9), 0)),
+        ]);
+        assert!(display_combo_values(&mut wf, &schemas).is_empty());
+    }
+
+    /// Round trip: display text -> editor -> wire. The user's setting must survive both hops.
+    #[test]
+    fn display_and_retype_round_trip() {
+        let schemas = combo_schemas();
+        let mut wf = wf_of(5, "RIFE VFI", &[("scale_factor", WorkflowInput::F64(2.0))]);
+        display_combo_values(&mut wf, &schemas);
+        retype_combo_values(&mut wf, &schemas);
+        assert_eq!(wf.0[&WorkflowNodeId(5)].inputs["scale_factor"], WorkflowInput::F64(2.0));
     }
 
     #[test]

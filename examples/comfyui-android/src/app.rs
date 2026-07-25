@@ -569,6 +569,10 @@ struct GraphDoc {
     bypassed: HashSet<NodeId>,
     /// Per seed / noise_seed widget: `true` = randomize before each queue (`control_after_generate`).
     seed_randomize: HashMap<(NodeId, String), bool>,
+    /// Widgets `/object_info` doesn't declare (the VideoHelperSuite encoder settings), as
+    /// `(class, value)`. The editor builds from the schema and cannot hold them, so they wait here
+    /// and are re-attached to the prompt at queue time.
+    extra_widgets: HashMap<(NodeId, String), (String, serde_json::Value)>,
     /// Bumped whenever the snarl is replaced, so stale node ids can be detected.
     epoch: u64,
     /// Undo/redo for this tab. Per-tab: tabs are independent documents.
@@ -621,6 +625,7 @@ impl GraphDoc {
             props_node: None,
             bypassed: HashSet::new(),
             seed_randomize: HashMap::new(),
+            extra_widgets: HashMap::new(),
             epoch: 0,
             history: crate::history::History::default(),
             history_rebase: false,
@@ -640,6 +645,7 @@ impl GraphDoc {
         self.props_node = None;
         self.bypassed.clear();
         self.seed_randomize.clear();
+        self.extra_widgets.clear();
         self.load_warnings.clear();
         self.view.reset();
         // Snarl ids restart at 0 on a fresh graph, so anything holding old ids must be stale.
@@ -1926,6 +1932,14 @@ impl ComfyApp {
     ) -> Result<(), String> {
         let schemas = self.schemas.as_ref().ok_or_else(|| "not connected".to_string())?;
         let object_info = schema::to_object_info(schemas);
+        // The editor binds a dropdown only to a string, so a numeric COMBO — API-format workflows
+        // and the Create builders both emit them — would rebuild the widget as an empty text box,
+        // losing the option list and the value with it. Hand it the schema's display text instead.
+        let mut workflow = workflow.clone();
+        let repairs = crate::preflight::display_combo_values(&mut workflow, schemas);
+        for n in repairs {
+            self.log.info(format!("repair: {n}"));
+        }
         let doc = self.graph_tabs.get_mut(idx).ok_or_else(|| "no graph tab".to_string())?;
         doc.graph.object_info = object_info;
         let auto = self.auto_arrange;
@@ -1935,9 +1949,10 @@ impl ComfyApp {
         doc.props_node = None;
         doc.bypassed.clear();
         doc.seed_randomize.clear();
+        doc.extra_widgets.clear();
         doc.view.reset();
         doc.epoch += 1;
-        doc.graph.load_api_workflow(workflow).map_err(|e| e.to_string())?;
+        doc.graph.load_api_workflow(&workflow).map_err(|e| e.to_string())?;
         doc.name = name;
         if auto {
             // Defer until the canvas paints — Create sync / off-tab loads never call `show`.
@@ -1950,13 +1965,15 @@ impl ComfyApp {
         Ok(())
     }
 
-    /// Like [`Self::replace_workflow_in_tab`], then apply seed-randomize flags from a UI load or Create.
+    /// Like [`Self::replace_workflow_in_tab`], then apply seed-randomize flags and undeclared
+    /// widget values from a UI load or Create.
     fn replace_workflow_in_tab_with_seeds(
         &mut self,
         idx: usize,
         name: String,
         workflow: &rucomfyui::Workflow,
         seed_randomize: &std::collections::BTreeMap<(u64, String), bool>,
+        extra_widgets: &std::collections::BTreeMap<(u64, String), serde_json::Value>,
         default_randomize: Option<bool>,
     ) -> Result<(), String> {
         self.replace_workflow_in_tab(idx, name, workflow)?;
@@ -1973,6 +1990,12 @@ impl ComfyApp {
                 &mut doc.seed_randomize,
             );
         }
+        graphview::apply_extra_widgets_from_workflow(
+            &doc.graph.snarl,
+            workflow,
+            extra_widgets,
+            &mut doc.extra_widgets,
+        );
         Ok(())
     }
 
@@ -1990,6 +2013,7 @@ impl ComfyApp {
         name: String,
         workflow: &rucomfyui::Workflow,
         seed_randomize: &std::collections::BTreeMap<(u64, String), bool>,
+        extra_widgets: &std::collections::BTreeMap<(u64, String), serde_json::Value>,
         default_randomize: Option<bool>,
     ) -> Result<(), String> {
         let schemas = self.schemas.as_ref().ok_or_else(|| "not connected".to_string())?;
@@ -2004,7 +2028,14 @@ impl ComfyApp {
             doc.graph.object_info = object_info;
         }
         let idx = self.active_graph;
-        self.replace_workflow_in_tab_with_seeds(idx, name, workflow, seed_randomize, default_randomize)
+        self.replace_workflow_in_tab_with_seeds(
+            idx,
+            name,
+            workflow,
+            seed_randomize,
+            extra_widgets,
+            default_randomize,
+        )
     }
 
     fn close_graph_tab(&mut self, idx: usize) {
@@ -2408,6 +2439,17 @@ impl ComfyApp {
                 host.haptic(Haptic::Error);
             }
             Msg::EnhanceNote(note) => self.enhance_note = note,
+            // A run that will save nothing has to reach whichever tab queued it: the Graph tab's
+            // toast, and the Create tab's pinned row, appended so an enhance note can't erase it.
+            Msg::OutputsDropped(note) => {
+                self.graph_status = note.clone();
+                if !self.enhance_note.contains(&note) {
+                    if !self.enhance_note.is_empty() {
+                        self.enhance_note.push_str(" — ");
+                    }
+                    self.enhance_note.push_str(&note);
+                }
+            }
             Msg::Queued => {
                 // PromptId arrives just before Queued, so the freshest prompt reflects this job;
                 // surface an expansion here since a status set in the PromptId arm is overwritten.
@@ -2645,14 +2687,20 @@ impl ComfyApp {
                 self.wf_loading = false;
                 self.wf_names = names;
             }
-            Msg::WorkflowLoaded { name, workflow, warnings, seed_randomize } => {
+            Msg::WorkflowLoaded { name, workflow, warnings, seed_randomize, extra_widgets } => {
                 self.wf_loading = false;
                 self.executing = None;
                 // A load can replace/create the active doc; any open graph modal referencing the
                 // old doc's node ids is now stale.
                 self.preflight_problems = None;
                 self.dup_run = None;
-                match self.load_workflow_into_tab_with_seeds(name, &workflow, &seed_randomize, None) {
+                match self.load_workflow_into_tab_with_seeds(
+                    name,
+                    &workflow,
+                    &seed_randomize,
+                    &extra_widgets,
+                    None,
+                ) {
                     Ok(()) => {
                         if !warnings.is_empty() {
                             self.log.warn(format!(
@@ -3376,6 +3424,21 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         }
+        // Widgets the editor never built (VHS encoder settings absent from /object_info) come back
+        // here rather than through the canvas. `export_ui` numbers nodes `snarl id + 1`.
+        if let Some(doc) = self.active_doc() {
+            for ((nid, name), (class, v)) in &doc.extra_widgets {
+                let wid = WorkflowNodeId((nid.0 as u32).saturating_add(1));
+                let Some(node) = wf.0.get_mut(&wid) else { continue };
+                // A snarl id freed by a delete can be handed to a different node.
+                if node.class_type != *class || node.inputs.contains_key(name) {
+                    continue;
+                }
+                if let Some(wi) = crate::preflight::input_of(v) {
+                    node.inputs.insert(name.clone(), wi);
+                }
+            }
+        }
         // Repairs: snap stale file paths / clip types to what this server actually has installed.
         for n in crate::preflight::snap_installed_enums(&mut wf, &schemas) {
             self.log.info(format!("repair: {n}"));
@@ -3469,8 +3532,11 @@ impl ComfyApp {
             "Queued".into()
         };
         self.graph_status.clear();
+        // A previous run's dropped-output warning must not read as this one's.
+        self.enhance_note.clear();
         self.last_graph_fp = Some(fp);
-        self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json), label);
+        let schemas = self.schemas.clone().unwrap_or_default();
+        self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json), schemas, label);
         host.haptic(Haptic::Medium);
     }
 
@@ -3511,12 +3577,14 @@ impl ComfyApp {
                 "create.json".into(),
                 &wf,
                 &Default::default(),
+                &Default::default(),
                 Some(self.params.randomize_seed),
             )
         } else {
             self.load_workflow_into_tab_with_seeds(
                 "create.json".into(),
                 &wf,
+                &Default::default(),
                 &Default::default(),
                 Some(self.params.randomize_seed),
             )
@@ -3596,6 +3664,7 @@ impl ComfyApp {
                 idx,
                 "create.json".into(),
                 &wf,
+                &Default::default(),
                 &Default::default(),
                 Some(self.params.randomize_seed),
             )
@@ -11513,7 +11582,7 @@ impl ComfyApp {
             return;
         }
         enum QAct {
-            Interrupt,
+            Interrupt(String),
             Delete(String),
             Clear,
             UsePrompt(String),
@@ -11580,11 +11649,11 @@ impl ComfyApp {
                                                     .small_button(format!("{} Cancel", icons::CLOSE))
                                                     .clicked()
                                                 {
-                                                    act = if is_running {
-                                                        Some(QAct::Interrupt)
+                                                    act = Some(if is_running {
+                                                        QAct::Interrupt(job.prompt_id.clone())
                                                     } else {
-                                                        Some(QAct::Delete(job.prompt_id.clone()))
-                                                    };
+                                                        QAct::Delete(job.prompt_id.clone())
+                                                    });
                                                 }
                                             },
                                         );
@@ -11645,9 +11714,9 @@ impl ComfyApp {
             self.queue_clear_arm = false;
         }
         match act {
-            Some(QAct::Interrupt) => {
+            Some(QAct::Interrupt(id)) => {
                 if let Some(e) = self.engine.as_ref() {
-                    e.interrupt();
+                    e.interrupt(Some(id));
                 }
                 self.status = "Interrupted the running job".into();
                 host.haptic(Haptic::Warning);
@@ -12829,9 +12898,28 @@ impl ComfyApp {
             .filter(|j| ours.contains(j.prompt_id.as_str()))
             .map(|j| j.prompt_id.clone())
             .collect();
+        // `current_prompt` holds whichever job POSTed last, which with several variants in flight
+        // is a pending one, not the one on the GPU. Name every job of ours the queue says is
+        // running as well — ComfyUI's targeted interrupt is a no-op unless that prompt is the
+        // running one, so naming several is safe and survives a stale queue snapshot.
+        let mut running_ours: Vec<String> = self
+            .queue_jobs
+            .0
+            .iter()
+            .filter(|j| ours.contains(j.prompt_id.as_str()))
+            .map(|j| j.prompt_id.clone())
+            .collect();
         if let Some(engine) = self.engine.as_mut() {
+            if let Some(live) = engine.current_prompt_id()
+                && !running_ours.contains(&live)
+            {
+                running_ours.push(live);
+            }
+            // Interrupt before cancel(): cancel() drops the id the fallback reads.
+            for id in running_ours {
+                engine.interrupt(Some(id));
+            }
             engine.cancel();
-            engine.interrupt();
             engine.queue_delete(pending_ours);
             host.haptic(Haptic::Warning);
         }
@@ -13908,6 +13996,7 @@ impl ComfyApp {
         graphview::bridge_and_remove(&mut doc.graph.snarl, nid);
         doc.bypassed.remove(&nid);
         doc.seed_randomize.retain(|(n, _), _| *n != nid);
+        doc.extra_widgets.retain(|(n, _), _| *n != nid);
         if doc.props_node == Some(nid) {
             doc.props_node = None;
         }

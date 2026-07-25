@@ -242,6 +242,35 @@ pub fn apply_seed_randomize_from_workflow(
     }
 }
 
+/// Re-key undeclared widget values from UI node ids onto the snarl ids `load_api_workflow` gave
+/// them, recording each node's class so a later id reuse can't attach them to a different node.
+pub fn apply_extra_widgets_from_workflow(
+    snarl: &Snarl<FlowNodeData>,
+    workflow: &rucomfyui::Workflow,
+    from_ui: &std::collections::BTreeMap<(u64, String), serde_json::Value>,
+    out: &mut HashMap<(NodeId, String), (String, serde_json::Value)>,
+) {
+    out.clear();
+    if from_ui.is_empty() {
+        return;
+    }
+    let wids: Vec<rucomfyui::WorkflowNodeId> =
+        workflow.topological_sort_with_depth().into_iter().flatten().collect();
+    let mut nids: Vec<NodeId> = snarl.node_ids().map(|(id, _)| id).collect();
+    nids.sort_by_key(|id| id.0);
+    if wids.len() != nids.len() {
+        return;
+    }
+    for (wid, nid) in wids.into_iter().zip(nids) {
+        let Some(class) = workflow.0.get(&wid).map(|n| n.class_type.clone()) else { continue };
+        for ((id, name), v) in from_ui {
+            if *id == wid.0 as u64 {
+                out.insert((nid, name.clone()), (class.clone(), v.clone()));
+            }
+        }
+    }
+}
+
 /// Set every seed / noise_seed widget on the graph to the same randomize flag.
 pub fn set_all_seed_randomize(
     snarl: &Snarl<FlowNodeData>,
@@ -1844,7 +1873,14 @@ impl GraphView {
                     continue;
                 }
                 let value = match &input.value {
-                    FlowValueType::Array { selected, .. } => json!(selected),
+                    // A numeric COMBO is a number in the file the web frontend writes; exporting
+                    // the display text instead leaves the workflow embedded in the PNG unqueueable
+                    // there. The editor holds only the text, so the schema supplies the original.
+                    FlowValueType::Array { selected, .. } => schema
+                        .and_then(|s| s.inputs.iter().find(|si| si.name == input.name))
+                        .and_then(|si| si.kind.enum_typed_value(selected))
+                        .cloned()
+                        .unwrap_or_else(|| json!(selected)),
                     FlowValueType::String { value, .. } => json!(value),
                     FlowValueType::Float { value, .. } => json!(value),
                     FlowValueType::SignedInt { value, .. } => json!(value),
@@ -1950,8 +1986,15 @@ pub fn ensure_file_combos(
                 if options.is_empty() || (is_lora && options.len() < opts.len()) {
                     *options = opts;
                 }
-                if selected.is_empty() || !options.iter().any(|o| o == selected) {
-                    *selected = options.first().cloned().unwrap_or_default();
+                // A value that misses the list snaps only when it numerically names an option
+                // (`1` for the `1.0` entry). Anything else keeps what the workflow stored: an
+                // uninstalled model is preflight's to report, not ours to silently replace.
+                if !options.iter().any(|o| o == selected) {
+                    if let Some(m) = numeric_option(options, selected) {
+                        *selected = m;
+                    } else if selected.is_empty() {
+                        *selected = options.first().cloned().unwrap_or_default();
+                    }
                 }
             }
             // Empty COMBO parsed as a connection pin — promote to a real dropdown.
@@ -1963,6 +2006,12 @@ pub fn ensure_file_combos(
             _ => {}
         }
     }
+}
+
+/// The option `value` names numerically, for combos whose options are numbers (`"1"` -> `"1.0"`).
+fn numeric_option(options: &[String], value: &str) -> Option<String> {
+    let n: f64 = value.trim().parse().ok()?;
+    options.iter().find(|o| o.trim().parse::<f64>().is_ok_and(|f| f == n)).cloned()
 }
 
 fn lora_name_selected(snarl: &Snarl<FlowNodeData>, node: NodeId) -> Option<String> {
@@ -2302,6 +2351,167 @@ pub fn elide_width(ui: &egui::Ui, s: &str, max_width: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The editor builds its widgets from `/object_info`, so a VideoHelperSuite node's
+    /// format-dependent encoder settings have no widget to live in and are dropped on load. They
+    /// ride beside the graph instead and are re-attached to the prompt at queue time — asserted on
+    /// what the wire carries, not on what `convert` produced.
+    #[test]
+    fn undeclared_widgets_survive_the_editor_round_trip_to_the_wire() {
+        let schemas = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+                "LoadImage": {"input": {"required": {"image": [["a.png"]]}},
+                    "output": ["IMAGE","MASK"], "output_name": ["IMAGE","MASK"], "output_is_list": [false,false]},
+                "VHS_VideoCombine": {"input": {"required": {
+                    "images": ["IMAGE"],
+                    "frame_rate": ["FLOAT", {"default": 8.0}],
+                    "filename_prefix": ["STRING", {"default": "AnimateDiff"}],
+                    "format": [["video/h264-mp4"]],
+                    "save_output": ["BOOLEAN", {"default": true}]
+                }}, "output": [], "output_name": [], "output_is_list": []}}"#,
+            )
+            .unwrap(),
+        );
+        let ui = serde_json::json!({
+            "nodes": [
+                {"id": 1, "type": "LoadImage", "mode": 0,
+                 "outputs": [{"name": "IMAGE", "type": "IMAGE", "links": [5]}],
+                 "widgets_values": ["a.png"]},
+                {"id": 2, "type": "VHS_VideoCombine", "mode": 0,
+                 "inputs": [{"name": "images", "type": "IMAGE", "link": 5}],
+                 "widgets_values": {
+                    "frame_rate": 32, "filename_prefix": "vid", "format": "video/h264-mp4",
+                    "save_output": true, "crf": 30, "pix_fmt": "yuv420p10le",
+                    "save_metadata": false, "trim_to_audio": true,
+                    "videopreview": {"hidden": false, "params": {"filename": "x.mp4"}}
+                 }}
+            ],
+            "links": [[5, 1, 0, 2, 0, "IMAGE"]]
+        });
+
+        // Load: convert, then park the undeclared widgets against their snarl ids.
+        let loaded = crate::uiwf::convert(&ui, &schemas).unwrap();
+        let mut graph = ComfyUiNodeGraph::new(crate::schema::to_object_info(&schemas));
+        graph.load_api_workflow(&loaded.workflow).unwrap();
+        let mut parked = HashMap::new();
+        apply_extra_widgets_from_workflow(
+            &graph.snarl,
+            &loaded.workflow,
+            &loaded.extra_widgets,
+            &mut parked,
+        );
+        assert_eq!(parked.len(), 4, "parked: {parked:?}");
+
+        // Queue: export, convert, then re-attach exactly as queue_graph does.
+        let view = GraphView::default();
+        let exported = view.export_ui(&graph, &schemas, &HashSet::new(), &HashMap::new());
+        let mut wf = crate::uiwf::convert(&exported, &schemas).unwrap().workflow;
+        for ((nid, name), (class, v)) in &parked {
+            let wid = rucomfyui::workflow::WorkflowNodeId((nid.0 as u32).saturating_add(1));
+            let Some(node) = wf.0.get_mut(&wid) else { continue };
+            if node.class_type != *class || node.inputs.contains_key(name) {
+                continue;
+            }
+            if let Some(wi) = crate::preflight::input_of(v) {
+                node.inputs.insert(name.clone(), wi);
+            }
+        }
+
+        let vhs = wf.0.values().find(|n| n.class_type == "VHS_VideoCombine").expect("no VHS");
+        use rucomfyui::workflow::WorkflowInput;
+        assert_eq!(vhs.inputs["crf"], WorkflowInput::I64(30));
+        assert_eq!(vhs.inputs["pix_fmt"], WorkflowInput::String("yuv420p10le".into()));
+        assert_eq!(vhs.inputs["save_metadata"], WorkflowInput::Boolean(false));
+        assert_eq!(vhs.inputs["trim_to_audio"], WorkflowInput::Boolean(true));
+        assert!(!vhs.inputs.contains_key("videopreview"));
+        // The declared widgets still come through the editor as before.
+        assert_eq!(vhs.inputs["filename_prefix"], WorkflowInput::String("vid".into()));
+        assert_eq!(vhs.inputs["frame_rate"], WorkflowInput::F64(32.0));
+    }
+
+    /// What `build_video` emits for `RIFE VFI.scale_factor` is a number, and the editor can only
+    /// bind a dropdown to a string — without the display pass the widget becomes an empty text box
+    /// and the queue sends `""`. Asserted end to end, on the value that reaches the wire.
+    #[test]
+    fn a_numeric_combo_survives_open_as_graph() {
+        let schemas = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"RIFE VFI": {"input": {"required": {
+                    "ckpt_name": [["rife49.pth"]],
+                    "scale_factor": [[0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0}]
+                }}, "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        );
+        use rucomfyui::workflow::{WorkflowInput, WorkflowNode, WorkflowNodeId};
+        let mut built = rucomfyui::Workflow::new([(WorkflowNodeId(1), {
+            let mut n = WorkflowNode::new("RIFE VFI");
+            n.add_input("ckpt_name".to_string(), WorkflowInput::String("rife49.pth".into()));
+            // Exactly what workflow.rs's video builder emits.
+            n.add_input("scale_factor".to_string(), WorkflowInput::I64(1));
+            n
+        })]);
+
+        crate::preflight::display_combo_values(&mut built, &schemas);
+        let mut graph = ComfyUiNodeGraph::new(crate::schema::to_object_info(&schemas));
+        graph.load_api_workflow(&built).unwrap();
+        // The widget is still a dropdown, on the right option.
+        let data = graph.snarl.node_ids().next().unwrap().1;
+        let input = data.inputs.iter().find(|i| i.name == "scale_factor").unwrap();
+        match &input.value {
+            FlowValueType::Array { selected, options } => {
+                assert_eq!(selected, "1.0");
+                assert_eq!(options.len(), 5);
+            }
+            other => panic!("dropdown collapsed to {other:?}"),
+        }
+
+        let view = GraphView::default();
+        let exported = view.export_ui(&graph, &schemas, &HashSet::new(), &HashMap::new());
+        let mut wf = crate::uiwf::convert(&exported, &schemas).unwrap().workflow;
+        crate::preflight::retype_combo_values(&mut wf, &schemas);
+        let rife = wf.0.values().find(|n| n.class_type == "RIFE VFI").expect("no RIFE");
+        assert_eq!(rife.inputs["scale_factor"], WorkflowInput::F64(1.0));
+    }
+
+    /// `ensure_file_combos` runs over every node every frame, so a value it does not recognise is
+    /// the last chance to lose the user's setting before it reaches the wire. A numeric spelling
+    /// snaps to the option it names; an unknown one survives for preflight to report.
+    #[test]
+    fn a_combo_value_is_never_silently_swapped_for_the_first_option() {
+        let schemas = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"RIFE VFI": {"input": {"required": {
+                    "ckpt_name": [["rife49.pth", "rife47.pth"]],
+                    "scale_factor": [[0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0}]
+                }}, "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        );
+        let object_info = crate::schema::to_object_info(&schemas);
+        let selected_after = |input: &str, stored: &str| -> String {
+            let mut data = FlowNodeData::new(object_info["RIFE VFI"].clone());
+            let slot = data.inputs.iter_mut().find(|i| i.name == input).expect("no such input");
+            let FlowValueType::Array { selected, .. } = &mut slot.value else { panic!("not a combo") };
+            *selected = stored.to_string();
+            ensure_file_combos(&mut data, &object_info, &[]);
+            match &data.inputs.iter().find(|i| i.name == input).unwrap().value {
+                FlowValueType::Array { selected, .. } => selected.clone(),
+                other => panic!("combo became {other:?}"),
+            }
+        };
+
+        // The integer spelling of a float option is the same choice, so it snaps to that option.
+        assert_eq!(selected_after("scale_factor", "1"), "1.0");
+        assert_eq!(selected_after("scale_factor", "1.0"), "1.0");
+        assert_eq!(selected_after("scale_factor", "2"), "2.0");
+        // A value naming no option is kept: swapping it for 0.25 would run settings nobody chose.
+        assert_eq!(selected_after("scale_factor", "8.0"), "8.0");
+        assert_eq!(selected_after("ckpt_name", "rife422.pth"), "rife422.pth");
+        // Nothing stored at all still needs a default to render.
+        assert_eq!(selected_after("scale_factor", ""), "0.25");
+    }
 
     /// Headless repro harness: load a real workflow (fixture env vars) and sweep taps across the
     /// canvas — egui hit-testing runs on the pointer events, so widget-soup panics surface here.

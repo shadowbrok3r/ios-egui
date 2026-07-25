@@ -879,7 +879,7 @@ fn schema_default(kind: &InputKind) -> Option<Value> {
     Some(match kind {
         // A declared default is no use when the server offers no options: sending it back is the
         // same certain rejection as any other value, so treat it as unfillable.
-        InputKind::Enum { options, default } if !options.is_empty() => Value::from(
+        InputKind::Enum { options, default, .. } if !options.is_empty() => Value::from(
             default.clone().or_else(|| options.first().cloned())?,
         ),
         InputKind::Enum { .. } => return None,
@@ -1905,7 +1905,7 @@ mod tests {
         if let Some(node) = s.nodes.get_mut(class)
             && let Some(i) = node.inputs.iter_mut().find(|i| i.name == input)
         {
-            i.kind = InputKind::Enum { options: Vec::new(), default: None };
+            i.kind = InputKind::Enum { options: Vec::new(), default: None, typed: None };
         }
         s
     }

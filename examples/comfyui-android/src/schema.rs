@@ -44,8 +44,9 @@ pub struct InputSchema {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum InputKind {
-    /// Dropdown of choices; non-string options are stringified.
-    Enum { options: Vec<String>, default: Option<String> },
+    /// Dropdown of choices; non-string options are stringified. `typed` holds the original JSON
+    /// values index-for-index with `options`, and is `None` when every option is already a string.
+    Enum { options: Vec<String>, default: Option<String>, typed: Option<Vec<Value>> },
     Int {
         default: i64,
         min: Option<i64>,
@@ -61,6 +62,32 @@ pub enum InputKind {
     Connection { ty: String },
     /// Unrecognized spec shape, ignored but recorded.
     Opaque,
+}
+
+impl InputKind {
+    /// The index of the enum option `text` names, matching the display form first and then
+    /// numerically, so `"1"` finds a `1.0` option.
+    fn enum_index(&self, text: &str) -> Option<usize> {
+        let InputKind::Enum { options, .. } = self else { return None };
+        if let Some(i) = options.iter().position(|o| o == text) {
+            return Some(i);
+        }
+        let n: f64 = text.trim().parse().ok()?;
+        options.iter().position(|o| o.trim().parse::<f64>().is_ok_and(|f| f == n))
+    }
+
+    /// The display form of the enum option `text` names.
+    pub fn enum_option_text(&self, text: &str) -> Option<&str> {
+        let InputKind::Enum { options, .. } = self else { return None };
+        options.get(self.enum_index(text)?).map(String::as_str)
+    }
+
+    /// The original JSON value of the enum option `text` names. `None` for an all-string option
+    /// list, which needs no retyping, and for text naming no option.
+    pub fn enum_typed_value(&self, text: &str) -> Option<&Value> {
+        let InputKind::Enum { typed: Some(typed), .. } = self else { return None };
+        typed.get(self.enum_index(text)?)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -349,16 +376,30 @@ fn parse_input(name: &str, required: bool, spec: &Value) -> InputSchema {
 }
 
 /// Stringify enum options; numbers/bools become their text form, `{content, image}` preview
-/// entries keep only `content`, nulls and oversized blobs drop.
+/// entries keep only `content`, nulls and oversized blobs drop. The surviving originals are kept
+/// alongside when any of them is not a string.
 fn enum_kind(opts: &[Value], meta: &serde_json::Map<String, Value>) -> InputKind {
-    let options: Vec<String> = opts
-        .iter()
-        .filter_map(option_text)
-        .filter(|s| !s.is_empty() && s.len() <= MAX_OPTION_LEN)
-        .take(MAX_OPTIONS)
-        .collect();
+    let mut options: Vec<String> = Vec::new();
+    let mut typed: Vec<Value> = Vec::new();
+    for v in opts {
+        if options.len() >= MAX_OPTIONS {
+            break;
+        }
+        let Some(s) = option_text(v) else { continue };
+        if s.is_empty() || s.len() > MAX_OPTION_LEN {
+            continue;
+        }
+        options.push(s);
+        // A `{content, image}` preview entry is a string option wearing a wrapper; the server
+        // takes the bare content, so record that rather than the object.
+        typed.push(match v {
+            Value::Object(_) => Value::String(options[options.len() - 1].clone()),
+            other => other.clone(),
+        });
+    }
     let default = meta.get("default").and_then(option_text);
-    InputKind::Enum { options, default }
+    let typed = typed.iter().any(|v| !v.is_string()).then_some(typed);
+    InputKind::Enum { options, default, typed }
 }
 
 fn option_text(v: &Value) -> Option<String> {
@@ -535,6 +576,7 @@ pub fn object_type(s: &str) -> oi::ObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn parse_str(s: &str) -> SchemaSet {
         parse(&serde_json::from_str(s).unwrap())
@@ -594,7 +636,7 @@ mod tests {
         assert!(set.skipped.is_empty(), "skipped: {:?}", set.skipped);
         assert_eq!(set.nodes.len(), 9);
         assert!(matches!(kind(&set, "BareString", "reset"), InputKind::Bool { default: false }));
-        assert!(matches!(kind(&set, "FloatOptions", "scale"), InputKind::Enum { options, default }
+        assert!(matches!(kind(&set, "FloatOptions", "scale"), InputKind::Enum { options, default, .. }
             if options == &["0.25", "0.5", "1.0"] && default.as_deref() == Some("1.0")));
         assert!(matches!(kind(&set, "IntOptions", "block"), InputKind::Enum { options, .. } if options == &["128", "64"]));
         assert!(matches!(kind(&set, "BoolOptions", "flag"), InputKind::Enum { options, .. } if options == &["false", "true"]));
@@ -604,6 +646,55 @@ mod tests {
         assert_eq!(set.nodes["ArrayOutput"].outputs[0].ty, "COMBO");
         assert_eq!(set.nodes["ArrayOutput"].outputs[1].ty, "IMAGE");
         assert!(!set.nodes["NoRequired"].inputs[0].required);
+    }
+
+    /// A COMBO of numbers keeps its originals, index-for-index with the display strings, and a
+    /// value naming an option resolves to the JSON the server membership-tests against.
+    #[test]
+    fn numeric_combo_options_keep_their_json_type() {
+        let set = parse_str(
+            r#"{"RIFE VFI": {"input": {"required": {
+                "ckpt_name": [["rife49.pth", "rife47.pth"]],
+                "scale_factor": [[0.25, 0.5, 1.0, 2.0, 4.0], {"default": 1.0}],
+                "fast_mode": [[false, true], {}]
+            }}, "output": ["IMAGE"]}}"#,
+        );
+        let scale = kind(&set, "RIFE VFI", "scale_factor");
+        let InputKind::Enum { options, typed, .. } = scale else { panic!("not an enum") };
+        assert_eq!(options, &["0.25", "0.5", "1.0", "2.0", "4.0"]);
+        assert_eq!(typed.as_deref().map(<[Value]>::to_vec), Some(vec![
+            json!(0.25), json!(0.5), json!(1.0), json!(2.0), json!(4.0)
+        ]));
+        // The display form and its numeric spellings all name the same option.
+        assert_eq!(scale.enum_typed_value("1.0"), Some(&json!(1.0)));
+        assert_eq!(scale.enum_typed_value("1"), Some(&json!(1.0)));
+        assert_eq!(scale.enum_option_text("1"), Some("1.0"));
+        assert_eq!(scale.enum_typed_value("3.0"), None);
+        assert_eq!(scale.enum_typed_value("rife49.pth"), None);
+        // Bools are options too; a string "true" names the bool option.
+        assert_eq!(kind(&set, "RIFE VFI", "fast_mode").enum_typed_value("true"), Some(&json!(true)));
+        // An all-string list needs no retyping, so it carries no originals.
+        let ckpt = kind(&set, "RIFE VFI", "ckpt_name");
+        assert!(matches!(ckpt, InputKind::Enum { typed: None, .. }));
+        assert_eq!(ckpt.enum_typed_value("rife49.pth"), None);
+        assert_eq!(ckpt.enum_option_text("rife49.pth"), Some("rife49.pth"));
+    }
+
+    /// A mixed list keeps each option's own type, and a `{content, image}` preview entry counts as
+    /// the string the server takes.
+    #[test]
+    fn mixed_and_preview_options_keep_the_value_the_server_wants() {
+        let set = parse_str(
+            r#"{"Mixed": {"input": {"required": {
+                "crop": [["disabled", "center", 0]],
+                "ckpt_name": [["real.safetensors", {"content": "preview.safetensors", "image": "x"}]]
+            }}, "output": []}}"#,
+        );
+        let crop = kind(&set, "Mixed", "crop");
+        assert_eq!(crop.enum_typed_value("disabled"), Some(&json!("disabled")));
+        assert_eq!(crop.enum_typed_value("0"), Some(&json!(0)));
+        // Every surviving option is a string, so the preview wrapper leaves the list untyped.
+        assert!(matches!(kind(&set, "Mixed", "ckpt_name"), InputKind::Enum { typed: None, .. }));
     }
 
     #[test]
