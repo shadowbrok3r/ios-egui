@@ -308,12 +308,26 @@ enum GraphPane {
     Props,
 }
 
-/// Source for the LoadImage image picker: the server's uploaded inputs, or the phone's gallery.
+/// Source for a node's file picker: your generated outputs, the server's uploaded inputs, or the
+/// phone's own photos. Gallery leads — it is the only source with real posters for videos.
 #[derive(PartialEq, Clone, Copy, Default)]
 enum ImgPickSource {
     #[default]
+    Gallery,
     Server,
     Device,
+}
+
+/// A gallery item on its way to becoming a node's input file: downloading now, uploaded to the
+/// server's `input` dir when the bytes land. The node is qualified by `(doc_id, epoch)` for the
+/// same reason [`ComfyApp::pending_uploads`] is — snarl reuses freed slab keys.
+struct NodeFilePick {
+    /// `subfolder/filename` of the download we're waiting on.
+    key: String,
+    filename: String,
+    node: NodeId,
+    doc_id: u64,
+    epoch: u64,
 }
 
 /// Full-screen state for one opened gallery image.
@@ -1065,6 +1079,10 @@ struct ComfyApp {
     pending_uploads: HashMap<u64, (u64, u64, NodeId)>,
     /// Monotonic id handed to each device-image upload.
     next_upload_id: u64,
+    /// A gallery item downloading on its way to becoming a node's input file.
+    node_upload_pending: Option<NodeFilePick>,
+    /// The node whose file picker is open as a popup over the graph canvas.
+    file_picker: Option<NodeId>,
     /// The image queued for "add to album" while the picker is open.
     album_target: Option<GalleryItem>,
     /// Create-album dialog open for these `(subfolder, filename)` pairs (selection kept).
@@ -1080,12 +1098,15 @@ struct ComfyApp {
     delete_confirm: Option<(Vec<(String, String)>, bool)>,
     /// After a viewer delete, reopen this `(subfolder, filename)` once the list refreshes.
     viewer_after_delete: Option<(String, String)>,
-    /// The Create-tab Output bottom panel is expanded; auto-set when a new image lands.
-    output_expanded: bool,
-    /// Soft keyboard was visible last frame; used to detect the open edge.
+    /// The Create-tab Output window is open; auto-set when a new image lands.
+    output_open: bool,
+    /// Soft keyboard is up: set at the top of `update`, so it reads as "this frame" while drawing
+    /// and as "last frame" when the next frame computes the open edge.
     kb_was_open: bool,
     /// The soft keyboard opened this frame; scroll the focused field into the shrunk viewport.
     kb_open_edge: bool,
+    /// Last gallery tile tapped and when — the app's own double-tap rule (see `DOUBLE_TAP_SECS`).
+    tile_tap: Option<(String, f64)>,
     /// Long-press-to-paint gesture: (press start time, screen origin, cancelled-as-a-scroll).
     sel_press: Option<(f64, egui::Pos2, bool)>,
     sel_long_fired: bool,
@@ -1628,6 +1649,8 @@ impl ComfyApp {
             device_images_loaded: false,
             pending_uploads: HashMap::new(),
             next_upload_id: 0,
+            node_upload_pending: None,
+            file_picker: None,
             album_target: None,
             album_create_draft: None,
             album_pending_add: None,
@@ -1636,9 +1659,10 @@ impl ComfyApp {
             confirm_gallery_delete: true,
             delete_confirm: None,
             viewer_after_delete: None,
-            output_expanded: false,
+            output_open: false,
             kb_was_open: false,
             kb_open_edge: false,
+            tile_tap: None,
             sel_press: None,
             sel_long_fired: false,
             sel_painting: false,
@@ -2168,35 +2192,36 @@ impl ComfyApp {
                 if let (true, Some((_, _, node)), Some(doc)) =
                     (still_ours, target, self.active_doc_mut())
                     && let Some(data) = doc.graph.snarl.get_node_mut(node)
+                    // Whatever file selector this node has — `image`, `video`, a custom loader's.
+                    && let Some(mi) = graphview::media_input_of(data)
+                    && let Some(inp) = data.inputs.get_mut(mi.idx)
+                    && let FlowValueType::Array { options, selected } = &mut inp.value
                 {
-                    // Select the uploaded image on the node's `image` input, adding it to the
-                    // option list so the picker and the node body show it.
-                    for inp in data.inputs.iter_mut() {
-                        if inp.name.eq_ignore_ascii_case("image")
-                            && let FlowValueType::Array { options, selected } = &mut inp.value
-                        {
-                            if !options.iter().any(|o| o == &image_ref) {
-                                options.insert(0, image_ref.clone());
-                            }
-                            *selected = image_ref.clone();
-                            wrote = true;
-                            break;
-                        }
+                    // Add it to the option list too, so the picker and the node body show it —
+                    // the server's enum only refreshes on reconnect.
+                    if !options.iter().any(|o| o == &image_ref) {
+                        options.insert(0, image_ref.clone());
                     }
+                    *selected = image_ref.clone();
+                    wrote = true;
                 }
                 // Reporting success outside the write meant a retargeted or input-less node still
                 // said "Loaded", having changed nothing.
+                // These uploads are always a graph node's file pick, so the feedback goes to the
+                // graph toast rather than Create's note line.
                 if wrote {
-                    self.note = format!("Loaded {} from device", elide(&image_ref, 40));
+                    self.graph_status =
+                        format!("Loaded {}", graphview::elide_tail(&image_ref, 40));
                     host.haptic(Haptic::Success);
                 } else if target.is_some() {
-                    self.note = "Upload finished, but that node is gone — pick it again".into();
+                    self.graph_status =
+                        "Upload finished, but that node is gone — pick it again".into();
                     host.haptic(Haptic::Warning);
                 }
             }
             Msg::InputUploadError { token, error } => {
                 if self.pending_uploads.remove(&token).is_some() {
-                    self.note = elide(&error, 120);
+                    self.graph_status = elide(&error, 120);
                     host.haptic(Haptic::Error);
                 }
             }
@@ -2382,7 +2407,7 @@ impl ComfyApp {
             Msg::Status(s) => self.status = s,
             Msg::Preview(ci) => {
                 self.preview = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR));
-                self.output_expanded = true;
+                self.output_open = true;
             }
             Msg::Result { image, bytes, label } => {
                 self.result_seq = self.result_seq.wrapping_add(1);
@@ -2398,7 +2423,7 @@ impl ComfyApp {
                     self.results.push((tex, bytes));
                     self.preview = None;
                     self.note.clear();
-                    self.output_expanded = true;
+                    self.output_open = true;
                 }
             }
             Msg::NodeExecuting(node) => {
@@ -2681,6 +2706,9 @@ impl ComfyApp {
                 if let Some(v) = &mut self.viewer {
                     v.loading = false;
                 }
+                // A node's file pick is NOT cancelled here: this message covers every gallery
+                // request, so an unrelated listing failure would kill a healthy download. The
+                // keyed `FullImageError` that accompanies a failed fetch handles that.
                 self.gallery_status = elide(&e, 200);
             }
             // A full-image fetch died (HTTP error / undecodable file / not connected). Fail exactly
@@ -2707,6 +2735,13 @@ impl ComfyApp {
                     }
                     self.autotag_failed.insert(key.clone());
                     self.clipemb_failed.insert(key.clone());
+                }
+                // A node's file pick: drop it, else the picker spins on a download that will
+                // never arrive and the node keeps its old file with no explanation.
+                if self.node_upload_pending.as_ref().is_some_and(|p| p.key == key) {
+                    self.node_upload_pending = None;
+                    self.graph_status = format!("Couldn't load that file: {}", elide(&why, 80));
+                    host.haptic(Haptic::Error);
                 }
                 if self.gallery_pick_pending.as_ref().is_some_and(|(k, _)| *k == key) {
                     self.gallery_pick_pending = None;
@@ -2738,7 +2773,9 @@ impl ComfyApp {
                 let for_emb = self.clipemb_pending.as_deref() == Some(key.as_str());
                 #[cfg(not(feature = "local-npu"))]
                 let for_emb = false;
-                if for_prefetch {
+                if self.take_node_upload(&key, &bytes) {
+                    // Headed for the server's input dir; the node selects it once it lands.
+                } else if for_prefetch {
                     self.prefetch_pending = None;
                     // Bytes already written by fetch_full; nothing else to do.
                 } else if for_pump {
@@ -2832,7 +2869,9 @@ impl ComfyApp {
                 }
             }
             Msg::VideoReady { key, bytes } => {
-                if let Some(v) = &mut self.viewer
+                if self.take_node_upload(&key, &bytes) {
+                    // A node's file pick — uploaded to the server's input dir, not played here.
+                } else if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
                     v.bytes = Some(bytes.clone());
@@ -12200,61 +12239,29 @@ impl ComfyApp {
             ui.add_space(2.0);
         });
 
-        // Output bottom sheet above the pane bar: drag its top edge to resize, the header button
-        // hides/shows it, and it auto-expands when a new generation lands.
-        {
-            let n = self.results.len();
-            let out_title = if n == 0 {
-                if self.preview.is_some() {
-                    "Output · preview".to_string()
-                } else {
-                    "Output".to_string()
-                }
-            } else if n == 1 {
-                "Output · 1 result".to_string()
-            } else {
-                format!("Output · {n} results")
-            };
-            let mut expanded = self.output_expanded;
-            let collapsed =
-                egui::Panel::bottom("create-output-collapsed").resizable(true).exact_size(34.0);
-            let expanded_panel = egui::Panel::bottom("create-output-expanded")
-                .resizable(true)
-                .default_size(280.0)
-                .min_size(120.0)
-                .max_size(680.0);
-            let toggled = egui::Panel::show_switched(
-                ui,
-                &mut expanded,
-                collapsed,
-                expanded_panel,
-                |ui, is_exp| {
-                    let mut toggle = false;
-                    ui.horizontal(|ui| {
-                        ui.strong(sanitize_ui_text(ui, &out_title));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let (lbl, hint) = if is_exp {
-                                (icons::CLOSE, "Hide output")
-                            } else {
-                                (icons::IMAGE, "Show output")
-                            };
-                            toggle = ui.small_button(lbl).on_hover_text(hint).clicked();
-                        });
+        // Output launcher strip above the pane bar. Deliberately a fixed 34px bar and nothing more:
+        // the results themselves live in a floating window (`output_window`). A resizable sheet
+        // here stacked three bottom panels deep, and once the soft keyboard shrank the viewport the
+        // Create pane had no room left to lay out in.
+        // Dropped entirely while the soft keyboard is up: the shrunk viewport already has to fit
+        // the nav bar, the pane bar and a top bar, and the strip is unreachable mid-edit anyway.
+        if !self.kb_was_open {
+            egui::Panel::bottom("create-output-bar").exact_size(34.0).show(ui, |ui| {
+                let title = self.output_title();
+                ui.horizontal(|ui| {
+                    ui.strong(sanitize_ui_text(ui, &title));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (lbl, hint) = if self.output_open {
+                            (icons::CLOSE, "Hide output")
+                        } else {
+                            (icons::IMAGE, "Show output")
+                        };
+                        if ui.small_button(lbl).on_hover_text(hint).clicked() {
+                            self.output_open = !self.output_open;
+                        }
                     });
-                    if is_exp {
-                        crate::theme::scroll_vertical()
-                            .id_salt("create-output-scroll")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| self.output(ui, host));
-                    }
-                    toggle
-                },
-            )
-            .inner;
-            if toggled {
-                expanded = !expanded;
-            }
-            self.output_expanded = expanded;
+                });
+            });
         }
 
         match self.create_pane {
@@ -12294,6 +12301,67 @@ impl ComfyApp {
             });
         self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
         self.create_fab(ui.ctx(), host, pane);
+        self.output_window(ui.ctx(), host, pane);
+    }
+
+    /// "Output · N results" — shared by the launcher strip and the floating window's title.
+    fn output_title(&self) -> String {
+        let n = self.results.len();
+        if n == 0 {
+            if self.preview.is_some() {
+                "Output · preview".to_string()
+            } else {
+                "Output".to_string()
+            }
+        } else if n == 1 {
+            "Output · 1 result".to_string()
+        } else {
+            format!("Output · {n} results")
+        }
+    }
+
+    /// Floating Output window over the Create pane, opened by the strip and by every new result.
+    /// Free-floating rather than docked: it takes no panel space, so the pane bar, the nav bar and
+    /// the soft keyboard can never squeeze the Create pane to nothing between them. egui constrains
+    /// it to `content_rect`, which already excludes the keyboard's occlusion.
+    fn output_window(&mut self, ctx: &egui::Context, host: &Host, pane: egui::Rect) {
+        if !self.output_open {
+            return;
+        }
+        let content = ctx.content_rect();
+        if !content.is_finite() || content.height() < 120.0 || content.width() < 120.0 {
+            return;
+        }
+        // Leave the FAB column clear so Queue/Cancel stay tappable with the window up.
+        let max_w = (content.width() - (crate::theme::FAB_SIZE + 24.0)).clamp(180.0, content.width());
+        // Bounded by the Create pane too, so a keyboard-shrunk pane shrinks the window (including a
+        // size the user dragged bigger on a previous, taller frame) instead of overflowing it.
+        let anchor = if pane.is_finite() && pane.width() > 80.0 { pane } else { content };
+        let max_h =
+            (content.height() * 0.55).min(anchor.height() - 16.0).clamp(120.0, 520.0);
+        // Default placement: bottom-left of the Create pane, just above the bars.
+        let default_pos = egui::pos2(anchor.left() + 8.0, anchor.bottom() - 8.0);
+        let mut open = true;
+        egui::Window::new(self.output_title())
+            .id(egui::Id::new("create-output-window"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .constrain_to(content)
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .default_pos(default_pos)
+            .default_width(max_w)
+            .max_width(max_w)
+            .max_height(max_h)
+            .show(ctx, |ui| {
+                crate::theme::scroll_vertical()
+                    .id_salt("create-output-scroll")
+                    .max_height((max_h - 44.0).max(80.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| self.output(ui, host));
+            });
+        self.output_open = open;
     }
 
     /// Fixed Create Main strip: current model, generation mode, Reset.
@@ -12980,8 +13048,12 @@ impl ComfyApp {
         let progress = (self.running && self.progress.1 > 0).then_some(self.progress);
         let executing = self.executing;
         let loras = self.installed_loras.clone();
-        let (long_press, lora_picks) = {
+        // Thumbnails for the files LoadImage-style nodes point at, so a node shows the picture it
+        // will load rather than a filename you'd have to go look up.
+        let input_thumbs = self.node_input_thumbs();
+        let (long_press, lora_picks, file_pick) = {
             let Some(doc) = self.active_doc_mut() else { return };
+            doc.view.set_input_thumbs(input_thumbs);
             let props = doc.props_node;
             doc.graph.set_live_execution(executing, progress, preview);
             if kb_edge {
@@ -13002,10 +13074,20 @@ impl ComfyApp {
             {
                 doc.props_node = Some(tapped);
             }
-            (doc.view.take_long_press(), doc.view.take_lora_picks())
+            (
+                doc.view.take_long_press(),
+                doc.view.take_lora_picks(),
+                doc.view.take_file_pick(),
+            )
         };
         for pick in lora_picks {
             self.apply_lora_pick(pick);
+        }
+        // Tapping a node's file widget opens the thumbnail picker over the canvas.
+        if let Some(node) = file_pick {
+            self.file_picker = Some(node);
+            self.img_pick_filter.clear();
+            host.haptic(Haptic::Light);
         }
         // Snapshot the graph once an edit settles. This has to run after `show`, which is where
         // snarl applies wire, drag and widget changes we never see directly.
@@ -13068,6 +13150,7 @@ impl ComfyApp {
         self.add_node_window(ui.ctx());
         self.search_window(ui.ctx());
         self.save_window(ui.ctx());
+        self.file_picker_window(ui.ctx(), host);
     }
 
     /// Popup after a long-press on empty graph canvas.
@@ -13181,12 +13264,25 @@ impl ComfyApp {
         let mut auto_wire = false;
         let mut duplicate = false;
         let mut delete = false;
+        let mut choose_file = false;
+        let media = self.node_media_input(nid);
         let resp = egui::Area::new(egui::Id::new("graph-node-menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen)
             .constrain(true)
             .show(ui.ctx(), |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    if let Some(mi) = &media {
+                        let (icon, what) =
+                            if mi.video { (icons::RUN, "video") } else { (icons::IMAGE, "image") };
+                        if ui
+                            .button(format!("{icon} Choose {what}…"))
+                            .on_hover_text("Pick from your gallery, the server, or this phone")
+                            .clicked()
+                        {
+                            choose_file = true;
+                        }
+                    }
                     if ui
                         .button(format!("{} Duplicate", icons::ADD))
                         .on_hover_text("Copy this node (values + input wires)")
@@ -13227,6 +13323,12 @@ impl ComfyApp {
             && !resp.response.contains_pointer()
             && !ui.ctx().input(|i| i.pointer.any_down());
         if outside_click {
+            close = true;
+        }
+        if choose_file {
+            self.file_picker = Some(nid);
+            self.img_pick_filter.clear();
+            host.haptic(Haptic::Light);
             close = true;
         }
         if duplicate {
@@ -13541,7 +13643,9 @@ impl ComfyApp {
             if ui.add_enabled(has_nodes, egui::Button::new("Go to first node")).clicked() {
                 let pos = self
                     .active_doc()
-                    .and_then(|d| graphview::first_node_pos(&d.graph.snarl));
+                    .and_then(|d| {
+                        graphview::first_node_pos(&d.graph.snarl, d.view.flow_vertical())
+                    });
                 if let Some(pos) = pos
                     && let Some(doc) = self.active_doc_mut()
                 {
@@ -13759,8 +13863,8 @@ impl ComfyApp {
                         &mut doc.seed_randomize,
                     );
                 }
-                // For LoadImage-style nodes, a thumbnail picker over the server inputs or the phone.
-                self.loadimage_picker(ui, host, node);
+                // For upload-style nodes (LoadImage, LoadVideo, …), a thumbnail picker.
+                self.file_picker_ui(ui, host, node, true);
                 ui.add_space(12.0);
             });
         for pick in lora_picks {
@@ -13773,39 +13877,278 @@ impl ComfyApp {
         }
     }
 
-    /// If `node` has an `image` selector (LoadImage), render a thumbnail picker so you can see what
-    /// you're choosing — either the server's input images (previewed via `/view?type=input`) or the
-    /// phone's own photo gallery (MediaStore), uploaded to the server on tap.
-    fn loadimage_picker(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId) {
-        let (input_idx, options, selected) = {
-            let Some(doc) = self.active_doc() else { return };
-            let Some(data) = doc.graph.snarl.get_node(node) else { return };
-            let found = data.inputs.iter().enumerate().find_map(|(i, inp)| {
-                if !inp.name.eq_ignore_ascii_case("image") {
-                    return None;
-                }
-                match &inp.value {
-                    FlowValueType::Array { options, selected } => {
-                        Some((i, options.clone(), selected.clone()))
-                    }
-                    _ => None,
-                }
-            });
-            match found {
-                Some(v) => v,
-                None => return,
+    /// Textures for the input files this graph's file-selector nodes currently point at, keyed by
+    /// the selected filename, fetching any that aren't cached yet. The canvas draws these on the
+    /// nodes themselves — `LoadImage` naming a file tells you nothing about which picture it is.
+    ///
+    /// Videos are skipped: `/view?type=input` hands back the raw container and nothing renders a
+    /// poster for input files, so there is no still to show (the node keeps its play-badge button).
+    fn node_input_thumbs(&mut self) -> HashMap<String, egui::TextureHandle> {
+        let Some(doc) = self.active_doc() else { return HashMap::new() };
+        let names: Vec<String> = doc
+            .graph
+            .snarl
+            .nodes()
+            .filter_map(|data| {
+                let (selected, video) = graphview::media_selected(data)?;
+                (!video && !selected.is_empty()).then(|| selected.to_string())
+            })
+            .collect();
+        let mut out = HashMap::new();
+        for name in names {
+            if out.contains_key(&name) {
+                continue;
             }
-        };
+            // Same cache and key the picker grid uses, so a file you just chose is already warm.
+            let key = format!("input#{name}");
+            if let Some(tex) = self.thumbs.get(&key) {
+                out.insert(name, tex.clone());
+            } else if self.thumbs.claim(&key) {
+                self.engine.as_ref().unwrap().fetch_input_thumb(name);
+            }
+        }
+        out
+    }
 
-        ui.separator();
-        ui.strong(format!("{} Choose image", icons::IMAGE));
-        ui.horizontal(|ui| {
-            crate::theme::selectable_value(ui, &mut self.img_pick_source, ImgPickSource::Server, "Server");
-            crate::theme::selectable_value(ui, &mut self.img_pick_source, ImgPickSource::Device, "Device");
+    /// Order gallery indices newest-first for a picker, whatever the Gallery tab is sorted by.
+    /// When you're choosing an input, the thing you just made is nearly always the thing you want,
+    /// and a picker is no place to inherit a "sort by name" you set while browsing.
+    fn newest_first(&self, mut indices: Vec<usize>) -> Vec<usize> {
+        // Stable, so items the API gave no mtime for keep the listing's own order — behind the
+        // dated ones rather than shuffled among them.
+        indices.sort_by(|a, b| {
+            let (ta, tb) = (
+                self.gallery.get(*a).and_then(|i| i.mtime),
+                self.gallery.get(*b).and_then(|i| i.mtime),
+            );
+            match (ta, tb) {
+                (Some(x), Some(y)) => y.total_cmp(&x),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
         });
+        indices
+    }
+
+    /// The file selector on `node`, if it has one (`LoadImage.image`, `VHS_LoadVideo.video`, …).
+    fn node_media_input(&self, node: NodeId) -> Option<graphview::MediaInput> {
+        let doc = self.active_doc()?;
+        graphview::media_input_of(doc.graph.snarl.get_node(node)?)
+    }
+
+    /// Thumbnail picker for a node's file selector, so you can SEE what you're choosing instead of
+    /// reading a dropdown of `ComfyUI_00042_.png`. Three sources: your gallery (the only one with
+    /// posters for videos — a pick is downloaded and re-uploaded into the server's input dir), the
+    /// files already uploaded to the server, and the phone's own photos.
+    ///
+    /// Shared by the Properties pane and the canvas popup, so both stay in step.
+    fn file_picker_ui(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId, header: bool) {
+        let Some(mi) = self.node_media_input(node) else { return };
+        if header {
+            ui.separator();
+            let icon = if mi.video { icons::RUN } else { icons::IMAGE };
+            let what = if mi.video { "video" } else { "image" };
+            ui.strong(format!("{icon} Choose {what}"));
+        }
+        // Device photos are stills from MediaStore — nothing to offer a video input.
+        if mi.video && self.img_pick_source == ImgPickSource::Device {
+            self.img_pick_source = ImgPickSource::Gallery;
+        }
+        ui.horizontal(|ui| {
+            crate::theme::selectable_value(
+                ui,
+                &mut self.img_pick_source,
+                ImgPickSource::Gallery,
+                "Gallery",
+            );
+            crate::theme::selectable_value(
+                ui,
+                &mut self.img_pick_source,
+                ImgPickSource::Server,
+                "Server",
+            );
+            if !mi.video {
+                crate::theme::selectable_value(
+                    ui,
+                    &mut self.img_pick_source,
+                    ImgPickSource::Device,
+                    "Device",
+                );
+            }
+            if self.node_upload_pending.is_some() || !self.pending_uploads.is_empty() {
+                ui.spinner();
+            }
+        });
+        // What's on the node right now — with its picture, since that's the whole point here.
+        if !mi.selected.is_empty() {
+            let key = format!("input#{}", mi.selected);
+            let tex = self.thumbs.get(&key).cloned();
+            if tex.is_none() && !mi.video && self.thumbs.claim(&key) {
+                self.engine.as_ref().unwrap().fetch_input_thumb(mi.selected.clone());
+            }
+            ui.horizontal(|ui| {
+                if let Some(tex) = &tex {
+                    ui.add(
+                        egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                            .fit_to_exact_size(egui::vec2(44.0, 44.0)),
+                    );
+                }
+                ui.weak(format!("now: {}", graphview::elide_tail(&mi.selected, 30)));
+            });
+        }
         match self.img_pick_source {
-            ImgPickSource::Server => self.loadimage_server_grid(ui, node, input_idx, &options, &selected),
+            ImgPickSource::Gallery => self.node_gallery_grid(ui, host, node, &mi),
+            ImgPickSource::Server => self.loadimage_server_grid(ui, node, mi.idx, &mi.options, &mi.selected),
             ImgPickSource::Device => self.loadimage_device_grid(ui, host, node),
+        }
+    }
+
+    /// Gallery source: your generated outputs, filtered to what this input takes. A tap downloads
+    /// the file and uploads it into the server's `input` dir — a LoadImage/LoadVideo node can only
+    /// reference inputs, so a gallery output has to be copied there first.
+    fn node_gallery_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &Host,
+        node: NodeId,
+        mi: &graphview::MediaInput,
+    ) {
+        if !matches!(self.conn, Conn::Connected) {
+            ui.weak("Connect to a server to browse its gallery.");
+            return;
+        }
+        let want_video = mi.video;
+        let items = self.newest_first(
+            self.gallery
+                .iter()
+                .enumerate()
+                .filter(|(_, it)| it.is_video == want_video)
+                .map(|(i, _)| i)
+                .collect(),
+        );
+        // Same fetched-once latch as the Gallery tab: emptiness alone would refire forever.
+        if !self.gallery_fetched && !self.gallery_loading {
+            self.gallery_loading = true;
+            self.engine.as_ref().unwrap().gallery_list(
+                self.gallery_gen,
+                0,
+                self.gallery_page_size(),
+                self.gallery_list_q(),
+                &self.gallery_view,
+            );
+        }
+        // The listing is paged and shared with the Gallery tab, so the kind this input wants can
+        // easily be further down it — offer the next page rather than claiming there are none.
+        let more = self.gallery_total as usize > self.gallery.len();
+        if items.is_empty() {
+            ui.add_space(8.0);
+            if self.gallery_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("loading gallery…");
+                });
+            } else if want_video {
+                ui.weak("No videos in the loaded part of your gallery.");
+            } else {
+                ui.weak("No images in the loaded part of your gallery.");
+            }
+        } else if let Some(idx) = self.gallery_pick_grid(ui, &items) {
+            self.pick_gallery_for_node(idx, node, host);
+        }
+        if more && !self.gallery_loading {
+            ui.add_space(4.0);
+            if ui
+                .button(format!("{} Load more", icons::GALLERY))
+                .on_hover_text(format!("{} of {} scanned", self.gallery.len(), self.gallery_total))
+                .clicked()
+            {
+                self.gallery_loading = true;
+                self.engine.as_ref().unwrap().gallery_list(
+                    self.gallery_gen,
+                    self.gallery.len() as u64,
+                    self.gallery_page_size(),
+                    self.gallery_list_q(),
+                    &self.gallery_view,
+                );
+            }
+        }
+    }
+
+    /// Download a gallery item, then upload it as a server input for `node`'s file selector.
+    fn pick_gallery_for_node(&mut self, idx: usize, node: NodeId, host: &Host) {
+        let Some(item) = self.gallery.get(idx).cloned() else { return };
+        let Some((doc_id, epoch)) = self.active_doc().map(|d| (d.id, d.epoch)) else { return };
+        let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
+        self.node_upload_pending = Some(NodeFilePick {
+            key: item.key(),
+            filename: item.filename.clone(),
+            node,
+            doc_id,
+            epoch,
+        });
+        // Videos take the raw path — a decode would fail and take the bytes with it.
+        let engine = self.engine.as_ref().unwrap();
+        if item.is_video {
+            engine.fetch_video(item.subfolder.clone(), item.filename.clone());
+        } else {
+            engine.fetch_full(item.subfolder.clone(), item.filename.clone(), cache_dir);
+        }
+        self.graph_status = format!("Loading {}…", graphview::elide_tail(&item.filename, 40));
+        host.haptic(Haptic::Light);
+    }
+
+    /// The downloaded gallery bytes are here — upload them as an input for the node that asked.
+    /// Returns true when this download belonged to a node pick.
+    fn take_node_upload(&mut self, key: &str, bytes: &[u8]) -> bool {
+        if !self.node_upload_pending.as_ref().is_some_and(|p| p.key == key) {
+            return false;
+        }
+        let Some(pending) = self.node_upload_pending.take() else { return false };
+        let token = self.next_upload_id;
+        self.next_upload_id += 1;
+        self.pending_uploads.insert(token, (pending.doc_id, pending.epoch, pending.node));
+        self.engine.as_ref().unwrap().upload_input_image(
+            token,
+            pending.filename,
+            bytes.to_vec(),
+        );
+        true
+    }
+
+    /// The canvas popup over [`Self::file_picker_ui`], opened by tapping a node's file widget or
+    /// from its long-press menu. Closes itself if the node goes away (undo, tab switch, reload).
+    fn file_picker_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(node) = self.file_picker else { return };
+        let Some(mi) = self.node_media_input(node) else {
+            self.file_picker = None;
+            return;
+        };
+        let title = {
+            let what = if mi.video { "video" } else { "image" };
+            let class = self
+                .active_doc()
+                .and_then(|d| d.graph.snarl.get_node(node))
+                .map(|n| elide(&n.object.name, 22))
+                .unwrap_or_default();
+            format!("{} Choose {what} · {class}", icons::IMAGE)
+        };
+        let mut open = true;
+        centered(ctx, egui::Window::new(title))
+            .collapsible(false)
+            .open(&mut open)
+            .default_size([360.0, 470.0])
+            .show(ctx, |ui| {
+                crate::theme::scroll_vertical()
+                    .id_salt("file-picker-window")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.file_picker_ui(ui, host, node, false);
+                        ui.add_space(8.0);
+                    });
+            });
+        if !open {
+            self.file_picker = None;
         }
     }
 
@@ -13824,7 +14167,9 @@ impl ComfyApp {
         (cols, tile)
     }
 
-    /// Grid over the server's uploaded input images.
+    /// Grid over the files already uploaded to the server's `input` dir. Stills preview through
+    /// `/view?type=input`; videos can't (that returns the raw container, and nothing server-side
+    /// renders a poster for inputs), so they show as a play badge over the filename tail.
     fn loadimage_server_grid(
         &mut self,
         ui: &mut egui::Ui,
@@ -13834,20 +14179,24 @@ impl ComfyApp {
         selected: &str,
     ) {
         if options.is_empty() {
-            ui.weak("No input images on the server yet — pick one from Device.");
+            ui.weak("Nothing uploaded to the server yet — pick from Gallery or Device.");
             return;
         }
         ui.add(
             egui::TextEdit::singleline(&mut self.img_pick_filter)
-                .hint_text("filter input images")
+                .hint_text("filter server files")
                 .desired_width(f32::INFINITY),
         );
         let filter = self.img_pick_filter.to_lowercase();
-        let matches: Vec<&String> = options
+        let mut matches: Vec<&String> = options
             .iter()
             .filter(|o| filter.is_empty() || o.to_lowercase().contains(&filter))
-            .take(120)
             .collect();
+        // Newest first, as far as this list can tell: the server's enum carries no timestamps, so
+        // reverse name order is the best available proxy — ComfyUI's own `ComfyUI_00042_` counters
+        // and the date-stamped names phones produce both sort newest-last ascending.
+        matches.sort_by(|a, b| b.as_str().cmp(a.as_str()));
+        matches.truncate(120);
 
         let (cols, tile) = Self::picker_grid_dims(ui);
         let mut picked: Option<String> = None;
@@ -13861,6 +14210,7 @@ impl ComfyApp {
                         continue;
                     }
                     let is_sel = **name == selected;
+                    let video = graphview::is_pick_video(name);
                     match self.thumbs.get(&key) {
                         Some(tex) => {
                             let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
@@ -13871,11 +14221,17 @@ impl ComfyApp {
                             }
                         }
                         None => {
-                            if self.thumbs.claim(&key) {
+                            // Never ask for a thumb of a video: /view hands back the container and
+                            // the decode fails, so the claim would just stick forever.
+                            if !video && self.thumbs.claim(&key) {
                                 self.engine.as_ref().unwrap().fetch_input_thumb((*name).clone());
                             }
-                            if ui.put(rect, egui::Button::new(elide(name, 12)).wrap()).clicked() {
+                            let label = graphview::elide_tail(name, 14);
+                            if ui.put(rect, egui::Button::new(label).wrap()).clicked() {
                                 picked = Some((*name).clone());
+                            }
+                            if video {
+                                video_badge(ui, rect);
                             }
                         }
                     }
@@ -13926,6 +14282,8 @@ impl ComfyApp {
             ui.ctx().request_repaint_after(Duration::from_millis(400));
             return None;
         }
+        // MediaStore lists by date_added descending, so this grid is already newest-first — the
+        // order every picker here uses (see `newest_first`).
         if !self.device_images_loaded {
             self.device_images = host.list_device_images(300);
             self.device_images_loaded = true;
@@ -14028,7 +14386,7 @@ impl ComfyApp {
                     host.haptic(Haptic::Light);
                 }
                 _ => {
-                    self.note = "Couldn't read that photo from the device".into();
+                    self.graph_status = "Couldn't read that photo from the device".into();
                     host.haptic(Haptic::Error);
                 }
             }
@@ -16158,7 +16516,8 @@ impl ComfyApp {
                                     self.selected.insert(item_key);
                                 }
                             }
-                        } else if resp.double_clicked() {
+                        } else if resp.double_clicked() || self.tile_double_tapped(ui, &resp, &item_key)
+                        {
                             open = Some(idx);
                         }
                     }
@@ -16169,6 +16528,31 @@ impl ComfyApp {
             ui.allocate_space(egui::vec2(avail, (n_rows - last) as f32 * row_h - spacing_y));
         }
         open
+    }
+
+    /// How long a second tap on the same tile still counts as a double-tap. Generous on purpose:
+    /// this is a deliberate two-tap gesture, not an accidental one, and the single tap it competes
+    /// with does nothing in browse mode.
+    const DOUBLE_TAP_SECS: f64 = 0.8;
+
+    /// The app's own double-tap test: a second tap **on the same tile** within
+    /// [`Self::DOUBLE_TAP_SECS`]. egui's `double_clicked` additionally requires the two taps to
+    /// land within `max_click_dist` of each other — a mouse-shaped rule that a finger re-placing
+    /// itself on a 100px thumbnail misses often enough to feel broken. The tile itself is the
+    /// target here, so only the pacing matters, and it is deliberately loose.
+    fn tile_double_tapped(&mut self, ui: &egui::Ui, resp: &egui::Response, key: &str) -> bool {
+        if !resp.clicked() {
+            return false;
+        }
+        let now = ui.input(|i| i.time);
+        let again = self
+            .tile_tap
+            .as_ref()
+            .is_some_and(|(k, t)| k == key && now - *t <= Self::DOUBLE_TAP_SECS);
+        // Either way this tap starts a fresh window: consuming it stops a third tap from
+        // re-opening, and a first tap has to be remembered to be matched.
+        self.tile_tap = if again { None } else { Some((key.to_string(), now)) };
+        again
     }
 
     /// Centered picker over the server gallery's image items; a tap fetches full bytes and sets
@@ -16210,13 +16594,14 @@ impl ComfyApp {
                     );
                 }
                 ui.separator();
-                let images: Vec<usize> = self
-                    .gallery
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, it)| !it.is_video)
-                    .map(|(i, _)| i)
-                    .collect();
+                let images = self.newest_first(
+                    self.gallery
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, it)| !it.is_video)
+                        .map(|(i, _)| i)
+                        .collect(),
+                );
                 if images.is_empty() {
                     ui.add_space(16.0);
                     ui.vertical_centered(|ui| {
@@ -16267,9 +16652,14 @@ impl ComfyApp {
         for row in indices.chunks(cols) {
             ui.horizontal(|ui| {
                 for &idx in row {
-                    let (thumb_key, subfolder, filename) = {
+                    let (thumb_key, subfolder, filename, is_video) = {
                         let Some(item) = self.gallery.get(idx) else { continue };
-                        (item.thumb_key(size), item.subfolder.clone(), item.filename.clone())
+                        (
+                            item.thumb_key(size),
+                            item.subfolder.clone(),
+                            item.filename.clone(),
+                            item.is_video,
+                        )
                     };
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
@@ -16284,6 +16674,7 @@ impl ComfyApp {
                             ui.put(rect, img).clicked()
                         }
                         None => {
+                            let label = graphview::elide_tail(&filename, 14);
                             if self.thumbs.claim(&thumb_key) {
                                 self.engine.as_ref().unwrap().fetch_thumb(
                                     subfolder,
@@ -16292,9 +16683,14 @@ impl ComfyApp {
                                     self.full_cache_root.clone(),
                                 );
                             }
-                            ui.put(rect, egui::Button::new(elide(&thumb_key, 12)).wrap()).clicked()
+                            ui.put(rect, egui::Button::new(label).wrap()).clicked()
                         }
                     };
+                    // The gate renders video posters, so a video tile looks like an image tile —
+                    // badge it the way the gallery grid does.
+                    if is_video {
+                        video_badge(ui, rect);
+                    }
                     if clicked {
                         pick = Some(idx);
                     }
@@ -18799,9 +19195,15 @@ impl EguiApp for ComfyApp {
             // The framework never calls EguiApp::theme, so apply the color scheme here.
             crate::theme::apply(ui.ctx());
             // Touch double-taps are slower and less precise than a mouse; widen egui's window.
+            // `max_click_dist` is doing double duty in egui: how far the finger may travel DURING a
+            // tap, and how far apart two taps may land and still count as a double-click. 12px is a
+            // mouse figure — a finger re-placing itself on a ~100px tile easily misses it, which is
+            // why the gallery's own rule below keys off the tile instead of the pixel distance.
+            // `max_click_dist` stays a finger-wobble allowance rather than a double-tap window:
+            // raising it far would start turning small scroll nudges into taps.
             ui.ctx().options_mut(|o| {
-                o.input_options.max_double_click_delay = 0.5;
-                o.input_options.max_click_dist = 12.0;
+                o.input_options.max_double_click_delay = 0.6;
+                o.input_options.max_click_dist = 16.0;
             });
             egui_extras::install_image_loaders(ui.ctx());
             self.load_settings(host);
@@ -18939,6 +19341,15 @@ impl EguiApp for ComfyApp {
             })
         {
             self.error_modal = None;
+        } else if self.file_picker.is_some()
+            && ui.ctx().input_mut(|i| {
+                i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                    || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+            })
+        {
+            // The node file picker is a canvas overlay: Back closes it rather than leaving the
+            // graph tab out from under it.
+            self.file_picker = None;
         } else if (self.tags_window_open
             || self.album_manage_open
             || self.album_create_draft.is_some()
@@ -19994,30 +20405,16 @@ impl ComfyApp {
     }
 }
 
-/// A menu / combo-box button whose popup opens *upward* and scrolls.
-///
-/// `Ui::menu_button` and `egui::ComboBox` only flip their popup above the button when it wouldn't
-/// otherwise fit — but egui's screen rect extends under the Android navigation bar, so a short menu
-/// "fits" below and ends up covering the nav bar and the system gesture area. Everything in a
-/// bottom control bar uses this instead, which always prefers opening upward. The bounded scroll
-/// area keeps a long list (e.g. every model) from running off the top of the screen.
+// The menu popups themselves live in `theme` (host-testable: see `menu_cap_uses_the_room_below`);
+// these keep the call sites in this file short.
 fn up_menu<R>(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    let _ = menu_popup(
-        ui,
-        label,
-        None,
-        egui::RectAlign::TOP_START,
-        &[egui::RectAlign::TOP_END, egui::RectAlign::BOTTOM_START],
-        egui::PopupCloseBehavior::CloseOnClick,
-        content,
-    );
+    crate::theme::up_menu(ui, label, content);
 }
 
-/// [`up_menu`] with a fixed button size (viewer action icons) and a chosen popup close behavior.
 fn up_menu_sized<R>(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
@@ -20025,72 +20422,15 @@ fn up_menu_sized<R>(
     close_behavior: egui::PopupCloseBehavior,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::Response {
-    menu_popup(
-        ui,
-        label,
-        Some(min_size),
-        egui::RectAlign::TOP_START,
-        &[egui::RectAlign::TOP_END, egui::RectAlign::BOTTOM_START],
-        close_behavior,
-        content,
-    )
+    crate::theme::up_menu_sized(ui, label, min_size, close_behavior, content)
 }
 
-/// Header menu: popup opens below the button, right-aligned so it grows left.
 fn down_menu<R>(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
     content: impl FnOnce(&mut egui::Ui) -> R,
 ) {
-    let _ = menu_popup(
-        ui,
-        label,
-        None,
-        egui::RectAlign::BOTTOM_END,
-        &[egui::RectAlign::BOTTOM_START, egui::RectAlign::TOP_END],
-        egui::PopupCloseBehavior::CloseOnClick,
-        content,
-    );
-}
-
-fn menu_popup<R>(
-    ui: &mut egui::Ui,
-    label: impl Into<egui::WidgetText>,
-    min_size: Option<egui::Vec2>,
-    align: egui::RectAlign,
-    alternatives: &'static [egui::RectAlign],
-    close_behavior: egui::PopupCloseBehavior,
-    content: impl FnOnce(&mut egui::Ui) -> R,
-) -> egui::Response {
-    use egui::containers::menu::MenuConfig;
-    let response = if let Some(size) = min_size {
-        ui.add_sized(size, egui::Button::new(label.into()))
-    } else {
-        ui.add(egui::Button::new(label.into()))
-    };
-    let config = MenuConfig::default().close_behavior(close_behavior);
-    // Grow with the screen so a full menu fits without an inner scrollbar.
-    let cap = (ui.ctx().content_rect().height() - 96.0).clamp(240.0, 640.0);
-    egui::Popup::menu(&response)
-        .align(align)
-        .align_alternatives(alternatives)
-        .gap(4.0)
-        .close_behavior(config.close_behavior)
-        .style(config.style.clone())
-        .info(
-            egui::UiStackInfo::new(egui::UiKind::Menu)
-                .with_tag_value(MenuConfig::MENU_CONFIG_TAG, config),
-        )
-        .show(|ui| {
-            crate::theme::scroll_vertical()
-                .max_height(cap)
-                .show(ui, |ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-                    content(ui)
-                })
-                .inner
-        });
-    response
+    crate::theme::down_menu(ui, label, content);
 }
 
 

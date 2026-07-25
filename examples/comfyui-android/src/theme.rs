@@ -292,3 +292,225 @@ pub fn scroll_both() -> egui::ScrollArea {
 pub fn scroll_horizontal() -> egui::ScrollArea {
     egui::ScrollArea::horizontal().scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
 }
+
+/// A menu / combo-box button whose popup opens *upward* and scrolls.
+///
+/// `Ui::menu_button` and `egui::ComboBox` only flip their popup above the button when it wouldn't
+/// otherwise fit — but egui's screen rect extends under the Android navigation bar, so a short menu
+/// "fits" below and ends up covering the nav bar and the system gesture area. Everything in a
+/// bottom control bar uses this instead, which always prefers opening upward. The bounded scroll
+/// area keeps a long list (e.g. every model) from running off the top of the screen.
+pub fn up_menu<R>(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    let _ = menu_popup(
+        ui,
+        label,
+        None,
+        egui::RectAlign::TOP_START,
+        &[egui::RectAlign::TOP_END, egui::RectAlign::BOTTOM_START],
+        egui::PopupCloseBehavior::CloseOnClick,
+        content,
+    );
+}
+
+/// [`up_menu`] with a fixed button size (viewer action icons) and a chosen popup close behavior.
+pub fn up_menu_sized<R>(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    min_size: egui::Vec2,
+    close_behavior: egui::PopupCloseBehavior,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::Response {
+    menu_popup(
+        ui,
+        label,
+        Some(min_size),
+        egui::RectAlign::TOP_START,
+        &[egui::RectAlign::TOP_END, egui::RectAlign::BOTTOM_START],
+        close_behavior,
+        content,
+    )
+}
+
+/// Header menu: popup opens below the button, right-aligned so it grows left.
+pub fn down_menu<R>(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) {
+    let _ = menu_popup(
+        ui,
+        label,
+        None,
+        egui::RectAlign::BOTTOM_END,
+        &[egui::RectAlign::BOTTOM_START, egui::RectAlign::TOP_END],
+        egui::PopupCloseBehavior::CloseOnClick,
+        content,
+    );
+}
+
+/// How tall a menu opened from `anchor` may grow: the room actually available on the side it opens
+/// toward, less a small margin. A fixed ceiling used to cut long menus (open workflow tabs, model
+/// lists) short on tall screens while leaving them off the screen edge on short ones.
+pub fn menu_height_cap(ctx: &egui::Context, anchor: egui::Rect, align: egui::RectAlign) -> f32 {
+    let screen = ctx.content_rect();
+    // `parent.y()` is the anchor edge the popup hangs off: BOTTOM_* opens downward from the
+    // anchor's bottom, TOP_* upward from its top.
+    let down = anchor.bottom().max(screen.top());
+    let below = screen.bottom() - down;
+    let above = anchor.top().min(screen.bottom()) - screen.top();
+    let (room, flipped) = match align.parent.y() {
+        egui::Align::Max => (below, above),
+        egui::Align::Min => (above, below),
+        egui::Align::Center => (screen.height(), screen.height()),
+    };
+    // Frame padding + the gap, so the scroll area itself stops short of the screen edge.
+    (room.max(flipped) - 24.0).clamp(160.0, screen.height())
+}
+
+pub fn menu_popup<R>(
+    ui: &mut egui::Ui,
+    label: impl Into<egui::WidgetText>,
+    min_size: Option<egui::Vec2>,
+    align: egui::RectAlign,
+    alternatives: &'static [egui::RectAlign],
+    close_behavior: egui::PopupCloseBehavior,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::Response {
+    use egui::containers::menu::MenuConfig;
+    let response = if let Some(size) = min_size {
+        ui.add_sized(size, egui::Button::new(label.into()))
+    } else {
+        ui.add(egui::Button::new(label.into()))
+    };
+    let config = MenuConfig::default().close_behavior(close_behavior);
+    // Grow with the screen so a full menu fits without an inner scrollbar.
+    let cap = menu_height_cap(ui.ctx(), response.rect, align);
+    egui::Popup::menu(&response)
+        .align(align)
+        .align_alternatives(alternatives)
+        .gap(4.0)
+        .close_behavior(config.close_behavior)
+        .style(config.style.clone())
+        .info(
+            egui::UiStackInfo::new(egui::UiKind::Menu)
+                .with_tag_value(MenuConfig::MENU_CONFIG_TAG, config),
+        )
+        .show(|ui| {
+            // egui sizes a popup's Area on a one-off sizing pass, seeded from
+            // `spacing.default_area_size` (600×400) — and that becomes the Ui's `max_rect` on every
+            // later frame, so the scroll area below could never grow past ~386px no matter what
+            // `max_height` said. Claiming the full cap *during the sizing pass only* lets the Area
+            // record a tall enough size; the list still shrinks to its content afterwards.
+            if ui.is_sizing_pass() {
+                ui.set_min_height(cap);
+            }
+            scroll_vertical()
+                .max_height(cap)
+                .show(ui, |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    content(ui)
+                })
+                .inner
+        });
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drive a `down_menu` with `rows` 32px entries on a `screen`-sized viewport and return how
+    /// much of the list is actually visible (the scroll viewport inside the popup).
+    fn menu_visible_height(screen: egui::Vec2, rows: usize) -> f32 {
+        menu_visible_height_at(screen, rows, false)
+    }
+
+    /// `bottom_bar`: put the button at the bottom of the screen and open the menu upward, the way
+    /// every control-bar menu (models, gallery filters) does.
+    fn menu_visible_height_at(screen: egui::Vec2, rows: usize, bottom_bar: bool) -> f32 {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen);
+        let seen = std::cell::Cell::new(0.0f32);
+        // Frame 1 clicks the button; egui sizes a popup from the previous frame's area state, so
+        // give it a few frames to settle before believing the measurement.
+        for frame in 0..5 {
+            let events = if frame == 1 {
+                let at = if bottom_bar { egui::pos2(40.0, screen.y - 20.0) } else { egui::pos2(40.0, 20.0) };
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if bottom_bar {
+                        ui.add_space(screen.y - 40.0);
+                    }
+                    let menu: fn(&mut egui::Ui, &str, &mut dyn FnMut(&mut egui::Ui)) =
+                        if bottom_bar {
+                            |ui, label, content| up_menu(ui, label, content)
+                        } else {
+                            |ui, label, content| down_menu(ui, label, content)
+                        };
+                    menu(ui, "Tabs", &mut |ui: &mut egui::Ui| {
+                        ui.set_min_width(260.0);
+                        // Inside the popup's scroll area, the clip rect IS the visible list.
+                        seen.set(ui.clip_rect().height().min(screen.y));
+                        for i in 0..rows {
+                            ui.add_sized([220.0, 32.0], egui::Button::new(format!("tab {i}")));
+                        }
+                    });
+                });
+            });
+        }
+        seen.get()
+    }
+
+    /// A menu must use the room it actually has. The cap used to be a fixed
+    /// `content_height - 96`, clamped to 640 — which on a landscape phone (the way the graph
+    /// editor is usable at all) left the open-workflow list showing a handful of tabs.
+    #[test]
+    fn menu_cap_uses_the_room_below() {
+        let portrait = egui::vec2(393.0, 873.0);
+        let landscape = egui::vec2(873.0, 393.0);
+
+        let tall = menu_visible_height(portrait, 24);
+        let short = menu_visible_height(landscape, 24);
+        println!("portrait menu {tall:.0}px, landscape {short:.0}px");
+
+        // Portrait: the old ceiling was 640; the room below a top-of-screen button is ~840.
+        assert!(tall > 640.0, "portrait menu only got {tall:.0}px of a 873px screen");
+        // Landscape: nearly the whole 393px, rather than (393 - 96) minus frame padding.
+        assert!(short > 300.0, "landscape menu only got {short:.0}px of a 393px screen");
+        // Neither may overflow its screen.
+        assert!(tall <= 873.0 && short <= 393.0, "menu overflowed the viewport");
+
+        // …and a short menu must still hug its content rather than claiming the whole cap.
+        let few = menu_visible_height(portrait, 3);
+        assert!(few < 200.0, "a 3-row menu took {few:.0}px");
+
+        // The bottom control bars open upward (models, gallery filters) — same room rule.
+        let upward = menu_visible_height_at(portrait, 24, true);
+        println!("upward menu {upward:.0}px");
+        assert!(upward > 640.0, "an upward menu only got {upward:.0}px of a 873px screen");
+        assert!(upward <= 873.0, "upward menu overflowed the viewport");
+    }
+}

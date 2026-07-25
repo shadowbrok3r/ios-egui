@@ -1340,6 +1340,12 @@ impl Engine {
                 }
                 Err(e) => {
                     log.error(format!("video download: {e}"));
+                    // Keyed first, so a waiter (the viewer, a node's file pick) can tell whether
+                    // THIS download is the one that failed; then the visible gallery message.
+                    let _ = tx.send(Msg::FullImageError {
+                        key: format!("{subfolder}/{filename}"),
+                        why: e.clone(),
+                    });
                     let _ = tx.send(Msg::GalleryError(e));
                 }
             }

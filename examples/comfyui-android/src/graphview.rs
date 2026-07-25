@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use egui::emath::TSTransform;
-use egui_snarl::ui::{
+use egui_snarl::ui::{NodeLayout, 
     BackgroundPattern, PinInfo, PinPlacement, SnarlStyle, SnarlViewer, SnarlWidget, WireStyle,
 };
 use egui_snarl::{InPin, InPinId, NodeId, OutPin, OutPinId, Snarl};
@@ -56,6 +56,14 @@ pub struct GraphView {
     /// Auto-arrange requested by a load, waiting for the canvas to paint before running.
     needs_auto_arrange: bool,
     sizes: HashMap<NodeId, egui::Vec2>,
+    /// `sizes` as of the previous frame: a queued arrange waits for two frames to agree, since a
+    /// node's first measure is taken before egui has settled its content.
+    prev_sizes: HashMap<NodeId, egui::Vec2>,
+    /// `sizes` the last arrange actually laid out from, for the load-time refine check.
+    arranged_sizes: HashMap<NodeId, egui::Vec2>,
+    /// Re-arranges still allowed if measures move after a *load* arrange (never after a manual
+    /// one — re-arranging under the user because a node grew would yank the canvas away).
+    refine_left: u8,
     to_global: TSTransform,
     pub view_rect: egui::Rect,
     /// Where the in-progress drag started (classified once at press). Header drags move a node;
@@ -70,8 +78,108 @@ pub struct GraphView {
     long_press: Option<LongPress>,
     /// `lora_name` picks this frame (recommended strengths applied by the app).
     lora_picks: Vec<LoraPick>,
+    /// A file-selector widget was tapped on the canvas this frame; the app opens its picker.
+    file_pick: Option<NodeId>,
+    /// Lay the graph out top-to-bottom rather than left-to-right, chosen from the canvas shape so
+    /// the flow runs along the screen's LONG axis (see [`arrange`]).
+    vertical: bool,
+    /// Thumbnails of the input files this graph's file-selector nodes point at, keyed by filename.
+    /// Supplied by the app each frame (it owns the thumb cache and the fetches); the canvas paints
+    /// them onto the nodes so a `LoadImage` shows its picture instead of just a filename.
+    input_thumbs: HashMap<String, egui::TextureHandle>,
     /// Screen-space pan queued for the next `show` to lift a focused node field above the keyboard.
     pending_pan: egui::Vec2,
+}
+
+/// File extensions the node file pickers treat as still images / as videos. `gif` counts as a
+/// video: VHS accepts animated gifs as clips, and a poster is the useful preview either way.
+pub const PICK_IMAGE_EXT: [&str; 6] = ["png", "jpg", "jpeg", "webp", "bmp", "avif"];
+pub const PICK_VIDEO_EXT: [&str; 7] = ["mp4", "webm", "mkv", "mov", "avi", "m4v", "gif"];
+
+/// Lowercase extension of a listed file (`"clipspace/foo.png [input]"` → `"png"`).
+pub fn pick_ext(name: &str) -> String {
+    let head = name.split_whitespace().next().unwrap_or(name);
+    head.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default()
+}
+
+pub fn is_pick_video(name: &str) -> bool {
+    PICK_VIDEO_EXT.contains(&pick_ext(name).as_str())
+}
+
+fn is_pick_media(name: &str) -> bool {
+    let ext = pick_ext(name);
+    PICK_IMAGE_EXT.contains(&ext.as_str()) || PICK_VIDEO_EXT.contains(&ext.as_str())
+}
+
+/// A node input that selects a file from the server's `input` directory — `LoadImage.image`,
+/// `VHS_LoadVideo.video`, and every other upload-style widget. Found by content rather than by
+/// class name so custom loaders come along for free.
+#[derive(Clone)]
+pub struct MediaInput {
+    pub idx: usize,
+    pub name: String,
+    pub options: Vec<String>,
+    pub selected: String,
+    /// The picker should offer videos rather than stills.
+    pub video: bool,
+}
+
+/// Is this input a file selector, and does it hold videos? Allocation-free, because the canvas asks
+/// this for every input row of every node, every frame — [`media_input_of`] clones the whole option
+/// list, which for a `LoadImage` on a busy server is hundreds of strings.
+fn media_input_kind(inp: &FlowInput) -> Option<bool> {
+    let FlowValueType::Array { options, .. } = &inp.value else { return None };
+    let named = matches!(
+        inp.name.to_ascii_lowercase().as_str(),
+        "image" | "video" | "file" | "media" | "images" | "video_file" | "image_file"
+    );
+    // A handful of options is enough to tell a file list from a sampler list; a widget with a
+    // media-ish name qualifies even while the server has nothing uploaded yet.
+    let sample = options.iter().take(12).count();
+    let media_options = sample > 0 && options.iter().take(12).filter(|o| is_pick_media(o)).count() * 2 > sample;
+    if !media_options && !(named && options.is_empty()) {
+        return None;
+    }
+    // Kind from the files themselves; the widget name decides an empty list.
+    Some(if options.is_empty() {
+        inp.name.to_ascii_lowercase().contains("video")
+    } else {
+        options.iter().filter(|o| is_pick_video(o)).count() * 2 > options.len()
+    })
+}
+
+/// Index of the node's file-selector input, if it has one. Allocation-free — prefer this on the
+/// per-frame canvas paths and read the input out of `data.inputs` when you need its value.
+pub fn media_input_idx(data: &FlowNodeData) -> Option<usize> {
+    data.inputs.iter().position(|inp| media_input_kind(inp).is_some())
+}
+
+/// The file the node's selector currently names, plus whether that selector takes videos.
+/// Allocation-free; the per-frame canvas and thumbnail paths use this.
+pub fn media_selected(data: &FlowNodeData) -> Option<(&str, bool)> {
+    let inp = data.inputs.get(media_input_idx(data)?)?;
+    let video = media_input_kind(inp)?;
+    match &inp.value {
+        FlowValueType::Array { selected, .. } => Some((selected.as_str(), video)),
+        _ => None,
+    }
+}
+
+/// The node's file selector, if it has one: an enum input whose options read as media filenames,
+/// or (before any file exists on the server) one named like an upload widget. Clones the option
+/// list for the picker UI; on per-frame paths use [`media_input_idx`] instead.
+pub fn media_input_of(data: &FlowNodeData) -> Option<MediaInput> {
+    let idx = media_input_idx(data)?;
+    let inp = data.inputs.get(idx)?;
+    let video = media_input_kind(inp)?;
+    let FlowValueType::Array { options, selected } = &inp.value else { return None };
+    Some(MediaInput {
+        idx,
+        name: inp.name.clone(),
+        options: options.clone(),
+        selected: selected.clone(),
+        video,
+    })
 }
 
 /// Whether this input is a ComfyUI seed widget that carries `control_after_generate`.
@@ -201,6 +309,9 @@ impl GraphView {
             arrange_settling: 0,
             needs_auto_arrange: false,
             sizes: HashMap::new(),
+            prev_sizes: HashMap::new(),
+            arranged_sizes: HashMap::new(),
+            refine_left: 0,
             to_global: TSTransform::IDENTITY,
             view_rect: egui::Rect::ZERO,
             drag_kind: DragKind::None,
@@ -208,6 +319,9 @@ impl GraphView {
             long_fired: false,
             long_press: None,
             lora_picks: Vec::new(),
+            file_pick: None,
+            vertical: false,
+            input_thumbs: HashMap::new(),
             pending_pan: egui::Vec2::ZERO,
         }
     }
@@ -221,10 +335,15 @@ impl GraphView {
         self.arrange_settling = 0;
         self.needs_auto_arrange = false;
         self.sizes.clear();
+        self.prev_sizes.clear();
+        self.arranged_sizes.clear();
+        self.refine_left = 0;
         self.press = None;
         self.long_fired = false;
         self.long_press = None;
         self.lora_picks.clear();
+        self.file_pick = None;
+        self.input_thumbs.clear();
         self.pending_pan = egui::Vec2::ZERO;
     }
 
@@ -246,6 +365,9 @@ impl GraphView {
         self.needs_auto_arrange = true;
         self.arrange_queued = false;
         self.arrange_wait = 0;
+        // One correction pass is allowed if the measures the load arrange used turn out to have
+        // been taken before the canvas settled.
+        self.refine_left = 1;
         self.cmd = Some(ViewCmd::FitAll);
     }
 
@@ -266,7 +388,8 @@ impl GraphView {
         if snarl.nodes_pos_ids().next().is_none() {
             return;
         }
-        arrange(snarl, &self.sizes);
+        arrange(snarl, &self.sizes, self.vertical);
+        self.arranged_sizes = self.sizes.clone();
         self.cmd = Some(ViewCmd::FitAll);
     }
 
@@ -318,6 +441,21 @@ impl GraphView {
         std::mem::take(&mut self.lora_picks)
     }
 
+    /// The node whose file selector was tapped on the canvas this frame.
+    pub fn take_file_pick(&mut self) -> Option<NodeId> {
+        self.file_pick.take()
+    }
+
+    /// Is the graph currently laid out top-to-bottom? (Portrait canvases; see [`arrange`].)
+    pub fn flow_vertical(&self) -> bool {
+        self.vertical
+    }
+
+    /// Hand the canvas this frame's input-file thumbnails (see [`Self::input_thumbs`]).
+    pub fn set_input_thumbs(&mut self, thumbs: HashMap<String, egui::TextureHandle>) {
+        self.input_thumbs = thumbs;
+    }
+
     /// Render the canvas (with lock gating and pending view commands), then the minimap overlay.
     /// Returns the node tapped this frame, if any — snarl itself only selects on shift-click,
     /// which doesn't exist on touch.
@@ -335,8 +473,16 @@ impl GraphView {
         seed_randomize: &mut HashMap<(NodeId, String), bool>,
     ) -> Option<NodeId> {
         self.sizes.retain(|id, _| g.snarl.get_node(*id).is_some());
+        // Canvas shape decides the flow axis, before any queued arrange runs this frame. The 1.15
+        // factor keeps a near-square canvas from flipping the whole layout back and forth.
+        let canvas = ui.available_rect_before_wrap();
+        if canvas.is_finite() && canvas.width() > 0.0 {
+            self.view_rect = canvas;
+        }
+        self.vertical = self.view_rect.height() > self.view_rect.width() * 1.15;
         self.arrange_settling = self.arrange_settling.saturating_sub(1);
         self.lora_picks.clear();
+        self.file_pick = None;
         // Keep file combos populated even when a single loader class shipped an empty list.
         for data in g.snarl.nodes_mut() {
             ensure_file_combos(data, &g.object_info, lora_files);
@@ -347,21 +493,26 @@ impl GraphView {
             self.arrange_on_load(&mut g.snarl);
         }
 
+        let ids: Vec<NodeId> = g.snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();
+        // A node's size settles over a frame or two (egui discards and re-runs the pass that
+        // initialises snarl's node state). Arranging from the first measure laid the canvas out
+        // from numbers that were about to change, so require two frames to agree.
+        let settled = sizes_agree(&self.sizes, &self.prev_sizes);
         if self.arrange_queued {
-            let ids: Vec<NodeId> = g.snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();
             if ids.is_empty() {
                 self.arrange_queued = false;
                 self.arrange_wait = 0;
             } else {
-                let ready = ids.iter().all(|id| self.sizes.contains_key(id));
+                let measured = ids.iter().filter(|id| self.sizes.contains_key(id)).count();
+                let ready = measured == ids.len() && settled;
                 self.arrange_wait = self.arrange_wait.saturating_add(1);
-                // Prefer real measures; after a few FitAll frames, arrange with what we have so a
-                // never-drawn node cannot stall the queue forever.
-                if ready || self.arrange_wait >= 3 {
-                    let measured = ids.iter().filter(|id| self.sizes.contains_key(id)).count();
+                // Prefer settled measures; after a few FitAll frames, arrange with what we have so
+                // a never-drawn node cannot stall the queue forever.
+                if ready || self.arrange_wait >= 6 {
                     log::info!(
-                        "graphview: queued arrange firing ({} nodes, {measured} measured, wait={}, locked={})",
+                        "graphview: queued arrange firing ({} nodes, {measured} measured, settled={settled}, widest={:.0}, wait={}, locked={})",
                         ids.len(),
+                        self.sizes.values().map(|s| s.x).fold(0.0f32, f32::max),
                         self.arrange_wait,
                         self.locked
                     );
@@ -371,7 +522,26 @@ impl GraphView {
                     ui.ctx().request_repaint();
                 }
             }
+        } else if self.refine_left > 0 && self.arrange_settling == 0 && !ids.is_empty() && settled {
+            // The load arrange laid out from sizes that have since moved (a node measured before
+            // its content settled, or one that had no measure at all). Re-run it once, now.
+            let moved = ids.iter().any(|id| {
+                let now = self.sizes.get(id);
+                match (now, self.arranged_sizes.get(id)) {
+                    (Some(now), Some(then)) => (*now - *then).abs().max_elem() > 8.0,
+                    (Some(_), None) => true,
+                    _ => false,
+                }
+            });
+            if moved {
+                self.refine_left -= 1;
+                log::info!("graphview: node sizes moved after the load arrange — refining");
+                self.request_arrange();
+            } else {
+                self.refine_left = 0;
+            }
         }
+        self.prev_sizes.clone_from(&self.sizes);
 
         // The snarl response rect is unbounded (scene ui); measure the canvas region ourselves.
         // (Before drag_gate: classify_press needs an up-to-date view_rect.)
@@ -393,6 +563,8 @@ impl GraphView {
             focus,
             bypassed,
             lora_picks: &mut self.lora_picks,
+            file_pick: &mut self.file_pick,
+            input_thumbs: &self.input_thumbs,
             seed_randomize,
             cmd,
             pan,
@@ -700,6 +872,33 @@ impl GraphView {
     }
 }
 
+/// Graph-space width of a node's text fields, and with it the width of a text-carrying node.
+/// A constant on purpose: a width taken from `available_width` feeds back into the node size snarl
+/// derives it from, so the node grows a little every frame (see [`Wrapper::show_input`]) and the
+/// measured `sizes` auto-arrange lays out from never settle. Sized to read on a phone at fit zoom.
+const NODE_FIELD_W: f32 = 260.0;
+
+/// Width budget for a combo's label on the canvas, and in the Properties pane (which has a whole
+/// panel to play with). The canvas figure keeps a node inside [`NODE_FIELD_W`] + its chrome.
+const CANVAS_COMBO_W: f32 = 168.0;
+const PROPS_COMBO_W: f32 = 280.0;
+
+/// Edge of the square preview a file-selector node shows for its currently selected image.
+const NODE_PREVIEW_W: f32 = 156.0;
+
+/// The size cache's entry for a measured node. Clamped at the point of capture rather than inside
+/// `arrange`, so every consumer — layout, the fit's bounds, the minimap, hit-testing — agrees on
+/// one number. Nothing in a node ratchets any more, so this is a backstop: it only stops a single
+/// pathological measure from throwing the whole layout off the canvas.
+pub fn clamp_measure(size: egui::Vec2) -> egui::Vec2 {
+    size.min(MAX_LAYOUT_NODE)
+}
+
+/// Layout backstop: no measured node size larger than this enters the size cache. A single
+/// pathological measure (a node drawn mid-transform, a runaway text layout) would otherwise push
+/// every later column off the canvas.
+const MAX_LAYOUT_NODE: egui::Vec2 = egui::vec2(1600.0, 3000.0);
+
 /// Graph-space height of a node's title bar, for header-only node dragging. Roughly the title
 /// row (one line + header frame margins); generous enough to grab, thin enough that the body and
 /// its pin rows below stay free for wiring.
@@ -740,6 +939,13 @@ fn style() -> SnarlStyle {
     // and they become fat finger targets clear of the draggable node frame.
     s.pin_placement = Some(PinPlacement::Outside { margin: 3.0 });
     s.pin_size = Some(15.0);
+    // Stack inputs above outputs instead of side by side. In snarl's default Coil layout the input
+    // column and the output column are measured against the same full node width and then SUMMED,
+    // so every node carries its output labels' width as dead horizontal weight — and arrange spaces
+    // its columns by exactly that width. Sandwich made a realistic txt2img graph 2039 -> 1775 units
+    // wide (fit zoom 0.175 -> 0.199 on a 393x873 phone); nodes come out uniform and a little taller,
+    // which is the right trade on a portrait screen. Revert by deleting this line.
+    s.node_layout = Some(NodeLayout::sandwich());
     s
 }
 
@@ -754,6 +960,14 @@ const DOT_RADIUS: f32 = 1.7;
 const DOT_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 70, 74);
 /// Cool rim on a resting node — a subtle glass edge against the black canvas.
 const NODE_RIM: egui::Color32 = egui::Color32::from_rgb(54, 84, 92);
+
+/// Do two measure snapshots describe the same canvas — same nodes, no size moved by more than a
+/// unit? Tells a settled layout from one egui is still converging.
+fn sizes_agree(a: &HashMap<NodeId, egui::Vec2>, b: &HashMap<NodeId, egui::Vec2>) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .all(|(id, s)| b.get(id).is_some_and(|p| (*s - *p).abs().max_elem() <= 1.0))
+}
 
 /// Bounding box of all nodes in graph space (measured sizes where known).
 fn bounds(snarl: &Snarl<FlowNodeData>, sizes: &HashMap<NodeId, egui::Vec2>) -> Option<egui::Rect> {
@@ -772,15 +986,27 @@ fn fit_transform(view: egui::Rect, ui_rect: egui::Rect) -> TSTransform {
     TSTransform::new(ui_rect.center().to_vec2() - view.center().to_vec2() * scale, scale)
 }
 
-/// Compact layout: columns by longest-path depth (left to right), nodes stacked within each
-/// column with small gaps, columns vertically centered — measured sizes, so nothing overlaps.
-/// Returns the placed rects.
+/// Compact layout: bands by longest-path depth, nodes stacked within each band with small gaps,
+/// bands centred across the flow — measured sizes, so nothing overlaps. Returns the placed rects.
+///
+/// `vertical` runs execution top-to-bottom instead of left-to-right. A deep workflow laid out
+/// across a portrait phone is a long thin ribbon, and fitting it puts every node at ~55px wide;
+/// turning the flow to match the screen's long axis is what makes the same graph readable
+/// (measured on a 393x873 viewport: 1775x368 at fit zoom 0.199, versus 608x1046 at 0.65).
 pub fn arrange(
     snarl: &mut Snarl<FlowNodeData>,
     sizes: &HashMap<NodeId, egui::Vec2>,
+    vertical: bool,
 ) -> Vec<egui::Rect> {
-    const H_GAP: f32 = 60.0;
-    const V_GAP: f32 = 24.0;
+    // Gaps along the flow (between depths) and across it (between siblings in a depth).
+    const FLOW_GAP: f32 = 60.0;
+    const CROSS_GAP: f32 = 24.0;
+    // A node's extent along the flow axis and across it, and how to build a position from the two.
+    let flow = |v: egui::Vec2| if vertical { v.y } else { v.x };
+    let cross = |v: egui::Vec2| if vertical { v.x } else { v.y };
+    let at = |along: f32, across: f32| {
+        if vertical { egui::pos2(across, along) } else { egui::pos2(along, across) }
+    };
 
     let ids: Vec<NodeId> = snarl.nodes_pos_ids().map(|(id, _, _)| id).collect();
     let mut successors: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
@@ -846,9 +1072,13 @@ pub fn arrange(
     // mostly straight left-to-right and the order of execution reads down each column.
     for column in &mut columns {
         column.sort_by(|a, b| {
-            let ya = snarl.get_node_info(*a).map(|n| n.pos.y).unwrap_or(0.0);
-            let yb = snarl.get_node_info(*b).map(|n| n.pos.y).unwrap_or(0.0);
-            ya.total_cmp(&yb)
+            let key = |id: &NodeId| {
+                snarl
+                    .get_node_info(*id)
+                    .map(|n| if vertical { n.pos.x } else { n.pos.y })
+                    .unwrap_or(0.0)
+            };
+            key(a).total_cmp(&key(b))
         });
     }
     let indices = |columns: &[Vec<NodeId>]| -> HashMap<NodeId, f32> {
@@ -893,25 +1123,32 @@ pub fn arrange(
     }
 
     let size_of = |id: NodeId| sizes.get(&id).copied().unwrap_or(NOMINAL_NODE);
-    // Column x offsets from the widest node in each column.
+    // Band offsets and thicknesses along the flow, from the deepest-extent node in each band.
     let mut col_x = Vec::with_capacity(columns.len());
+    let mut col_w = Vec::with_capacity(columns.len());
     let mut x = 0.0f32;
     for column in &columns {
         col_x.push(x);
+        let w = if column.is_empty() {
+            0.0
+        } else {
+            column.iter().map(|&id| flow(size_of(id))).fold(1.0f32, f32::max)
+        };
+        col_w.push(w);
         if !column.is_empty() {
-            let w = column.iter().map(|&id| size_of(id).x).fold(1.0f32, f32::max);
-            x += w + H_GAP;
+            x += w + FLOW_GAP;
         }
     }
-    // Seed each node's center-y from a per-column centered stack (a non-overlapping start).
+    // Seed each node's cross-axis centre from a centred stack per band (a non-overlapping start).
     let mut cy: HashMap<NodeId, f32> = HashMap::new();
     for column in &columns {
-        let total: f32 = column.iter().map(|&id| size_of(id).y + V_GAP).sum::<f32>() - V_GAP;
+        let total: f32 =
+            column.iter().map(|&id| cross(size_of(id)) + CROSS_GAP).sum::<f32>() - CROSS_GAP;
         let mut top = -total / 2.0;
         for &id in column {
-            let h = size_of(id).y;
+            let h = cross(size_of(id));
             cy.insert(id, top + h / 2.0);
-            top += h + V_GAP;
+            top += h + CROSS_GAP;
         }
     }
     // Push each node down to keep V_GAP from the one above while preserving column order.
@@ -919,40 +1156,109 @@ pub fn arrange(
         for w in 1..column.len() {
             let prev = column[w - 1];
             let cur = column[w];
-            let min_c = cy[&prev] + size_of(prev).y / 2.0 + V_GAP + size_of(cur).y / 2.0;
+            let min_c =
+                cy[&prev] + cross(size_of(prev)) / 2.0 + CROSS_GAP + cross(size_of(cur)) / 2.0;
             if cy[&cur] < min_c {
                 cy.insert(cur, min_c);
             }
         }
     };
-    // Relax each node toward its neighbours' mean center-y, then restore spacing within columns.
+    // A column's mean centre — the relaxation puts each column back on its own mean after every
+    // separation pass, so the pass can only SPREAD a column, never translate it.
+    let column_mean = |column: &[NodeId], cy: &HashMap<NodeId, f32>| -> f32 {
+        if column.is_empty() {
+            return 0.0;
+        }
+        column.iter().filter_map(|id| cy.get(id)).sum::<f32>() / column.len() as f32
+    };
+    // What the relaxation is FOR: wires that run straight across, rather than diagonally.
+    let edges: Vec<(NodeId, NodeId)> = successors
+        .iter()
+        .flat_map(|(from, tos)| tos.iter().map(|to| (*from, *to)))
+        .collect();
+    let wire_cost = |cy: &HashMap<NodeId, f32>| -> f32 {
+        edges
+            .iter()
+            .filter_map(|(a, b)| Some((cy.get(a)?, cy.get(b)?)))
+            .map(|(a, b)| (a - b).abs())
+            .sum()
+    };
+    let vspan = |cy: &HashMap<NodeId, f32>| -> f32 {
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for (&id, &c) in cy {
+            let h = cross(size_of(id));
+            lo = lo.min(c - h / 2.0);
+            hi = hi.max(c + h / 2.0);
+        }
+        if hi > lo { hi - lo } else { 0.0 }
+    };
+    // Straighter wires are worth some height, but only if they buy twice as much straightening as
+    // the height they cost — otherwise the compact seeded stack wins.
+    let seed_span = vspan(&cy);
+    let score = |cy: &HashMap<NodeId, f32>| wire_cost(cy) + 0.5 * (vspan(cy) - seed_span).max(0.0);
+
+    // Relax each node toward its neighbours' mean centre-y, then restore spacing within columns.
+    //
+    // Both halves used to make the layout taller every single iteration: `resolve` can only push a
+    // node DOWN, so each pass translated whichever nodes sat in a fan-in/fan-out conflict further
+    // down while everything else stayed put. Over the 8 iterations that inflated the vertical span
+    // to ~2.9x the seeded stack (measured: a chain+diamond went 648 -> 1432, an img2img graph with
+    // a disconnected node 948 -> 2798), and that multiplier lands on the measured node HEIGHT. So:
+    // every separation pass is now mean-preserving, and the best iterate is kept rather than the
+    // last, which means the relaxation can never return a layout worse than the seed it started
+    // from.
+    let mut best = cy.clone();
+    let mut best_score = score(&cy);
     for _ in 0..8 {
         for neighbors in [&predecessors, &successors] {
             for column in &columns {
                 for &id in column {
-                    if let Some(ns) = neighbors.get(&id)
-                        && !ns.is_empty()
-                    {
-                        let avg = ns.iter().filter_map(|n| cy.get(n)).sum::<f32>() / ns.len() as f32;
-                        cy.insert(id, avg);
+                    let Some(ns) = neighbors.get(&id) else { continue };
+                    // Average over the neighbours actually found: dividing by `ns.len()` when one
+                    // is missing biases the result toward 0, i.e. toward the top of the layout.
+                    let (sum, found) = ns
+                        .iter()
+                        .filter_map(|n| cy.get(n))
+                        .fold((0.0, 0usize), |(s, k), v| (s + v, k + 1));
+                    if found > 0 {
+                        cy.insert(id, sum / found as f32);
                     }
                 }
             }
             for column in &columns {
+                let before = column_mean(column, &cy);
                 resolve(column, &mut cy);
+                let drift = column_mean(column, &cy) - before;
+                if drift != 0.0 {
+                    for id in column {
+                        if let Some(c) = cy.get_mut(id) {
+                            *c -= drift;
+                        }
+                    }
+                }
             }
         }
+        let s = score(&cy);
+        if s < best_score {
+            best_score = s;
+            best = cy.clone();
+        }
     }
+    let cy = best;
+
     let mut rects = Vec::new();
     for (d, column) in columns.iter().enumerate() {
-        let x = col_x[d];
         for &id in column {
             let size = size_of(id);
-            let y = cy[&id] - size.y / 2.0;
+            // Centred within the band rather than pinned to its leading edge: a thin node beside a
+            // deep one used to sit against the edge with the whole difference left as a void.
+            let along = col_x[d] + (col_w[d] - flow(size)) / 2.0;
+            let across = cy[&id] - cross(size) / 2.0;
+            let pos = at(along, across);
             if let Some(info) = snarl.get_node_info_mut(id) {
-                info.pos = egui::pos2(x, y);
+                info.pos = pos;
             }
-            rects.push(egui::Rect::from_min_size(egui::pos2(x, y), size));
+            rects.push(egui::Rect::from_min_size(pos, size));
         }
     }
     rects
@@ -960,19 +1266,22 @@ pub fn arrange(
 
 /// Position of a workflow's first node: the leftmost node with no incoming wires (any of them),
 /// falling back to the leftmost node overall.
-pub fn first_node_pos(snarl: &Snarl<FlowNodeData>) -> Option<egui::Pos2> {
+pub fn first_node_pos(snarl: &Snarl<FlowNodeData>, vertical: bool) -> Option<egui::Pos2> {
     let has_input: HashSet<NodeId> = snarl.wires().map(|(_, in_pin)| in_pin.node).collect();
+    // "First" is along the flow: leftmost when execution runs left-to-right, topmost when the
+    // canvas is portrait and the layout runs top-to-bottom.
+    let along = |p: egui::Pos2| if vertical { p.y } else { p.x };
     let mut root: Option<egui::Pos2> = None;
-    let mut leftmost: Option<egui::Pos2> = None;
+    let mut first: Option<egui::Pos2> = None;
     for (id, pos, _) in snarl.nodes_pos_ids() {
-        if leftmost.is_none_or(|p| pos.x < p.x) {
-            leftmost = Some(pos);
+        if first.is_none_or(|p| along(pos) < along(p)) {
+            first = Some(pos);
         }
-        if !has_input.contains(&id) && root.is_none_or(|p| pos.x < p.x) {
+        if !has_input.contains(&id) && root.is_none_or(|p| along(pos) < along(p)) {
             root = Some(pos);
         }
     }
-    root.or(leftmost)
+    root.or(first)
 }
 
 /// Delete `nid`, first bridging its MODEL/CLIP inputs to the matching outputs so a loader chain
@@ -1022,6 +1331,8 @@ struct Wrapper<'a> {
     focus: Option<NodeId>,
     bypassed: &'a HashSet<NodeId>,
     lora_picks: &'a mut Vec<LoraPick>,
+    file_pick: &'a mut Option<NodeId>,
+    input_thumbs: &'a HashMap<String, egui::TextureHandle>,
     seed_randomize: &'a mut HashMap<(NodeId, String), bool>,
     cmd: Option<ViewCmd>,
     /// Screen-space pan to add this frame (locked-mode drag started on a node).
@@ -1058,15 +1369,47 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
             .and_then(|n| n.inputs.get(pin.id.input))
             .is_some_and(is_seed_widget)
             && pin.remotes.is_empty();
-        let info = if seed {
-            show_seed_input(ui, pin, snarl, self.locked, self.seed_randomize)
-        } else if self.locked {
-            let mut info = None;
-            ui.add_enabled_ui(false, |ui| info = Some(self.inner.show_input(pin, ui, snarl)));
-            info.unwrap_or_else(PinInfo::circle)
-        } else {
-            self.inner.show_input(pin, ui, snarl)
-        };
+        // A file selector opens the thumbnail picker instead of a dropdown of bare filenames.
+        let media = pin.remotes.is_empty()
+            && snarl
+                .get_node(pin.id.node)
+                .and_then(media_input_idx)
+                .is_some_and(|idx| idx == pin.id.input);
+        // Every other enum (model / sampler / scheduler / LoRA names) gets the elided combo.
+        let enum_row = !media
+            && pin.remotes.is_empty()
+            && snarl
+                .get_node(pin.id.node)
+                .and_then(|n| n.inputs.get(pin.id.input))
+                .is_some_and(|i| matches!(i.value, FlowValueType::Array { .. }));
+        // Cap the row's width before the widget lays out. `rucomfyui_node_graph` draws string
+        // inputs with a plain `text_edit_singleline`/`multiline`, which take `available_width` —
+        // and snarl derives that from the node's size measured on the PREVIOUS frame. Each frame's
+        // row therefore comes out a little wider than the node it was measured in, the node grows
+        // to fit, and the pair ratchets outward frame after frame (121 → 173 → 225 → … units in
+        // `load_arrange_matches_a_later_manual_arrange`) until it hits the graph-space viewport —
+        // a ceiling that scales with 1/zoom, so a far-out fit lets it run a very long way. Those
+        // measures are what `final_node_rect` caches and auto-arrange spaces its columns by.
+        let info = ui
+            .scope(|ui| {
+                ui.set_max_width(NODE_FIELD_W);
+                if media {
+                    show_media_input(ui, pin, snarl, self.locked, self.file_pick)
+                } else if enum_row {
+                    show_enum_input(ui, pin, snarl, self.locked)
+                } else if seed {
+                    show_seed_input(ui, pin, snarl, self.locked, self.seed_randomize)
+                } else if self.locked {
+                    let mut info = None;
+                    ui.add_enabled_ui(false, |ui| {
+                        info = Some(self.inner.show_input(pin, ui, snarl))
+                    });
+                    info.unwrap_or_else(PinInfo::circle)
+                } else {
+                    self.inner.show_input(pin, ui, snarl)
+                }
+            })
+            .inner;
         if let Some(file) = lora_name_changed(snarl, pin.id.node, before.as_deref()) {
             self.lora_picks.push(LoraPick { node: pin.id.node, file });
         }
@@ -1161,6 +1504,26 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<FlowNodeData>,
     ) {
+        // The file a LoadImage-style node points at, drawn as the picture it actually is. The
+        // footer (not the body) is where node images go — `rucomfyui_node_graph::has_body` is
+        // hardcoded false and it renders output images here too.
+        let preview = snarl
+            .get_node(node_id)
+            .and_then(media_selected)
+            .filter(|(sel, video)| !video && !sel.is_empty())
+            .and_then(|(sel, _)| self.input_thumbs.get(sel))
+            .cloned();
+        if let Some(tex) = preview {
+            ui.add(
+                egui::Image::new(egui::load::SizedTexture::from_handle(&tex))
+                    // A FIXED graph-space box, never `available_width`: a node's measured size is
+                    // fed back as next frame's layout width, so anything elastic in here would
+                    // ratchet the node wider every frame (and auto-arrange lays out from those
+                    // measurements). See [`NODE_FIELD_W`].
+                    .fit_to_exact_size(egui::vec2(NODE_PREVIEW_W, NODE_PREVIEW_W))
+                    .corner_radius(4.0),
+            );
+        }
         self.inner.show_footer(node_id, inputs, outputs, ui, snarl);
     }
 
@@ -1171,7 +1534,7 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         _ui: &mut egui::Ui,
         _snarl: &mut Snarl<FlowNodeData>,
     ) {
-        self.sizes.insert(node, rect.size());
+        self.sizes.insert(node, clamp_measure(rect.size()));
     }
 
     fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<FlowNodeData>) {
@@ -1278,13 +1641,7 @@ fn show_seed_input(
     let input = &mut node.inputs[pin.id.input];
     let key = (pin.id.node, input.name.clone());
     let mut randomize = seed_randomize.get(&key).copied().unwrap_or(false);
-    let color = {
-        let mut hasher = std::hash::DefaultHasher::new();
-        use std::hash::{Hash, Hasher};
-        format!("{:?}", input.typ).hash(&mut hasher);
-        let hash = (hasher.finish() % 3600) as f32 / 3600.0;
-        egui::ecolor::Hsva::new(hash, 0.5, 0.5, 1.0).into()
-    };
+    let color = pin_color(input);
     ui.add_enabled_ui(!locked, |ui| {
         ui.horizontal(|ui| {
             ui.label(&input.name);
@@ -1311,6 +1668,90 @@ fn show_seed_input(
         });
     });
     PinInfo::circle().with_fill(color)
+}
+
+/// A file-selector row on the canvas: the current filename as a button that asks the app to open
+/// the thumbnail picker. The dropdown it replaces listed bare filenames, which is no way to choose
+/// between a dozen `ComfyUI_00042_.png`s — let alone between videos.
+fn show_media_input(
+    ui: &mut egui::Ui,
+    pin: &InPin,
+    snarl: &mut Snarl<FlowNodeData>,
+    locked: bool,
+    pick: &mut Option<NodeId>,
+) -> PinInfo {
+    let node = &snarl[pin.id.node];
+    let input = &node.inputs[pin.id.input];
+    let color = pin_color(input);
+    let video = media_input_kind(input).unwrap_or(false);
+    let selected = match &input.value {
+        FlowValueType::Array { selected, .. } => selected.clone(),
+        _ => String::new(),
+    };
+    let name = input.name.clone();
+    ui.add_enabled_ui(!locked, |ui| {
+        ui.label(&name);
+        // No film glyph in the bundled font; the play triangle is what marks video everywhere else.
+        let icon = if video { crate::icons::RUN } else { crate::icons::IMAGE };
+        let label = if selected.is_empty() {
+            format!("{icon} Choose…")
+        } else {
+            // Filenames are long and front-loaded with sameness; the tail identifies the file.
+            format!("{icon} {}", elide_tail(&sanitize_ui_text(ui, &selected), 22))
+        };
+        if ui
+            .button(label)
+            .on_hover_text(if video { "Pick a video" } else { "Pick an image" })
+            .clicked()
+        {
+            *pick = Some(pin.id.node);
+        }
+    });
+    PinInfo::circle().with_fill(color)
+}
+
+/// Enum row on the canvas (checkpoint / sampler / scheduler / LoRA / VAE names). Drawn here rather
+/// than delegated so the label is elided to the node's width budget — see [`option_combo`].
+fn show_enum_input(
+    ui: &mut egui::Ui,
+    pin: &InPin,
+    snarl: &mut Snarl<FlowNodeData>,
+    locked: bool,
+) -> PinInfo {
+    let node = &mut snarl[pin.id.node];
+    let input = &mut node.inputs[pin.id.input];
+    let color = pin_color(input);
+    let name = input.name.clone();
+    let salt = egui::Id::new(("canvas-enum", pin.id.node, pin.id.input));
+    ui.add_enabled_ui(!locked, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(&name);
+            if let FlowValueType::Array { options, selected } = &mut input.value {
+                option_combo(ui, salt, selected, options, CANVAS_COMBO_W);
+            }
+        });
+    });
+    PinInfo::circle().with_fill(color)
+}
+
+/// Pin colour for an input, matching `rucomfyui_node_graph`'s type-hash scheme (its own
+/// `data_type_color` is private).
+fn pin_color(input: &FlowInput) -> egui::Color32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::hash::DefaultHasher::new();
+    format!("{:?}", input.typ).hash(&mut hasher);
+    let hash = (hasher.finish() % 3600) as f32 / 3600.0;
+    egui::ecolor::Hsva::new(hash, 0.5, 0.5, 1.0).into()
+}
+
+/// Like [`elide`], but keeps the END of the string — filenames differ in their tail.
+pub fn elide_tail(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let tail: String = s.chars().skip(n - max).collect();
+    format!("…{tail}")
 }
 
 // ── UI-format export ──────────────────────────────────────────────────────────
@@ -1692,12 +2133,14 @@ fn value_editor(
         FlowValueType::Array { options, selected } => {
             ui.horizontal(|ui| {
                 ui.label(&input.name);
-                option_combo(ui, salt, selected, options);
+                option_combo(ui, salt, selected, options, PROPS_COMBO_W);
             });
         }
         FlowValueType::String { value, multiline } => {
             // Label above, field to the visible right edge. Prefer clip_rect over available_width:
             // inside a vertical ScrollArea the latter grows with content and the field overruns.
+            // (This is the Properties pane — a normal panel, where both are in screen units. The
+            // canvas is the opposite case: see [`NODE_FIELD_W`].)
             ui.label(&input.name);
             let width = (ui.clip_rect().right() - ui.cursor().left() - 8.0).max(48.0);
             let edit = if *multiline {
@@ -1747,9 +2190,20 @@ fn value_editor(
 }
 
 /// Dropdown over a possibly-huge option list: filters by substring and caps rendered rows.
-fn option_combo(ui: &mut egui::Ui, salt: egui::Id, selected: &mut String, options: &[String]) {
+fn option_combo(
+    ui: &mut egui::Ui,
+    salt: egui::Id,
+    selected: &mut String,
+    options: &[String],
+    max_w: f32,
+) {
+    // Elided to a WIDTH, not a character count: a ComboBox lays its selected text out at infinite
+    // width in `TextWrapMode::Extend` and allocates the result, so on the canvas a long
+    // `SDXL/juggernautXL_version9Rundiffusion.safetensors` blows straight past the node's width cap
+    // and widens its whole arrange column (measured: long model names alone were 19% of a txt2img
+    // graph's horizontal span).
     egui::ComboBox::from_id_salt(salt)
-        .selected_text(elide(&sanitize_ui_text(ui, selected), 32))
+        .selected_text(elide_width(ui, &sanitize_ui_text(ui, selected), max_w))
         .show_ui(ui, |ui| {
             let filter_id = salt.with("filter");
             let mut filter: String =
@@ -2111,7 +2565,7 @@ mod tests {
                     (id, egui::vec2(150.0 + (i * 37 % 250) as f32, 60.0 + (i * 53 % 400) as f32))
                 })
                 .collect();
-            let rects = arrange(&mut graph.snarl, &sizes);
+            let rects = arrange(&mut graph.snarl, &sizes, false);
             for (i, a) in rects.iter().enumerate() {
                 for b in &rects[i + 1..] {
                     assert!(
@@ -2435,6 +2889,166 @@ mod tests {
         assert!(after.x > snarl.get_node_info(a).unwrap().pos.x);
     }
 
+    /// The vertical relaxation must not inflate the layout. It used to: `resolve` could only push a
+    /// node DOWN, so each of the 8x2 passes translated whichever nodes sat in a fan-in/fan-out
+    /// conflict further down while unconflicted nodes (a disconnected note, a second component)
+    /// stayed put — which is what put "some nodes 10-20 node-widths away from the rest" on screen.
+    /// Measured before the fix on this exact shape: 948 units tall seeded, 2798 after 8 iterations.
+    #[test]
+    fn relaxation_does_not_inflate_the_vertical_span() {
+        let oi = crate::schema::to_object_info(&crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"A": {"input": {"required": {"a": ["MODEL"], "b": ["MODEL"], "c": ["MODEL"]}},
+                     "output": ["MODEL"], "output_name": ["MODEL"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        ));
+        let obj = oi.values().next().unwrap().clone();
+        let mut snarl: Snarl<FlowNodeData> = Snarl::new();
+        // A fan-out into a fan-in (the shape that conflicts), plus a node wired to nothing.
+        let root = snarl.insert_node(egui::pos2(0.0, 0.0), FlowNodeData::new(obj.clone()));
+        let mid: Vec<NodeId> = (0..4)
+            .map(|i| {
+                snarl.insert_node(egui::pos2(600.0, i as f32 * 400.0), FlowNodeData::new(obj.clone()))
+            })
+            .collect();
+        let sink = snarl.insert_node(egui::pos2(1200.0, 0.0), FlowNodeData::new(obj.clone()));
+        let _loose = snarl.insert_node(egui::pos2(600.0, 2000.0), FlowNodeData::new(obj));
+        for (i, &m) in mid.iter().enumerate() {
+            snarl.connect(OutPinId { node: root, output: 0 }, InPinId { node: m, input: 0 });
+            snarl.connect(OutPinId { node: m, output: 0 }, InPinId { node: sink, input: i.min(2) });
+        }
+        let sizes: HashMap<NodeId, egui::Vec2> = snarl
+            .nodes_pos_ids()
+            .map(|(id, _, _)| (id, egui::vec2(280.0, 300.0)))
+            .collect();
+
+        let rects = arrange(&mut snarl, &sizes, false);
+        let span = rects.iter().fold(egui::Rect::NOTHING, |acc, r| acc.union(*r));
+        // The tallest column is the 4 fanned nodes + the loose one: 5*300 + 4*V_GAP(24) = 1596.
+        let minimal = 5.0 * 300.0 + 4.0 * 24.0;
+        println!("vspan {:.0} (minimal stack {minimal:.0})", span.height());
+        assert!(
+            span.height() <= minimal * 1.15,
+            "relaxation inflated the layout to {:.0} units tall against a {minimal:.0} minimum",
+            span.height()
+        );
+        // And it still has to be a valid layout.
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                assert!(!a.shrink(1.0).intersects(b.shrink(1.0)), "overlap: {a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// A single absurd measure must not throw the rest of the graph off the canvas — the shape of
+    /// the load-arrange bug in [`load_arrange_matches_a_later_manual_arrange`], where one ratcheted
+    /// node width put every column after it a screen away.
+    #[test]
+    fn arrange_survives_a_pathological_measure() {
+        let oi = crate::schema::to_object_info(&crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"A": {"input": {"required": {"in": ["MODEL"]}},
+                     "output": ["MODEL"], "output_name": ["MODEL"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        ));
+        let obj = oi.values().next().unwrap().clone();
+        let mut snarl: Snarl<FlowNodeData> = Snarl::new();
+        let a = snarl.insert_node(egui::pos2(0.0, 0.0), FlowNodeData::new(obj.clone()));
+        let b = snarl.insert_node(egui::pos2(600.0, 0.0), FlowNodeData::new(obj.clone()));
+        let c = snarl.insert_node(egui::pos2(1200.0, 0.0), FlowNodeData::new(obj));
+        snarl.connect(
+            egui_snarl::OutPinId { node: a, output: 0 },
+            egui_snarl::InPinId { node: b, input: 0 },
+        );
+        snarl.connect(
+            egui_snarl::OutPinId { node: b, output: 0 },
+            egui_snarl::InPinId { node: c, input: 0 },
+        );
+        // `a` measured absurdly — as `final_node_rect` would have received it. The cache clamps on
+        // the way in, which is the boundary this invariant now lives at.
+        assert_eq!(
+            clamp_measure(egui::vec2(9000.0, 40000.0)),
+            MAX_LAYOUT_NODE,
+            "a pathological measure must be clamped before it reaches the size cache"
+        );
+        let sizes: HashMap<NodeId, egui::Vec2> = [
+            (a, clamp_measure(egui::vec2(9000.0, 40000.0))),
+            (b, clamp_measure(egui::vec2(220.0, 300.0))),
+            (c, clamp_measure(egui::vec2(220.0, 300.0))),
+        ]
+        .into_iter()
+        .collect();
+        let rects = arrange(&mut snarl, &sizes, false);
+        let span = rects
+            .iter()
+            .fold(egui::Rect::NOTHING, |acc, r| acc.union(*r));
+        assert!(
+            span.width() <= 3.0 * MAX_LAYOUT_NODE.x,
+            "one bad measure spread the layout {} units wide",
+            span.width()
+        );
+        // Flow still reads left to right.
+        let pos = |id| snarl.get_node_info(id).unwrap().pos;
+        assert!(pos(b).x > pos(a).x && pos(c).x > pos(b).x);
+    }
+
+    /// The file picker finds upload widgets by what their options look like, so custom loaders get
+    /// it for free — and it must not fire on the enums that merely happen to be lists of names.
+    #[test]
+    fn media_inputs_are_found_by_their_files() {
+        let oi = crate::schema::to_object_info(&crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+                 "LoadImage": {"input": {"required": {"image": [["a.png", "clipspace/b.png [input]"]]}},
+                     "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]},
+                 "VHS_LoadVideo": {"input": {"required": {"video": [["clip.mp4", "loop.webm", "anim.gif"]],
+                                                          "frame_load_cap": ["INT"]}},
+                     "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]},
+                 "KSampler": {"input": {"required": {"sampler_name": [["euler", "dpmpp_2m", "ddim"]]}},
+                     "output": ["LATENT"], "output_name": ["LATENT"], "output_is_list": [false]},
+                 "CheckpointLoaderSimple": {"input": {"required": {"ckpt_name": [["sd15.safetensors", "xl.ckpt"]]}},
+                     "output": ["MODEL"], "output_name": ["MODEL"], "output_is_list": [false]},
+                 "EmptyLoader": {"input": {"required": {"video": [[]]}},
+                     "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]}
+                }"#,
+            )
+            .unwrap(),
+        ));
+        let of = |class: &str| media_input_of(&FlowNodeData::new(oi.get(class).unwrap().clone()));
+
+        let image = of("LoadImage").expect("LoadImage.image is a file selector");
+        assert_eq!(image.name, "image");
+        assert!(!image.video);
+
+        let video = of("VHS_LoadVideo").expect("VHS_LoadVideo.video is a file selector");
+        assert_eq!(video.name, "video");
+        assert!(video.video, "a list of .mp4/.webm/.gif is a video selector");
+
+        assert!(of("KSampler").is_none(), "sampler names are not files");
+        assert!(of("CheckpointLoaderSimple").is_none(), "checkpoints are not media files");
+
+        // Nothing uploaded yet: the widget name is all there is to go on.
+        let empty = of("EmptyLoader").expect("an empty upload widget still gets the picker");
+        assert!(empty.video);
+    }
+
+    /// Two frames must agree before a queued arrange fires: egui discards and re-runs the pass
+    /// that initialises snarl node state, so the first measure is not the final one.
+    #[test]
+    fn sizes_agree_only_on_matching_snapshots() {
+        let mut a: HashMap<NodeId, egui::Vec2> = HashMap::new();
+        let mut b: HashMap<NodeId, egui::Vec2> = HashMap::new();
+        assert!(sizes_agree(&a, &b), "two empty snapshots agree");
+        a.insert(NodeId(0), egui::vec2(200.0, 100.0));
+        assert!(!sizes_agree(&a, &b), "a new node is not settled");
+        b.insert(NodeId(0), egui::vec2(200.4, 100.0));
+        assert!(sizes_agree(&a, &b), "sub-unit jitter still counts as settled");
+        b.insert(NodeId(0), egui::vec2(260.0, 100.0));
+        assert!(!sizes_agree(&a, &b), "a real size change is not settled");
+    }
+
     #[test]
     fn first_node_prefers_leftmost_root() {
         let oi = crate::schema::to_object_info(&crate::schema::parse(
@@ -2458,6 +3072,315 @@ mod tests {
             egui_snarl::OutPinId { node: b, output: 0 },
             egui_snarl::InPinId { node: c, input: 0 },
         );
-        assert_eq!(first_node_pos(&snarl), Some(egui::pos2(100.0, 0.0)));
+        assert_eq!(first_node_pos(&snarl, false), Some(egui::pos2(100.0, 0.0)));
+    }
+
+    /// The auto-arrange a load runs must land where a manual Auto-arrange later would — the whole
+    /// point of doing it automatically.
+    ///
+    /// Regression: a node's text widgets took `ui.available_width()`, which snarl derives from the
+    /// node's size *from the previous frame*, so each frame's content came out a little wider than
+    /// the last and the node ratcheted outward (measured 121 → 173 → 225 → … units here) until it
+    /// hit the graph-space viewport — a bound that scales with 1/zoom, so the far-out fit right
+    /// after a load let it run for a long way. The load arrange fired on the first frame every
+    /// node merely *had* a size, i.e. mid-ratchet, and spaced its columns by those inflated
+    /// widths: a compact cluster with the trailing columns flung off-screen. Pressing the button
+    /// later worked because by then the sizes had stopped moving.
+    #[test]
+    fn load_arrange_matches_a_later_manual_arrange() {
+        let oi = crate::schema::to_object_info(&crate::schema::parse(
+            &serde_json::from_str(
+                r#"{"T": {"input": {"required": {"text": ["STRING", {"multiline": true}],
+                                                 "in": ["MODEL"]}},
+                     "output": ["MODEL"], "output_name": ["MODEL"], "output_is_list": [false]}}"#,
+            )
+            .unwrap(),
+        ));
+        let obj = oi.values().next().unwrap().clone();
+        let mut graph = ComfyUiNodeGraph::new(oi.clone());
+        // Positions as `load_api_workflow` lays them out: 600 per depth column, 400 per row.
+        let mut prev: Option<NodeId> = None;
+        for i in 0..6 {
+            let id = graph.snarl.insert_node(
+                egui::pos2(i as f32 * 600.0, 0.0),
+                FlowNodeData::new(obj.clone()),
+            );
+            if let Some(p) = prev {
+                graph.snarl.connect(OutPinId { node: p, output: 0 }, InPinId { node: id, input: 1 });
+            }
+            prev = Some(id);
+        }
+        let mut view = GraphView::new(9);
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(420.0, 840.0));
+        let run = |view: &mut GraphView, graph: &mut ComfyUiNodeGraph, frames: usize| {
+            for _ in 0..frames {
+                let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let _ = ctx.run_ui(input, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let _ = view.show(
+                            ui,
+                            graph,
+                            None,
+                            None,
+                            &HashSet::new(),
+                            &[],
+                            &mut HashMap::new(),
+                        );
+                    });
+                });
+            }
+        };
+        let positions = |graph: &ComfyUiNodeGraph| -> Vec<(NodeId, egui::Pos2)> {
+            let mut v: Vec<_> = graph.snarl.nodes_pos_ids().map(|(id, p, _)| (id, p)).collect();
+            v.sort_by_key(|(id, _)| id.0);
+            v
+        };
+
+        // What a workflow load does.
+        view.mark_needs_auto_arrange();
+        run(&mut view, &mut graph, 8);
+        let auto = positions(&graph);
+        assert!(!view.arrange_pending(), "the load arrange never settled");
+        // Measures stopped moving, and no node grew to viewport size.
+        let widest = view.sizes.values().map(|s| s.x).fold(0.0f32, f32::max);
+        assert!(widest < 600.0, "a node measured {widest} units wide");
+        let measured = view.sizes.clone();
+        run(&mut view, &mut graph, 2);
+        assert!(sizes_agree(&view.sizes, &measured), "node sizes are still ratcheting");
+
+        // What tapping Auto-arrange later does. Same layout, or the automatic one was not usable.
+        view.request_arrange();
+        run(&mut view, &mut graph, 8);
+        for ((id, a), (_, m)) in auto.iter().zip(positions(&graph).iter()) {
+            assert!(
+                (*a - *m).length() < 1.0,
+                "{id:?}: load put the node at {a:?}, a later manual arrange at {m:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // TEMPORARY INVESTIGATION PROBE — delete with everything below this marker.
+    // ---------------------------------------------------------------------------------------
+
+    /// object_info for a realistic SDXL txt2img graph: long enum filenames, multiline prompts,
+    /// several INT/FLOAT drag values, two more enums on the sampler, a STRING filename prefix.
+    fn probe_schemas() -> crate::schema::SchemaSet {
+        crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+        "CheckpointLoaderSimple": {"input": {"required": {
+            "ckpt_name": [["sd_xl_base_1.0_0.9vae.safetensors","juggernautXL_v9Rundiffusion.safetensors"]]}},
+            "output": ["MODEL","CLIP","VAE"], "output_name": ["MODEL","CLIP","VAE"], "output_is_list": [false,false,false]},
+        "LoraLoader": {"input": {"required": {
+            "model": ["MODEL"], "clip": ["CLIP"],
+            "lora_name": [["SDXL/detail_tweaker_xl_v1.0_offset_noise.safetensors","add-detail-xl.safetensors"]],
+            "strength_model": ["FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}],
+            "strength_clip": ["FLOAT", {"default": 1.0, "min": -20.0, "max": 20.0, "step": 0.01}]}},
+            "output": ["MODEL","CLIP"], "output_name": ["MODEL","CLIP"], "output_is_list": [false,false]},
+        "CLIPTextEncode": {"input": {"required": {
+            "text": ["STRING", {"multiline": true}], "clip": ["CLIP"]}},
+            "output": ["CONDITIONING"], "output_name": ["CONDITIONING"], "output_is_list": [false]},
+        "EmptyLatentImage": {"input": {"required": {
+            "width": ["INT", {"default": 1024, "min": 16, "max": 16384, "step": 8}],
+            "height": ["INT", {"default": 1024, "min": 16, "max": 16384, "step": 8}],
+            "batch_size": ["INT", {"default": 1, "min": 1, "max": 64}]}},
+            "output": ["LATENT"], "output_name": ["LATENT"], "output_is_list": [false]},
+        "KSampler": {"input": {"required": {
+            "model": ["MODEL"], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"], "latent_image": ["LATENT"],
+            "seed": ["INT", {"default": 0, "min": 0, "max": 18446744073709551615}],
+            "steps": ["INT", {"default": 25, "min": 1, "max": 10000}],
+            "cfg": ["FLOAT", {"default": 7.5, "min": 0.0, "max": 100.0, "step": 0.1}],
+            "sampler_name": [["dpmpp_2m_sde_gpu","euler_ancestral","dpmpp_3m_sde"]],
+            "scheduler": [["karras","exponential","sgm_uniform"]],
+            "denoise": ["FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}]}},
+            "output": ["LATENT"], "output_name": ["LATENT"], "output_is_list": [false]},
+        "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}},
+            "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]},
+        "SaveImage": {"input": {"required": {
+            "images": ["IMAGE"], "filename_prefix": ["STRING", {"default": "ComfyUI"}]}},
+            "output": [], "output_name": [], "output_is_list": []}
+    }"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    const PROBE_POS_PROMPT: &str = "cinematic portrait of a weathered lighthouse keeper, \
+        salt-crusted wool coat, volumetric rim light through sea fog, 85mm, shallow depth of \
+        field, hyperdetailed skin texture, film grain, muted teal and amber palette, \
+        award-winning photography, shot on Kodak Portra 400";
+    const PROBE_NEG_PROMPT: &str = "blurry, lowres, jpeg artifacts, watermark, text, signature, \
+        extra fingers, deformed hands, oversaturated, plastic skin";
+
+    fn probe_set_string(data: &mut FlowNodeData, name: &str, text: &str) {
+        for inp in data.inputs.iter_mut() {
+            if inp.name == name
+                && let FlowValueType::String { value, .. } = &mut inp.value
+            {
+                *value = text.to_string();
+            }
+        }
+    }
+
+    fn probe_in_idx(data: &FlowNodeData, name: &str) -> usize {
+        data.inputs.iter().position(|i| i.name == name).unwrap_or_else(|| panic!("no input {name}"))
+    }
+
+    fn probe_out_idx(data: &FlowNodeData, name: &str) -> usize {
+        data.outputs
+            .iter()
+            .position(|o| o.name == name)
+            .unwrap_or_else(|| panic!("no output {name}"))
+    }
+
+    /// Build the 8-node txt2img chain at load-time positions (600 per depth column).
+    fn probe_graph() -> ComfyUiNodeGraph {
+        let oi = crate::schema::to_object_info(&probe_schemas());
+        let mut graph = ComfyUiNodeGraph::new(oi.clone());
+        let mk = |class: &str| FlowNodeData::new(oi.get(class).expect(class).clone());
+
+        let ckpt = graph.snarl.insert_node(egui::pos2(0.0, 0.0), mk("CheckpointLoaderSimple"));
+        let lora = graph.snarl.insert_node(egui::pos2(600.0, 0.0), mk("LoraLoader"));
+        let mut pos_n = mk("CLIPTextEncode");
+        probe_set_string(&mut pos_n, "text", PROBE_POS_PROMPT);
+        let pos = graph.snarl.insert_node(egui::pos2(1200.0, 0.0), pos_n);
+        let mut neg_n = mk("CLIPTextEncode");
+        probe_set_string(&mut neg_n, "text", PROBE_NEG_PROMPT);
+        let neg = graph.snarl.insert_node(egui::pos2(1200.0, 400.0), neg_n);
+        let empty = graph.snarl.insert_node(egui::pos2(1200.0, 800.0), mk("EmptyLatentImage"));
+        let ks = graph.snarl.insert_node(egui::pos2(1800.0, 0.0), mk("KSampler"));
+        let vae = graph.snarl.insert_node(egui::pos2(2400.0, 0.0), mk("VAEDecode"));
+        let mut save_n = mk("SaveImage");
+        probe_set_string(&mut save_n, "filename_prefix", "portraits/lighthouse_keeper_v3");
+        let save = graph.snarl.insert_node(egui::pos2(3000.0, 0.0), save_n);
+
+        let wire = |graph: &mut ComfyUiNodeGraph, from: NodeId, out: &str, to: NodeId, inp: &str| {
+            let o = probe_out_idx(graph.snarl.get_node(from).unwrap(), out);
+            let i = probe_in_idx(graph.snarl.get_node(to).unwrap(), inp);
+            graph.snarl.connect(OutPinId { node: from, output: o }, InPinId { node: to, input: i });
+        };
+        wire(&mut graph, ckpt, "MODEL", lora, "model");
+        wire(&mut graph, ckpt, "CLIP", lora, "clip");
+        wire(&mut graph, lora, "CLIP", pos, "clip");
+        wire(&mut graph, lora, "CLIP", neg, "clip");
+        wire(&mut graph, lora, "MODEL", ks, "model");
+        wire(&mut graph, pos, "CONDITIONING", ks, "positive");
+        wire(&mut graph, neg, "CONDITIONING", ks, "negative");
+        wire(&mut graph, empty, "LATENT", ks, "latent_image");
+        wire(&mut graph, ks, "LATENT", vae, "samples");
+        wire(&mut graph, ckpt, "VAE", vae, "vae");
+        wire(&mut graph, vae, "IMAGE", save, "images");
+        graph
+    }
+
+    /// Drive the real canvas headlessly at phone size and print, every frame, the transform
+    /// scale, every node's measured size and the graph's x/y span — first through a workflow
+    /// load (`mark_needs_auto_arrange`), then through a manual `request_arrange`.
+    /// A realistic txt2img graph must arrange into a layout a phone can actually read, and the two
+    /// entry points must agree. Guards the numbers this was tuned against (measured on a 393x873
+    /// viewport): before the fixes the same graph came out 2255 units wide at fit zoom 0.159, with
+    /// its vertical span inflated ~2.9x by a relaxation pass that only ever pushed nodes DOWN.
+    #[test]
+    fn realistic_graph_arranges_compactly() {
+        // Portrait phone: the flow turns top-to-bottom so a deep workflow fits at a readable zoom.
+        let portrait = arrange_probe(egui::vec2(393.0, 873.0));
+        assert!(portrait.vertical, "a portrait canvas must lay the flow out top-to-bottom");
+        assert!(
+            portrait.zoom > 0.4,
+            "fit zoom {:.3} — nodes render at {:.0}px on a 393px screen, too small to work with",
+            portrait.zoom,
+            portrait.widest * portrait.zoom
+        );
+        assert!(
+            portrait.span.width() < 900.0 && portrait.span.height() < 1600.0,
+            "portrait span {:.0}x{:.0}",
+            portrait.span.width(),
+            portrait.span.height()
+        );
+
+        // Landscape / graph fullscreen keeps the familiar left-to-right reading.
+        let landscape = arrange_probe(egui::vec2(873.0, 393.0));
+        assert!(!landscape.vertical, "a landscape canvas must keep the left-to-right flow");
+        assert!(
+            landscape.span.width() > landscape.span.height(),
+            "landscape span {:.0}x{:.0} is not a left-to-right ribbon",
+            landscape.span.width(),
+            landscape.span.height()
+        );
+        // Was 2255 units wide at zoom 0.159 before the width fixes (combos elided, sandwich layout).
+        assert!(
+            landscape.span.width() < 2000.0,
+            "landscape span {:.0} units wide",
+            landscape.span.width()
+        );
+
+        // No single node may dominate a band: combos elide, string fields are capped.
+        for probe in [&portrait, &landscape] {
+            assert!(probe.widest < 400.0, "widest node {:.0} units", probe.widest);
+        }
+    }
+
+    struct ArrangeProbe {
+        span: egui::Rect,
+        zoom: f32,
+        widest: f32,
+        vertical: bool,
+    }
+
+    /// Load the realistic graph onto a `screen`-sized canvas, let the auto-arrange settle, then
+    /// press the manual button and confirm it reproduces the same layout.
+    fn arrange_probe(screen: egui::Vec2) -> ArrangeProbe {
+        let mut graph = probe_graph();
+        let mut view = GraphView::new(9);
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen);
+        let frame = |view: &mut GraphView, graph: &mut ComfyUiNodeGraph| {
+            let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let _ =
+                        view.show(ui, graph, None, None, &HashSet::new(), &[], &mut HashMap::new());
+                });
+            });
+        };
+
+        view.mark_needs_auto_arrange();
+        for _ in 0..15 {
+            frame(&mut view, &mut graph);
+        }
+        let loaded: Vec<(NodeId, egui::Pos2)> =
+            graph.snarl.nodes_pos_ids().map(|(id, p, _)| (id, p)).collect();
+
+        view.request_arrange();
+        for _ in 0..10 {
+            frame(&mut view, &mut graph);
+        }
+        let manual: Vec<(NodeId, egui::Pos2)> =
+            graph.snarl.nodes_pos_ids().map(|(id, p, _)| (id, p)).collect();
+        for ((id, a), (_, m)) in loaded.iter().zip(manual.iter()) {
+            assert!(
+                (*a - *m).length() < 1.0,
+                "{id:?}: load put it at {a:?}, the manual button at {m:?}"
+            );
+        }
+
+        let span = bounds(&graph.snarl, &view.sizes).expect("laid out");
+        println!(
+            "{}x{} canvas -> span {:.0}x{:.0} zoom {:.3} vertical={}",
+            screen.x,
+            screen.y,
+            span.width(),
+            span.height(),
+            view.to_global.scaling,
+            view.flow_vertical()
+        );
+        ArrangeProbe {
+            span,
+            zoom: view.to_global.scaling,
+            widest: view.sizes.values().map(|s| s.x).fold(0.0f32, f32::max),
+            vertical: view.flow_vertical(),
+        }
     }
 }
