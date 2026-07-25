@@ -22,6 +22,7 @@ pub const ADD: &str = "➕";
 pub const RUN: &str = "▶";
 pub const STOP: &str = "⏹";
 pub const BACK: &str = "◀";
+pub const FORWARD: &str = "▶";
 pub const LOCKED: &str = "🔒";
 pub const UNLOCKED: &str = "🔓";
 pub const ALBUM: &str = "📚";
@@ -63,6 +64,7 @@ const ALL: &[(&str, &str)] = &[
     ("RUN", RUN),
     ("STOP", STOP),
     ("BACK", BACK),
+    ("FORWARD", FORWARD),
     ("LOCKED", LOCKED),
     ("UNLOCKED", UNLOCKED),
     ("ALBUM", ALBUM),

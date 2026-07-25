@@ -5590,16 +5590,10 @@ impl ComfyApp {
         }
     }
 
-    /// Positive prompt: label + chips + rewrite on one row, then the editor with the history gutter.
+    /// Positive prompt: label + chips + history nav + rewrite on one row, then the editor.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.prompt_field_ui(ui, PromptField::Positive, "Prompt", Some(host));
-        ui.horizontal(|ui| {
-            self.dup_fix_chip_ui(ui);
-            if self.hist_stash.is_some() {
-                let total = self.prompt_history.len() + 1;
-                ui.weak(format!("history {}/{total}", self.hist_slider.clamp(1, total)));
-            }
-        });
+        ui.horizontal(|ui| self.dup_fix_chip_ui(ui));
         // Video is the only mode the gate expands, so the Expand/Raw controls live under video.
         if self.params.mode == Mode::Video {
             self.video_expand_controls(ui, host);
@@ -5825,8 +5819,8 @@ impl ComfyApp {
         }
     }
 
-    /// Maintain scrub state; false hides the history gutter (empty history).
-    fn hist_gutter_prep(&mut self) -> bool {
+    /// Maintain scrub state; false hides the history buttons (empty history).
+    fn hist_nav_prep(&mut self) -> bool {
         if self.prompt_history.is_empty() {
             self.hist_stash = None;
             self.hist_applied = None;
@@ -5844,21 +5838,31 @@ impl ComfyApp {
         true
     }
 
-    /// Vertical prompt-history scrubber spanning the editor height; top = live draft. The live
-    /// draft is stashed as the newest slot, so the top restores it; a manual edit detaches.
-    fn hist_gutter_slider(&mut self, ui: &mut egui::Ui, height: f32) {
+    /// Older / newer prompt-history buttons plus the position counter while scrubbing. The live
+    /// draft is stashed as the newest slot, so stepping forward to it restores the draft; a manual
+    /// edit detaches.
+    fn hist_nav_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.hist_nav_prep() {
+            return;
+        }
         let total = self.prompt_history.len() + 1;
-        let mut val = if self.hist_stash.is_some() { self.hist_slider.clamp(1, total) } else { total };
-        let before = val;
-        ui.scope(|ui| {
-            // slider_width is a vertical slider's length; grow past the editor with deep
-            // history so per-entry travel stays scrubbable by touch.
-            let min_len = ((total as f32) * 4.0 + 15.0).min(160.0);
-            ui.spacing_mut().slider_width = height.max(min_len);
-            ui.add(egui::Slider::new(&mut val, 1..=total).vertical().show_value(false));
-        });
-        if val != before {
-            self.scrub_to(ui.ctx(), val, total);
+        let cur = if self.hist_stash.is_some() { self.hist_slider.clamp(1, total) } else { total };
+        if ui
+            .add_enabled(cur > 1, egui::Button::new(icons::BACK))
+            .on_hover_text("Older prompt")
+            .clicked()
+        {
+            self.scrub_to(ui.ctx(), cur - 1, total);
+        }
+        if ui
+            .add_enabled(cur < total, egui::Button::new(icons::FORWARD))
+            .on_hover_text("Newer prompt")
+            .clicked()
+        {
+            self.scrub_to(ui.ctx(), cur + 1, total);
+        }
+        if self.hist_stash.is_some() {
+            ui.weak(format!("{cur}/{total}"));
         }
     }
 
@@ -5898,8 +5902,8 @@ impl ComfyApp {
         self.prompt_field_ui(ui, PromptField::Negative, "Negative", None);
     }
 
-    /// One prompt field: a `label` + chip-view toggle (+ rewrite on positive), then the editor.
-    /// The positive field gets the vertical history gutter on the editor's left.
+    /// One prompt field: a `label` + chip-view toggle (+ history nav and rewrite on positive),
+    /// then the editor.
     fn prompt_field_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -5907,7 +5911,8 @@ impl ComfyApp {
         label: &str,
         host: Option<&Host>,
     ) {
-        ui.horizontal(|ui| {
+        // Wrapped so the extra history buttons drop to a second line instead of clipping.
+        ui.horizontal_wrapped(|ui| {
             ui.label(label);
             let on = self.field_chips(field);
             if ui
@@ -5917,27 +5922,14 @@ impl ComfyApp {
             {
                 self.set_field_chips(field, !on);
             }
-            if field == PromptField::Positive
-                && let Some(host) = host
-            {
-                self.rewrite_menu_ui(ui, host);
+            if field == PromptField::Positive {
+                self.hist_nav_ui(ui);
+                if let Some(host) = host {
+                    self.rewrite_menu_ui(ui, host);
+                }
             }
         });
-        if field == PromptField::Positive && self.hist_gutter_prep() {
-            let height_id = egui::Id::new("hist-gutter-height");
-            // Last-frame editor height; rows-based estimate on the first frame.
-            let fallback =
-                ui.text_style_height(&egui::TextStyle::Body) * field.rows() as f32 + 4.0;
-            let height =
-                ui.ctx().data(|d| d.get_temp::<f32>(height_id)).unwrap_or(fallback);
-            ui.horizontal_top(|ui| {
-                self.hist_gutter_slider(ui, height);
-                let body = ui.vertical(|ui| self.prompt_editor_body(ui, field));
-                ui.ctx().data_mut(|d| d.insert_temp(height_id, body.response.rect.height()));
-            });
-        } else {
-            self.prompt_editor_body(ui, field);
-        }
+        self.prompt_editor_body(ui, field);
     }
 
     /// The chip editor or the text field for `field`.
@@ -18518,6 +18510,27 @@ impl ComfyApp {
                 ui.strong(title);
             });
         };
+        // One value line: the copy-column indent, then a non-wrapping label. The panel's horizontal
+        // scroll carries a long model / LoRA / sampler string instead of clipping it.
+        let value_row = |ui: &mut egui::Ui, text: String, weak: bool| {
+            ui.horizontal(|ui| {
+                ui.add_space(COPY_W);
+                let rich = egui::RichText::new(text);
+                let rich = if weak { rich.weak() } else { rich };
+                ui.add(egui::Label::new(rich).wrap_mode(egui::TextWrapMode::Extend));
+            });
+        };
+        // Prose and chips still wrap at the panel width; only the single-line values extend.
+        let wrap_w = (width - 20.0 - COPY_W).max(100.0);
+        let wrapped = |ui: &mut egui::Ui, add: &mut dyn FnMut(&mut egui::Ui)| {
+            ui.horizontal(|ui| {
+                ui.add_space(COPY_W);
+                ui.scope(|ui| {
+                    ui.set_max_width(wrap_w);
+                    add(ui);
+                });
+            });
+        };
         let area = egui::Area::new(egui::Id::new("viewer-meta-overlay"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(left, anchor.bottom() + 2.0))
@@ -18529,8 +18542,8 @@ impl ComfyApp {
                         ui.set_width(width);
                         ui.set_max_width(width);
                         ui.set_max_height((screen.height() * 0.55).clamp(180.0, 360.0));
-                        crate::theme::scroll_vertical().show(ui, |ui| {
-                            ui.set_max_width((width - 20.0).max(120.0));
+                        // Both axes: values wider than the panel scroll sideways rather than clip.
+                        crate::theme::scroll_both().show(ui, |ui| {
                             if meta_loading {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
@@ -18544,14 +18557,12 @@ impl ComfyApp {
                                 .filter(|m| !m.is_empty())
                                 .unwrap_or(item_models.as_slice());
                             if !models.is_empty() {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(COPY_W);
-                                    ui.label(format!(
-                                        "{} {}",
-                                        icons::MODEL,
-                                        elide(&models.join(", "), 120)
-                                    ));
-                                });
+                                let line = format!(
+                                    "{} {}",
+                                    icons::MODEL,
+                                    elide(&models.join(", "), 600)
+                                );
+                                value_row(ui, line, false);
                             }
                             if let Some(meta) = meta.as_ref() {
                                 if !meta.loras.is_empty() {
@@ -18567,15 +18578,13 @@ impl ComfyApp {
                                             .strength_clip
                                             .map(|c| format!(" / clip {c:.2}"))
                                             .unwrap_or_default();
-                                        ui.horizontal(|ui| {
-                                            ui.add_space(COPY_W);
-                                            ui.label(format!(
-                                                "{} {}  (model {:.2}{clip})",
-                                                icons::DOT,
-                                                elide(&l.name, 64),
-                                                l.strength_model
-                                            ));
-                                        });
+                                        let line = format!(
+                                            "{} {}  (model {:.2}{clip})",
+                                            icons::DOT,
+                                            elide(&l.name, 300),
+                                            l.strength_model
+                                        );
+                                        value_row(ui, line, false);
                                     }
                                 }
                                 if let Some(p) = meta.positive.as_deref().filter(|s| !s.is_empty()) {
@@ -18585,8 +18594,7 @@ impl ComfyApp {
                                     if go {
                                         copy_positive = Some(p.to_string());
                                     }
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(COPY_W);
+                                    wrapped(ui, &mut |ui| {
                                         ui.add(egui::Label::new(p).wrap());
                                     });
                                 }
@@ -18597,8 +18605,7 @@ impl ComfyApp {
                                     if go {
                                         copy_negative = Some(n.to_string());
                                     }
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(COPY_W);
+                                    wrapped(ui, &mut |ui| {
                                         ui.add(egui::Label::new(n).wrap());
                                     });
                                 }
@@ -18626,10 +18633,7 @@ impl ComfyApp {
                                         "Copy sampler / scheduler / steps / CFG for Create",
                                         &mut copy_sampler,
                                     );
-                                    ui.horizontal(|ui| {
-                                        ui.add_space(COPY_W);
-                                        ui.weak(bits.join(" · "));
-                                    });
+                                    value_row(ui, bits.join(" · "), true);
                                 }
                                 if meta.is_empty() && models.is_empty() {
                                     ui.weak("No prompt metadata in this workflow.");
@@ -18646,11 +18650,12 @@ impl ComfyApp {
                                     ui.add_space(COPY_W);
                                     ui.strong(format!("{} Tags", icons::SEARCH));
                                 });
-                                ui.horizontal_wrapped(|ui| {
-                                    ui.add_space(COPY_W);
-                                    for t in &indexed_tags {
-                                        ui.weak(format!("{} {}", icons::DOT, t));
-                                    }
+                                wrapped(ui, &mut |ui| {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for t in &indexed_tags {
+                                            ui.weak(format!("{} {}", icons::DOT, t));
+                                        }
+                                    });
                                 });
                             }
                         });
