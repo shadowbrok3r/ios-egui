@@ -145,6 +145,8 @@ pub enum Msg {
     GalleryMutated(String),
     /// Trash row ids for the images a delete just moved — fuels the Undo snackbar.
     TrashedIds(Vec<i64>),
+    /// A delete response reported per-item failures; optimistic tombstones must lift.
+    TrashFailed,
     /// One page of the server trash listing (`/gallery/api/list?trash=1`).
     TrashPage { total: u64, items: Vec<crate::types::TrashItem> },
     /// A restore/purge finished; the UI reloads the trash view (and the gallery on restore).
@@ -1120,6 +1122,9 @@ impl Engine {
                                         .collect()
                                 })
                                 .unwrap_or_default();
+                            if !errors.is_empty() {
+                                let _ = tx.send(Msg::TrashFailed);
+                            }
                             let gone = trashed + cleared;
                             if gone == 0 {
                                 let why = if errors.is_empty() {
@@ -1916,7 +1921,7 @@ async fn queue_prompt_with_workflow_meta(
     client: &Client,
     queue_authed: Option<&(String, reqwest::Client)>,
     wf: &Workflow,
-    ui_workflow: Option<&Value>,
+    ui_workflow: &Value,
     log: &Logger,
 ) -> Result<Queued, String> {
     let body = serde_json::json!({
@@ -2213,11 +2218,13 @@ async fn stream_execution(
     // for final images. A bare image job with nothing to embed falls through to execute()'s
     // lower-latency streaming transport instead.
     if ui_workflow.is_some() || force_queue_post {
+        // Synthesized embed when no graph doc supplied one, so `workflow` is never null.
+        let ui_meta = ui_workflow.unwrap_or_else(|| crate::uiwf::api_to_ui(&wf, &schemas));
         let queued = match queue_prompt_with_workflow_meta(
             &client,
             queue_authed.as_ref(),
             &wf,
-            ui_workflow.as_ref(),
+            &ui_meta,
             &log,
         )
         .await

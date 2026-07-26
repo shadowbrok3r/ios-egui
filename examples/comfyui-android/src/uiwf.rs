@@ -4,7 +4,7 @@
 //! `PrimitiveNode` inlining, KJNodes `SetNode`/`GetNode` invisible wires,
 //! `control_after_generate` phantom values, and both array- and dict-form `widgets_values`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rucomfyui::Workflow;
 use rucomfyui::workflow::{WorkflowInput, WorkflowMeta, WorkflowNode, WorkflowNodeId};
@@ -845,6 +845,220 @@ fn array_to_dict(schema: &NodeSchema, arr: &[Value]) -> serde_json::Map<String, 
     map
 }
 
+// ── API → UI synthesis ────────────────────────────────────────────────────────
+
+/// Dependency depth of `id`: longest Slot chain feeding it. Cycle-tolerant (a revisit scores 0).
+fn api_depth(
+    id: WorkflowNodeId,
+    wf: &Workflow,
+    memo: &mut BTreeMap<WorkflowNodeId, u32>,
+    visiting: &mut std::collections::HashSet<WorkflowNodeId>,
+) -> u32 {
+    if let Some(&d) = memo.get(&id) {
+        return d;
+    }
+    if !visiting.insert(id) {
+        return 0;
+    }
+    let d = wf
+        .0
+        .get(&id)
+        .and_then(|n| {
+            n.inputs
+                .values()
+                .filter_map(WorkflowInput::as_slot)
+                .filter(|(src, _)| wf.0.contains_key(src))
+                .map(|(src, _)| api_depth(src, wf, memo, visiting) + 1)
+                .max()
+        })
+        .unwrap_or(0);
+    visiting.remove(&id);
+    memo.insert(id, d);
+    d
+}
+
+/// The UI-format socket type string for a schema input kind.
+fn ui_type(kind: &InputKind) -> String {
+    match kind {
+        InputKind::Connection { ty } => ty.clone(),
+        InputKind::Enum { .. } => "COMBO".into(),
+        InputKind::Int { .. } => "INT".into(),
+        InputKind::Float { .. } => "FLOAT".into(),
+        InputKind::Bool { .. } => "BOOLEAN".into(),
+        InputKind::Text { .. } => "STRING".into(),
+        InputKind::Opaque => "*".into(),
+    }
+}
+
+/// A scalar [`WorkflowInput`] as the JSON value the UI file stores; enum display text maps back
+/// through `typed` so numeric COMBOs stay numbers. `None` for slots.
+fn scalar_json(input: &WorkflowInput, kind: Option<&InputKind>) -> Option<Value> {
+    Some(match input {
+        WorkflowInput::String(s) => kind
+            .and_then(|k| k.enum_typed_value(s))
+            .cloned()
+            .unwrap_or_else(|| Value::String(s.clone())),
+        WorkflowInput::I64(v) => serde_json::json!(v),
+        WorkflowInput::U64(v) => serde_json::json!(v),
+        WorkflowInput::F64(v) => serde_json::json!(v),
+        WorkflowInput::Boolean(b) => Value::Bool(*b),
+        WorkflowInput::Slot(..) => return None,
+    })
+}
+
+/// The widget value a UI file stores for a schema input the API workflow leaves unset (or feeds
+/// by link): the schema default.
+fn default_json(kind: &InputKind) -> Value {
+    match kind {
+        InputKind::Enum { options, default, .. } => {
+            let text = default.clone().or_else(|| options.first().cloned()).unwrap_or_default();
+            let typed = kind.enum_typed_value(&text).cloned();
+            typed.unwrap_or(Value::String(text))
+        }
+        InputKind::Int { default, .. } => serde_json::json!(default),
+        InputKind::Float { default, .. } => serde_json::json!(default),
+        InputKind::Bool { default } => Value::Bool(*default),
+        InputKind::Text { default, .. } => Value::String(default.clone()),
+        _ => Value::Null,
+    }
+}
+
+/// Synthesize UI-format JSON (legacy 0.4 shape) from an API-format workflow, for embedding in the
+/// PNG when no graph doc backs the job. Inputs and widget values follow schema order; nodes lay
+/// out left-to-right by dependency depth. Inverse of [`convert`] up to layout.
+pub fn api_to_ui(wf: &Workflow, schemas: &SchemaSet) -> Value {
+    use serde_json::json;
+
+    let mut memo = BTreeMap::new();
+    let mut visiting = std::collections::HashSet::new();
+    let mut order: Vec<WorkflowNodeId> = wf.0.keys().copied().collect();
+    order.sort_by_key(|&id| (api_depth(id, wf, &mut memo, &mut visiting), id.0));
+
+    // Ordered input names per node: schema inputs first (widget order), then undeclared extras.
+    let ordered_inputs = |id: WorkflowNodeId| -> Vec<String> {
+        let node = &wf.0[&id];
+        let schema = schemas.nodes.get(&node.class_type);
+        let mut names: Vec<String> =
+            schema.map(|s| s.inputs.iter().map(|i| i.name.clone()).collect()).unwrap_or_default();
+        let mut extras: Vec<&String> =
+            node.inputs.keys().filter(|k| !names.iter().any(|n| &n == k)).collect();
+        extras.sort();
+        names.extend(extras.into_iter().cloned());
+        names
+    };
+
+    let mut link_rows = Vec::new();
+    let mut last_link = 0u64;
+    let mut in_links: HashMap<(WorkflowNodeId, usize), u64> = HashMap::new();
+    let mut out_links: HashMap<(WorkflowNodeId, u32), Vec<u64>> = HashMap::new();
+    for &id in &order {
+        for (i, name) in ordered_inputs(id).iter().enumerate() {
+            let Some((src, slot)) = wf.0[&id].inputs.get(name).and_then(WorkflowInput::as_slot)
+            else {
+                continue;
+            };
+            if !wf.0.contains_key(&src) {
+                continue;
+            }
+            last_link += 1;
+            let ty = schemas
+                .nodes
+                .get(&wf.0[&src].class_type)
+                .and_then(|s| s.outputs.get(slot as usize))
+                .map(|o| o.ty.clone())
+                .unwrap_or_else(|| "*".to_string());
+            link_rows.push(json!([last_link, src.0, slot, id.0, i, ty]));
+            in_links.insert((id, i), last_link);
+            out_links.entry((src, slot)).or_default().push(last_link);
+        }
+    }
+
+    let mut nodes = Vec::new();
+    let mut row_in_depth: HashMap<u32, u32> = HashMap::new();
+    for (pos, &id) in order.iter().enumerate() {
+        let node = &wf.0[&id];
+        let schema = schemas.nodes.get(&node.class_type);
+        let depth = memo.get(&id).copied().unwrap_or(0);
+        let row = row_in_depth.entry(depth).or_insert(0);
+
+        let inputs: Vec<Value> = ordered_inputs(id)
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let kind = schema.and_then(|s| s.inputs.iter().find(|si| &si.name == name));
+                let mut entry = json!({
+                    "name": name,
+                    "type": kind.map(|si| ui_type(&si.kind)).unwrap_or_else(|| "*".into()),
+                    "link": in_links.get(&(id, i)),
+                });
+                if kind.is_some_and(|si| is_widget(&si.kind)) {
+                    entry["widget"] = json!({ "name": name });
+                }
+                entry
+            })
+            .collect();
+
+        let outputs: Vec<Value> = schema
+            .map(|s| {
+                s.outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, o)| {
+                        json!({
+                            "name": o.name,
+                            "type": o.ty,
+                            "links": out_links.get(&(id, i as u32)).cloned().unwrap_or_default(),
+                            "slot_index": i,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut widgets_values = Vec::new();
+        for si in schema.map(|s| s.inputs.as_slice()).unwrap_or_default() {
+            if !is_widget(&si.kind) {
+                continue;
+            }
+            let value = node
+                .inputs
+                .get(&si.name)
+                .and_then(|v| scalar_json(v, Some(&si.kind)))
+                .unwrap_or_else(|| default_json(&si.kind));
+            widgets_values.push(value);
+            if takes_seed_control(si) {
+                widgets_values.push(json!("fixed"));
+            }
+        }
+
+        nodes.push(json!({
+            "id": id.0,
+            "type": node.class_type,
+            "pos": [40.0 + depth as f32 * 280.0, 40.0 + *row as f32 * 160.0],
+            "size": [240.0, 120.0],
+            "flags": {},
+            "order": pos,
+            "mode": 0,
+            "inputs": inputs,
+            "outputs": outputs,
+            "properties": { "Node name for S&R": node.class_type },
+            "widgets_values": widgets_values,
+        }));
+        *row += 1;
+    }
+
+    json!({
+        "last_node_id": order.iter().map(|id| id.0).max().unwrap_or(0),
+        "last_link_id": last_link,
+        "nodes": nodes,
+        "links": link_rows,
+        "groups": [],
+        "config": {},
+        "extra": {},
+        "version": 0.4,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,6 +1354,46 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// UNETLoader(1) → Lora(2) → KSampler(3): the synthesized UI JSON reconverts to the same
+    /// classes and inputs (links, widget values, seed phantom skipped).
+    #[test]
+    fn api_to_ui_round_trips_through_convert() {
+        let mut wf = Workflow::default();
+        wf.0.insert(
+            WorkflowNodeId(1),
+            WorkflowNode::new("UNETLoader").with_input("unet_name", "u.safetensors"),
+        );
+        wf.0.insert(
+            WorkflowNodeId(2),
+            WorkflowNode::new("LoraLoaderModelOnly")
+                .with_input("model", WorkflowInput::slot(WorkflowNodeId(1), 0))
+                .with_input("lora_name", "l.safetensors")
+                .with_input("strength_model", 0.8f64),
+        );
+        wf.0.insert(
+            WorkflowNodeId(3),
+            WorkflowNode::new("KSampler")
+                .with_input("model", WorkflowInput::slot(WorkflowNodeId(2), 0))
+                .with_input("seed", 123i64)
+                .with_input("steps", 30i64)
+                .with_input("cfg", 6.5f64)
+                .with_input("sampler_name", "uni_pc")
+                .with_input("scheduler", "simple")
+                .with_input("denoise", 1.0f64),
+        );
+        let s = schemas();
+        let ui = api_to_ui(&wf, &s);
+        assert!(ui["nodes"].as_array().is_some_and(|n| n.len() == 3));
+        assert!(ui["links"].as_array().is_some_and(|l| l.len() == 2));
+        let c = convert(&ui, &s).unwrap();
+        assert_eq!(c.workflow.0.len(), wf.0.len());
+        for (id, node) in &wf.0 {
+            let got = &c.workflow.0[id];
+            assert_eq!(got.class_type, node.class_type, "node {id}");
+            assert_eq!(got.inputs, node.inputs, "node {id}");
         }
     }
 }

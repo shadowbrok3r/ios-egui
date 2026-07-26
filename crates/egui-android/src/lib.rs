@@ -48,6 +48,8 @@ struct Adapter {
     ime_synced_focus: Option<egui::Id>,
     /// Force one egui→EditText sync after a text-actions bar edit (paste/cut/select-all).
     ime_force_sync: bool,
+    /// The next successful seed restarts the IME session (field switch / out-of-band edit).
+    ime_seed_restart: bool,
     /// Points subtracted from `screen_rect.max.y` this frame for the soft keyboard.
     ime_inset_pt: f32,
 }
@@ -60,6 +62,10 @@ impl Adapter {
     /// Consecutive frames hidden (after having been open) before a forced re-show.
     /// Long on purpose — winit's implicit hide is patched out; this is only a safety net.
     const IME_RECOVER_FRAMES: u16 = 120;
+    /// Open->hidden frames before a pre-API-30 device (no insets dismissal edge) treats the
+    /// hide as an external dismissal. Short enough to feel instant at the 100ms drain cadence,
+    /// long enough to absorb IME-switch / rotation inset dips.
+    const IME_SYNTH_DISMISS_FRAMES: u16 = 6;
     /// Frames to wait after a forced re-show before trying again.
     const IME_RECOVER_COOLDOWN_FRAMES: u16 = 300;
 }
@@ -87,24 +93,7 @@ impl eframe::App for Adapter {
         // and the recovery path below would re-show it (and the actions bar would never hide).
         // Treat it as leaving the field. Before `hold`/focus are read so it takes effect now.
         if self.ime_bridge_hot && crate::ime_bridge::take_dismissed() {
-            if let Some(id) = self.last_focus {
-                ui.ctx().memory_mut(|m| m.surrender_focus(id));
-            }
-            let _ = crate::ime_bridge::set_soft_keyboard(false);
-            crate::ime_bridge::clear_preedit_tracking();
-            crate::ime_bridge::clear_carry();
-            self.ime_bridge_hot = false;
-            self.ime_seen_open = false;
-            self.ime_recover_arm = 0;
-            self.ime_recover_cooldown = 0;
-            self.ime_hide_arm = 0;
-            self.ime_hold_frames = 0;
-            self.bar_touch = false;
-            self.ime_force_sync = false;
-            self.last_focus = None;
-            self.last_ime = None;
-            self.ime_synced_focus = None;
-            self.pending_events.clear();
+            self.ime_teardown(ui.ctx());
         }
         self.bar_touch |= pressed_in_bar;
         let hold = self.bar_touch || self.ime_hold_frames > 0;
@@ -183,10 +172,31 @@ impl eframe::App for Adapter {
         );
         if switched_field {
             crate::ime_bridge::clear_preedit_tracking();
+            // Events deferred against field A's document must not replay into field B, and
+            // the seed for B restarts the IME session so the keyboard re-reads the document.
+            crate::ime_bridge::clear_carry();
+            self.ime_seed_restart = true;
         }
         // A field gaining focus may carry a stuck composition from an earlier tap/dismissal —
-        // egui paints no caret while composing. Empty Preedit resets it; no-op otherwise.
-        if self.ime_bridge_hot && self.last_focus.is_some() && prev_focus != self.last_focus {
+        // egui paints no caret while composing, and a stuck purpose never self-heals (its only
+        // reset is an IME event). Not gated on ime_bridge_hot: the session-opening tap runs this
+        // before the flag turns on, and that tap is exactly when the stale state must clear.
+        if let Some(id) = self.last_focus
+            && prev_focus != self.last_focus
+        {
+            // The reset deletes the stored cursor span while a composition is stuck; a
+            // programmatic focus gain (no tap to collapse it) must collapse it first.
+            if let Some(mut st) = egui::text_edit::TextEditState::load(ui.ctx(), id)
+                && let Some(range) = st.cursor.char_range()
+            {
+                let r = range.as_sorted_char_range();
+                if r.start != r.end {
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(r.end),
+                    )));
+                    st.store(ui.ctx(), id);
+                }
+            }
             self.pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
                 text: String::new(),
                 active_range_chars: None,
@@ -239,7 +249,13 @@ impl eframe::App for Adapter {
                     // showSoftInput restarts the IME session (see logcat "Session id mismatch"),
                     // which can corrupt in-flight typing/backspace if fired too eagerly.
                     self.ime_recover_arm = self.ime_recover_arm.saturating_add(1);
-                    if self.ime_recover_cooldown > 0 {
+                    if !crate::host::ime_inset_reliable()
+                        && self.ime_recover_arm >= Self::IME_SYNTH_DISMISS_FRAMES
+                    {
+                        // Pre-API-30: no insets edge ever reports the keyboard's own hide key,
+                        // so a debounced open->hidden edge is the external-dismissal signal.
+                        self.ime_teardown(ui.ctx());
+                    } else if self.ime_recover_cooldown > 0 {
                         self.ime_recover_cooldown -= 1;
                     } else if self.ime_recover_arm >= Self::IME_RECOVER_FRAMES {
                         let _ = crate::ime_bridge::show_ime_force();
@@ -258,30 +274,41 @@ impl eframe::App for Adapter {
             if self.ime_hide_arm >= 30 && self.ime_bridge_hot {
                 let _ = crate::ime_bridge::set_soft_keyboard(false);
                 crate::ime_bridge::clear_preedit_tracking();
+                crate::ime_bridge::clear_carry();
                 self.ime_bridge_hot = false;
                 self.ime_seen_open = false;
                 self.last_ime = None;
                 self.ime_synced_focus = None;
                 self.ime_force_sync = false;
+                self.ime_seed_restart = false;
             }
         }
         // egui → EditText only when opening the keyboard, switching fields, or bar paste/cut —
         // never while typing (setText resets the caret and triggers invalidateInput).
         // Retries until the undoer has a stable snapshot: seeding before that pushed "" into the
         // EditText, and every later IME op then edited against an empty mirror.
+        // Latched until the seed actually lands: the seed retries across frames while the
+        // undoer settles, and the restart intent must survive those retries.
+        self.ime_seed_restart |= crate::ime_bridge::take_reseed_restart();
         let need_sync =
             self.ime_force_sync || switched_field || crate::ime_bridge::take_needs_reseed();
         if need_sync {
             crate::ime_bridge::invalidate_last_sync();
-            let seeded = crate::ime_bridge::sync_focused_text_edit(ui.ctx(), self.last_focus);
+            let seeded = if self.ime_seed_restart {
+                crate::ime_bridge::sync_focused_text_edit_restart(ui.ctx(), self.last_focus)
+            } else {
+                crate::ime_bridge::sync_focused_text_edit(ui.ctx(), self.last_focus)
+            };
             if seeded {
                 self.ime_synced_focus = self.last_focus;
                 self.ime_force_sync = false;
+                self.ime_seed_restart = false;
             } else if self.ime_bridge_hot && self.last_focus.is_some() {
                 self.ime_force_sync = true;
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             } else {
                 self.ime_force_sync = false;
+                self.ime_seed_restart = false;
             }
         }
         // Mirror egui's caret into the EditText every frame it differs (the call is a no-op when
@@ -354,6 +381,30 @@ impl eframe::App for Adapter {
 }
 
 impl Adapter {
+    /// Drop the whole IME session: surrender focus, hide the keyboard, and reset every bridge
+    /// latch. Used for external dismissals (back gesture) and their synthesized pre-API-30 twin.
+    fn ime_teardown(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.last_focus {
+            ctx.memory_mut(|m| m.surrender_focus(id));
+        }
+        let _ = crate::ime_bridge::set_soft_keyboard(false);
+        crate::ime_bridge::clear_preedit_tracking();
+        crate::ime_bridge::clear_carry();
+        self.ime_bridge_hot = false;
+        self.ime_seen_open = false;
+        self.ime_recover_arm = 0;
+        self.ime_recover_cooldown = 0;
+        self.ime_hide_arm = 0;
+        self.ime_hold_frames = 0;
+        self.bar_touch = false;
+        self.ime_force_sync = false;
+        self.ime_seed_restart = false;
+        self.last_focus = None;
+        self.last_ime = None;
+        self.ime_synced_focus = None;
+        self.pending_events.clear();
+    }
+
     /// Restore text-field focus after a bar tap.
     /// Skips when already focused — `Memory::request_focus` always sets `interrupt_ime`, and
     /// egui-winit then does `set_ime_allowed(false/true)` which hides our keyboard and fails
@@ -514,6 +565,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
                 last_ime: None,
                 ime_synced_focus: None,
                 ime_force_sync: false,
+                ime_seed_restart: false,
                 ime_inset_pt: 0.0,
             }))
         }),

@@ -40,3 +40,8 @@ pub use egui_android::device_orientation_deg;
 /// Android-only frame-accurate video decoding (MediaMetadataRetriever) for in-app playback.
 #[cfg(target_os = "android")]
 pub use egui_android::video;
+
+/// Tell the Android IME bridge a text buffer changed outside the IME (programmatic edit while
+/// possibly focused), so it drops carried IME state and reseeds the hidden EditText.
+#[cfg(target_os = "android")]
+pub use egui_android::ime_bridge::notify_out_of_band_edit as note_ime_out_of_band_edit;

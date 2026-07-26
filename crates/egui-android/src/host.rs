@@ -992,6 +992,15 @@ fn keyboard_pts(host: &Host, pixels_per_point: f32) -> f32 {
     if raw > host.safe_area_insets().bottom + 40.0 { raw } else { 0.0 }
 }
 
+// The WindowMetrics IME-inset probe is unavailable (API < 30 or a JNI failure); the same
+// boundary gates the Java insets-listener dismissal signal.
+static IME_INSET_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Whether inset-based IME signals (occlusion + external-dismissal edge) work on this device.
+pub(crate) fn ime_inset_reliable() -> bool {
+    !IME_INSET_OFF.load(Ordering::Relaxed)
+}
+
 // IME occlusion in px via `getCurrentWindowMetrics().getWindowInsets()` — WindowManager is a
 // system service, not a View, so this is render-thread safe. Latches off on API < 30 or the
 // first JNI failure and falls back to the content-rect path above.
@@ -1001,7 +1010,6 @@ fn ime_inset_px() -> Option<f32> {
         NotReady,
         Unsupported,
     }
-    static IME_INSET_OFF: AtomicBool = AtomicBool::new(false);
     if IME_INSET_OFF.load(Ordering::Relaxed) {
         return None;
     }

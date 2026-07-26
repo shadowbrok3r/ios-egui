@@ -228,13 +228,22 @@ pub fn token_at(text: &str, cursor_byte: usize) -> (Range<usize>, &str) {
 }
 
 /// Replace `range` with `tag, ` and return the new text plus the cursor byte after the insertion.
+/// The range is clamped to `text`'s length and snapped down to char boundaries.
 pub fn accept_suggestion(text: &str, range: Range<usize>, tag: &str) -> (String, usize) {
+    let mut start = range.start.min(text.len());
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = range.end.min(text.len()).max(start);
+    while end > start && !text.is_char_boundary(end) {
+        end -= 1;
+    }
     let insert = format!("{tag}, ");
-    let cursor = range.start + insert.len();
-    let mut out = String::with_capacity(text.len() - (range.end - range.start) + insert.len());
-    out.push_str(&text[..range.start]);
+    let cursor = start + insert.len();
+    let mut out = String::with_capacity(text.len() - (end - start) + insert.len());
+    out.push_str(&text[..start]);
     out.push_str(&insert);
-    out.push_str(&text[range.end..]);
+    out.push_str(&text[end..]);
     (out, cursor)
 }
 
@@ -312,7 +321,10 @@ fn parse_segment(seg: &str) -> (String, f32) {
     while wraps_in_parens(s) {
         let inner = s[1..s.len() - 1].trim();
         if let Some(pos) = inner.rfind(':') {
-            if let Ok(w) = inner[pos + 1..].trim().parse::<f32>() {
+            // Non-finite weights (nan/inf) would survive clamp and re-render forever.
+            if let Some(w) =
+                inner[pos + 1..].trim().parse::<f32>().ok().filter(|w| w.is_finite())
+            {
                 weight *= w;
                 s = inner[..pos].trim();
                 continue;
@@ -578,6 +590,23 @@ mod tests {
         let (out, cur) = accept_suggestion(text, r, "long hair");
         assert_eq!(out, "a cat, long hair, ");
         assert_eq!(cur, out.len());
+    }
+
+    /// A range computed against an older text (frozen across frames) must clamp, not panic.
+    #[test]
+    fn accept_suggestion_survives_stale_ranges() {
+        // Range beyond the current text after it shrank.
+        let (out, cur) = accept_suggestion("ab", 5..9, "tag");
+        assert_eq!(out, "abtag, ");
+        assert!(cur <= out.len());
+        // Range endpoints inside multibyte chars after the text reshaped.
+        let text = "naïve café";
+        for start in 0..=text.len() + 2 {
+            for end in start..=text.len() + 2 {
+                let (out, cur) = accept_suggestion(text, start..end, "t");
+                assert!(cur <= out.len());
+            }
+        }
     }
 
     #[test]

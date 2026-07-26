@@ -1096,6 +1096,11 @@ struct ComfyApp {
     playback_seq: u64,
     /// Ignore gallery pages from queries older than this (filter changed mid auto-load chain).
     gallery_gen: u64,
+    /// Server-side rows consumed by the current listing (next page offset); tombstone-filtered
+    /// pages make `gallery.len()` undercount it.
+    gallery_fetch_pos: u64,
+    /// Recently deleted keys, hidden from incoming pages until the server index settles.
+    trash_tombstones: HashMap<(String, String), std::time::Instant>,
     albums: Vec<Album>,
     facets: Facets,
     album_new_name: String,
@@ -1686,6 +1691,8 @@ impl ComfyApp {
             player: None,
             playback_seq: 0,
             gallery_gen: 0,
+            gallery_fetch_pos: 0,
+            trash_tombstones: HashMap::new(),
             albums: Vec::new(),
             facets: Facets::default(),
             album_new_name: String::new(),
@@ -2191,6 +2198,9 @@ impl ComfyApp {
             Msg::AlbumError(e) => {
                 self.gallery_status = elide(&e, 160);
                 self.album_pending_add = None;
+                // A failed delete rides this message; optimistic tombstones must not keep
+                // hiding images the server never trashed.
+                self.trash_tombstones.clear();
                 host.haptic(Haptic::Error);
             }
             Msg::GalleryMutated(note) => {
@@ -2203,6 +2213,10 @@ impl ComfyApp {
             Msg::TrashedIds(ids) => {
                 // Undo handle for the snackbar; a newer delete replaces the older window.
                 self.undo_trash = Some((ids, ctx.input(|i| i.time)));
+            }
+            Msg::TrashFailed => {
+                // Items the server could not trash are still live; stop hiding them.
+                self.trash_tombstones.clear();
             }
             Msg::TrashPage { total, items } => {
                 self.trash_loading = false;
@@ -2218,6 +2232,7 @@ impl ComfyApp {
                 }
                 // Restored files re-enter the listing; purges don't change it.
                 if restored {
+                    self.trash_tombstones.clear();
                     self.refresh_gallery();
                 }
                 host.haptic(Haptic::Success);
@@ -2762,10 +2777,35 @@ impl ComfyApp {
                 self.gallery_loading = false;
                 self.gallery_fetched = true;
                 self.gallery_total = page.total;
+                // Server rows consumed, counted before tombstones shrink the page.
+                let fetched = page.offset + page.items.len() as u64;
+                self.gallery_fetch_pos = fetched;
+                self.trash_tombstones.retain(|_, t| t.elapsed().as_secs() < 120);
+                // A listing indexed mid-delete can still carry just-deleted rows; hide them
+                // until the server prunes the ghosts.
+                let fresh: Vec<GalleryItem> = page
+                    .items
+                    .into_iter()
+                    .filter(|it| {
+                        !self
+                            .trash_tombstones
+                            .contains_key(&(it.subfolder.clone(), it.filename.clone()))
+                    })
+                    .collect();
                 if page.offset == 0 {
-                    self.gallery = page.items;
+                    self.gallery = fresh;
                 } else {
-                    self.gallery.extend(page.items);
+                    // Tombstone-shrunk pages shift server offsets; drop rows already listed.
+                    let seen: HashSet<(String, String)> = self
+                        .gallery
+                        .iter()
+                        .map(|it| (it.subfolder.clone(), it.filename.clone()))
+                        .collect();
+                    self.gallery.extend(
+                        fresh
+                            .into_iter()
+                            .filter(|it| !seen.contains(&(it.subfolder.clone(), it.filename.clone()))),
+                    );
                 }
                 if self.triage_collect > 0 && page.offset == 0 {
                     self.triage_collect -= 1;
@@ -2790,15 +2830,17 @@ impl ComfyApp {
                 // With a model filter, album, or grouping active, the whole set has to be present
                 // for the groups/results to be complete — keep paging (in big chunks) instead of
                 // making the user tap "Load more". Capped so a huge namespace can't runaway.
-                let loaded = self.gallery.len() as u64;
+                // Offsets advance by server rows (fetch_pos), not the tombstone-filtered local
+                // count; an empty page stops the chain instead of refetching the same offset.
                 let more = self.gallery_wants_all()
-                    && loaded < self.gallery_total
-                    && loaded < GALLERY_LOAD_ALL_CAP;
+                    && fetched > page.offset
+                    && fetched < self.gallery_total
+                    && fetched < GALLERY_LOAD_ALL_CAP;
                 if more {
                     self.gallery_loading = true;
                     self.engine.as_ref().unwrap().gallery_list(
                         self.gallery_gen,
-                        loaded,
+                        fetched,
                         self.gallery_page_size(),
                         self.gallery_list_q(),
                         &self.gallery_view,
@@ -5861,6 +5903,7 @@ impl ComfyApp {
 
         match act {
             Some(EAct::Accept) => {
+                self.note_prompt_edited();
                 self.params.positive = streamed.trim().to_string();
                 if raw_on_accept {
                     self.params.raw_prompt = true;
@@ -5953,6 +5996,7 @@ impl ComfyApp {
             self.prompt_history[val - 1].clone()
         };
         // Plain field assignment so the chip view and autocomplete re-read the new text.
+        self.note_prompt_edited();
         self.params.positive = entry.positive.clone();
         self.params.negative = entry.negative.clone();
         self.hist_applied = Some((entry.positive, entry.negative));
@@ -6075,16 +6119,16 @@ impl ComfyApp {
         // Freeze the row the instant a press starts: a focus/cursor flip on press-down would
         // otherwise recompute (and reorder) it under the finger, inserting whatever slid into
         // that slot. While a press is in flight, reuse the snapshot taken just before it.
+        // The splice range stays live: an IME commit mid-press can reshape the text, and a
+        // stale byte range would slice out of bounds.
         let frozen_id = egui::Id::new(("tag_suggest_frozen", field.disc()));
-        let (range, sugg) = if press_in_flight {
+        let sugg = if press_in_flight {
             ui.ctx()
-                .data(|d| {
-                    d.get_temp::<(std::ops::Range<usize>, Vec<(String, u32, u8)>)>(frozen_id)
-                })
-                .unwrap_or((range, sugg))
+                .data(|d| d.get_temp::<Vec<(String, u32, u8)>>(frozen_id))
+                .unwrap_or(sugg)
         } else {
-            ui.ctx().data_mut(|d| d.insert_temp(frozen_id, (range.clone(), sugg.clone())));
-            (range, sugg)
+            ui.ctx().data_mut(|d| d.insert_temp(frozen_id, sugg.clone()));
+            sugg
         };
         if sugg.is_empty() {
             set_alive(ui.ctx(), false);
@@ -6110,6 +6154,7 @@ impl ComfyApp {
         set_alive(ui.ctx(), true);
         if let Some((new_text, cursor_byte)) = accepted {
             let char_idx = new_text[..cursor_byte].chars().count();
+            self.note_prompt_edited();
             *self.field_text_mut(field) = new_text;
             if let Some(mut st) = egui::TextEdit::load_state(ui.ctx(), id) {
                 let cur = egui::text::CCursor::new(char_idx);
@@ -6196,11 +6241,13 @@ impl ComfyApp {
             if let Some(tag) = chips.get(i).map(|c| c.tag.clone()) {
                 let other = field.other();
                 let joined = tags::push_chip(self.field_text(other), &tag);
+                self.note_prompt_edited();
                 *self.field_text_mut(other) = joined;
                 new_text = Some(tags::remove_chip(&text, i));
             }
         }
         if let Some(t) = new_text {
+            self.note_prompt_edited();
             *self.field_text_mut(field) = t;
         }
         if to_text {
@@ -6296,8 +6343,15 @@ impl ComfyApp {
         }
     }
 
+    /// Tell the IME bridge a prompt buffer changed programmatically (chips, history, fixes),
+    /// so the hidden-EditText mirror reseeds instead of editing against a stale document.
+    fn note_prompt_edited(&self) {
+        egui_mobile::note_ime_out_of_band_edit();
+    }
+
     /// Apply a lint fix: one whole-field assignment. Trigger fixes target the mode's active field.
     fn apply_fix(&mut self, fix: lint::Fix) {
+        self.note_prompt_edited();
         match fix {
             lint::Fix::SetPositive(s) => self.params.positive = s,
             lint::Fix::SetNegative(s) => self.params.negative = s,
@@ -6695,6 +6749,7 @@ impl ComfyApp {
                         .on_hover_text("Load the canonical Wan negative prompt")
                         .clicked()
                     {
+                        self.note_prompt_edited();
                         self.params.negative = crate::types::WAN_NEGATIVE.to_string();
                     }
                 });
@@ -14568,7 +14623,8 @@ impl ComfyApp {
         }
         // The listing is paged and shared with the Gallery tab, so the kind this input wants can
         // easily be further down it — offer the next page rather than claiming there are none.
-        let more = self.gallery_total as usize > self.gallery.len();
+        // Server-cursor compare: tombstone-hidden rows make gallery.len() undercount.
+        let more = self.gallery_total > self.gallery_fetch_pos;
         if items.is_empty() {
             ui.add_space(8.0);
             if self.gallery_loading {
@@ -14594,7 +14650,7 @@ impl ComfyApp {
                 self.gallery_loading = true;
                 self.engine.as_ref().unwrap().gallery_list(
                     self.gallery_gen,
-                    self.gallery.len() as u64,
+                    self.gallery_fetch_pos,
                     self.gallery_page_size(),
                     self.gallery_list_q(),
                     &self.gallery_view,
@@ -15112,6 +15168,7 @@ impl ComfyApp {
         self.thumbs.reset_pending();
         // Supersede any in-flight pages of the previous query (auto-load chains overlap).
         self.gallery_gen = self.gallery_gen.wrapping_add(1);
+        self.gallery_fetch_pos = 0;
         self.engine.as_ref().unwrap().gallery_list(
             self.gallery_gen,
             0,
@@ -16388,7 +16445,7 @@ impl ComfyApp {
             }
 
             ui.add_space(6.0);
-            if self.gallery.len() < self.gallery_total as usize {
+            if self.gallery_fetch_pos < self.gallery_total {
                 ui.vertical_centered(|ui| {
                     if self.gallery_loading {
                         ui.spinner();
@@ -16424,7 +16481,7 @@ impl ComfyApp {
             self.gallery_loading = true;
             self.engine.as_ref().unwrap().gallery_list(
                 self.gallery_gen,
-                self.gallery.len() as u64,
+                self.gallery_fetch_pos,
                 self.gallery_page_size(),
                 self.gallery_list_q(),
                 &self.gallery_view,
@@ -16686,8 +16743,18 @@ impl ComfyApp {
         if self.confirm_gallery_delete {
             self.delete_confirm = Some((items, false));
         } else {
-            self.engine.as_ref().unwrap().delete_images(items);
+            self.send_delete_images(items);
         }
+    }
+
+    /// Tombstone the keys, then send the delete: a listing the server indexed mid-delete can
+    /// still carry these rows, and the tombstones keep them out of the grid until it settles.
+    fn send_delete_images(&mut self, items: Vec<(String, String)>) {
+        let now = std::time::Instant::now();
+        for it in &items {
+            self.trash_tombstones.insert(it.clone(), now);
+        }
+        self.engine.as_ref().unwrap().delete_images(items);
     }
 
     /// Prefer the next filmstrip neighbor after a viewer delete; fall back to previous.
@@ -16837,7 +16904,7 @@ impl ComfyApp {
                 self.confirm_gallery_delete = false;
             }
             self.delete_confirm = None;
-            self.engine.as_ref().unwrap().delete_images(items);
+            self.send_delete_images(items);
             host.haptic(Haptic::Warning);
         }
     }
@@ -17464,7 +17531,7 @@ impl ComfyApp {
                     let items = self.items_for_keys(&t.trash);
                     if !items.is_empty() {
                         let n = items.len();
-                        self.engine.as_ref().unwrap().delete_images(items);
+                        self.send_delete_images(items);
                         self.gallery_status = format!("Triage: moved {n} to trash");
                         host.haptic(Haptic::Warning);
                     }
@@ -19235,6 +19302,7 @@ impl ComfyApp {
             });
         match act {
             Some(true) => {
+                self.note_prompt_edited();
                 self.params.positive = rewritten;
                 self.rewrite_review = None;
                 self.status = "Rewrite applied".into();
@@ -19310,10 +19378,12 @@ impl ComfyApp {
             });
         match act {
             Some(WAct::Add(tag)) => {
+                self.note_prompt_edited();
                 self.params.positive = tags::push_chip(&self.params.positive, &tag);
                 host.haptic(Haptic::Light);
             }
             Some(WAct::AddTop(n)) => {
+                self.note_prompt_edited();
                 for tag in result.top_general(n) {
                     self.params.positive = tags::push_chip(&self.params.positive, &tag);
                 }
@@ -19589,14 +19659,16 @@ impl ComfyApp {
         }
         let Some((key, subfolder, filename)) = next else {
             // Still paging the gallery — keep the UI alive until the listing is complete.
+            // Server-cursor offsets: tombstone-hidden rows make gallery.len() undercount
+            // and would refire the same page forever.
             let wants_page = matches!(self.conn, Conn::Connected)
-                && self.gallery.len() < self.gallery_total as usize
-                && self.gallery.len() < GALLERY_LOAD_ALL_CAP as usize;
+                && self.gallery_fetch_pos < self.gallery_total
+                && self.gallery_fetch_pos < GALLERY_LOAD_ALL_CAP;
             if wants_page && !self.gallery_loading && self.engine.is_some() {
                 self.gallery_loading = true;
                 self.engine.as_ref().unwrap().gallery_list(
                     self.gallery_gen,
-                    self.gallery.len() as u64,
+                    self.gallery_fetch_pos,
                     self.gallery_page_size(),
                     self.gallery_list_q(),
                     &self.gallery_view,

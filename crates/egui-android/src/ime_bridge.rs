@@ -21,17 +21,23 @@ const TRACE: bool = true;
 /// Events drained from the Java `InputConnectionWrapper` queue.
 #[derive(Debug, Clone)]
 pub enum ImeEvent {
-    Selection { start: usize, end: usize },
+    /// `strong` (a `U` event) survives mutations earlier in the batch: it is the EditText's
+    /// settled caret after the batch's last mutation, deferred rather than dropped.
+    Selection { start: usize, end: usize, strong: bool },
     Commit(String),
     Preedit(String),
     /// `finishComposingText`: end composition KEEPING the composing text as committed.
     Finish,
-    Delete { before: usize, after: usize },
+    /// `anchor` is the pre-deletion selection∪composition span in code points; with it egui
+    /// deletes at Java's exact position instead of around its own (possibly drifted) caret.
+    Delete { before: usize, after: usize, anchor: Option<(usize, usize)> },
     /// `setComposingRegion`: existing text `[start, end)` (content `text`) becomes the composition.
     Region { start: usize, end: usize, text: String },
     /// `replaceText`: replace `[start, end)` with `text`, committed.
     Replace { start: usize, end: usize, text: String },
     Key(i32),
+    /// DEL/FORWARD_DEL that Java already applied to `[start, start+deleted)` in the mirror.
+    KeyDelSpan { code: i32, deleted: usize, start: usize },
     /// Java skipped an egui→EditText push (undrained events); the mirror record is a lie.
     SyncDropped,
 }
@@ -369,22 +375,30 @@ pub fn take_pending() -> Vec<ImeEvent> {
 fn parse_event(s: &str) -> Option<ImeEvent> {
     let (kind, rest) = s.split_once('\t')?;
     match kind {
-        "S" => {
+        "S" | "U" => {
             let (a, b) = rest.split_once('\t')?;
             Some(ImeEvent::Selection {
                 start: a.parse().ok()?,
                 end: b.parse().ok()?,
+                strong: kind == "U",
             })
         }
         "T" => Some(ImeEvent::Commit(rest.to_owned())),
         "C" => Some(ImeEvent::Preedit(rest.to_owned())),
         "F" => Some(ImeEvent::Finish),
         "D" => {
-            let (a, b) = rest.split_once('\t')?;
-            Some(ImeEvent::Delete {
-                before: a.parse().ok()?,
-                after: b.parse().ok()?,
-            })
+            // 2-field legacy, or 4-field with the pre-deletion union anchor (-1 = no anchor).
+            let mut it = rest.split('\t');
+            let before = it.next()?.parse().ok()?;
+            let after = it.next()?.parse().ok()?;
+            let anchor = match (it.next(), it.next()) {
+                (Some(a), Some(b)) => {
+                    let (a, b): (i64, i64) = (a.parse().ok()?, b.parse().ok()?);
+                    (a >= 0 && b >= a).then_some((a as usize, b as usize))
+                }
+                _ => None,
+            };
+            Some(ImeEvent::Delete { before, after, anchor })
         }
         "R" | "X" => {
             let (a, rest) = rest.split_once('\t')?;
@@ -398,7 +412,23 @@ fn parse_event(s: &str) -> Option<ImeEvent> {
                 ImeEvent::Replace { start, end, text }
             })
         }
-        "K" => Some(ImeEvent::Key(rest.parse().ok()?)),
+        "K" => {
+            // 1-field legacy, or 3-field DEL with the span Java already deleted.
+            let mut it = rest.split('\t');
+            let code = it.next()?.parse().ok()?;
+            match (it.next(), it.next()) {
+                (Some(deleted), Some(start))
+                    if matches!(code, KEYCODE_DEL | KEYCODE_FORWARD_DEL) =>
+                {
+                    Some(ImeEvent::KeyDelSpan {
+                        code,
+                        deleted: deleted.parse().ok()?,
+                        start: start.parse().ok()?,
+                    })
+                }
+                _ => Some(ImeEvent::Key(code)),
+            }
+        }
         "Y" => Some(ImeEvent::SyncDropped),
         _ => None,
     }
@@ -406,11 +436,30 @@ fn parse_event(s: &str) -> Option<ImeEvent> {
 
 /// A Java-side skipped push was reported; the next frame must reseed the EditText.
 static NEEDS_RESEED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The reseed must restart the IME session (the buffer changed outside the IME).
+static RESEED_RESTART: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether a dropped push requires a reseed. Clears the latch.
 pub fn take_needs_reseed() -> bool {
     NEEDS_RESEED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Whether the next successful reseed must restart the IME session. Clears the latch.
+pub fn take_reseed_restart() -> bool {
+    RESEED_RESTART.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An app-side edit changed a (possibly focused) text buffer outside the IME: carried events
+/// and the mirror record are stale, and the next settled frame reseeds the EditText with an
+/// IME session restart so autocomplete re-reads the document.
+pub fn notify_out_of_band_edit() {
+    clear_carry();
+    clear_preedit_tracking();
+    invalidate_last_sync();
+    NEEDS_RESEED.store(true, std::sync::atomic::Ordering::Relaxed);
+    RESEED_RESTART.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 
 /// Probe the latest undoer snapshot string without mutating the real undoer.
 pub fn probe_undoer_text(state: &egui::text_edit::TextEditState) -> Option<String> {
@@ -502,13 +551,48 @@ pub fn apply_pending(
             continue;
         }
         match ev {
-            ImeEvent::Selection { start, end } => {
-                last_sel = Some((start, end));
+            ImeEvent::Selection { start, end, strong } => {
+                if !strong {
+                    last_sel = Some((start, end));
+                    continue;
+                }
+                // The batch's settled caret: valid only once the batch's mutations have
+                // landed in egui, so it defers behind any staged mutation.
+                if had_mutate {
+                    deferred.push(ImeEvent::Selection { start, end, strong });
+                    continue;
+                }
+                set_state_selection(ctx, focus, start, end);
+                if let Ok(mut g) = LAST_SYNC.lock()
+                    && let Some((_, s, e)) = g.as_mut()
+                {
+                    *s = start as i32;
+                    *e = end as i32;
+                }
+                // An older weak S staged earlier in the drain must not win over this.
+                last_sel = None;
             }
             ImeEvent::Commit(text) => {
                 had_mutate = true;
-                if let Ok(mut g) = LAST_PREEDIT.lock() {
-                    g.clear();
+                let had_preedit = LAST_PREEDIT
+                    .lock()
+                    .map(|mut g| {
+                        let had = !g.is_empty();
+                        g.clear();
+                        had
+                    })
+                    .unwrap_or(false);
+                // egui drops Commit("\n") outright; Enter is the event that inserts a newline.
+                // An active preedit is removed first (the EditText's commit replaced it too).
+                if text == "\n" || text == "\r" || text == "\r\n" {
+                    if had_preedit {
+                        pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                            text: String::new(),
+                            active_range_chars: None,
+                        }));
+                    }
+                    pending_events.push(key(egui::Key::Enter));
+                    continue;
                 }
                 // Ime::Commit (not Event::Text): replaces the active preedit and resets egui's
                 // composition state; a bare Text leaves stale ImeComposition cursor purpose.
@@ -537,12 +621,46 @@ pub fn apply_pending(
                     pending_events.push(egui::Event::Ime(egui::ImeEvent::Commit(preedit)));
                 }
             }
-            ImeEvent::Delete { before, after } => {
-                had_mutate = true;
+            ImeEvent::Delete { before, after, anchor } => {
                 let preedit = LAST_PREEDIT
                     .lock()
                     .map(|g| g.clone())
                     .unwrap_or_default();
+                // Anchored + no preedit: delete at Java's exact union bounds instead of
+                // around egui's own caret, which may have drifted from the mirror's.
+                if let Some((a0, a1)) = anchor
+                    && preedit.is_empty()
+                {
+                    if had_mutate {
+                        deferred.push(ImeEvent::Delete { before, after, anchor });
+                        continue;
+                    }
+                    had_mutate = true;
+                    if before > 0 {
+                        set_state_selection(ctx, focus, a0, a0);
+                        for _ in 0..before {
+                            pending_events.push(key(egui::Key::Backspace));
+                        }
+                        if after > 0 {
+                            // The after side lands next frame, shifted by the deletion.
+                            deferred.push(ImeEvent::Delete {
+                                before: 0,
+                                after,
+                                anchor: Some((
+                                    a0.saturating_sub(before),
+                                    a1.saturating_sub(before),
+                                )),
+                            });
+                        }
+                    } else if after > 0 {
+                        set_state_selection(ctx, focus, a1, a1);
+                        for _ in 0..after {
+                            pending_events.push(key(egui::Key::Delete));
+                        }
+                    }
+                    continue;
+                }
+                had_mutate = true;
                 // With an active preedit, egui keeps it selected and a bare Backspace would
                 // delete the whole word: lift the preedit, delete around it, re-apply.
                 if !preedit.is_empty() {
@@ -579,7 +697,7 @@ pub fn apply_pending(
                         live.chars().skip(start).take(end.saturating_sub(start)).collect();
                     if slice != text {
                         log::warn!("egui-android ime: stale Region {start}..{end}, resyncing");
-                        resync_after_stale(ctx, focus, &live);
+                        resync_after_stale(ctx, focus, &live, pending_events);
                         poisoned = true;
                         continue;
                     }
@@ -604,7 +722,7 @@ pub fn apply_pending(
                 if let Some(live) = settled_text(ctx, focus) {
                     if end > live.chars().count() {
                         log::warn!("egui-android ime: stale Replace {start}..{end}, resyncing");
-                        resync_after_stale(ctx, focus, &live);
+                        resync_after_stale(ctx, focus, &live, pending_events);
                         poisoned = true;
                         continue;
                     }
@@ -650,6 +768,42 @@ pub fn apply_pending(
                 if let Some(k) = egui_key {
                     pending_events.push(key(k));
                 }
+            }
+            ImeEvent::KeyDelSpan { code, deleted, start } => {
+                // Live preedit: Java deleted the whole composing span; an empty Preedit
+                // removes egui's (selected) preedit identically and resets composition.
+                let had_preedit = LAST_PREEDIT
+                    .lock()
+                    .map(|mut g| {
+                        let had = !g.is_empty();
+                        g.clear();
+                        had
+                    })
+                    .unwrap_or(false);
+                if had_preedit {
+                    had_mutate = true;
+                    pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: String::new(),
+                        active_range_chars: None,
+                    }));
+                    continue;
+                }
+                // Java deleted nothing (doc edge): egui must not delete either.
+                if deleted == 0 {
+                    continue;
+                }
+                if had_mutate {
+                    deferred.push(ImeEvent::KeyDelSpan { code, deleted, start });
+                    continue;
+                }
+                had_mutate = true;
+                // Select Java's exact span; one keypress removes a selection wholesale.
+                set_state_selection(ctx, focus, start, start + deleted);
+                pending_events.push(key(if code == KEYCODE_FORWARD_DEL {
+                    egui::Key::Delete
+                } else {
+                    egui::Key::Backspace
+                }));
             }
             ImeEvent::SyncDropped => {
                 // The mirror record describes a push Java never applied; drop it and reseed.
@@ -709,11 +863,21 @@ fn settled_text(ctx: &egui::Context, focus: Option<egui::Id>) -> Option<String> 
 }
 
 /// Recovery from a stale absolute-offset event: end preedit tracking and push egui's settled
-/// text with an IME session restart, so the keyboard rebuilds from the real document.
-fn resync_after_stale(ctx: &egui::Context, focus: Option<egui::Id>, live: &str) {
+/// text with an IME session restart, so the keyboard rebuilds from the real document. The empty
+/// Preedit also ends egui's composition — a stuck one paints no caret and never self-heals.
+fn resync_after_stale(
+    ctx: &egui::Context,
+    focus: Option<egui::Id>,
+    live: &str,
+    pending_events: &mut Vec<egui::Event>,
+) {
     if let Ok(mut g) = LAST_PREEDIT.lock() {
         g.clear();
     }
+    pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: String::new(),
+        active_range_chars: None,
+    }));
     let caret = focus
         .and_then(|id| egui::text_edit::TextEditState::load(ctx, id))
         .map(|state| {
@@ -766,6 +930,16 @@ pub fn resync_out_of_band(ctx: &egui::Context, focus: Option<egui::Id>) -> bool 
 /// range into the selectable EditText puts Android into selection mode, which dismisses the
 /// keyboard (Select All). Gboard trackpad still updates egui via `onSelectionChanged`.
 pub fn sync_focused_text_edit(ctx: &egui::Context, focus: Option<egui::Id>) -> bool {
+    sync_focused_text_edit_inner(ctx, focus, false)
+}
+
+/// [`sync_focused_text_edit`] with an IME session restart: the mirror is untrusted (field
+/// switch, app-side edit), so the keyboard must rebuild from the pushed document.
+pub fn sync_focused_text_edit_restart(ctx: &egui::Context, focus: Option<egui::Id>) -> bool {
+    sync_focused_text_edit_inner(ctx, focus, true)
+}
+
+fn sync_focused_text_edit_inner(ctx: &egui::Context, focus: Option<egui::Id>, restart: bool) -> bool {
     let Some(id) = focus else { return false };
     let Some(state) = egui::text_edit::TextEditState::load(ctx, id) else {
         return false;
@@ -778,6 +952,10 @@ pub fn sync_focused_text_edit(ctx: &egui::Context, focus: Option<egui::Id>) -> b
     };
     let (start, end) = selection_chars(&state);
     let caret = if start == end { start } else { end };
-    sync_to_ime(&text, caret, caret);
+    if restart {
+        sync_to_ime_inner(&text, caret, caret, true);
+    } else {
+        sync_to_ime(&text, caret, caret);
+    }
     true
 }

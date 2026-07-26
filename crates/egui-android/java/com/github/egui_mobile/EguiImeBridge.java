@@ -53,6 +53,11 @@ public class EguiImeBridge extends InputConnectionWrapper {
         }
         // Empty commit included: it clears an active composition (egui guards the no-op case).
         activity.enqueue("T\t" + (text != null ? text : ""));
+        // egui places the caret after the committed text; any other placement (bracket pairs,
+        // CJK segments) ships as a strong selection so egui follows the EditText's caret.
+        if (newCursorPosition != 1) {
+            activity.enqueueSelectionStrong();
+        }
         trace("commitText(\"" + clip(text) + "\", " + newCursorPosition + (attr != null ? ", attr" : "") + ")");
         return ret;
     }
@@ -176,10 +181,11 @@ public class EguiImeBridge extends InputConnectionWrapper {
     // ---- deletion ----
 
     /** Code points deleted by deleteSurroundingText(beforeU16, afterU16) around the union of
-     * selection and composing span (AOSP semantics), as {beforeCp, afterCp}. */
-    private int[] deleteSpansCp(int beforeLength, int afterLength) {
+     * selection and composing span (AOSP semantics), as {beforeCp, afterCp, unionStartCp,
+     * unionEndCp}. Anchors are captured BEFORE the deletion mutates the Editable. */
+    private int[] deleteSpansCp(int beforeLength, int afterLength, boolean codePoints) {
         Editable ed = activity.imeEditable();
-        if (ed == null) return new int[] {Math.max(0, beforeLength), Math.max(0, afterLength)};
+        if (ed == null) return new int[] {Math.max(0, beforeLength), Math.max(0, afterLength), -1, -1};
         int a = activity.imeSelStart();
         int b = activity.imeSelEnd();
         if (a > b) { int t = a; a = b; b = t; }
@@ -190,17 +196,26 @@ public class EguiImeBridge extends InputConnectionWrapper {
             if (ca < a) a = ca;
             if (ce > b) b = ce;
         }
-        int beforeStart = Math.max(0, a - Math.max(0, beforeLength));
-        int afterEnd = Math.min(ed.length(), b + Math.max(0, afterLength));
+        int beforeU16 = codePoints
+                ? a - Character.offsetByCodePoints(ed, a, -Math.min(Math.max(0, beforeLength), Character.codePointCount(ed, 0, a)))
+                : Math.max(0, beforeLength);
+        int afterU16 = codePoints
+                ? Character.offsetByCodePoints(ed, b, Math.min(Math.max(0, afterLength), Character.codePointCount(ed, b, ed.length()))) - b
+                : Math.max(0, afterLength);
+        int beforeStart = Math.max(0, a - beforeU16);
+        int afterEnd = Math.min(ed.length(), b + afterU16);
+        int unionStartCp = Character.codePointCount(ed, 0, a);
         return new int[] {
             Character.codePointCount(ed, beforeStart, a),
             Character.codePointCount(ed, b, afterEnd),
+            unionStartCp,
+            unionStartCp + Character.codePointCount(ed, a, b),
         };
     }
 
     @Override
     public boolean deleteSurroundingText(int beforeLength, int afterLength) {
-        int[] cp = deleteSpansCp(beforeLength, afterLength);
+        int[] cp = deleteSpansCp(beforeLength, afterLength, false);
         activity.suppressSelectionEnqueue = true;
         boolean ret;
         try {
@@ -208,13 +223,14 @@ public class EguiImeBridge extends InputConnectionWrapper {
         } finally {
             activity.suppressSelectionEnqueue = false;
         }
-        activity.enqueue("D\t" + cp[0] + "\t" + cp[1]);
-        trace("deleteSurroundingText(" + beforeLength + ", " + afterLength + ") cp=" + cp[0] + "," + cp[1]);
+        activity.enqueue("D\t" + cp[0] + "\t" + cp[1] + "\t" + cp[2] + "\t" + cp[3]);
+        trace("deleteSurroundingText(" + beforeLength + ", " + afterLength + ") cp=" + cp[0] + "," + cp[1] + " union=" + cp[2] + ".." + cp[3]);
         return ret;
     }
 
     @Override
     public boolean deleteSurroundingTextInCodePoints(int beforeLength, int afterLength) {
+        int[] cp = deleteSpansCp(beforeLength, afterLength, true);
         activity.suppressSelectionEnqueue = true;
         boolean ret;
         try {
@@ -222,8 +238,8 @@ public class EguiImeBridge extends InputConnectionWrapper {
         } finally {
             activity.suppressSelectionEnqueue = false;
         }
-        activity.enqueue("D\t" + Math.max(0, beforeLength) + "\t" + Math.max(0, afterLength));
-        trace("deleteSurroundingTextInCodePoints(" + beforeLength + ", " + afterLength + ")");
+        activity.enqueue("D\t" + cp[0] + "\t" + cp[1] + "\t" + cp[2] + "\t" + cp[3]);
+        trace("deleteSurroundingTextInCodePoints(" + beforeLength + ", " + afterLength + ") union=" + cp[2] + ".." + cp[3]);
         return ret;
     }
 
@@ -263,9 +279,11 @@ public class EguiImeBridge extends InputConnectionWrapper {
             int code = event.getKeyCode();
             if (code == KeyEvent.KEYCODE_DEL || code == KeyEvent.KEYCODE_FORWARD_DEL) {
                 if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                    activity.mirrorDeleteKey(code == KeyEvent.KEYCODE_DEL);
-                    activity.enqueue("K\t" + code);
-                    if (TRACE) trace("sendKeyEvent(" + KeyEvent.keyCodeToString(code) + ") queued");
+                    // Ships the exact deleted span so egui removes the same range instead of
+                    // one char at its own (possibly drifted) caret.
+                    int[] span = activity.mirrorDeleteKey(code == KeyEvent.KEYCODE_DEL);
+                    activity.enqueue("K\t" + code + "\t" + span[0] + "\t" + span[1]);
+                    if (TRACE) trace("sendKeyEvent(" + KeyEvent.keyCodeToString(code) + ") queued del=" + span[0] + "@" + span[1]);
                 }
                 return true;
             }

@@ -181,6 +181,15 @@ public class EguiNativeActivity extends NativeActivity {
 
     /** Current selection as an S event with code-point offsets. */
     private void enqueueSelection() {
+        enqueueSelectionKind("S");
+    }
+
+    /** Current selection as a strong U event: survives mutations earlier in the same batch. */
+    void enqueueSelectionStrong() {
+        enqueueSelectionKind("U");
+    }
+
+    private void enqueueSelectionKind(String kind) {
         EditText edit = imeEdit;
         Editable ed = edit != null ? edit.getText() : null;
         if (ed == null) {
@@ -188,11 +197,14 @@ public class EguiNativeActivity extends NativeActivity {
         }
         int s = Math.max(0, edit.getSelectionStart());
         int e = Math.max(0, edit.getSelectionEnd());
-        enqueue("S\t" + Character.codePointCount(ed, 0, Math.min(s, ed.length()))
+        enqueue(kind + "\t" + Character.codePointCount(ed, 0, Math.min(s, ed.length()))
                 + "\t" + Character.codePointCount(ed, 0, Math.min(e, ed.length())));
     }
 
     void imeBatchBegin() {
+        if (batchDepth == 0) {
+            batchSawSelChange = false;
+        }
         batchDepth++;
     }
 
@@ -200,12 +212,13 @@ public class EguiNativeActivity extends NativeActivity {
         if (batchDepth > 0) {
             batchDepth--;
         }
-        // Selection settled by the batch (e.g. trackpad moves inside begin/endBatchEdit);
-        // mutating ops inside the batch make Rust drop it anyway.
+        // Selection settled by the batch (trackpad moves, or a caret placed after the batch's
+        // last mutation). Emitted as a strong U event so mutations earlier in the same drained
+        // batch cannot suppress it on the Rust side.
         if (batchDepth == 0 && batchSawSelChange) {
             batchSawSelChange = false;
             if (!updatingFromNative && !suppressSelectionEnqueue) {
-                enqueueSelection();
+                enqueueSelectionStrong();
             }
         }
     }
@@ -216,12 +229,13 @@ public class EguiNativeActivity extends NativeActivity {
     }
 
     /** Apply DEL/FORWARD_DEL to the hidden Editable: composing span, else selection, else one
-     * code point — the same range egui deletes for the key from the native queue. */
-    void mirrorDeleteKey(boolean backspace) {
+     * code point — the same range egui deletes for the key from the native queue.
+     * Returns {deletedCodePoints, spanStartCodePoint} so Rust can delete the identical range. */
+    int[] mirrorDeleteKey(boolean backspace) {
         EditText edit = imeEdit;
         Editable ed = edit != null ? edit.getText() : null;
         if (ed == null) {
-            return;
+            return new int[] {0, 0};
         }
         suppressSelectionEnqueue = true;
         try {
@@ -238,13 +252,19 @@ public class EguiNativeActivity extends NativeActivity {
                 a = ca;
                 b = cb;
             }
+            if (a == b) {
+                if (backspace && a > 0) {
+                    a = Character.offsetByCodePoints(ed, a, -1);
+                } else if (!backspace && b < ed.length()) {
+                    b = Character.offsetByCodePoints(ed, b, 1);
+                }
+            }
+            int startCp = Character.codePointCount(ed, 0, a);
+            int deletedCp = Character.codePointCount(ed, a, b);
             if (a != b) {
                 ed.delete(a, b);
-            } else if (backspace && a > 0) {
-                ed.delete(Character.offsetByCodePoints(ed, a, -1), a);
-            } else if (!backspace && b < ed.length()) {
-                ed.delete(b, Character.offsetByCodePoints(ed, b, 1));
             }
+            return new int[] {deletedCp, startCp};
         } finally {
             suppressSelectionEnqueue = false;
         }
@@ -471,6 +491,12 @@ public class EguiNativeActivity extends NativeActivity {
 
     void enqueue(String event) {
         if (!updatingFromNative) {
+            // A mutation inside a batch stales any selection change seen before it; only a
+            // caret placed after the batch's last mutation survives to the batch-end U event.
+            // F/R excluded: they reposition composition without mutating text.
+            if (batchDepth > 0 && !event.isEmpty() && "TCDXK".indexOf(event.charAt(0)) >= 0) {
+                batchSawSelChange = false;
+            }
             pending.offer(event);
             if (!nativeWakeBroken) {
                 try {
