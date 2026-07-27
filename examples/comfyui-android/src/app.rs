@@ -47,6 +47,9 @@ const GALLERY_PAGE_MAX: u64 = 500;
 const BUILTIN_ORIGIN: &str = "@builtin";
 /// Window for the second Create Reset tap to confirm.
 const RESET_CONFIRM_SECS: f64 = 4.0;
+/// Height (pt) of the framework's floating Paste/Copy/Cut/Select-all bar, plus its gap above the
+/// keyboard. Measured, not read back: only `egui-android` knows the bar's real rect.
+const TEXT_ACTIONS_BAR_H: f32 = 64.0;
 
 enum Conn {
     Disconnected,
@@ -1150,8 +1153,13 @@ struct ComfyApp {
     kb_open_edge: bool,
     /// Soft keyboard height (pt) this frame; trailing scroll padding so a low field can clear it.
     kb_height: f32,
+    /// Editing text: the keyboard is up, or a text field holds focus and it is about to be. Every
+    /// bottom bar collapses on this so the shrunk viewport is all content.
+    kb_editing: bool,
     /// Focused widget the last time the keyboard-avoidance scroll ran; re-scrolls when it changes.
     kb_last_focus: Option<egui::Id>,
+    /// Focused widget the last time the graph canvas panned a field clear; re-pans when it changes.
+    graph_last_focus: Option<egui::Id>,
     /// Last gallery tile tapped and when — the app's own double-tap rule (see `DOUBLE_TAP_SECS`).
     tile_tap: Option<(String, f64)>,
     /// Long-press-to-paint gesture: (press start time, screen origin, cancelled-as-a-scroll).
@@ -1717,7 +1725,9 @@ impl ComfyApp {
             kb_was_open: false,
             kb_open_edge: false,
             kb_height: 0.0,
+            kb_editing: false,
             kb_last_focus: None,
+            graph_last_focus: None,
             tile_tap: None,
             sel_press: None,
             sel_long_fired: false,
@@ -12794,7 +12804,8 @@ impl ComfyApp {
         }
 
         // Above the app nav bar (Create / Graph / Gallery / Settings).
-        egui::Panel::bottom("create-panes").show(ui, |ui| {
+        let mut panes_open = !self.kb_editing;
+        let _ = egui::Panel::bottom("create-panes").show_collapsible(ui, &mut panes_open, |ui| {
             ui.add_space(2.0);
             self.create_pane_bar(ui);
             ui.add_space(2.0);
@@ -12804,10 +12815,13 @@ impl ComfyApp {
         // the results themselves live in a floating window (`output_window`). A resizable sheet
         // here stacked three bottom panels deep, and once the soft keyboard shrank the viewport the
         // Create pane had no room left to lay out in.
-        // Dropped entirely while the soft keyboard is up: the shrunk viewport already has to fit
+        // Dropped entirely while text is being edited: the shrunk viewport already has to fit
         // the nav bar, the pane bar and a top bar, and the strip is unreachable mid-edit anyway.
-        if !self.kb_was_open {
-            egui::Panel::bottom("create-output-bar").exact_size(34.0).show(ui, |ui| {
+        let mut output_bar_open = !self.kb_editing;
+        let _ = egui::Panel::bottom("create-output-bar").exact_size(34.0).show_collapsible(
+            ui,
+            &mut output_bar_open,
+            |ui| {
                 let title = self.output_title();
                 ui.horizontal(|ui| {
                     ui.strong(sanitize_ui_text(ui, &title));
@@ -12822,8 +12836,8 @@ impl ComfyApp {
                         }
                     });
                 });
-            });
-        }
+            },
+        );
 
         match self.create_pane {
             CreatePane::Main => {
@@ -13443,9 +13457,11 @@ impl ComfyApp {
             return;
         }
 
-        // Bottom: File/Edit/View | Canvas/Properties | fullscreen toggle.
+        // Bottom: File/Edit/View | Canvas/Properties | fullscreen toggle. Back/Esc still exits
+        // fullscreen while the bar is collapsed for an edit.
         let fs = self.graph_fullscreen;
-        egui::Panel::bottom("graph-controls").show(ui, |ui| {
+        let mut controls_open = !self.kb_editing;
+        let _ = egui::Panel::bottom("graph-controls").show_collapsible(ui, &mut controls_open, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 self.graph_controls(ui, host);
@@ -13617,7 +13633,12 @@ impl ComfyApp {
 
     fn graph_canvas(&mut self, ui: &mut egui::Ui, host: &Host) {
         let fallback_pane = ui.available_rect_before_wrap();
-        let kb_edge = self.kb_open_edge;
+        // Pan on the keyboard's open edge and whenever focus moves to another in-node field: the
+        // second tap with the keyboard already up gets no edge, and the floating text-actions bar
+        // sits over the band the field would otherwise stay in.
+        let focused = ui.ctx().memory(|m| m.focused());
+        let kb_edge = self.kb_editing && (self.kb_open_edge || focused != self.graph_last_focus);
+        self.graph_last_focus = focused;
 
         let preview = self
             .running
@@ -13639,8 +13660,8 @@ impl ComfyApp {
             let props = doc.props_node;
             doc.graph.set_live_execution(executing, progress, preview);
             if kb_edge {
-                // Pull a focused in-node field up to clear the graph-controls bar and keyboard.
-                let avoid = ui.max_rect().bottom() - 96.0;
+                // Pull a focused in-node field up to clear the keyboard and the actions bar.
+                let avoid = ui.max_rect().bottom() - (TEXT_ACTIONS_BAR_H + 32.0);
                 doc.view.keep_focus_above(ui.ctx(), avoid);
             }
             if let Some(tapped) =
@@ -14448,7 +14469,10 @@ impl ComfyApp {
                 }
                 // For upload-style nodes (LoadImage, LoadVideo, …), a thumbnail picker.
                 self.file_picker_ui(ui, host, node, true);
-                ui.add_space(12.0);
+                // Trailing space so a field low in the list can still scroll clear of the keyboard
+                // and the floating text-actions bar, then scroll after the fields.
+                ui.add_space(if self.kb_was_open { self.kb_height.max(160.0) } else { 12.0 });
+                self.scroll_focus_into_view(ui);
             });
         for pick in lora_picks {
             self.apply_lora_pick(pick);
@@ -15234,6 +15258,12 @@ impl ComfyApp {
         self.cache_prefetch
     }
 
+    /// Id of the gallery search box. Its bar is the one bottom bar that holds a text field, so the
+    /// bar has to know whether that field is the one being edited before it decides to collapse.
+    fn gallery_search_id() -> egui::Id {
+        egui::Id::new("gallery-search-edit")
+    }
+
     fn gallery_controls(&mut self, ui: &mut egui::Ui, connected: bool, host: &Host) -> bool {
         let mut changed = false;
         #[cfg(not(feature = "local-npu"))]
@@ -15257,7 +15287,9 @@ impl ComfyApp {
             };
             let resp = ui.add_sized(
                 egui::vec2(search_w, 28.0),
-                egui::TextEdit::singleline(&mut self.gallery_q).hint_text(hint),
+                egui::TextEdit::singleline(&mut self.gallery_q)
+                    .id(Self::gallery_search_id())
+                    .hint_text(hint),
             );
             if !self.gallery_q.is_empty()
                 && ui
@@ -16283,14 +16315,23 @@ impl ComfyApp {
         self.tags_window(ui.ctx());
 
         let mut refresh = false;
-        egui::Panel::bottom("gallery-controls").show(ui, |ui| {
+        // The one bottom bar that holds a text field, so it stays up while that field is the one
+        // being edited — collapsing it would drop the focused widget and take the keyboard with it.
+        // Keyed on live focus rather than `kb_editing`: the inset outlives the blur by half a
+        // second, and collapsing then would yank the bar (and any menu hanging off it) mid-tap.
+        let editing_search =
+            !self.select_mode && ui.ctx().memory(|m| m.focused()) == Some(Self::gallery_search_id());
+        let mut controls_open = editing_search || self.select_mode || !ui.ctx().text_edit_focused();
+        let _ = egui::Panel::bottom("gallery-controls").show_collapsible(ui, &mut controls_open, |ui| {
             ui.add_space(2.0);
             if self.select_mode {
                 self.selection_bar(ui, host);
             } else {
                 refresh = self.gallery_controls(ui, connected, host);
             }
-            ui.add_space(2.0);
+            // Trailing room for the framework's floating text-actions bar, which pins itself just
+            // above the keyboard and would otherwise cover the search row.
+            ui.add_space(if editing_search { TEXT_ACTIONS_BAR_H } else { 2.0 });
         });
         if self.gallery_pull_to_refresh(ui) {
             refresh = true;
@@ -17747,7 +17788,8 @@ impl ComfyApp {
         ui.separator();
 
         let can_undo = pos > 0;
-        egui::Panel::bottom("triage-actions").show(ui, |ui| {
+        let mut actions_open = !self.kb_editing;
+        let _ = egui::Panel::bottom("triage-actions").show_collapsible(ui, &mut actions_open, |ui| {
             const BTN_H: f32 = 40.0;
             const GAP: f32 = 4.0;
             ui.add_space(2.0);
@@ -18118,7 +18160,8 @@ impl ComfyApp {
             let can_read_tags =
                 !v.item.is_video && v.bytes.is_some() && self.wd14_pack.is_some() && !self.wd14_running;
             let mut remix_held = false;
-            egui::Panel::bottom("viewer-actions").show(ui, |ui| {
+            let mut actions_open = !self.kb_editing;
+            let _ = egui::Panel::bottom("viewer-actions").show_collapsible(ui, &mut actions_open, |ui| {
                 const BTN_H: f32 = 36.0;
                 const GAP: f32 = 4.0;
                 ui.add_space(2.0);
@@ -18836,9 +18879,10 @@ impl ComfyApp {
         let center = self.filmstrip_center;
         let mut picked = None;
         let mut centered = false;
-        egui::Panel::bottom("filmstrip")
+        let mut strip_open = !self.kb_editing;
+        let _ = egui::Panel::bottom("filmstrip")
             .exact_size(FRAME + 12.0)
-            .show(ui, |ui| {
+            .show_collapsible(ui, &mut strip_open, |ui| {
                 crate::theme::scroll_horizontal().id_salt("viewer_filmstrip").auto_shrink([false, false]).show(
                     ui,
                     |ui| {
@@ -18909,7 +18953,8 @@ impl ComfyApp {
     }
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
-        egui::Panel::bottom("logs-actions").show(ui, |ui| {
+        let mut actions_open = !self.kb_editing;
+        let _ = egui::Panel::bottom("logs-actions").show_collapsible(ui, &mut actions_open, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Copy all").clicked() {
@@ -19833,6 +19878,10 @@ impl EguiApp for ComfyApp {
         self.kb_height = host.keyboard_height();
         self.kb_open_edge = kb_open && !self.kb_was_open;
         self.kb_was_open = kb_open;
+        // Focus leads the keyboard's slide-in by several frames and the inset trails its slide-out
+        // by half a second, so the union collapses the bars once and restores them once, with no
+        // gap in between. Kept apart from `kb_open_edge`, which must fire against a settled layout.
+        self.kb_editing = kb_open || ui.ctx().text_edit_focused();
 
         let t_msgs = std::time::Instant::now();
         for m in self.engine.as_ref().unwrap().drain() {
@@ -20110,8 +20159,10 @@ impl EguiApp for ComfyApp {
         }
 
         // Navigation sits at the bottom, within thumb reach. Panels are laid out before the
-        // central content so the tab bar always keeps its height on a short screen.
-        egui::Panel::bottom("nav").show(ui, |ui| {
+        // central content so the tab bar always keeps its height on a short screen. Slides away
+        // while text is being edited, which also makes a mid-edit tab switch impossible.
+        let mut nav_open = !self.kb_editing;
+        let _ = egui::Panel::bottom("nav").show_collapsible(ui, &mut nav_open, |ui| {
             ui.add_space(2.0);
             // Global run progress (local jobs and server-wide queue from other clients).
             if self.running || self.queue_remaining > 0 {

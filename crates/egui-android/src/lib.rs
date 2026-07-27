@@ -97,6 +97,21 @@ impl eframe::App for Adapter {
         }
         self.bar_touch |= pressed_in_bar;
         let hold = self.bar_touch || self.ime_hold_frames > 0;
+        // The focused field was not laid out last frame — the app switched tab/page or closed the
+        // section holding it mid-edit. egui's focus dead-man switch drops it, but `pin_text_focus`
+        // re-requests it every frame, so the keyboard and the actions bar outlive the widget they
+        // belong to. Same treatment as a back-gesture dismissal. Only follows egui's own verdict
+        // (focus already dropped, read before `pin_text_focus` resurrects it): egui spares a
+        // just-requested focus for one pass, so `request_focus` on a field that appears next frame
+        // still works. `used_ids` covers scroll-culled and clipped fields.
+        if self.ime_bridge_hot
+            && !hold
+            && let Some(id) = self.last_focus
+            && ui.ctx().memory(|m| m.focused()) != Some(id)
+            && !ui.ctx().viewport(|v| v.prev_pass.used_ids.contains_key(&id))
+        {
+            self.ime_teardown(ui.ctx());
+        }
         // egui surrenders focus on the frame a full CLICK lands (SurrenderFocusOn::Clicks checks
         // any_click during the widget's interact). allow_blur must be true on that same frame or
         // last_focus survives and pin_text_focus re-focuses the field. Keyed to any_click, not
@@ -441,25 +456,30 @@ impl Adapter {
             self.has_clip = crate::host::clipboard_has_text();
             self.next_clip_poll = self.frame + 30;
         }
-        let insets = self.host.safe_area_insets();
-        // Shown but unmeasured (guest field, or an inset read that returned 0) → assume a
-        // typical keyboard fraction so the bar still floats above it.
-        let kb = if keyboard > 0.0 { keyboard } else { rect.height() * 0.4 };
-        let overlap = (kb - insets.bottom).max(0.0);
-        let keyboard_top = rect.bottom() - overlap;
-        // Above the keyboard, raised further to clear the focused field when egui reports it.
-        let field = ctx.output(|o| o.ime.as_ref().map(|ime| (ime.rect.top(), ime.rect.center().x)));
-        let (anchor_y, anchor_x) = match field {
-            Some((top, cx)) => (keyboard_top.min(top), cx),
-            None => (keyboard_top, rect.center().x),
+        // Fixed just above the keyboard and horizontally centred — the same place every frame,
+        // whatever field is focused and wherever the caret sits. `rect` is the full-height safe
+        // area and `ime_inset_pt` is what this frame's layout was shortened by, so their difference
+        // is the keyboard's top edge, in lockstep with the layout the app just drew. Before the
+        // first inset lands — and on a window that never resizes for the IME, or a guest viewport
+        // that asked for the keyboard itself — assume a typical keyboard fraction rather than
+        // parking the bar behind the keys.
+        let overlap = if self.ime_inset_pt > 0.0 {
+            self.ime_inset_pt
+        } else if guest_kb || (self.ime_bridge_hot && !self.ime_seen_open) {
+            rect.height() * 0.4
+        } else {
+            0.0
         };
-        let pos = egui::pos2(anchor_x, anchor_y - 8.0);
+        let keyboard_top = (rect.bottom() - overlap).max(rect.top() + 1.0);
+        let pos = egui::pos2(rect.center().x, keyboard_top - 8.0);
         let mut acted = false;
         let area = egui::Area::new(egui::Id::new("egui-android-text-actions"))
             .order(egui::Order::Foreground)
             .pivot(egui::Align2::CENTER_BOTTOM)
             .fixed_pos(pos)
-            .constrain_to(rect)
+            // Clamped to the area above the keyboard, so an over-tall bar rides up instead of down
+            // over the keys.
+            .constrain_to(egui::Rect::from_min_max(rect.min, egui::pos2(rect.max.x, keyboard_top)))
             .show(&ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.spacing_mut().button_padding = egui::vec2(10.0, 8.0);
