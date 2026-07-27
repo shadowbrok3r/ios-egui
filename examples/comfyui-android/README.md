@@ -22,14 +22,33 @@ sign-in, per-user gallery + albums, server-side model filtering).
 - **Generate tab** — Text → Image and Image → Image (current result or an image URL as input,
   denoise slider), checkpoint/sampler/scheduler menus, steps, CFG, size, seed with random toggle,
   progress + preview, Save to `<app files>/comfyui/`.
-- **Prompt expansion** (comfy-gate) — **Expand** under the positive prompt streams
-  `POST /api/expand` and renders the rewrite as a live diff to accept or discard. The request
-  carries a `dialect` so the rewrite comes back in the family's own idiom: `wan-i2v` / `wan-t2v`
-  for video, and for images the catalog family (Illustrious, Pony, Flux…) or, failing that, the
-  loader filename for the gate to classify. Video prompts are *also* rewritten automatically at
-  queue time, so accepting one turns **Raw** on (a `raw:` marker) to stop the server rewriting it
-  twice; image prompts are never touched at queue time, and this preview is the only way they get
-  rewritten.
+- **Prompt rewriting** — one row under the positive prompt, and the button always names the engine
+  that will run it, so a rewrite is never ambiguous about where it came from:
+  - **Expand · comfy-gate** streams `POST /api/expand` and renders the rewrite as a live diff to
+    accept or discard. The request carries a `dialect` so the text comes back in the family's own
+    idiom: `wan-i2v` / `wan-t2v` for video, and for images the catalog family (Illustrious, Pony,
+    Flux…) or, failing that, the loader filename for the gate to classify.
+  - **Rewrite · on device** runs the local Qwen rewrite pack on the phone's CPU (feature
+    `local-npu`), with the target style picked from its menu — no server needed.
+  - **⭐ Variations** (comfy-gate only) asks `POST /api/variations` for alternatives instead of a
+    faithful rewrite: each option changes exactly one axis (setting, pose, lighting, wardrobe,
+    mood, composition) and is shown with that label as a diff against the original, so what
+    changed is visible before you pick. Strength (subtle/moderate/wild), count (1–6) and a **Keep
+    unchanged** list are in the window — *Again* re-rolls with the new knobs, *Keep mine* walks
+    away. Keep is seeded from the applied character's injected tags, so a variation can't quietly
+    restyle the character; the server also anchors anything the prompt weights, like
+    `(pink hair:1.2)`. Partial results are rendered with a note about what failed.
+  - **Settings → Prompt rewriting** chooses between them: *Auto* offers whichever can run (both,
+    when both can), *comfy-gate* or *On device* force one and say why if it can't run. A server
+    that answers 404/501/503 is remembered for the session, so Auto stops offering it. (For
+    Variations, only 404/503 hide the button — a 501 means just *this* family has no variations
+    prompt.)
+  - Video prompts are *also* rewritten automatically by comfy-gate at queue time whichever engine
+    you use, so accepting a server rewrite turns **Raw** on (a `raw:` marker) to stop it being
+    rewritten twice; image prompts are never touched at queue time.
+- **Create output** — finished images land in a floating **Output** window that only opens when you
+  tap it in the launcher strip; new results while it's closed show up as a "N new" count rather
+  than throwing a window over whatever you were editing.
 - **Graph tab** — a full node editor (`rucomfyui_node_graph`, egui-snarl) over the server's real
   node catalog:
   - **Workflows** lists the server's saved workflows (`/userdata?dir=workflows`); tap one to open

@@ -15,7 +15,9 @@ use rucomfyui::workflow::WorkflowNodeId;
 use rucomfyui_node_graph::{ComfyUiNodeGraph, NodeId, internal::FlowNodeData, internal::FlowValueType};
 
 use crate::apps::{AppDef, AppSet, KnobTy, Status};
-use crate::engine::{Engine, ExpandMsg, GenCtx, Msg, QueueJob};
+use crate::engine::{
+    Engine, ExpandMsg, GenCtx, Msg, QueueJob, Variation, Variations, VariationsMsg, VariationsReq,
+};
 use crate::gallery::{self, ImageMeta, RemixDiffRow, RemixField, ThumbCache};
 use crate::graphview::{self, GraphView, LongPress, LoraPick, elide, elide_width, sanitize_ui_text};
 use crate::icons;
@@ -32,7 +34,8 @@ use crate::types::{
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, GenMode, Img2ImgSource, LoraCatalog,
-    LoraPack, Mode, TrashItem, ModelKind, Params, PromptHist, RatingFilter, SamplerPack, Settings,
+    LoraPack, Mode, TrashItem, ModelKind, Params, PromptHist, RatingFilter, RewriteEngine,
+    SamplerPack, Settings, VARIATION_COUNT_RANGE, VariationStrength,
     append_negatives, checkpoint_family, fallback_vec, file_basename, is_wan_related, merge_triggers,
     pick_wan_unet_pair, push_prompt_hist, strip_injected,
 };
@@ -697,6 +700,23 @@ struct ExpandReview {
     raw_on_accept: bool,
 }
 
+/// A `/api/variations` request in flight or awaiting a pick: the prompt it was asked about, the
+/// alternatives that came back, and what the server held fixed. `done` flips when the request
+/// ends; `error` holds a failure (including a partial one worth showing beside real options).
+struct VariationsReview {
+    original: String,
+    dialect_label: String,
+    /// How many were asked for, so the "writing N…" line stays true even if the knobs in the
+    /// window are turned while the request is still out.
+    asked: u32,
+    got: Variations,
+    done: bool,
+    error: Option<String>,
+    /// Accepting also turns Raw on, for the same reason as [`ExpandReview::raw_on_accept`]:
+    /// only video is rewritten again at queue time.
+    raw_on_accept: bool,
+}
+
 /// Rolling per-frame CPU timing, mirrored to logcat (`adb logcat -s comfyui`) so on-device
 /// sluggishness can be traced to a screen and phase. `update()` feeds it each frame's splits.
 #[derive(Default)]
@@ -984,6 +1004,29 @@ struct ComfyApp {
     expand_rx: Option<std::sync::mpsc::Receiver<ExpandMsg>>,
     /// Abort flag for the in-flight `/api/expand` request (set when the review is dismissed).
     expand_cancel: Option<Arc<AtomicBool>>,
+    /// Settings: which engine the prompt rewrite button uses (server `/api/expand` vs local pack).
+    rewrite_engine: RewriteEngine,
+    /// This server answered `/api/expand` with 404/501/503, so server rewriting is off the table
+    /// until the connection changes. Session-only: a redeployed gate shouldn't stay written off.
+    expand_unsupported: bool,
+    /// `/api/variations` alternatives in flight or awaiting a pick (the variations modal).
+    variations_review: Option<VariationsReview>,
+    /// Result channel for the in-flight `/api/variations` request.
+    variations_rx: Option<std::sync::mpsc::Receiver<VariationsMsg>>,
+    /// Abort flag for that request (set when the modal is dismissed).
+    variations_cancel: Option<Arc<AtomicBool>>,
+    /// Same standing verdict as `expand_unsupported`, for `/api/variations` (404/503). Separate:
+    /// a gate can have the expander but not the newer variations endpoint.
+    variations_unsupported: bool,
+    /// Settings: how many alternatives to request, and how far they may drift.
+    variation_count: u32,
+    variation_strength: VariationStrength,
+    /// Elements the variations request must hold fixed, comma-separated and user-editable.
+    /// Session-only; re-seeded from the applied character's injected tags when that changes, so a
+    /// variation can't quietly restyle the character.
+    variation_keep: String,
+    /// The character injection `variation_keep` was last seeded from (empty = none).
+    variation_keep_seed: String,
     /// The pending-jobs queue sheet is open.
     queue_sheet_open: bool,
     /// Two-tap arm state for the sheet's "Clear pending" button.
@@ -1144,8 +1187,12 @@ struct ComfyApp {
     delete_confirm: Option<(Vec<(String, String)>, bool)>,
     /// After a viewer delete, reopen this `(subfolder, filename)` once the list refreshes.
     viewer_after_delete: Option<(String, String)>,
-    /// The Create-tab Output window is open; auto-set when a new image lands.
+    /// The Create-tab Output window is open. Only ever set by the user: results land quietly and
+    /// are counted in `output_unseen` instead of throwing a window over whatever is being edited.
     output_open: bool,
+    /// Results that arrived while the Output window was closed, for the launcher strip's badge.
+    /// Session-only, cleared when the window is opened or a fresh run starts.
+    output_unseen: usize,
     /// Soft keyboard is up: set at the top of `update`, so it reads as "this frame" while drawing
     /// and as "last frame" when the next frame computes the open edge.
     kb_was_open: bool,
@@ -1629,6 +1676,16 @@ impl ComfyApp {
             expand_review: None,
             expand_rx: None,
             expand_cancel: None,
+            rewrite_engine: RewriteEngine::default(),
+            expand_unsupported: false,
+            variations_review: None,
+            variations_rx: None,
+            variations_cancel: None,
+            variations_unsupported: false,
+            variation_count: crate::types::default_variation_count(),
+            variation_strength: VariationStrength::default(),
+            variation_keep: String::new(),
+            variation_keep_seed: String::new(),
             my_prompts: Vec::new(),
             queue_sheet_open: false,
             queue_clear_arm: false,
@@ -1722,6 +1779,7 @@ impl ComfyApp {
             delete_confirm: None,
             viewer_after_delete: None,
             output_open: false,
+            output_unseen: 0,
             kb_was_open: false,
             kb_open_edge: false,
             kb_height: 0.0,
@@ -2536,9 +2594,11 @@ impl ComfyApp {
                 }
             }
             Msg::Status(s) => self.status = s,
+            // Neither a preview nor a finished result opens the Output window: it's a floating
+            // window over the pane being edited, and popping it up mid-edit steals the screen. The
+            // launcher strip counts what arrived instead (`output_unseen`).
             Msg::Preview(ci) => {
                 self.preview = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR));
-                self.output_open = true;
             }
             Msg::Result { image, bytes, label } => {
                 self.result_seq = self.result_seq.wrapping_add(1);
@@ -2554,7 +2614,9 @@ impl ComfyApp {
                     self.results.push((tex, bytes));
                     self.preview = None;
                     self.note.clear();
-                    self.output_open = true;
+                    if !self.output_open {
+                        self.output_unseen = self.output_unseen.saturating_add(1);
+                    }
                 }
             }
             Msg::NodeExecuting(node) => {
@@ -3279,6 +3341,7 @@ impl ComfyApp {
             self.progress = (0, 0);
             self.preview = None;
             self.results.clear();
+            self.output_unseen = 0;
             self.result_view = None;
             self.run_total = 0;
             self.run_seen.clear();
@@ -3347,6 +3410,7 @@ impl ComfyApp {
             self.progress = (0, 0);
             self.preview = None;
             self.results.clear();
+            self.output_unseen = 0;
             self.result_view = None;
             self.run_total = 0;
             self.run_seen.clear();
@@ -4480,6 +4544,9 @@ impl ComfyApp {
             wizard_custom_tags: self.wizard_custom_tags.clone(),
             global_looks: self.global_looks.clone(),
             active_main_looks: self.active_main_looks.clone(),
+            rewrite_engine: self.rewrite_engine,
+            variation_count: self.variation_count,
+            variation_strength: self.variation_strength,
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -4547,6 +4614,9 @@ impl ComfyApp {
         self.create_companions_open = saved.create_companions_open;
         self.prompt_history = saved.prompt_history;
         self.cache_prefetch = saved.cache_prefetch;
+        self.rewrite_engine = saved.rewrite_engine;
+        self.variation_count = saved.variation_count.clamp(*VARIATION_COUNT_RANGE.start(), *VARIATION_COUNT_RANGE.end());
+        self.variation_strength = saved.variation_strength;
         #[cfg(feature = "local-npu")]
         {
             self.local_npu = saved.local_npu;
@@ -4767,6 +4837,10 @@ impl ComfyApp {
     fn connect(&mut self, host: &Host) {
         self.conn = Conn::Connecting;
         self.status.clear();
+        // A different server (or the same one redeployed) gets a fresh verdict on the rewrite
+        // endpoints.
+        self.expand_unsupported = false;
+        self.variations_unsupported = false;
         let url = self.server_url.clone();
         let key = self.api_key.clone();
         let session = self.session.clone();
@@ -4972,6 +5046,11 @@ impl ComfyApp {
                         self.local_pack_status_panel(ui, host);
                     });
             }
+
+            egui::CollapsingHeader::new(format!("{} Prompt rewriting", icons::GENERATE))
+                .id_salt("settings_rewrite")
+                .default_open(false)
+                .show(ui, |ui| self.rewrite_settings(ui, host));
 
             egui::CollapsingHeader::new(format!("{} Gallery", icons::GALLERY))
                 .id_salt("settings_gallery")
@@ -5648,59 +5727,174 @@ impl ComfyApp {
         }
     }
 
-    /// Positive prompt: label + chips + history nav + rewrite on one row, then the editor.
+    /// Positive prompt: label + chips + history nav on one row, the editor, then the rewrite row.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
-        self.prompt_field_ui(ui, PromptField::Positive, "Prompt", Some(host));
+        self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
         ui.horizontal(|ui| self.dup_fix_chip_ui(ui));
-        self.expand_controls(ui, host);
+        self.rewrite_controls(ui, host);
     }
 
-    /// Under the positive field: stream the gate's `/api/expand` rewrite into a review modal
-    /// (Expand), and — video only — toggle the queue-time expander off (Raw). Video is auto-expanded
-    /// at queue time, so its hint is about staying terse; image families are preview-only
-    /// server-side (a wrong tag rewrite is invisible until the image lands), so Expand is the only
-    /// way an image prompt is ever rewritten.
-    fn expand_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
-        let video = self.params.mode == Mode::Video;
-        let connected = matches!(self.conn, Conn::Connected)
-            || self.engine.as_ref().is_some_and(|e| e.is_connected());
-        let busy = self.expand_review.as_ref().is_some_and(|r| !r.done);
-        let (_, label) = self.expand_dialect();
-        let hover = if video {
-            "Rewrite this terse prompt into full video prose on the server".to_string()
+    /// Whether comfy-gate's `/api/expand` can run right now: connected, and this server hasn't
+    /// already answered that it has no expander.
+    fn server_rewrite_ok(&self) -> bool {
+        !self.expand_unsupported
+            && (matches!(self.conn, Conn::Connected)
+                || self.engine.as_ref().is_some_and(|e| e.is_connected()))
+    }
+
+    /// Whether the on-device rewrite pack can run right now.
+    #[cfg(feature = "local-npu")]
+    fn device_rewrite_ok(&self) -> bool {
+        self.rewrite_pack.is_some()
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn device_rewrite_ok(&self) -> bool {
+        false
+    }
+
+    /// An on-device rewrite is in flight.
+    #[cfg(feature = "local-npu")]
+    fn device_rewrite_busy(&self) -> bool {
+        self.rewrite_running
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn device_rewrite_busy(&self) -> bool {
+        false
+    }
+
+    /// Which engine the rewrite button will use, per the Settings choice and what's available —
+    /// the *primary* one in Auto. `None` means nothing can run; see
+    /// [`Self::rewrite_unavailable_reason`].
+    fn active_rewrite_engine(&self) -> Option<RewriteEngine> {
+        self.rewrite_engine.resolve(self.server_rewrite_ok(), self.device_rewrite_ok())
+    }
+
+    /// `(offer comfy-gate, offer on-device)` in the rewrite row. Auto offers every engine that can
+    /// run — both at once when both can, since each button names its own engine — while an explicit
+    /// pick offers only that one, so a forced choice can't be quietly satisfied by the other.
+    fn rewrite_controls_shown(&self) -> (bool, bool) {
+        let (server, device) = (self.server_rewrite_ok(), self.device_rewrite_ok());
+        match self.rewrite_engine {
+            RewriteEngine::Auto => (server, device),
+            RewriteEngine::Server => (server, false),
+            RewriteEngine::Device => (false, device),
+        }
+    }
+
+    /// Why no rewrite engine is available, naming the one the user actually picked so the fix is
+    /// obvious (connect, push a pack, or change the Settings choice).
+    fn rewrite_unavailable_reason(&self) -> String {
+        let no_device = if cfg!(feature = "local-npu") {
+            "no on-device rewrite pack (push one to /storage/emulated/0/ComfyUI/rewrite)"
         } else {
-            format!("Rewrite this terse prompt for {label} on the server")
+            "this build has no on-device rewriter"
         };
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    connected && !busy,
-                    egui::Button::new(format!("{} Expand", icons::GENERATE)),
-                )
-                .on_hover_text(hover)
-                .clicked()
-            {
-                self.start_expand(ui.ctx(), host);
+        let no_server = if self.expand_unsupported {
+            "this server has no prompt expander"
+        } else {
+            "not connected"
+        };
+        match self.rewrite_engine {
+            RewriteEngine::Server => format!("comfy-gate rewriting: {no_server}"),
+            RewriteEngine::Device => format!("On-device rewriting: {no_device}"),
+            RewriteEngine::Auto => format!("No rewriter: {no_server}, and {no_device}"),
+        }
+    }
+
+    /// The one place a prompt gets rewritten, under the positive field. Which engine runs is the
+    /// Settings choice (server `/api/expand` vs the on-device pack), and the button says which one
+    /// it is so a rewrite is never ambiguous about where it came from. The video-only **Raw**
+    /// checkbox is independent of that: it opts the queued prompt out of comfy-gate's *queue-time*
+    /// expander, which runs on video regardless of who wrote the text.
+    fn rewrite_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let video = self.params.mode == Mode::Video;
+        let active = self.active_rewrite_engine();
+        let (show_server, show_device) = self.rewrite_controls_shown();
+        let busy = self.expand_review.as_ref().is_some_and(|r| !r.done);
+        let (_, dialect) = self.expand_dialect();
+        ui.horizontal_wrapped(|ui| {
+            if show_server {
+                let hover = if video {
+                    "Rewrite this terse prompt into full video prose on comfy-gate".to_string()
+                } else {
+                    format!("Rewrite this terse prompt for {dialect} on comfy-gate")
+                };
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::Button::new(format!("{} Expand · comfy-gate", icons::GENERATE)),
+                    )
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    self.start_expand(ui.ctx(), host);
+                }
+                if busy {
+                    ui.add(egui::Spinner::new());
+                }
+                // Alternatives rather than a rewrite: one axis deliberately changed per option.
+                // Server-only — the on-device pack has no equivalent.
+                if !self.variations_unsupported {
+                    let vbusy = self.variations_review.as_ref().is_some_and(|r| !r.done);
+                    if ui
+                        .add_enabled(
+                            !vbusy,
+                            egui::Button::new(format!("{} Variations", icons::STAR)),
+                        )
+                        .on_hover_text(
+                            "Ask comfy-gate for alternative prompts — each changes one thing \
+                             (setting, pose, lighting…) and keeps the rest",
+                        )
+                        .clicked()
+                    {
+                        self.start_variations(ui.ctx(), host);
+                    }
+                    if vbusy {
+                        ui.add(egui::Spinner::new());
+                    }
+                }
             }
-            if busy {
-                ui.add(egui::Spinner::new());
+            if show_device {
+                self.rewrite_menu_ui(ui, host);
+                // The menu's own spinner is only visible while the menu is open; a CPU rewrite
+                // takes long enough that the row needs to show it too.
+                if self.device_rewrite_busy() {
+                    ui.add(egui::Spinner::new());
+                }
+            }
+            if !show_server && !show_device {
+                let reason = self.rewrite_unavailable_reason();
+                ui.add_enabled(false, egui::Button::new(format!("{} Rewrite", icons::GENERATE)))
+                    .on_hover_text(reason);
             }
             if video {
-                ui.checkbox(&mut self.params.raw_prompt, "Raw")
-                    .on_hover_text("Submit verbatim — skip the server's automatic prompt expander");
+                ui.checkbox(&mut self.params.raw_prompt, "Raw").on_hover_text(
+                    "Submit verbatim — skip comfy-gate's automatic queue-time expander",
+                );
             }
         });
-        if video {
-            ui.weak(
+        match active {
+            // The queue-time expander is comfy-gate's, not the rewrite button's: it runs on video
+            // whichever engine wrote the text, so this line stands for both engines.
+            _ if video => ui.weak(
                 "Auto-expanded at queue time. Keep it terse: triggers, then 2-3 short action \
                  phrases. Over 500 chars or Raw skips it.",
-            );
-        } else {
-            ui.weak(format!(
+            ),
+            Some(RewriteEngine::Device) => ui.weak(
+                "Rewritten on this phone by the local pack — no server round-trip. Pick the target \
+                 style from the menu.",
+            ),
+            Some(RewriteEngine::Server) => ui.weak(format!(
                 "Image prompts are never rewritten at queue time. Expand rewrites a terse idea \
-                 for {label} — accept it or discard it."
-            ));
-        }
+                 for {dialect} on the server — accept it or discard it."
+            )),
+            _ => ui.weak(format!(
+                "{} — change it in Settings → Prompt rewriting.",
+                self.rewrite_unavailable_reason()
+            )),
+        };
     }
 
     /// What to send as `/api/expand`'s `dialect`, plus a human label for the button/modal.
@@ -5760,6 +5954,317 @@ impl ComfyApp {
         ctx.request_repaint();
     }
 
+    /// Elements a variation must not touch: whatever the user typed into the modal's Keep field,
+    /// re-seeded from the applied character's injected tags whenever that changes. The server
+    /// already anchors anything the prompt weights (`(pink hair:1.2)`); this covers the identity
+    /// tags a character put in the prompt unweighted, which a drifting variation would restyle.
+    ///
+    /// Re-seeding is keyed on the injection itself, so a hand-edited Keep survives every run for
+    /// that character and is replaced only when a different one (or none) is applied.
+    fn sync_variation_keep(&mut self) {
+        let seed = self
+            .active_character
+            .as_ref()
+            .map(|c| c.pos_injected.trim().to_string())
+            .unwrap_or_default();
+        if seed != self.variation_keep_seed {
+            self.variation_keep = seed.clone();
+            self.variation_keep_seed = seed;
+        }
+    }
+
+    /// The Keep field as the API's `keep` list.
+    fn variation_keep_list(&self) -> Vec<String> {
+        self.variation_keep
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    /// Ask comfy-gate for alternative prompts and open the picker modal. Re-run from inside the
+    /// modal too (Again), which is why it reads its parameters from state rather than arguments.
+    fn start_variations(&mut self, ctx: &egui::Context, host: &Host) {
+        let text = self.params.positive.trim().to_string();
+        if text.is_empty() {
+            self.status = "Variations: the prompt is empty".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        if self.engine.is_none() {
+            self.status = "Variations: not connected".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        self.sync_variation_keep();
+        let (dialect, dialect_label) = self.expand_dialect();
+        let count = self.variation_count.clamp(*VARIATION_COUNT_RANGE.start(), *VARIATION_COUNT_RANGE.end());
+        let req = VariationsReq {
+            text: text.clone(),
+            dialect,
+            count,
+            strength: self.variation_strength.key().to_string(),
+            keep: self.variation_keep_list(),
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = self.engine.as_ref().map(|e| e.variations(req, cancel.clone()));
+        self.variations_rx = rx;
+        self.variations_cancel = Some(cancel);
+        self.variations_review = Some(VariationsReview {
+            original: text,
+            dialect_label,
+            asked: count,
+            got: Variations::default(),
+            done: false,
+            error: None,
+            raw_on_accept: self.params.mode == Mode::Video,
+        });
+        // Each option is its own completion, run back to back — say so, it's a few seconds.
+        self.status = format!("Asking for {count} variations…");
+        host.haptic(Haptic::Medium);
+        ctx.request_repaint();
+    }
+
+    /// Drain the finished `/api/variations` request into `variations_review`.
+    fn poll_variations(&mut self) {
+        let Some(rx) = self.variations_rx.as_ref() else { return };
+        let msg = match rx.try_recv() {
+            Ok(m) => Some(m),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            // The worker vanished without an answer (aborted/panicked): fail the modal rather
+            // than leaving a spinner up forever.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.variations_rx = None;
+        let Some(review) = self.variations_review.as_mut() else { return };
+        review.done = true;
+        match msg {
+            Some(VariationsMsg::Done(got)) => {
+                let errs = got.error_lines();
+                // Partial success is normal: show what came back and name what didn't.
+                if !errs.is_empty() {
+                    review.error = Some(format!("{} of them failed: {}", errs.len(), errs.join("; ")));
+                }
+                review.got = got;
+                self.status = format!("{} variations — pick one or keep yours", review.got.variations.len());
+            }
+            Some(VariationsMsg::Error(e)) => {
+                review.error = Some(e);
+                self.status = "Variations failed — keeping your prompt".into();
+            }
+            Some(VariationsMsg::Unsupported(e)) => {
+                self.variations_unsupported = true;
+                self.log.warn(format!("variations: {e} — hiding the button for this session"));
+                if let Some(r) = self.variations_review.as_mut() {
+                    r.error = Some(e);
+                }
+                self.status = "Variations aren't available on this server".into();
+            }
+            None => review.error = Some("variations interrupted".into()),
+        }
+    }
+
+    /// The variations picker: each alternative as a comma-segment diff against the original, with
+    /// the axis it changed. Use replaces the prompt (and, for video, turns Raw on so the accepted
+    /// text isn't rewritten again at queue time); Keep mine changes nothing.
+    fn variations_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(review) = self.variations_review.as_ref() else { return };
+        let original = review.original.clone();
+        let dialect_label = review.dialect_label.clone();
+        let done = review.done;
+        let error = review.error.clone();
+        let raw_on_accept = review.raw_on_accept;
+        let asked = review.asked;
+        let items: Vec<Variation> = review
+            .got
+            .variations
+            .iter()
+            .filter(|v| !v.text.trim().is_empty())
+            .cloned()
+            .collect();
+        let anchors = review.got.anchors.clone();
+
+        egui::Area::new(egui::Id::new("variations-scrim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::Pos2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.content_rect();
+                ui.allocate_rect(rect, egui::Sense::click());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(100));
+            });
+
+        enum VAct {
+            Use(String, String),
+            Again,
+            Close,
+        }
+        let mut act: Option<VAct> = None;
+        let max_h = (ctx.content_rect().height() * 0.55).clamp(160.0, 460.0);
+        let mut count = self.variation_count;
+        let mut strength = self.variation_strength;
+        let mut keep = self.variation_keep.clone();
+        centered(ctx, egui::Window::new("Prompt variations"))
+            .collapsible(false)
+            .default_width(400.0)
+            .show(ctx, |ui| {
+                if !done {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.weak(format!("comfy-gate is writing {asked} for {dialect_label}…"));
+                    });
+                } else {
+                    ui.weak(format!(
+                        "Each option changes one thing and keeps the rest. Written for \
+                         {dialect_label}."
+                    ));
+                }
+                if let Some(e) = &error {
+                    // Partial success is the documented normal case, so it reads as a caveat
+                    // beside real options; only a total failure gets the red treatment.
+                    let color = if items.is_empty() {
+                        egui::Color32::from_rgb(225, 105, 105)
+                    } else {
+                        ui.visuals().warn_fg_color
+                    };
+                    ui.colored_label(color, sanitize_ui_text(ui, e));
+                }
+                if !anchors.is_empty() {
+                    ui.weak(sanitize_ui_text(ui, &format!("Held fixed: {}", anchors.join(", "))));
+                }
+                ui.separator();
+                crate::theme::scroll_vertical()
+                    .id_salt("variations-scroll")
+                    .max_height(max_h)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (i, v) in items.iter().enumerate() {
+                            let axis = if v.axis.trim().is_empty() {
+                                format!("Option {}", i + 1)
+                            } else {
+                                v.axis.trim().to_string()
+                            };
+                            ui.horizontal(|ui| {
+                                ui.strong(sanitize_ui_text(ui, &axis));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button(format!("{} Use", icons::CHECK)).clicked() {
+                                            act = Some(VAct::Use(v.text.clone(), axis.clone()));
+                                        }
+                                    },
+                                );
+                            });
+                            ui.horizontal_wrapped(|ui| {
+                                for (op, seg) in tags::prompt_diff(&original, &v.text) {
+                                    let text = sanitize_ui_text(ui, &seg);
+                                    match op {
+                                        -1 => ui.label(
+                                            egui::RichText::new(text)
+                                                .color(egui::Color32::from_rgb(225, 105, 105))
+                                                .strikethrough(),
+                                        ),
+                                        1 => ui.label(
+                                            egui::RichText::new(text)
+                                                .color(egui::Color32::from_rgb(110, 200, 120)),
+                                        ),
+                                        _ => ui.label(egui::RichText::new(text).weak()),
+                                    };
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                        if done && items.is_empty() && error.is_none() {
+                            ui.weak("The server returned no alternatives.");
+                        }
+                    });
+                ui.separator();
+                // Re-roll controls: the same knobs the request takes, so a set that drifted too
+                // far (or not far enough) is one tap from being asked for again.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Change");
+                    for s in VariationStrength::ALL {
+                        crate::theme::selectable_value(ui, &mut strength, s, s.label());
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut count)
+                            .range(*VARIATION_COUNT_RANGE.start()..=*VARIATION_COUNT_RANGE.end())
+                            .prefix("×"),
+                    )
+                    .on_hover_text("How many alternatives to ask for (1-6)");
+                });
+                ui.label("Keep unchanged");
+                ui.add(
+                    egui::TextEdit::singleline(&mut keep)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("comma-separated, e.g. black choker"),
+                )
+                .on_hover_text(
+                    "Elements every alternative must preserve. Weighted tags like (pink hair:1.2) \
+                     are held automatically.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let w = ((ui.available_width() - 4.0) / 2.0).max(60.0);
+                    let size = egui::vec2(w, 32.0);
+                    if ui
+                        .add_enabled(
+                            done,
+                            egui::Button::new(format!("{} Again", icons::REFRESH)).min_size(size),
+                        )
+                        .clicked()
+                    {
+                        act = Some(VAct::Again);
+                    }
+                    let close = if done { "Keep mine" } else { "Cancel" };
+                    if ui
+                        .add_sized(size, egui::Button::new(format!("{} {close}", icons::CLOSE)))
+                        .clicked()
+                    {
+                        act = Some(VAct::Close);
+                    }
+                });
+            });
+        self.variation_count = count;
+        self.variation_strength = strength;
+        // A hand-edit deliberately does NOT move the seed: the seed records which character
+        // injection produced the field, so leaving it alone means the edit survives every later
+        // run for that character (and is replaced only when the character itself changes).
+        self.variation_keep = keep;
+
+        match act {
+            Some(VAct::Use(text, axis)) => {
+                self.params.positive = text.trim().to_string();
+                if raw_on_accept {
+                    self.params.raw_prompt = true;
+                }
+                self.close_variations();
+                self.status = format!("Variation applied ({axis})");
+                host.haptic(Haptic::Light);
+            }
+            Some(VAct::Again) => {
+                self.close_variations();
+                self.start_variations(ctx, host);
+            }
+            Some(VAct::Close) => {
+                let streaming = !done;
+                self.close_variations();
+                self.status =
+                    if streaming { "Variations cancelled".into() } else { "Kept your prompt".into() };
+                host.haptic(Haptic::Light);
+            }
+            None => {}
+        }
+    }
+
+    /// Drop the variations modal and abort any in-flight request behind it.
+    fn close_variations(&mut self) {
+        self.variations_review = None;
+        self.variations_rx = None;
+        if let Some(c) = self.variations_cancel.take() {
+            c.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Drain streamed `/api/expand` tokens into `expand_review` (the worker repaints on each).
     fn poll_expand(&mut self) {
         let Some(rx) = self.expand_rx.as_ref() else { return };
@@ -5779,6 +6284,18 @@ impl ComfyApp {
                     break;
                 }
                 Ok(ExpandMsg::Error(e)) => {
+                    if let Some(r) = self.expand_review.as_mut() {
+                        r.done = true;
+                        r.error = Some(e);
+                    }
+                    ended = true;
+                    break;
+                }
+                Ok(ExpandMsg::Unsupported(e)) => {
+                    // A standing answer, not a bad attempt: stop offering server rewriting (Auto
+                    // falls through to the on-device pack) until the connection changes.
+                    self.expand_unsupported = true;
+                    self.log.warn(format!("expand: {e} — server rewriting disabled for this session"));
                     if let Some(r) = self.expand_review.as_mut() {
                         r.done = true;
                         r.error = Some(e);
@@ -5857,10 +6374,11 @@ impl ComfyApp {
                     ui.horizontal(|ui| {
                         if streaming {
                             ui.add(egui::Spinner::new());
-                            ui.weak(format!("Writing for {dialect_label}…"));
+                            ui.weak(format!("comfy-gate is writing for {dialect_label}…"));
                         } else {
                             ui.weak(format!(
-                                "Written for {dialect_label}. Review it, then accept or discard."
+                                "Written for {dialect_label} by comfy-gate. Review it, then \
+                                 accept or discard."
                             ));
                         }
                     });
@@ -6024,18 +6542,12 @@ impl ComfyApp {
 
     /// Negative prompt: label + chip toggle, then the chip editor or text field.
     fn negative_prompt_ui(&mut self, ui: &mut egui::Ui) {
-        self.prompt_field_ui(ui, PromptField::Negative, "Negative", None);
+        self.prompt_field_ui(ui, PromptField::Negative, "Negative");
     }
 
     /// One prompt field: a `label` + chip-view toggle (+ history nav and rewrite on positive),
     /// then the editor.
-    fn prompt_field_ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        field: PromptField,
-        label: &str,
-        host: Option<&Host>,
-    ) {
+    fn prompt_field_ui(&mut self, ui: &mut egui::Ui, field: PromptField, label: &str) {
         // Wrapped so the extra history buttons drop to a second line instead of clipping.
         ui.horizontal_wrapped(|ui| {
             ui.label(label);
@@ -6049,9 +6561,6 @@ impl ComfyApp {
             }
             if field == PromptField::Positive {
                 self.hist_nav_ui(ui);
-                if let Some(host) = host {
-                    self.rewrite_menu_ui(ui, host);
-                }
             }
         });
         self.prompt_editor_body(ui, field);
@@ -12795,6 +13304,7 @@ impl ComfyApp {
         #[cfg(feature = "local-npu")]
         self.rewrite_review_window(ui.ctx());
         self.expand_review_window(ui.ctx(), host);
+        self.variations_window(ui.ctx(), host);
         if self.result_view.is_some() {
             let pane = ui.available_rect_before_wrap();
             self.result_viewer(ui, host);
@@ -12823,21 +13333,37 @@ impl ComfyApp {
             &mut output_bar_open,
             |ui| {
                 let title = self.output_title();
+                let unseen = self.output_unseen;
                 ui.horizontal(|ui| {
                     ui.strong(sanitize_ui_text(ui, &title));
+                    // Results never open the window themselves, so the count is the only thing
+                    // saying "there's something new down here".
+                    if unseen > 0 {
+                        ui.colored_label(
+                            crate::theme::PINK,
+                            format!("{unseen} new"),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (lbl, hint) = if self.output_open {
                             (icons::CLOSE, "Hide output")
+                        } else if unseen > 0 {
+                            (icons::IMAGE, "Show output (new results)")
                         } else {
                             (icons::IMAGE, "Show output")
                         };
-                        if ui.small_button(lbl).on_hover_text(hint).clicked() {
+                        let btn = egui::Button::new(lbl).small().selected(unseen > 0);
+                        if ui.add(btn).on_hover_text(hint).clicked() {
                             self.output_open = !self.output_open;
                         }
                     });
                 });
             },
         );
+        // Opening it — by the strip, or anything else that sets the flag — marks them seen.
+        if self.output_open {
+            self.output_unseen = 0;
+        }
 
         match self.create_pane {
             CreatePane::Main => {
@@ -12897,7 +13423,8 @@ impl ComfyApp {
         }
     }
 
-    /// Floating Output window over the Create pane, opened by the strip and by every new result.
+    /// Floating Output window over the Create pane, opened only from the strip — a result landing
+    /// never opens it, it just bumps the strip's "N new" count.
     /// Free-floating rather than docked: it takes no panel space, so the pane bar, the nav bar and
     /// the soft keyboard can never squeeze the Create pane to nothing between them. egui constrains
     /// it to `content_rect`, which already excludes the keyboard's occlusion.
@@ -15755,6 +16282,87 @@ impl ComfyApp {
             });
         }
         self.full_cache_report.clone()
+    }
+
+    /// Where the on-device rewrite pack is, for the Settings status line.
+    #[cfg(feature = "local-npu")]
+    fn rewrite_pack_label(&self) -> String {
+        match self.rewrite_pack.as_ref() {
+            Some(p) => format!("pack at {}", p.display()),
+            None => "no pack — push one to /storage/emulated/0/ComfyUI/rewrite".into(),
+        }
+    }
+
+    #[cfg(not(feature = "local-npu"))]
+    fn rewrite_pack_label(&self) -> String {
+        "not in this build (needs the local-npu feature)".into()
+    }
+
+    /// Settings → Prompt rewriting: choose the engine the Create rewrite button uses, and show
+    /// which one is live. Both engines produce the same kind of accept/discard diff, so without
+    /// this the only way to tell a server rewrite from an on-device one is the logs.
+    fn rewrite_settings(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let before = self.rewrite_engine;
+        ui.horizontal_wrapped(|ui| {
+            for engine in RewriteEngine::ALL {
+                crate::theme::selectable_value(ui, &mut self.rewrite_engine, engine, engine.label());
+            }
+        });
+        if self.rewrite_engine != before {
+            // Flush now so a quit right after the toggle can't lose it (as Local NPU does).
+            self.autosave_settings_now(host);
+        }
+        ui.weak(
+            "comfy-gate rewrites on the server (POST /api/expand), in the dialect the checkpoint's \
+             family wants. On device runs the local rewrite pack on this phone's CPU — slower, but \
+             it needs no server. Auto offers whichever engines can run (both, when both can). An \
+             explicit pick never silently switches: if it can't run, the button says so.",
+        );
+        ui.add_space(6.0);
+        let (_, dialect) = self.expand_dialect();
+        match self.rewrite_controls_shown() {
+            (true, true) => ui.label(format!(
+                "{} Both offered under the prompt: Expand · comfy-gate (for {dialect}) and \
+                 Rewrite · on device",
+                icons::CHECK
+            )),
+            (true, false) => ui.label(format!(
+                "{} Rewrites now run on comfy-gate (for {dialect})",
+                icons::CHECK
+            )),
+            (false, true) => ui.label(format!("{} Rewrites now run on this device", icons::CHECK)),
+            (false, false) => {
+                let reason = self.rewrite_unavailable_reason();
+                ui.colored_label(ui.visuals().warn_fg_color, format!("{} {reason}", icons::WARN))
+            }
+        };
+        ui.add_space(4.0);
+        let server_state = if self.expand_unsupported {
+            "this server answered with no prompt expander (reconnect to re-check)"
+        } else if self.server_rewrite_ok() {
+            "connected"
+        } else {
+            "not connected"
+        };
+        ui.weak(format!("comfy-gate: {server_state}"));
+        ui.weak(format!("On device: {}", self.rewrite_pack_label()));
+        ui.add_space(4.0);
+        ui.weak(
+            "Video prompts are also expanded by comfy-gate at queue time, whichever engine you \
+             pick here — the Raw checkbox under the prompt is what opts a video run out of that.",
+        );
+        ui.add_space(6.0);
+        // Variations is a comfy-gate-only sibling of Expand; its knobs live in its own modal, but
+        // they persist, so say what they currently are rather than hiding them here entirely.
+        ui.weak(format!(
+            "Variations (comfy-gate only) asks for alternative prompts instead of a faithful \
+             rewrite — currently {} × {}, set from the Variations window itself.",
+            self.variation_count,
+            self.variation_strength.label().to_lowercase(),
+        ));
+        if self.variations_unsupported {
+            ui.weak("This server has no /api/variations — the button is hidden until reconnect.");
+        }
     }
 
     fn gallery_cache_settings(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -19200,7 +19808,7 @@ impl ComfyApp {
         }
         use local_rewrite::RewriteKind;
         let video = self.params.mode == Mode::Video;
-        ui.menu_button("Rewrite", |ui| {
+        ui.menu_button(format!("{} Rewrite · on device", icons::GENERATE), |ui| {
             if self.rewrite_running {
                 ui.add(egui::Spinner::new());
                 ui.label("Rewriting…");
@@ -19305,6 +19913,8 @@ impl ComfyApp {
             .collapsible(false)
             .default_width(380.0)
             .show(ctx, |ui| {
+                // Say who wrote it: the server's Expand review is a near-identical diff modal.
+                ui.weak("Written on this device by the local rewrite pack.");
                 if !changed {
                     ui.weak("The rewrite made no changes.");
                 }
@@ -19910,6 +20520,7 @@ impl EguiApp for ComfyApp {
             }
         }
         self.poll_expand();
+        self.poll_variations();
         #[cfg(feature = "local-npu")]
         {
             self.poll_d3_anima();
@@ -22303,4 +22914,3 @@ fn inject_lora_triggers(snarl: &mut egui_snarl::Snarl<FlowNodeData>, triggers: &
 }
 
 app!(ComfyApp::new);
-

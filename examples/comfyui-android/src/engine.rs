@@ -189,8 +189,88 @@ pub enum ExpandMsg {
     Delta(String),
     /// The stream reached `[DONE]` (or closed cleanly) — no more deltas.
     Done,
-    /// The request failed or the expander is down/disabled; the caller keeps the original text.
+    /// The request failed or the expander is down; the caller keeps the original text.
     Error(String),
+    /// This server has no usable expander at all (404 = plain ComfyUI or a gate older than the
+    /// endpoint, 501, 503 = expansion switched off). Shown like [`Self::Error`], but the app also
+    /// remembers it and stops offering server-side rewriting until the connection changes.
+    Unsupported(String),
+}
+
+/// One alternative from `POST /api/variations`: the same prompt with a single `axis`
+/// (setting / pose / lighting / wardrobe / mood / composition) deliberately changed.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct Variation {
+    #[serde(default)]
+    pub axis: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub elapsed_ms: Option<u64>,
+}
+
+/// `POST /api/variations`' response. Every field defaults: partial success is normal (some
+/// variations can fail validation and land in `errors` while the rest come back fine), and the
+/// shape of an `errors` entry isn't pinned down, so it stays raw JSON until it's rendered.
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct Variations {
+    #[serde(default)]
+    pub dialect: String,
+    /// Elements the server held fixed: whatever the user weighted, plus the request's `keep`.
+    #[serde(default)]
+    pub anchors: Vec<String>,
+    #[serde(default)]
+    pub variations: Vec<Variation>,
+    #[serde(default)]
+    pub errors: Vec<Value>,
+}
+
+impl Variations {
+    /// `errors` as display lines, whatever shape the entries take (string, or an object with a
+    /// message/error/detail field, else the raw JSON).
+    pub fn error_lines(&self) -> Vec<String> {
+        self.errors
+            .iter()
+            .map(|e| match e {
+                Value::String(s) => s.clone(),
+                Value::Object(map) => ["error", "message", "detail", "reason"]
+                    .iter()
+                    .find_map(|k| map.get(*k).and_then(|v| v.as_str()))
+                    .map(|s| match map.get("axis").and_then(|v| v.as_str()) {
+                        Some(axis) => format!("{axis}: {s}"),
+                        None => s.to_string(),
+                    })
+                    .unwrap_or_else(|| e.to_string()),
+                other => other.to_string(),
+            })
+            .collect()
+    }
+}
+
+/// A `POST /api/variations` request. `dialect` follows the same rule as `/api/expand`: a family
+/// key or the workflow's loader filename, empty to let the server use its generic prompt.
+pub struct VariationsReq {
+    pub text: String,
+    pub dialect: String,
+    /// Server clamps to 1..=6; [`variations_body`] clamps too so the count shown is the count sent.
+    pub count: u32,
+    /// `subtle` | `moderate` | `wild`; empty means the server default (`moderate`).
+    pub strength: String,
+    /// Elements that must survive the rewrite unchanged (on top of the weights the server reads
+    /// out of the text itself).
+    pub keep: Vec<String>,
+}
+
+/// The outcome of a `POST /api/variations` request.
+pub enum VariationsMsg {
+    /// The response parsed; `variations` may still be partial (see [`Variations::error_lines`]).
+    Done(Variations),
+    /// This attempt failed (all variations failed, bad request, transport) — keep the original.
+    Error(String),
+    /// This server has no variations endpoint (404) or expansion is switched off (503), so the
+    /// app stops offering it until the connection changes. Note 501 is NOT this: it means only
+    /// *this dialect* has no variation prompt, which another checkpoint may well have.
+    Unsupported(String),
 }
 
 pub struct Engine {
@@ -499,6 +579,31 @@ impl Engine {
             }
             None => {
                 let _ = tx.send(ExpandMsg::Error("Not connected".into()));
+            }
+        }
+        rx
+    }
+
+    /// Ask the gate for `POST /api/variations` alternatives to a prompt. Unlike
+    /// [`Self::expand_prompt`] this answers with one JSON body rather than a stream — the point is
+    /// to compare the options side by side — so the result arrives as a single [`VariationsMsg`].
+    /// Each alternative costs its own completion server-side (~0.7 s each, run back to back), so
+    /// this uses [`Self::queue_http`]'s long read timeout and `cancel` aborts the wait.
+    pub fn variations(
+        &self,
+        req: VariationsReq,
+        cancel: Arc<AtomicBool>,
+    ) -> Receiver<VariationsMsg> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        match self.queue_http.clone() {
+            Some(http) => {
+                let (base, ctx, log) = (self.base.clone(), self.ctx.clone(), self.log.clone());
+                self.rt.spawn(async move {
+                    fetch_variations(http, base, req, cancel, tx, ctx, log).await;
+                });
+            }
+            None => {
+                let _ = tx.send(VariationsMsg::Error("Not connected".into()));
             }
         }
         rx
@@ -2083,6 +2188,128 @@ fn expand_body(text: &str, dialect: &str) -> serde_json::Value {
     body
 }
 
+/// `POST /api/variations`' request body. `count` is clamped here as well as server-side so the
+/// number the UI promised is the number asked for; `dialect`, `strength` and `keep` are omitted
+/// when empty so the server applies its own defaults (generic dialect, `moderate`, no extra
+/// anchors) instead of being handed a blank.
+fn variations_body(req: &VariationsReq) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "text": req.text,
+        "count": req.count.clamp(1, 6),
+    });
+    let dialect = req.dialect.trim();
+    if !dialect.is_empty() {
+        body["dialect"] = Value::String(dialect.to_string());
+    }
+    let strength = req.strength.trim();
+    if !strength.is_empty() {
+        body["strength"] = Value::String(strength.to_string());
+    }
+    let keep: Vec<Value> = req
+        .keep
+        .iter()
+        .map(|k| k.trim())
+        .filter(|k| !k.is_empty())
+        .map(|k| Value::String(k.to_string()))
+        .collect();
+    if !keep.is_empty() {
+        body["keep"] = Value::Array(keep);
+    }
+    body
+}
+
+/// Why `/api/variations` said no, and whether that verdict is about the whole server (`true` →
+/// [`VariationsMsg::Unsupported`], stop offering it) or just this attempt. 501 is deliberately the
+/// latter: it means this *dialect* has no variation prompt, so another checkpoint may still work.
+fn variations_status_hint(status: u16) -> (String, bool) {
+    match status {
+        400 => ("The server rejected this prompt".into(), false),
+        401 | 403 => ("Not signed in — sign in and try again".into(), false),
+        404 => ("This server has no prompt variations".into(), true),
+        501 => ("This model family has no variations prompt".into(), false),
+        502 => ("Every variation failed — keeping your prompt".into(), false),
+        503 => ("Prompt expansion is switched off on the server".into(), true),
+        504 => ("The prompt expander timed out".into(), false),
+        other => (format!("Variations unavailable (HTTP {other})"), false),
+    }
+}
+
+/// `POST /api/variations` and hand back the parsed body. One request, one answer: the endpoint
+/// doesn't stream (the options are meant to be compared side by side), so `cancel` races the whole
+/// request — dropping the future aborts it — rather than stopping between chunks.
+async fn fetch_variations(
+    http: reqwest::Client,
+    base: String,
+    req: VariationsReq,
+    cancel: Arc<AtomicBool>,
+    tx: Sender<VariationsMsg>,
+    ctx: egui::Context,
+    log: Logger,
+) {
+    macro_rules! send {
+        ($m:expr) => {{
+            let _ = tx.send($m);
+            ctx.request_repaint();
+        }};
+    }
+    let body = variations_body(&req);
+    let sent = http.post(format!("{base}/api/variations")).json(&body).send();
+    let resp = tokio::select! {
+        biased;
+        _ = wait_cancelled(&cancel) => return,
+        r = sent => r,
+    };
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            log.warn(format!("variations request failed: {e}"));
+            send!(VariationsMsg::Error(format!("variations: {e}")));
+            return;
+        }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let (hint, unsupported) = variations_status_hint(status.as_u16());
+        log.warn(format!("variations unavailable: HTTP {status}"));
+        send!(if unsupported {
+            VariationsMsg::Unsupported(hint)
+        } else {
+            VariationsMsg::Error(hint)
+        });
+        return;
+    }
+    let parsed = tokio::select! {
+        biased;
+        _ = wait_cancelled(&cancel) => return,
+        j = resp.json::<Variations>() => j,
+    };
+    match parsed {
+        Ok(v) => {
+            // Each option is its own completion run back to back, so the summed server time is
+            // what the user waited for — worth having in the log when a set feels slow.
+            let ms: u64 = v.variations.iter().filter_map(|x| x.elapsed_ms).sum();
+            log.info(format!(
+                "variations: {} option(s), {} error(s), dialect '{}', {:.1}s server time",
+                v.variations.len(),
+                v.errors.len(),
+                v.dialect,
+                ms as f32 / 1000.0
+            ));
+            // A 200 with nothing usable is still a failure for the caller; the gate documents an
+            // empty list as a 502, so this is a defensive path, not the expected one.
+            if v.variations.iter().all(|x| x.text.trim().is_empty()) {
+                send!(VariationsMsg::Error("The server returned no variations".into()));
+            } else {
+                send!(VariationsMsg::Done(v));
+            }
+        }
+        Err(e) => {
+            log.warn(format!("variations parse failed: {e}"));
+            send!(VariationsMsg::Error(format!("variations: {e}")));
+        }
+    }
+}
+
 /// Why `/api/expand` said no, in words worth showing in the review modal. The gate documents 400
 /// (no text), 502 (expander unreachable), 503 (expansion disabled) and 504 (expander timed out);
 /// a 404 means the server has no expander at all — a plain ComfyUI, or a gate older than the
@@ -2133,8 +2360,16 @@ async fn stream_expand(
     };
     let status = resp.status();
     if !status.is_success() {
+        let code = status.as_u16();
         log.warn(format!("expand unavailable: HTTP {status}"));
-        send!(ExpandMsg::Error(expand_status_hint(status.as_u16())));
+        let hint = expand_status_hint(code);
+        // 404/501/503 are "this server can't do this at all", not "this attempt failed": the app
+        // takes them as a standing answer, so it stops pointing the user at a button that can't work.
+        send!(if matches!(code, 404 | 501 | 503) {
+            ExpandMsg::Unsupported(hint)
+        } else {
+            ExpandMsg::Error(hint)
+        });
         return;
     }
     let mut resp = resp;
@@ -2921,6 +3156,90 @@ mod tests {
         );
     }
 
+    fn vreq(count: u32, strength: &str, keep: &[&str]) -> VariationsReq {
+        VariationsReq {
+            text: "1girl, (pink hair:1.2), bathtub".into(),
+            dialect: "illustrious".into(),
+            count,
+            strength: strength.into(),
+            keep: keep.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Optional fields are omitted rather than sent blank (a blank would override the server's own
+    /// defaults), and `count` is clamped client-side so the modal can't promise 9 and ask for 9.
+    #[test]
+    fn variations_body_omits_blanks_and_clamps_count() {
+        let body = variations_body(&vreq(3, "wild", &["black choker", "  ", "horns"]));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "text": "1girl, (pink hair:1.2), bathtub",
+                "count": 3,
+                "dialect": "illustrious",
+                "strength": "wild",
+                "keep": ["black choker", "horns"],
+            })
+        );
+        let mut req = vreq(99, "  ", &[]);
+        req.dialect = "  ".into();
+        let body = variations_body(&req);
+        assert_eq!(body["count"], 6);
+        assert!(body.get("dialect").is_none());
+        assert!(body.get("strength").is_none());
+        assert!(body.get("keep").is_none());
+        assert_eq!(variations_body(&vreq(0, "", &[]))["count"], 1);
+    }
+
+    /// 404/503 are verdicts about the server (hide the button); 501 is only about the *dialect*,
+    /// so another checkpoint may still have variations and the button must stay.
+    #[test]
+    fn variations_status_hint_only_disables_for_server_wide_failures() {
+        assert!(variations_status_hint(404).1);
+        assert!(variations_status_hint(503).1);
+        assert!(!variations_status_hint(501).1);
+        assert!(!variations_status_hint(502).1);
+        assert!(!variations_status_hint(400).1);
+        assert!(variations_status_hint(418).0.contains("418"));
+    }
+
+    /// `errors` entries aren't a pinned shape, so rendering must survive strings, objects with any
+    /// of the usual message keys, and anything else.
+    #[test]
+    fn variation_error_lines_render_whatever_shape_arrives() {
+        let got: Variations = serde_json::from_value(serde_json::json!({
+            "variations": [{"axis": "pose", "text": "a"}],
+            "errors": [
+                "flat string",
+                {"axis": "mood", "error": "dropped an anchor"},
+                {"message": "no axis here"},
+                42,
+            ],
+        }))
+        .unwrap();
+        let lines = got.error_lines();
+        assert_eq!(lines[0], "flat string");
+        assert_eq!(lines[1], "mood: dropped an anchor");
+        assert_eq!(lines[2], "no axis here");
+        assert_eq!(lines[3], "42");
+        // Partial success is normal: the good option still parsed.
+        assert_eq!(got.variations.len(), 1);
+        assert_eq!(got.variations[0].axis, "pose");
+    }
+
+    /// A response missing every optional field must still parse — the app renders what it gets.
+    #[test]
+    fn variations_response_tolerates_missing_fields() {
+        let got: Variations = serde_json::from_value(serde_json::json!({
+            "variations": [{"text": "just text"}]
+        }))
+        .unwrap();
+        assert!(got.dialect.is_empty());
+        assert!(got.anchors.is_empty());
+        assert!(got.errors.is_empty());
+        assert_eq!(got.variations[0].elapsed_ms, None);
+    }
+
     /// Every documented expander failure reads as a sentence, and an undocumented one still says
     /// which status came back rather than swallowing it.
     #[test]
@@ -3148,3 +3467,4 @@ mod tests {
         assert!(!looks_like_image(b""));
     }
 }
+

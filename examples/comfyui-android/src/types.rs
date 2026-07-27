@@ -1211,6 +1211,83 @@ impl LocalBackend {
     }
 }
 
+/// Which engine rewrites the Create positive prompt. Two exist and they are not interchangeable —
+/// comfy-gate's `POST /api/expand` is a server LLM that writes in the checkpoint family's dialect,
+/// the on-device pack is a CPU Qwen model that works with no server at all (feature `local-npu`) —
+/// so the choice is explicit and the Create button always says which one it will use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum RewriteEngine {
+    /// comfy-gate when it's reachable and has the endpoint, else the on-device pack.
+    #[default]
+    Auto,
+    /// Always comfy-gate `POST /api/expand`.
+    Server,
+    /// Always the on-device rewrite pack.
+    Device,
+}
+
+impl RewriteEngine {
+    pub const ALL: [RewriteEngine; 3] = [Self::Auto, Self::Server, Self::Device];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Server => "comfy-gate",
+            Self::Device => "On device",
+        }
+    }
+
+    /// The engine that will actually run, or `None` when the chosen one can't. Only `Auto` ever
+    /// switches engines: an explicit pick that isn't available reports unavailable rather than
+    /// quietly running the other one, so what the user chose is what the button offers.
+    pub fn resolve(self, server_ok: bool, device_ok: bool) -> Option<RewriteEngine> {
+        match self {
+            Self::Auto if server_ok => Some(Self::Server),
+            Self::Auto if device_ok => Some(Self::Device),
+            Self::Auto => None,
+            Self::Server => server_ok.then_some(Self::Server),
+            Self::Device => device_ok.then_some(Self::Device),
+        }
+    }
+}
+
+/// How far `POST /api/variations` may drift from the prompt it was given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum VariationStrength {
+    Subtle,
+    #[default]
+    Moderate,
+    Wild,
+}
+
+impl VariationStrength {
+    pub const ALL: [VariationStrength; 3] = [Self::Subtle, Self::Moderate, Self::Wild];
+
+    /// The wire value; the server takes these three and nothing else.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Subtle => "subtle",
+            Self::Moderate => "moderate",
+            Self::Wild => "wild",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Subtle => "Subtle",
+            Self::Moderate => "Moderate",
+            Self::Wild => "Wild",
+        }
+    }
+}
+
+/// How many alternatives to ask `/api/variations` for; the server clamps to 1..=6.
+pub const VARIATION_COUNT_RANGE: std::ops::RangeInclusive<u32> = 1..=6;
+
+pub fn default_variation_count() -> u32 {
+    3
+}
+
 /// Cap on persisted MRU checkpoint filenames.
 pub const CHECKPOINT_RECENT_MAX: usize = 40;
 
@@ -2097,6 +2174,15 @@ pub struct Settings {
     /// Current Create-Main combobox selections (at most one per single-axis kind), with undo records.
     #[serde(default)]
     pub active_main_looks: Vec<AppliedMainLook>,
+    /// Which engine the Create prompt rewrite button uses (server `/api/expand` vs on-device pack).
+    #[serde(default)]
+    pub rewrite_engine: RewriteEngine,
+    /// How many alternatives the Variations button asks for (`/api/variations` `count`).
+    #[serde(default = "default_variation_count")]
+    pub variation_count: u32,
+    /// How far those alternatives may drift (`/api/variations` `strength`).
+    #[serde(default)]
+    pub variation_strength: VariationStrength,
 }
 
 pub fn default_server_output_root() -> String {
@@ -3000,6 +3086,28 @@ mod tests {
         ));
         assert!(!entry.matches_checkpoint("flux1-dev.safetensors", &["flux".into()]));
         assert!(!entry.matches_checkpoint("unknown.safetensors", &[]));
+    }
+
+    /// Auto is the only setting allowed to switch engines. An explicit pick that can't run must
+    /// report unavailable, never quietly run the other engine — the whole point of the setting is
+    /// that you can tell where a rewrite came from.
+    #[test]
+    fn rewrite_engine_resolves_without_silent_fallback() {
+        use RewriteEngine::*;
+        assert_eq!(Auto.resolve(true, true), Some(Server));
+        assert_eq!(Auto.resolve(false, true), Some(Device));
+        assert_eq!(Auto.resolve(true, false), Some(Server));
+        assert_eq!(Auto.resolve(false, false), None);
+        assert_eq!(Server.resolve(true, true), Some(Server));
+        assert_eq!(Server.resolve(false, true), None);
+        assert_eq!(Device.resolve(true, true), Some(Device));
+        assert_eq!(Device.resolve(true, false), None);
+        // Never resolves to Auto itself: callers match on the concrete engine.
+        for chosen in RewriteEngine::ALL {
+            for (s, d) in [(true, true), (true, false), (false, true), (false, false)] {
+                assert_ne!(chosen.resolve(s, d), Some(Auto));
+            }
+        }
     }
 
     /// Only families comfy-gate actually has a dialect for may map; anything else must return
