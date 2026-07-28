@@ -1145,6 +1145,9 @@ struct ComfyApp {
     trash_loading: bool,
     /// Ids from the last delete + when it landed, for the "Undo" snackbar window.
     undo_trash: Option<(Vec<i64>, f64)>,
+    /// Top edge of the highest bottom bar drawn this frame, so floating pills park above the
+    /// buttons instead of on them. Reset every frame; infinite means "no bar this frame".
+    bottom_bar_top: f32,
     /// Query + layout of the Gallery tab (model filter, album, sort, grouping, columns).
     gallery_view: GalleryView,
     thumbs: ThumbCache,
@@ -1769,6 +1772,7 @@ impl ComfyApp {
             trash_total: 0,
             trash_loading: false,
             undo_trash: None,
+            bottom_bar_top: f32::INFINITY,
             gallery_view: GalleryView::default(),
             thumbs: ThumbCache::default(),
             viewer: None,
@@ -4094,7 +4098,7 @@ impl ComfyApp {
         ui.separator();
 
         let empty = self.inpaint.as_ref().unwrap().canvas.is_empty();
-        egui::Panel::bottom("inpaint-actions").show(ui, |ui| {
+        let bar = egui::Panel::bottom("inpaint-actions").show(ui, |ui| {
             const BTN_H: f32 = 36.0;
             const ICON_W: f32 = 40.0;
             ui.add_space(2.0);
@@ -4139,6 +4143,7 @@ impl ComfyApp {
             });
             ui.add_space(2.0);
         });
+        self.note_bottom_bar(Some(bar));
 
         {
             let st = self.inpaint.as_mut().unwrap();
@@ -13371,11 +13376,12 @@ impl ComfyApp {
 
         // Above the app nav bar (Create / Graph / Gallery / Settings).
         let mut panes_open = !self.kb_editing;
-        let _ = egui::Panel::bottom("create-panes").show_collapsible(ui, &mut panes_open, |ui| {
+        let bar = egui::Panel::bottom("create-panes").show_collapsible(ui, &mut panes_open, |ui| {
             ui.add_space(2.0);
             self.create_pane_bar(ui);
             ui.add_space(2.0);
         });
+        self.note_bottom_bar(bar);
 
         // Output launcher strip above the pane bar. Deliberately a fixed 34px bar and nothing more:
         // the results themselves live in a floating window (`output_window`). A resizable sheet
@@ -13384,7 +13390,7 @@ impl ComfyApp {
         // Dropped entirely while text is being edited: the shrunk viewport already has to fit
         // the nav bar, the pane bar and a top bar, and the strip is unreachable mid-edit anyway.
         let mut output_bar_open = !self.kb_editing;
-        let _ = egui::Panel::bottom("create-output-bar").exact_size(34.0).show_collapsible(
+        let bar = egui::Panel::bottom("create-output-bar").exact_size(34.0).show_collapsible(
             ui,
             &mut output_bar_open,
             |ui| {
@@ -13416,6 +13422,7 @@ impl ComfyApp {
                 });
             },
         );
+        self.note_bottom_bar(bar);
         // Opening it — by the strip, or anything else that sets the flag — marks them seen.
         if self.output_open {
             self.output_unseen = 0;
@@ -14044,7 +14051,7 @@ impl ComfyApp {
         // fullscreen while the bar is collapsed for an edit.
         let fs = self.graph_fullscreen;
         let mut controls_open = !self.kb_editing;
-        let _ = egui::Panel::bottom("graph-controls").show_collapsible(ui, &mut controls_open, |ui| {
+        let bar = egui::Panel::bottom("graph-controls").show_collapsible(ui, &mut controls_open, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 self.graph_controls(ui, host);
@@ -14077,6 +14084,7 @@ impl ComfyApp {
             });
             ui.add_space(2.0);
         });
+        self.note_bottom_bar(bar);
 
         self.load_warnings_banner(ui);
         match self.graph_pane {
@@ -16997,7 +17005,7 @@ impl ComfyApp {
         let editing_search =
             !self.select_mode && ui.ctx().memory(|m| m.focused()) == Some(Self::gallery_search_id());
         let mut controls_open = editing_search || self.select_mode || !ui.ctx().text_edit_focused();
-        let _ = egui::Panel::bottom("gallery-controls").show_collapsible(ui, &mut controls_open, |ui| {
+        let bar = egui::Panel::bottom("gallery-controls").show_collapsible(ui, &mut controls_open, |ui| {
             ui.add_space(2.0);
             if self.select_mode {
                 self.selection_bar(ui, host);
@@ -17008,6 +17016,7 @@ impl ComfyApp {
             // above the keyboard and would otherwise cover the search row.
             ui.add_space(if editing_search { TEXT_ACTIONS_BAR_H } else { 2.0 });
         });
+        self.note_bottom_bar(bar);
         if self.gallery_pull_to_refresh(ui) {
             refresh = true;
         }
@@ -17119,23 +17128,98 @@ impl ComfyApp {
                 }
                 let header = format!("{} ({})", elide(&group.label, 40), group.items.len());
                 let id = ui.make_persistent_id(&group.key);
-                egui::collapsing_header::CollapsingState::load_with_default_open(
+                let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
                     ui.ctx(),
                     id,
                     self.gallery_view.groups_open,
-                )
-                .show_header(ui, |ui| {
-                    ui.label(&header);
-                    let keys: Vec<String> = group
-                        .items
-                        .iter()
-                        .filter_map(|&i| self.gallery.get(i).map(|it| it.key()))
-                        .collect();
-                    let all_sel =
-                        !keys.is_empty() && keys.iter().all(|k| self.selected.contains(k));
-                    let btn = if all_sel { "None" } else { "All" };
+                );
+                let keys: Vec<String> = group
+                    .items
+                    .iter()
+                    .filter_map(|&i| self.gallery.get(i).map(|it| it.key()))
+                    .collect();
+                let all_sel = !keys.is_empty() && keys.iter().all(|k| self.selected.contains(k));
+                let btn = if all_sel { "None" } else { "All" };
+                // Measured rather than a constant, so the row tracks the Text size setting — and
+                // measured on the WIDER of the two labels, or selecting a group would shove the
+                // strip (and the point its title truncates at) sideways as "All" became "None".
+                let sel_w = ["All", "None"]
+                    .iter()
+                    .map(|s| {
+                        egui::WidgetText::from(*s)
+                            .into_galley(
+                                ui,
+                                Some(egui::TextWrapMode::Extend),
+                                f32::INFINITY,
+                                egui::TextStyle::Button,
+                            )
+                            .size()
+                            .x
+                    })
+                    .fold(0.0_f32, f32::max)
+                    + ui.spacing().button_padding.x * 2.0;
+                // The whole title strip toggles the group, like every other collapsing header in
+                // the app: `show_header` senses only the arrow, a ~20px target a thumb misses more
+                // often than it hits. Painted the way `CollapsingHeader` paints itself, so grouped
+                // gallery sections read as the same framed section buttons used everywhere else.
+                // The select button keeps its own rect and never doubles as a toggle.
+                let row = ui.horizontal(|ui| {
+                    let indent = ui.spacing().indent;
+                    let pad = ui.spacing().button_padding;
+                    let strip_w =
+                        (ui.available_width() - sel_w - ui.spacing().item_spacing.x).max(64.0);
+                    let galley = egui::WidgetText::from(header.as_str()).into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Truncate),
+                        (strip_w - indent - pad.x).max(16.0),
+                        egui::TextStyle::Button,
+                    );
+                    let h = (galley.size().y + pad.y * 2.0).max(ui.spacing().interact_size.y);
+                    let (_, rect) = ui.allocate_space(egui::vec2(strip_w, h));
+                    let resp = ui.interact(rect, id, egui::Sense::click());
+                    resp.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::CollapsingHeader,
+                            ui.is_enabled(),
+                            &header,
+                        )
+                    });
+                    // Toggle before `openness` is read: `animate_bool` stamps its tick on the
+                    // first read of a frame, so a later read with the flipped target returns the
+                    // stale value and the arrow loses the first frame of its turn. egui's own
+                    // header toggles first for the same reason.
+                    if resp.clicked() {
+                        state.toggle(ui);
+                    }
+                    if ui.is_rect_visible(rect) {
+                        let visuals = *ui.style().interact(&resp);
+                        ui.painter().rect(
+                            rect.expand(visuals.expansion),
+                            visuals.corner_radius,
+                            visuals.weak_bg_fill,
+                            visuals.bg_stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                        let (mut icon_rect, _) = ui.spacing().icon_rectangles(rect);
+                        icon_rect
+                            .set_center(egui::pos2(rect.left() + indent / 2.0, rect.center().y));
+                        let openness = state.openness(ui.ctx());
+                        egui::collapsing_header::paint_default_icon(
+                            ui,
+                            openness,
+                            &resp.clone().with_new_rect(icon_rect),
+                        );
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.left() + indent,
+                                rect.center().y - galley.size().y / 2.0,
+                            ),
+                            galley,
+                            visuals.text_color(),
+                        );
+                    }
                     if ui
-                        .small_button(btn)
+                        .add_sized(egui::vec2(sel_w, h), egui::Button::new(btn))
                         .on_hover_text(if all_sel {
                             "Clear selection in this group"
                         } else {
@@ -17154,8 +17238,8 @@ impl ComfyApp {
                             }
                         }
                     }
-                })
-                .body(|ui| {
+                });
+                state.show_body_indented(&row.response, ui, |ui| {
                     open = self.gallery_grid(ui, &group.items, cols).or(open);
                 });
             }
@@ -18548,7 +18632,7 @@ impl ComfyApp {
 
         let can_undo = pos > 0;
         let mut actions_open = !self.kb_editing;
-        let _ = egui::Panel::bottom("triage-actions").show_collapsible(ui, &mut actions_open, |ui| {
+        let bar = egui::Panel::bottom("triage-actions").show_collapsible(ui, &mut actions_open, |ui| {
             const BTN_H: f32 = 40.0;
             const GAP: f32 = 4.0;
             ui.add_space(2.0);
@@ -18666,6 +18750,7 @@ impl ComfyApp {
             }
             ui.add_space(2.0);
         });
+        self.note_bottom_bar(bar);
 
         if let Some(key) = cur_key.clone() {
             match self.gallery.iter().find(|it| it.key() == key).cloned() {
@@ -18920,7 +19005,7 @@ impl ComfyApp {
                 !v.item.is_video && v.bytes.is_some() && self.wd14_pack.is_some() && !self.wd14_running;
             let mut remix_held = false;
             let mut actions_open = !self.kb_editing;
-            let _ = egui::Panel::bottom("viewer-actions").show_collapsible(ui, &mut actions_open, |ui| {
+            let bar = egui::Panel::bottom("viewer-actions").show_collapsible(ui, &mut actions_open, |ui| {
                 const BTN_H: f32 = 36.0;
                 const GAP: f32 = 4.0;
                 ui.add_space(2.0);
@@ -19102,6 +19187,7 @@ impl ComfyApp {
                 });
                 ui.add_space(2.0);
             });
+            self.note_bottom_bar(bar);
             // A held Remix skips the diff sheet and applies the full meta instantly. Partial
             // (gate-summary) meta doesn't qualify while the workflow scrape is still coming.
             let meta_ready = self.remix_sheet.is_none()
@@ -19639,7 +19725,7 @@ impl ComfyApp {
         let mut picked = None;
         let mut centered = false;
         let mut strip_open = !self.kb_editing;
-        let _ = egui::Panel::bottom("filmstrip")
+        let bar = egui::Panel::bottom("filmstrip")
             .exact_size(FRAME + 12.0)
             .show_collapsible(ui, &mut strip_open, |ui| {
                 crate::theme::scroll_horizontal().id_salt("viewer_filmstrip").auto_shrink([false, false]).show(
@@ -19705,6 +19791,7 @@ impl ComfyApp {
                     },
                 );
             });
+        self.note_bottom_bar(bar);
         if centered {
             self.filmstrip_center = false;
         }
@@ -19713,7 +19800,7 @@ impl ComfyApp {
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         let mut actions_open = !self.kb_editing;
-        let _ = egui::Panel::bottom("logs-actions").show_collapsible(ui, &mut actions_open, |ui| {
+        let bar = egui::Panel::bottom("logs-actions").show_collapsible(ui, &mut actions_open, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Copy all").clicked() {
@@ -19734,6 +19821,7 @@ impl ComfyApp {
             });
             ui.add_space(2.0);
         });
+        self.note_bottom_bar(bar);
 
         let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
         // Newest first: row 0 is the latest line, so long sessions need no scrolling.
@@ -20643,6 +20731,9 @@ impl EguiApp for ComfyApp {
         // by half a second, so the union collapses the bars once and restores them once, with no
         // gap in between. Kept apart from `kb_open_edge`, which must fire against a settled layout.
         self.kb_editing = kb_open || ui.ctx().text_edit_focused();
+        // Bottom bars re-measure themselves below; floating pills read the result at the end of
+        // the frame, after every panel this screen draws has claimed its strip.
+        self.bottom_bar_top = f32::INFINITY;
 
         let t_msgs = std::time::Instant::now();
         for m in self.engine.as_ref().unwrap().drain() {
@@ -20924,7 +21015,7 @@ impl EguiApp for ComfyApp {
         // central content so the tab bar always keeps its height on a short screen. Slides away
         // while text is being edited, which also makes a mid-edit tab switch impossible.
         let mut nav_open = !self.kb_editing;
-        let _ = egui::Panel::bottom("nav").show_collapsible(ui, &mut nav_open, |ui| {
+        let bar = egui::Panel::bottom("nav").show_collapsible(ui, &mut nav_open, |ui| {
             ui.add_space(2.0);
             // Global run progress (local jobs and server-wide queue from other clients).
             if self.running || self.queue_remaining > 0 {
@@ -20971,6 +21062,7 @@ impl EguiApp for ComfyApp {
             self.nav_bar(ui);
             ui.add_space(2.0);
         });
+        self.note_bottom_bar(bar);
 
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
@@ -21443,6 +21535,14 @@ impl ComfyApp {
         self.trash_open = open;
     }
 
+    /// Remember where a bottom bar starts, so floating pills park above its buttons instead of on
+    /// top of them. Takes the panel's own return value; a fully collapsed bar records nothing.
+    fn note_bottom_bar<R>(&mut self, bar: Option<egui::InnerResponse<R>>) {
+        if let Some(bar) = bar {
+            self.bottom_bar_top = self.bottom_bar_top.min(bar.response.rect.top());
+        }
+    }
+
     /// Post-delete Undo snackbar: a floating pill for a few seconds after images move to trash.
     fn undo_trash_pill(&mut self, ctx: &egui::Context, host: &Host) {
         const UNDO_WINDOW: f64 = 8.0;
@@ -21453,10 +21553,22 @@ impl ComfyApp {
             return;
         }
         ctx.request_repaint_after(Duration::from_millis(250));
+        // Sit above whatever bottom bar this screen drew, not at a fixed height: at 96px the pill
+        // landed on the gallery selection bar's Delete button — the one place a finger is already
+        // heading — and every bar's height moves with the app's text-size setting anyway.
+        let content = ctx.content_rect();
+        // The ceiling can never fall under the floor: `f32::clamp` panics on min > max, and a
+        // landscape screen with the keyboard up leaves the content rect well under 160pt tall.
+        let ceiling = (content.height() * 0.6).max(96.0);
+        let lift = if self.bottom_bar_top.is_finite() {
+            (content.bottom() - self.bottom_bar_top + 10.0).clamp(96.0, ceiling)
+        } else {
+            96.0
+        };
         let mut undo = false;
         egui::Area::new(egui::Id::new("undo-trash-pill"))
             .order(egui::Order::Foreground)
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -lift))
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(egui::Color32::from_black_alpha(200))
