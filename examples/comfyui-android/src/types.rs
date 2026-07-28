@@ -47,6 +47,18 @@ pub struct ActiveLora {
     pub model_only: bool,
 }
 
+impl ActiveLora {
+    /// Model and CLIP currently hold the same number, to slider precision.
+    ///
+    /// This is what makes the strength lock default to *on* without storing a flag per slot: two
+    /// equal strengths are a linked pair, and the only way they can differ is a workflow the user
+    /// pasted/remixed in or an edit made with the lock deliberately off. Either way, differing
+    /// numbers are the user's, and silently collapsing them onto one value would change the render.
+    pub fn strengths_linked(&self) -> bool {
+        (self.strength_model - self.strength_clip).abs() < 0.005
+    }
+}
+
 /// Canonical Wan negative prompt (anti-3D prefix + the standard Chinese quality block).
 pub const WAN_NEGATIVE: &str = "(((realistic))), ((photograph)), 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
@@ -1448,6 +1460,53 @@ fn default_strength_source() -> String {
     "default".into()
 }
 
+/// Step for the LoRA strength ◀ / ▶ buttons, and the granularity the slider track grows by.
+pub const LORA_STRENGTH_STEP: f32 = 0.5;
+
+/// ComfyUI's own `LoraLoader` bound. Wide enough to be "any number" in practice, but it keeps a
+/// held-down bump button from running off to infinity.
+pub const LORA_STRENGTH_LIMIT: f32 = 100.0;
+
+/// Track bounds for a LoRA the catalog knows no range for.
+pub const LORA_STRENGTH_FALLBACK: (f32, f32) = (-2.0, 2.0);
+
+/// Nudge a strength by `delta`, snapped to two decimals (so 0.5 steps off a catalogued 0.85 stay
+/// reversible) and held inside ComfyUI's own limits.
+pub fn bump_lora_strength(value: f32, delta: f32) -> f32 {
+    let v = ((value + delta) * 100.0).round() / 100.0;
+    v.clamp(-LORA_STRENGTH_LIMIT, LORA_STRENGTH_LIMIT)
+}
+
+/// Slider track for a LoRA strength: `base` (the catalogued range, or [`LORA_STRENGTH_FALLBACK`]),
+/// widened by one [`LORA_STRENGTH_STEP`] at each end and then far enough to contain `values`.
+///
+/// A catalogued range is only ever a *hint*. Civitai's "recommended" numbers are routinely narrower
+/// than what a LoRA actually tolerates — the example images under the same LoRA often run well past
+/// them — so a hard cap there makes good settings unreachable. The recommendation decides where the
+/// track spends its precision; it never decides what is allowed. The ◀ / ▶ buttons and the typed
+/// value box are free to leave the track, and the track regrows on the next frame to follow.
+pub fn lora_strength_range(
+    base: Option<(f32, f32)>,
+    values: &[f32],
+) -> std::ops::RangeInclusive<f32> {
+    let (mut lo, mut hi) = base.unwrap_or(LORA_STRENGTH_FALLBACK);
+    if hi < lo {
+        std::mem::swap(&mut lo, &mut hi);
+    }
+    lo -= LORA_STRENGTH_STEP;
+    hi += LORA_STRENGTH_STEP;
+    for v in values {
+        let v = v.clamp(-LORA_STRENGTH_LIMIT, LORA_STRENGTH_LIMIT);
+        if v < lo {
+            lo = (v / LORA_STRENGTH_STEP).floor() * LORA_STRENGTH_STEP;
+        }
+        if v > hi {
+            hi = (v / LORA_STRENGTH_STEP).ceil() * LORA_STRENGTH_STEP;
+        }
+    }
+    lo..=hi.max(lo + LORA_STRENGTH_STEP)
+}
+
 impl LoraEntry {
     pub fn display_name(&self) -> &str {
         if self.name.trim().is_empty() { &self.file } else { &self.name }
@@ -1489,6 +1548,14 @@ impl LoraEntry {
             _ => {}
         }
         parts.join(" · ")
+    }
+
+    /// Catalogued strength window, with [`LORA_STRENGTH_FALLBACK`] filling in whichever end the
+    /// catalog left blank. Shapes the slider track only — see [`lora_strength_range`].
+    pub fn strength_range(&self) -> (f32, f32) {
+        let lo = self.strength_model_min.unwrap_or(LORA_STRENGTH_FALLBACK.0);
+        let hi = self.strength_model_max.unwrap_or(LORA_STRENGTH_FALLBACK.1.max(lo));
+        if hi < lo { (hi, lo) } else { (lo, hi) }
     }
 
     /// Model/CLIP strengths for Add, clamped to an optional recommended range.
@@ -2183,6 +2250,11 @@ pub struct Settings {
     /// How far those alternatives may drift (`/api/variations` `strength`).
     #[serde(default)]
     pub variation_strength: VariationStrength,
+    /// LoRA files whose Model/CLIP strengths the user explicitly unlinked; every other slot moves
+    /// the pair together. Only slots whose two numbers currently *match* need recording — one whose
+    /// numbers already differ reads as unlinked on its own ([`ActiveLora::strengths_linked`]).
+    #[serde(default)]
+    pub lora_unlinked: Vec<String>,
 }
 
 pub fn default_server_output_root() -> String {
@@ -2609,6 +2681,100 @@ mod tests {
         let json = serde_json::json!({"server_url": "http://x", "params": params});
         let s: Settings = serde_json::from_value(json).unwrap();
         assert!(s.prompt_history.is_empty());
+    }
+
+    #[test]
+    fn settings_without_lora_unlinked_default_empty() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(s.lora_unlinked.is_empty());
+    }
+
+    fn lora_with_range(min: Option<f32>, max: Option<f32>) -> LoraEntry {
+        serde_json::from_value(serde_json::json!({
+            "file": "x.safetensors",
+            "strength_model_min": min,
+            "strength_model_max": max,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn strength_range_fills_missing_ends_from_the_fallback() {
+        assert_eq!(lora_with_range(None, None).strength_range(), LORA_STRENGTH_FALLBACK);
+        assert_eq!(lora_with_range(Some(0.5), Some(1.0)).strength_range(), (0.5, 1.0));
+        assert_eq!(lora_with_range(Some(0.4), None).strength_range(), (0.4, 2.0));
+        assert_eq!(lora_with_range(None, Some(1.2)).strength_range(), (-2.0, 1.2));
+        // A catalogued min above the fallback max must not produce an inverted window.
+        assert_eq!(lora_with_range(Some(3.0), None).strength_range(), (3.0, 3.0));
+        // A catalog that has them backwards is still a usable window.
+        assert_eq!(lora_with_range(Some(1.0), Some(0.2)).strength_range(), (0.2, 1.0));
+    }
+
+    /// The whole point of the feature: a recommendation of 0.5–1.0 must not stop the user reaching
+    /// 3.5, and once there the track must contain it so the handle is still draggable.
+    #[test]
+    fn slider_track_pads_the_recommendation_and_grows_to_hold_the_value() {
+        let rec = Some((0.5, 1.0));
+        let r = lora_strength_range(rec, &[1.0, 1.0]);
+        assert_eq!((*r.start(), *r.end()), (0.0, 1.5), "one step of headroom past the catalog");
+
+        let r = lora_strength_range(rec, &[3.5, 1.0]);
+        assert!(*r.end() >= 3.5, "track must contain a value bumped past the recommendation");
+        assert_eq!(*r.end(), 3.5);
+
+        // Grown ends land on the step grid, so the track doesn't jitter as the value moves.
+        let r = lora_strength_range(rec, &[2.1, 1.0]);
+        assert_eq!(*r.end(), 2.5);
+        let r = lora_strength_range(rec, &[-2.1, 1.0]);
+        assert_eq!(*r.start(), -2.5);
+
+        // Both strengths are considered, so the two sliders share one track.
+        let r = lora_strength_range(rec, &[1.0, 4.0]);
+        assert_eq!(*r.end(), 4.0);
+
+        // No catalogued range at all: the ±2 default, padded.
+        let r = lora_strength_range(None, &[1.0, 1.0]);
+        assert_eq!((*r.start(), *r.end()), (-2.5, 2.5));
+    }
+
+    #[test]
+    fn slider_track_is_never_empty_or_inverted() {
+        for base in [Some((1.0, 1.0)), Some((2.0, -2.0)), None] {
+            for v in [-500.0, 0.0, 500.0] {
+                let r = lora_strength_range(base, &[v, v]);
+                assert!(*r.end() > *r.start(), "{base:?} @ {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn bump_steps_by_a_half_reversibly_and_stops_at_comfyui_limits() {
+        // Plain arithmetic, not grid-snapping: a catalogued 0.85 survives an up-then-down trip.
+        assert_eq!(bump_lora_strength(0.85, LORA_STRENGTH_STEP), 1.35);
+        assert_eq!(bump_lora_strength(1.35, -LORA_STRENGTH_STEP), 0.85);
+        // Float drift is rounded off so repeated taps stay on clean numbers.
+        let mut v = 0.0;
+        for _ in 0..7 {
+            v = bump_lora_strength(v, LORA_STRENGTH_STEP);
+        }
+        assert_eq!(v, 3.5);
+        assert_eq!(bump_lora_strength(LORA_STRENGTH_LIMIT, LORA_STRENGTH_STEP), LORA_STRENGTH_LIMIT);
+        assert_eq!(
+            bump_lora_strength(-LORA_STRENGTH_LIMIT, -LORA_STRENGTH_STEP),
+            -LORA_STRENGTH_LIMIT
+        );
+    }
+
+    #[test]
+    fn strengths_linked_tracks_equality_not_a_stored_flag() {
+        let mut l = card_lora("a.safetensors", 0.8);
+        assert!(l.strengths_linked(), "an equal pair is linked by default");
+        l.strength_clip = 0.7;
+        assert!(!l.strengths_linked(), "a pasted 0.8/0.7 pair reads as unlinked, not collapsed");
+        l.strength_clip = 0.8004;
+        assert!(l.strengths_linked(), "slider-precision equality still counts");
     }
 
     #[test]

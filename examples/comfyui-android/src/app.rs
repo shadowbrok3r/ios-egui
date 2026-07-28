@@ -1260,6 +1260,10 @@ struct ComfyApp {
     queue_variants: usize,
     /// Bypass the Wan LoRA filter in the video pickers (session-only).
     video_lora_show_all: bool,
+    /// LoRA files whose Model/CLIP strength lock the user opened (persisted). Everything not in
+    /// here moves the pair together; see [`crate::types::ActiveLora::strengths_linked`] for why an
+    /// already-differing pair needs no entry.
+    lora_unlinked: HashSet<String>,
     /// Long-press menu on empty graph canvas: `(graph_pos, screen_pos, armed)`.
     /// `armed` stays false until the opening press is released so that release doesn't dismiss.
     canvas_menu: Option<(egui::Pos2, egui::Pos2, bool)>,
@@ -1815,6 +1819,7 @@ impl ComfyApp {
             viewer_remix_long_fired: false,
             queue_variants: 1,
             video_lora_show_all: false,
+            lora_unlinked: HashSet::new(),
             canvas_menu: None,
             node_menu: None,
             gallery_scroll_y: 0.0,
@@ -4547,6 +4552,11 @@ impl ComfyApp {
             rewrite_engine: self.rewrite_engine,
             variation_count: self.variation_count,
             variation_strength: self.variation_strength,
+            lora_unlinked: {
+                let mut v: Vec<String> = self.lora_unlinked.iter().cloned().collect();
+                v.sort();
+                v
+            },
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -4617,6 +4627,7 @@ impl ComfyApp {
         self.rewrite_engine = saved.rewrite_engine;
         self.variation_count = saved.variation_count.clamp(*VARIATION_COUNT_RANGE.start(), *VARIATION_COUNT_RANGE.end());
         self.variation_strength = saved.variation_strength;
+        self.lora_unlinked = saved.lora_unlinked.into_iter().collect();
         #[cfg(feature = "local-npu")]
         {
             self.local_npu = saved.local_npu;
@@ -7332,6 +7343,9 @@ impl ComfyApp {
             self.video_lora_options(&self.params.video.unet_high, &self.params.video.loras_high);
         let lo_options =
             self.video_lora_options(&self.params.video.unet_low, &self.params.video.loras_low);
+        // Snapshot each row's catalogued range up front: the list itself is borrowed mutably below.
+        let hi_ranges = self.video_lora_ranges(&self.params.video.loras_high);
+        let lo_ranges = self.video_lora_ranges(&self.params.video.loras_low);
         ui.checkbox(&mut self.video_lora_show_all, "Show all LoRAs")
             .on_hover_text("Skip the Wan filter (catalog bases + wan filename match)");
         egui::CollapsingHeader::new("High noise LoRAs")
@@ -7342,6 +7356,7 @@ impl ComfyApp {
                     ui,
                     &mut self.params.video.loras_high,
                     &hi_options,
+                    &hi_ranges,
                     "vlora_hi",
                 ) {
                     self.on_video_lora_event(true, ev);
@@ -7355,6 +7370,7 @@ impl ComfyApp {
                     ui,
                     &mut self.params.video.loras_low,
                     &lo_options,
+                    &lo_ranges,
                     "vlora_lo",
                 ) {
                     self.on_video_lora_event(false, ev);
@@ -10185,6 +10201,8 @@ impl ComfyApp {
         if !self.params.loras.is_empty() {
             ui.label("Active");
             let mut remove: Option<usize> = None;
+            // `(file, was linked)` — the lock button's meaning depends on the state it was drawn in.
+            let mut toggle_link: Option<(String, bool)> = None;
             for (i, lora) in self.params.loras.clone().iter().enumerate() {
                 let title = self
                     .lora_catalog
@@ -10212,28 +10230,56 @@ impl ComfyApp {
                             remove = Some(i);
                         }
                     });
+                    let unlinked_pref = self.lora_unlinked.contains(&lora.file);
                     if let Some(slot) = self.params.loras.get_mut(i) {
-                        let (lo, hi) = meta
-                            .as_ref()
-                            .map(|e| {
-                                let lo = e.strength_model_min.unwrap_or(-2.0);
-                                let hi = e.strength_model_max.unwrap_or(2.0);
-                                (lo.min(hi), lo.max(hi).max(lo + 0.01))
-                            })
-                            .unwrap_or((-2.0, 2.0));
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::Slider::new(&mut slot.strength_model, lo..=hi).text("Model"),
-                            );
-                            if let Some(meta) = meta.as_ref() {
-                                ui.weak(sanitize_ui_text(
-                                    ui,
-                                    &format!("rec: {}", meta.strength_hint()),
-                                ));
-                            }
-                        });
+                        let linked = !unlinked_pref && slot.strengths_linked();
+                        // One track for both sliders, so a linked pair reads as a single number.
+                        let range = crate::types::lora_strength_range(
+                            meta.as_ref().map(|e| e.strength_range()),
+                            &[slot.strength_model, slot.strength_clip],
+                        );
+                        lora_strength_row(
+                            ui,
+                            "Model",
+                            &mut slot.strength_model,
+                            range.clone(),
+                            true,
+                            |_| {},
+                        );
+                        if linked {
+                            // Mirror before drawing CLIP so the locked slider shows this frame's
+                            // number rather than trailing the Model slider by a frame.
+                            slot.strength_clip = slot.strength_model;
+                        }
                         if !slot.model_only {
-                            ui.add(egui::Slider::new(&mut slot.strength_clip, lo..=hi).text("CLIP"));
+                            let mut toggled = false;
+                            lora_strength_row(
+                                ui,
+                                "CLIP",
+                                &mut slot.strength_clip,
+                                range,
+                                !linked,
+                                |ui| {
+                                    let (icon, hint) = if linked {
+                                        (icons::LOCKED, "CLIP follows Model — tap to set them apart")
+                                    } else {
+                                        (
+                                            icons::UNLOCKED,
+                                            "CLIP is independent — tap to lock it to Model",
+                                        )
+                                    };
+                                    toggled = ui.small_button(icon).on_hover_text(hint).clicked();
+                                },
+                            );
+                            if toggled {
+                                toggle_link = Some((lora.file.clone(), linked));
+                            }
+                        }
+                        if let Some(meta) = meta.as_ref() {
+                            ui.weak(sanitize_ui_text(
+                                ui,
+                                &format!("rec: {}", meta.strength_hint()),
+                            ));
                         }
                         ui.checkbox(&mut slot.model_only, "Model only (no CLIP)");
                     }
@@ -10245,6 +10291,19 @@ impl ComfyApp {
                             lora_meta_body(ui, &lora.file, meta.as_ref());
                         });
                 });
+            }
+            if let Some((file, was_linked)) = toggle_link {
+                if was_linked {
+                    self.lora_unlinked.insert(file);
+                } else {
+                    // Locking is the explicit moment the two numbers are allowed to collapse:
+                    // clearing the preference alone would leave an already-differing pair reading
+                    // as unlinked, so the button would appear to do nothing.
+                    self.lora_unlinked.remove(&file);
+                    if let Some(slot) = self.params.loras.iter_mut().find(|l| l.file == file) {
+                        slot.strength_clip = slot.strength_model;
+                    }
+                }
             }
             if let Some(i) = remove {
                 self.remove_lora_at(i);
@@ -11360,6 +11419,11 @@ impl ComfyApp {
         }
         out.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
         out
+    }
+
+    /// Catalogued strength window per Wan stack row, positionally matching `list`.
+    fn video_lora_ranges(&self, list: &[ActiveLora]) -> Vec<Option<(f32, f32)>> {
+        list.iter().map(|l| self.lora_catalog.entry(&l.file).map(|e| e.strength_range())).collect()
     }
 
     /// Apply catalog strengths/negatives for a picked Wan LoRA, then re-derive triggers.
@@ -22379,6 +22443,7 @@ fn video_lora_list(
     ui: &mut egui::Ui,
     list: &mut Vec<crate::types::ActiveLora>,
     installed: &[String],
+    ranges: &[Option<(f32, f32)>],
     salt: &str,
 ) -> Option<VloraEvent> {
     let mut event = None;
@@ -22390,16 +22455,17 @@ fn video_lora_list(
             if lora.file != before {
                 event = Some(VloraEvent::Picked(i));
             }
-            ui.horizontal(|ui| {
-                ui.add(egui::Slider::new(&mut lora.strength_model, 0.0..=2.0).text("Model"));
-                if ui
-                    .small_button(icons::TRASH)
-                    .on_hover_text("Remove LoRA")
-                    .clicked()
-                {
-                    remove = Some(i);
-                }
+            // Wan LoRAs are model-only and never want a negative strength, so the fallback floor is
+            // 0 rather than −2; past that the track behaves like the Create tab's.
+            let base = ranges.get(i).copied().flatten().or(Some((0.0, 2.0)));
+            let range = crate::types::lora_strength_range(base, &[lora.strength_model]);
+            let mut kill = false;
+            lora_strength_row(ui, "Model", &mut lora.strength_model, range, true, |ui| {
+                kill = ui.small_button(icons::TRASH).on_hover_text("Remove LoRA").clicked();
             });
+            if kill {
+                remove = Some(i);
+            }
             if lora.strength_model == 0.0 || lora.file.trim().is_empty() {
                 ui.weak("inert — spare slot");
             }
@@ -22451,6 +22517,47 @@ fn centered_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
         egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Center),
         add,
     );
+}
+
+/// One LoRA strength slider flanked by ◀ / ▶ buttons that step by [`LORA_STRENGTH_STEP`].
+///
+/// The buttons — and the value box, via [`egui::SliderClamping::Never`] — are free to take the
+/// value past the ends of `range`; the track is a precision window over the catalogued
+/// recommendation, not a limit (see [`crate::types::lora_strength_range`]). `enabled` is false for
+/// a CLIP slider that is currently locked to Model, which also drops its step buttons: the value is
+/// still readable, it just isn't the thing you edit.
+fn lora_strength_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    enabled: bool,
+    lead: impl FnOnce(&mut egui::Ui),
+) -> bool {
+    let step = crate::types::LORA_STRENGTH_STEP;
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        lead(ui);
+        if enabled && ui.small_button(icons::BACK).on_hover_text(format!("−{step:.2}")).clicked() {
+            *value = crate::types::bump_lora_strength(*value, -step);
+            changed = true;
+        }
+        // Whatever is left after the buttons already drawn, less the value box, the text label and
+        // the trailing ▶ — sized so the row fits the card instead of clipping its last button.
+        ui.spacing_mut().slider_width = (ui.available_width() - 140.0).clamp(56.0, 220.0);
+        changed |= ui
+            .add_enabled(
+                enabled,
+                egui::Slider::new(value, range).clamping(egui::SliderClamping::Never).text(label),
+            )
+            .changed();
+        if enabled && ui.small_button(icons::FORWARD).on_hover_text(format!("+{step:.2}")).clicked()
+        {
+            *value = crate::types::bump_lora_strength(*value, step);
+            changed = true;
+        }
+    });
+    changed
 }
 
 /// Underlined title with − / value / + (text field, not a drag slider).
