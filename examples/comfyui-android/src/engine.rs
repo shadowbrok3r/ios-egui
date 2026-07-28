@@ -145,8 +145,9 @@ pub enum Msg {
     GalleryMutated(String),
     /// Trash row ids for the images a delete just moved — fuels the Undo snackbar.
     TrashedIds(Vec<i64>),
-    /// A delete response reported per-item failures; optimistic tombstones must lift.
-    TrashFailed,
+    /// Items a delete did not remove; their optimistic tombstones must lift. Never the whole
+    /// request — an item the server did trash stays hidden even when a sibling failed.
+    TrashFailed(Vec<(String, String)>),
     /// One page of the server trash listing (`/gallery/api/list?trash=1`).
     TrashPage { total: u64, items: Vec<crate::types::TrashItem> },
     /// A restore/purge finished; the UI reloads the trash view (and the gallery on restore).
@@ -1197,6 +1198,7 @@ impl Engine {
             .first()
             .map(|(sf, f)| format!("{sf}/{f}"))
             .unwrap_or_default();
+        let keys = items.clone();
         let body = items_body(items);
         let (tx, ctx, log) = self.emitters();
         self.rt.spawn(async move {
@@ -1227,10 +1229,14 @@ impl Engine {
                                         .collect()
                                 })
                                 .unwrap_or_default();
-                            if !errors.is_empty() {
-                                let _ = tx.send(Msg::TrashFailed);
-                            }
                             let gone = trashed + cleared;
+                            // Un-hide only what the server still holds: everything on a total
+                            // failure, else just the items its `errors` name.
+                            let live =
+                                if gone == 0 { keys.clone() } else { failed_keys(&keys, &errors) };
+                            if !live.is_empty() {
+                                let _ = tx.send(Msg::TrashFailed(live));
+                            }
                             if gone == 0 {
                                 let why = if errors.is_empty() {
                                     "server rejected every item".into()
@@ -1259,10 +1265,12 @@ impl Engine {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     log.error(format!("delete failed: HTTP {status}: {}", head(&body, 200)));
+                    let _ = tx.send(Msg::TrashFailed(keys));
                     Msg::AlbumError(format!("Delete failed: HTTP {status}"))
                 }
                 Err(e) => {
                     log.error(format!("delete failed: {e}"));
+                    let _ = tx.send(Msg::TrashFailed(keys));
                     Msg::AlbumError(format!("Delete failed: {e}"))
                 }
             };
@@ -3058,6 +3066,16 @@ fn items_body(items: Vec<(String, String)>) -> Value {
     serde_json::json!({ "items": items })
 }
 
+/// Which of `keys` a delete response's `errors` name. comfy-gate formats each line
+/// `"<filename>: <why>"`, so the match is by filename — a name shared across subfolders lifts both.
+fn failed_keys(keys: &[(String, String)], errors: &[String]) -> Vec<(String, String)> {
+    let named: std::collections::HashSet<&str> = errors
+        .iter()
+        .map(|e| e.split_once(": ").map(|(f, _)| f).unwrap_or(e.as_str()))
+        .collect();
+    keys.iter().filter(|(_, f)| named.contains(f.as_str())).cloned().collect()
+}
+
 /// Pull the session token out of a login response's `Set-Cookie` headers.
 ///
 /// A wrong password is not an HTTP error from comfy-gate — success and failure are both a 303, and
@@ -3136,6 +3154,31 @@ mod tests {
 
     fn current(id: Option<&str>) -> CurrentPrompt {
         Arc::new(Mutex::new(id.map(str::to_string)))
+    }
+
+    /// A partial delete must lift the tombstone for the failed item only — lifting the whole
+    /// request is what used to make just-deleted siblings reappear in the grid.
+    #[test]
+    fn failed_keys_names_only_the_items_the_server_rejected() {
+        let keys = vec![
+            ("u1/a".to_string(), "one.png".to_string()),
+            ("u1/a".to_string(), "two.png".to_string()),
+            ("u1/b".to_string(), "three.png".to_string()),
+        ];
+        let errors = vec!["two.png: Permission denied".to_string()];
+        assert_eq!(failed_keys(&keys, &errors), vec![("u1/a".into(), "two.png".into())]);
+        assert!(failed_keys(&keys, &[]).is_empty());
+    }
+
+    /// The same filename under two folders is one error line; both copies stop being hidden.
+    #[test]
+    fn failed_keys_lifts_every_folder_sharing_a_named_filename() {
+        let keys = vec![
+            ("u1/a".to_string(), "dup.png".to_string()),
+            ("u1/b".to_string(), "dup.png".to_string()),
+        ];
+        let errors = vec!["dup.png: not found".to_string()];
+        assert_eq!(failed_keys(&keys, &errors).len(), 2);
     }
 
     /// The gate has no graph to read the family from on this endpoint, so a present-but-blank

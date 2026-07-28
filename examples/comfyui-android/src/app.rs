@@ -35,7 +35,7 @@ use crate::types::{
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, GenMode, Img2ImgSource, LoraCatalog,
     LoraPack, Mode, TrashItem, ModelKind, Params, PromptHist, RatingFilter, RewriteEngine,
-    SamplerPack, Settings, VARIATION_COUNT_RANGE, VariationStrength,
+    SamplerPack, Settings, Tombstone, VARIATION_COUNT_RANGE, VariationStrength,
     append_negatives, checkpoint_family, fallback_vec, file_basename, is_wan_related, merge_triggers,
     pick_wan_unet_pair, push_prompt_hist, strip_injected,
 };
@@ -44,6 +44,13 @@ use crate::types::LocalBackend;
 
 /// Ceiling on auto-loaded gallery items, so a huge namespace can't page forever.
 const GALLERY_LOAD_ALL_CAP: u64 = 5000;
+/// How long a deleted key stays hidden from incoming listings.
+const TOMBSTONE_TTL_SECS: f64 = 7.0 * 24.0 * 3600.0;
+/// Hiding window for a tombstone with no recorded size — long enough for a delete to settle in the
+/// server index, short enough that a recycled filename isn't hidden for long.
+const TOMBSTONE_SETTLE_SECS: f64 = 120.0;
+/// Cap on kept tombstones (newest first), so heavy deleting can't grow the settings file forever.
+const TOMBSTONE_MAX: usize = 4000;
 /// comfy-gate clamps `/gallery/api/list` `limit` at this.
 const GALLERY_PAGE_MAX: u64 = 500;
 /// `AppliedMainLook::origin` sentinel marking a baked-in preset (vs "" global or a character name).
@@ -53,6 +60,13 @@ const RESET_CONFIRM_SECS: f64 = 4.0;
 /// Height (pt) of the framework's floating Paste/Copy/Cut/Select-all bar, plus its gap above the
 /// keyboard. Measured, not read back: only `egui-android` knows the bar's real rect.
 const TEXT_ACTIONS_BAR_H: f32 = 64.0;
+
+/// What a delete recorded about a row: its byte size (0 = the listing never said) and when.
+#[derive(Clone, Copy)]
+struct Deleted {
+    size: u64,
+    at: f64,
+}
 
 enum Conn {
     Disconnected,
@@ -1145,8 +1159,9 @@ struct ComfyApp {
     /// Server-side rows consumed by the current listing (next page offset); tombstone-filtered
     /// pages make `gallery.len()` undercount it.
     gallery_fetch_pos: u64,
-    /// Recently deleted keys, hidden from incoming pages until the server index settles.
-    trash_tombstones: HashMap<(String, String), std::time::Instant>,
+    /// Deleted keys hidden from incoming pages until the server index settles, holding each row's
+    /// size and delete time. Persisted: a resurrected row must stay hidden across a restart too.
+    trash_tombstones: HashMap<(String, String), Deleted>,
     albums: Vec<Album>,
     facets: Facets,
     album_new_name: String,
@@ -2271,9 +2286,8 @@ impl ComfyApp {
             Msg::AlbumError(e) => {
                 self.gallery_status = elide(&e, 160);
                 self.album_pending_add = None;
-                // A failed delete rides this message; optimistic tombstones must not keep
-                // hiding images the server never trashed.
-                self.trash_tombstones.clear();
+                // A failed delete rides this message, but the tombstones it must lift arrive
+                // keyed on `TrashFailed` — clearing them all here would unhide earlier deletes.
                 host.haptic(Haptic::Error);
             }
             Msg::GalleryMutated(note) => {
@@ -2287,9 +2301,11 @@ impl ComfyApp {
                 // Undo handle for the snackbar; a newer delete replaces the older window.
                 self.undo_trash = Some((ids, ctx.input(|i| i.time)));
             }
-            Msg::TrashFailed => {
-                // Items the server could not trash are still live; stop hiding them.
-                self.trash_tombstones.clear();
+            Msg::TrashFailed(keys) => {
+                // Exactly the items the server could not trash are still live; stop hiding those.
+                for k in &keys {
+                    self.trash_tombstones.remove(k);
+                }
             }
             Msg::TrashPage { total, items } => {
                 self.trash_loading = false;
@@ -2857,18 +2873,16 @@ impl ComfyApp {
                 // Server rows consumed, counted before tombstones shrink the page.
                 let fetched = page.offset + page.items.len() as u64;
                 self.gallery_fetch_pos = fetched;
-                self.trash_tombstones.retain(|_, t| t.elapsed().as_secs() < 120);
+                self.prune_tombstones();
+                self.drop_stale_cache(&page.items);
                 // A listing indexed mid-delete can still carry just-deleted rows; hide them
                 // until the server prunes the ghosts.
-                let fresh: Vec<GalleryItem> = page
-                    .items
-                    .into_iter()
-                    .filter(|it| {
-                        !self
-                            .trash_tombstones
-                            .contains_key(&(it.subfolder.clone(), it.filename.clone()))
-                    })
-                    .collect();
+                let mut fresh: Vec<GalleryItem> = Vec::with_capacity(page.items.len());
+                for it in page.items {
+                    if !self.tombstone_hides(&it) {
+                        fresh.push(it);
+                    }
+                }
                 if page.offset == 0 {
                     self.gallery = fresh;
                 } else {
@@ -3892,33 +3906,6 @@ impl ComfyApp {
         }
     }
 
-    fn share_bytes(&mut self, host: &Host, bytes: &[u8], name: &str) -> String {
-        let Some(dir) = host.documents_dir() else {
-            return "No storage directory".into();
-        };
-        let folder = format!("{dir}/comfyui/share");
-        let _ = std::fs::create_dir_all(&folder);
-        let path = format!("{folder}/{name}");
-        match std::fs::write(&path, bytes) {
-            Ok(()) => {
-                let mime = if name.to_lowercase().ends_with(".mp4") {
-                    "video/mp4"
-                } else if name.to_lowercase().ends_with(".webp") {
-                    "image/webp"
-                } else {
-                    "image/png"
-                };
-                host.share_media(&path, name, mime);
-                host.haptic(Haptic::Light);
-                "Opening share sheet…".to_string()
-            }
-            Err(e) => {
-                self.log.error(format!("share failed: {e}"));
-                format!("Share failed: {e}")
-            }
-        }
-    }
-
     /// The per-source preview + picker for the selected [`Img2ImgSource`], shared by the img2img
     /// setup block and the Video start-image row.
     fn image_source_preview(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -4519,6 +4506,7 @@ impl ComfyApp {
             checkpoint_favorites: self.checkpoint_favorites.clone(),
             checkpoint_recent: self.checkpoint_recent.clone(),
             confirm_gallery_delete: self.confirm_gallery_delete,
+            trash_tombstones: self.tombstones_sorted(),
             create_setup_open: self.create_setup_open,
             create_companions_open: self.create_companions_open,
             #[cfg(feature = "local-npu")]
@@ -4620,6 +4608,12 @@ impl ComfyApp {
         self.checkpoint_favorites = saved.checkpoint_favorites;
         self.checkpoint_recent = saved.checkpoint_recent;
         self.confirm_gallery_delete = saved.confirm_gallery_delete;
+        self.trash_tombstones = saved
+            .trash_tombstones
+            .into_iter()
+            .map(|t| ((t.subfolder, t.filename), Deleted { size: t.size, at: t.at }))
+            .collect();
+        self.prune_tombstones();
         self.create_setup_open = saved.create_setup_open;
         self.create_companions_open = saved.create_companions_open;
         self.prompt_history = saved.prompt_history;
@@ -13260,7 +13254,6 @@ impl ComfyApp {
         let n = self.results.len();
         let mut close = false;
         let mut save = false;
-        let mut share = false;
         let mut inpaint = false;
         let mut go: Option<isize> = None;
         ui.horizontal(|ui| {
@@ -13275,9 +13268,6 @@ impl ComfyApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Save").clicked() {
                     save = true;
-                }
-                if ui.button("Share").on_hover_text("Share via other apps").clicked() {
-                    share = true;
                 }
                 if ui
                     .button(format!("{} Fix area", icons::MODEL))
@@ -13318,15 +13308,17 @@ impl ComfyApp {
                 );
             });
         });
+        // Swipe across the image steps the batch, same gesture as the gallery viewer.
+        if go.is_none()
+            && let Some(dir) = self.horizontal_swipe(ui, image_rect)
+        {
+            go = Some(dir as isize);
+        }
 
         if close {
             self.result_view = None;
         } else if save {
             self.save_result_at(host, idx);
-        } else if share {
-            let bytes = self.results[idx].1.clone();
-            let name = format!("output-{}.png", idx + 1);
-            self.note = self.share_bytes(host, &bytes, &name);
         } else if inpaint {
             let bytes = self.results[idx].1.clone();
             let name = format!("output-{}.png", idx + 1);
@@ -16282,10 +16274,21 @@ impl ComfyApp {
         gallery::resolve_full_cache_root(host.documents_dir().as_deref())
     }
 
-    /// Memoized cache root; refreshes when missing.
+    /// Memoized cache root; refreshes when missing. Also marks the tree `.nomedia` so the cached
+    /// full-size images never reach the phone's Photos app — only an explicit Save does that.
     fn ensure_full_cache_root(&mut self, host: &Host) -> Option<&str> {
         if self.full_cache_root.is_none() {
             self.full_cache_root = Self::resolve_full_cache_root(host);
+            if let Some(root) = self.full_cache_root.clone() {
+                let mut marked = gallery::ensure_nomedia(gallery::DURABLE_GALLERY_ROOT);
+                marked |= gallery::ensure_nomedia(&root);
+                // Images indexed before the marker existed only leave Photos on a rescan.
+                if marked {
+                    host.media_scan(gallery::DURABLE_GALLERY_ROOT);
+                    host.media_scan(root);
+                    self.log.info("gallery cache marked .nomedia; asked Photos to rescan");
+                }
+            }
         }
         self.full_cache_root.as_deref()
     }
@@ -17463,11 +17466,94 @@ impl ComfyApp {
     /// Tombstone the keys, then send the delete: a listing the server indexed mid-delete can
     /// still carry these rows, and the tombstones keep them out of the grid until it settles.
     fn send_delete_images(&mut self, items: Vec<(String, String)>) {
-        let now = std::time::Instant::now();
-        for it in &items {
-            self.trash_tombstones.insert(it.clone(), now);
+        let at = unix_now();
+        let root = self.full_cache_root.clone();
+        // Sizes come from the listing, and tell a resurrected row apart from a new image that was
+        // handed the same filename.
+        let sized: Vec<((String, String), u64)> = items
+            .iter()
+            .map(|(sub, file)| {
+                let size = self
+                    .gallery
+                    .iter()
+                    .find(|it| &it.subfolder == sub && &it.filename == file)
+                    .map(|it| it.size)
+                    .unwrap_or(0);
+                ((sub.clone(), file.clone()), size)
+            })
+            .collect();
+        for (key, size) in sized {
+            // Drop the on-device copy too; a deleted image should stop occupying the phone.
+            if let Some(root) = root.as_deref() {
+                gallery::forget_full_cache(root, &format!("{}/{}", key.0, key.1));
+            }
+            self.thumbs.forget(&format!("{}/{}", key.0, key.1));
+            self.trash_tombstones.insert(key, Deleted { size, at });
         }
+        self.prune_tombstones();
         self.engine.as_ref().unwrap().delete_images(items);
+    }
+
+    /// Whether a recent delete should keep `it` out of the grid; a retired tombstone is dropped.
+    fn tombstone_hides(&mut self, it: &GalleryItem) -> bool {
+        let key = (it.subfolder.clone(), it.filename.clone());
+        let Some(&Deleted { size, at }) = self.trash_tombstones.get(&key) else {
+            return false;
+        };
+        let verdict =
+            gallery::tombstone_verdict(size, it.size, unix_now() - at, TOMBSTONE_SETTLE_SECS);
+        if verdict != gallery::TombstoneVerdict::Hide {
+            self.trash_tombstones.remove(&key);
+        }
+        verdict == gallery::TombstoneVerdict::Hide
+    }
+
+    /// Evict cached copies whose byte length disagrees with the listing.
+    ///
+    /// ComfyUI numbers a save by `max(existing) + 1` over the output folder, and comfy-gate's soft
+    /// delete moves the file into `.trash/` where that scan can't see it — so deleting the
+    /// highest-numbered image hands its exact filename to the next render. Both caches are keyed by
+    /// name, and would otherwise keep serving the deleted image's pixels under the new file's name.
+    fn drop_stale_cache(&mut self, items: &[GalleryItem]) {
+        let Some(root) = self.full_cache_root.clone() else { return };
+        for it in items.iter().filter(|it| it.size > 0) {
+            let key = it.key();
+            if gallery::full_cache_len(&root, &key).is_some_and(|len| len != it.size) {
+                gallery::forget_full_cache(&root, &key);
+                self.thumbs.forget(&key);
+                self.log.info(format!("gallery cache: {} changed on the server", elide(&key, 60)));
+            }
+        }
+    }
+
+    /// Tombstones in a stable order — autosave diffs the serialized settings, so `HashMap` order
+    /// would rewrite the file every second.
+    fn tombstones_sorted(&self) -> Vec<Tombstone> {
+        let mut out: Vec<Tombstone> = self
+            .trash_tombstones
+            .iter()
+            .map(|((subfolder, filename), d)| Tombstone {
+                subfolder: subfolder.clone(),
+                filename: filename.clone(),
+                size: d.size,
+                at: d.at,
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.subfolder, &a.filename).cmp(&(&b.subfolder, &b.filename)));
+        out
+    }
+
+    /// Expire tombstones past their TTL and keep only the newest [`TOMBSTONE_MAX`].
+    fn prune_tombstones(&mut self) {
+        let now = unix_now();
+        self.trash_tombstones.retain(|_, d| now - d.at < TOMBSTONE_TTL_SECS);
+        if self.trash_tombstones.len() <= TOMBSTONE_MAX {
+            return;
+        }
+        let mut by_age: Vec<((String, String), Deleted)> = self.trash_tombstones.drain().collect();
+        by_age.sort_by(|(_, a), (_, b)| b.at.total_cmp(&a.at));
+        by_age.truncate(TOMBSTONE_MAX);
+        self.trash_tombstones = by_age.into_iter().collect();
     }
 
     /// Prefer the next filmstrip neighbor after a viewer delete; fall back to previous.
@@ -18075,10 +18161,11 @@ impl ComfyApp {
     }
 
     /// Horizontal swipe over `rect`: `1` = next, `-1` = previous. Vertical-dominant drags ignored.
+    /// Shared by the gallery viewer and the Create-result viewer, which are never open together.
     ///
     /// egui clears `press_origin` on the release frame, so the press is tracked in
     /// [`Self::viewer_swipe_origin`].
-    fn viewer_horizontal_swipe(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Option<i32> {
+    fn horizontal_swipe(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Option<i32> {
         let (pressed, released, down, pos) = ui.input(|i| {
             (
                 i.pointer.any_pressed(),
@@ -19075,7 +19162,7 @@ impl ComfyApp {
             // Horizontal swipe changes the picture (dominant X drag from the image area).
             if act.is_none()
                 && self.remix_sheet.is_none()
-                && let Some(dir) = self.viewer_horizontal_swipe(ui, image_rect)
+                && let Some(dir) = self.horizontal_swipe(ui, image_rect)
             {
                 let cur = self.viewer.as_ref().unwrap().idx;
                 if let Some(n) = self.gallery_neighbor(cur, dir) {
@@ -22922,6 +23009,14 @@ fn str_fingerprint(s: &str) -> u64 {
     let mut h = DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+/// Wall clock in unix seconds. Tombstones outlive the process, so `Instant` cannot time them.
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Compact tag-count label: `1.2M`, `87k`, or the bare number.

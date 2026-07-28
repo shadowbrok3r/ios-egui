@@ -39,6 +39,7 @@ const K_SAVE_GALLERY: i32 = 104;
 const K_REQ_MEDIA_PERM: i32 = 105;
 const K_SHARE_MEDIA: i32 = 106;
 const K_SET_ORIENTATION: i32 = 107;
+const K_MEDIA_SCAN: i32 = 108;
 
 // ActivityInfo.SCREEN_ORIENTATION_* constants.
 const SCREEN_ORIENTATION_UNSPECIFIED: i32 = -1;
@@ -114,6 +115,11 @@ pub fn drain(host: &Host) {
                 start_settings_for_package("android.settings.APPLICATION_DETAILS_SETTINGS")
             }
             K_SET_ORIENTATION => jni_set_orientation(host.drv_int()),
+            K_MEDIA_SCAN => {
+                if let Some(path) = host.drv_str_a() {
+                    media_scan(&path);
+                }
+            }
             other => log::info!("egui-android: host request kind {other} not handled"),
         }
     }
@@ -567,6 +573,32 @@ fn share_media(path: &str, name: &str, mime: &str) {
     });
     if done.is_none() {
         log::error!("share_media: JNI call failed for {name}");
+    }
+}
+
+/// Hand `path` to MediaProvider for a rescan. A directory holding `.nomedia` drops the Photos
+/// entries it was indexed under. Best-effort; failures are logged and swallowed.
+fn media_scan(path: &str) {
+    let done = with_activity(|env, activity| {
+        let jpath = env.new_string(path)?;
+        let paths = env.new_object_array(1, "java/lang/String", &jpath)?;
+        let null = JObject::null();
+        env.call_static_method(
+            "android/media/MediaScannerConnection",
+            "scanFile",
+            "(Landroid/content/Context;[Ljava/lang/String;[Ljava/lang/String;Landroid/media/MediaScannerConnection$OnScanCompletedListener;)V",
+            &[
+                JValue::Object(activity),
+                (&paths).into(),
+                (&null).into(),
+                (&null).into(),
+            ],
+        )?;
+        log::info!("media_scan: {path}");
+        Ok(())
+    });
+    if done.is_none() {
+        log::error!("media_scan: JNI call failed for {path}");
     }
 }
 
@@ -1420,6 +1452,9 @@ pub trait HostExt {
     /// Insert an image/video file into MediaStore, then present the system share sheet for it.
     /// `mime` is e.g. `"image/png"` or `"video/mp4"`.
     fn share_media(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>);
+    /// Rescan a file or directory into MediaStore. A directory holding `.nomedia` loses the Photos
+    /// entries an earlier scan gave it, so this is how an app un-publishes its own image folder.
+    fn media_scan(&self, path: impl Into<String>);
     /// Ask the user to grant photo-gallery access. Because `ndk_context` only exposes the
     /// Application (not the Activity) under android-activity 0.6, the runtime permission dialog
     /// can't be shown from here, so this opens the app's Settings page where the user toggles
@@ -1503,6 +1538,9 @@ impl HostExt for Host {
         // Same tab-packed meta as save_to_gallery: path in str_a, "name\tmime" in str_b.
         let meta = format!("{}\t{}", display_name.into(), mime.into());
         self.drv_enqueue(K_SHARE_MEDIA, Some(path.into()), Some(meta), 0);
+    }
+    fn media_scan(&self, path: impl Into<String>) {
+        self.drv_enqueue(K_MEDIA_SCAN, Some(path.into()), None, 0);
     }
     fn request_media_images_permission(&self) {
         self.drv_enqueue(K_REQ_MEDIA_PERM, None, None, 0);

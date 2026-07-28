@@ -2191,6 +2191,10 @@ pub struct Settings {
     /// Ask before deleting gallery images (viewer or multi-select).
     #[serde(default = "default_true")]
     pub confirm_gallery_delete: bool,
+    /// Deleted gallery keys, sorted so an unchanged set serializes identically. Kept across
+    /// restarts so a row the server index resurrects stays hidden instead of coming back on launch.
+    #[serde(default)]
+    pub trash_tombstones: Vec<Tombstone>,
     /// Create Main: text-encoder/VAE and img2img source block is expanded.
     #[serde(default = "default_true")]
     pub create_setup_open: bool,
@@ -2362,6 +2366,23 @@ impl TrashItem {
     pub fn thumb_key(&self, size: u32) -> String {
         format!("{}/{}#{size}", self.subfolder, self.filename)
     }
+}
+
+/// A deleted gallery row, remembered so a listing indexed mid-delete can't put it back on screen.
+///
+/// `size` is the image's byte length when it was deleted. ComfyUI numbers a save `max(existing) + 1`
+/// over the output folder and comfy-gate's soft delete moves the file out of that folder, so the
+/// next render can be handed the same filename — a row with this name but a different size is a new
+/// image, not the deleted one.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub subfolder: String,
+    pub filename: String,
+    #[serde(default)]
+    pub size: u64,
+    /// Unix seconds at delete time.
+    #[serde(default)]
+    pub at: f64,
 }
 
 /// One image in the server's `/gallery/api/list` response.

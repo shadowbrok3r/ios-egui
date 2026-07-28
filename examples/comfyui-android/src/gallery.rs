@@ -721,6 +721,9 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 /// Durable gallery tree (same root as model packs). Full images live in `gallery_full/`.
 pub const DURABLE_GALLERY_ROOT: &str = "/storage/emulated/0/ComfyUI";
 
+/// Keeps Android's media scanner from indexing a directory tree into the phone's Photos app.
+const NOMEDIA: &str = ".nomedia";
+
 /// Soft cap on the full-image cache; oldest mtime files evict first.
 const FULL_CACHE_BUDGET: u64 = 32 * 1024 * 1024 * 1024;
 
@@ -771,7 +774,52 @@ fn full_cache_key_path(dir: &Path, key: &str) -> PathBuf {
 
 fn is_full_cache_meta(name: &std::ffi::OsStr) -> bool {
     let s = name.to_string_lossy();
-    s == ".write_test" || s.ends_with(".key")
+    s == ".write_test" || s == NOMEDIA || s.ends_with(".key")
+}
+
+/// What a delete's tombstone should do with a listing row carrying its name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TombstoneVerdict {
+    /// The deleted image itself, still in the server index — keep it out of the grid.
+    Hide,
+    /// A different image under the recycled save number — retire the tombstone and show it.
+    Recycled,
+    /// Nothing identifiable left to hide.
+    Expired,
+}
+
+/// Rule the gallery applies to a listed row a delete tombstoned.
+///
+/// `deleted` is the row's byte size at delete time (0 when the listing never said), `listed` the
+/// size the server reports now, `age` seconds since the delete, `settle` how long a sizeless
+/// tombstone may hide. Sizes decide it when both are known: ComfyUI numbers a save
+/// `max(existing) + 1` over the output folder and comfy-gate's soft delete moves the file out of
+/// that folder, so the next render can be handed the deleted image's exact filename.
+pub fn tombstone_verdict(deleted: u64, listed: u64, age: f64, settle: f64) -> TombstoneVerdict {
+    if deleted > 0 && listed > 0 && deleted != listed {
+        return TombstoneVerdict::Recycled;
+    }
+    if deleted > 0 || age < settle {
+        TombstoneVerdict::Hide
+    } else {
+        TombstoneVerdict::Expired
+    }
+}
+
+/// Write `.nomedia` into `dir`; true only when it was newly created (nothing there before).
+pub fn ensure_nomedia(dir: &str) -> bool {
+    let path = Path::new(dir).join(NOMEDIA);
+    if path.exists() {
+        return false;
+    }
+    std::fs::create_dir_all(dir).is_ok() && std::fs::write(&path, b"").is_ok()
+}
+
+/// Drop a cached image and its key sidecar, so a deleted server image stops occupying the phone.
+pub fn forget_full_cache(root: &str, key: &str) {
+    let dir = Path::new(root);
+    let _ = std::fs::remove_file(full_cache_path(dir, key));
+    let _ = std::fs::remove_file(full_cache_key_path(dir, key));
 }
 
 /// Persist the original gallery key next to a cached image (for CLIP indexing without a listing).
@@ -789,8 +837,15 @@ pub fn ensure_full_cache_key(root: &str, key: &str) {
 
 /// True when `root` holds a non-empty file for gallery key `subfolder/filename`.
 pub fn full_cache_has(root: &str, key: &str) -> bool {
+    full_cache_len(root, key).is_some()
+}
+
+/// Byte length of the cached image for `key`, or `None` when absent or empty. Compared against the
+/// listing's size to spot a cache entry whose filename now names different bytes.
+pub fn full_cache_len(root: &str, key: &str) -> Option<u64> {
     let path = full_cache_path(Path::new(root), key);
-    path.is_file() && path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+    let meta = path.metadata().ok().filter(|m| m.is_file())?;
+    (meta.len() > 0).then_some(meta.len())
 }
 
 /// Read a previously cached full image, or `None` on miss / IO error.
@@ -877,6 +932,10 @@ pub fn clear_full_cache(root: &str) -> Result<usize, String> {
     let mut n = 0usize;
     for ent in rd.flatten() {
         let path = ent.path();
+        // `.nomedia` stays: removing it re-publishes the tree to Photos on the next scan.
+        if ent.file_name() == NOMEDIA {
+            continue;
+        }
         if path.is_file() && std::fs::remove_file(&path).is_ok() {
             n += 1;
         }
@@ -1043,6 +1102,22 @@ impl ThumbCache {
         self.pending.clear();
     }
 
+    /// Drop every decoded size of one gallery key, and any in-flight claim on them.
+    pub fn forget(&mut self, key: &str) {
+        let prefix = format!("{key}#");
+        let mut freed = 0usize;
+        self.pending.retain(|k| !k.starts_with(&prefix));
+        self.order.retain(|(k, cost)| {
+            let stale = k.starts_with(&prefix);
+            if stale {
+                freed += *cost;
+            }
+            !stale
+        });
+        self.bytes = self.bytes.saturating_sub(freed);
+        self.textures.retain(|k, _| !k.starts_with(&prefix));
+    }
+
     pub fn insert(&mut self, key: String, tex: egui::TextureHandle, bytes: usize) {
         self.pending.remove(&key);
         if self.textures.insert(key.clone(), tex).is_none() {
@@ -1101,6 +1176,70 @@ mod tests {
         assert_eq!(meta.clips, vec!["clip_l.safetensors", "t5xxl.safetensors"]);
         assert_eq!(meta.clip_type.as_deref(), Some("flux"));
         assert_eq!(meta.vae.as_deref(), Some("ae.safetensors"));
+    }
+
+    /// The symptom this exists for: delete the newest image, render again, and ComfyUI writes the
+    /// filename just freed. Hiding by name alone would swallow that brand-new image.
+    #[test]
+    fn a_recycled_save_number_retires_the_tombstone() {
+        use TombstoneVerdict::*;
+        // Same name, same bytes: the delete has not reached the index yet.
+        assert_eq!(tombstone_verdict(1_048_576, 1_048_576, 5.0, 120.0), Hide);
+        // Same name, different bytes: a new image took the number.
+        assert_eq!(tombstone_verdict(1_048_576, 990_000, 5.0, 120.0), Recycled);
+        // Sizes stay decisive well past the settle window — that is what makes the long TTL safe.
+        assert_eq!(tombstone_verdict(1_048_576, 990_000, 86_400.0, 120.0), Recycled);
+        assert_eq!(tombstone_verdict(1_048_576, 1_048_576, 86_400.0, 120.0), Hide);
+    }
+
+    /// Without a recorded size there is nothing to tell the two apart, so the hide is brief.
+    #[test]
+    fn a_sizeless_tombstone_only_hides_while_the_delete_settles() {
+        use TombstoneVerdict::*;
+        assert_eq!(tombstone_verdict(0, 1_048_576, 5.0, 120.0), Hide);
+        assert_eq!(tombstone_verdict(0, 1_048_576, 300.0, 120.0), Expired);
+        // A listing that omits size falls back to the same window.
+        assert_eq!(tombstone_verdict(1_048_576, 0, 5.0, 120.0), Hide);
+    }
+
+    fn temp_dir(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("comfyui-gallery-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// The marker is written once; a second call must report "already there" so the app doesn't
+    /// re-trigger a media rescan on every launch.
+    #[test]
+    fn nomedia_is_written_once() {
+        let dir = temp_dir("nomedia");
+        assert!(ensure_nomedia(&dir));
+        assert!(Path::new(&dir).join(".nomedia").is_file());
+        assert!(!ensure_nomedia(&dir));
+    }
+
+    /// A cleared cache keeps its `.nomedia`: losing it re-publishes the tree to the phone's Photos.
+    #[test]
+    fn clearing_the_cache_keeps_the_nomedia_marker() {
+        let dir = temp_dir("clear");
+        ensure_nomedia(&dir);
+        write_full_cache(&dir, "u1/a/1.png", b"png");
+        assert_eq!(clear_full_cache(&dir).unwrap(), 2, "image + key sidecar");
+        assert!(Path::new(&dir).join(".nomedia").is_file());
+        assert_eq!(full_cache_stats(&dir).files, 0);
+    }
+
+    /// Deleting an image server-side must free its on-device copy, sidecar included.
+    #[test]
+    fn forgetting_a_key_drops_the_image_and_its_sidecar() {
+        let dir = temp_dir("forget");
+        write_full_cache(&dir, "u1/a/1.png", b"png");
+        write_full_cache(&dir, "u1/a/2.png", b"png");
+        forget_full_cache(&dir, "u1/a/1.png");
+        assert!(!full_cache_has(&dir, "u1/a/1.png"));
+        assert!(full_cache_keys(&dir).iter().all(|k| k != "u1/a/1.png"));
+        assert!(full_cache_has(&dir, "u1/a/2.png"), "siblings survive");
     }
 
     fn item(sub: &str, file: &str, models: &[&str]) -> GalleryItem {
@@ -1340,6 +1479,26 @@ mod tests {
         assert!(c.len() < 11, "expected eviction, kept {}", c.len());
         assert!(c.get("big").is_some(), "the newest entry must survive");
         assert!(c.get("k0").is_none(), "the oldest entry should go first");
+    }
+
+    /// A recycled filename names different pixels: every decoded size of that key must go, and
+    /// its claim with them, or the grid keeps painting the deleted image.
+    #[test]
+    fn forget_drops_every_size_of_one_key() {
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture("t", egui::ColorImage::filled([1, 1], egui::Color32::RED), egui::TextureOptions::LINEAR);
+        let mut c = ThumbCache::default();
+        c.insert("u1/a/1.png#320".into(), tex.clone(), 1024);
+        c.insert("u1/a/1.png#1024".into(), tex.clone(), 4096);
+        c.insert("u1/a/10.png#320".into(), tex.clone(), 1024);
+        c.claim("u1/a/1.png#512");
+        c.forget("u1/a/1.png");
+        assert!(c.get("u1/a/1.png#320").is_none());
+        assert!(c.get("u1/a/1.png#1024").is_none());
+        // A key the stale one merely prefixes must survive.
+        assert!(c.get("u1/a/10.png#320").is_some());
+        assert_eq!(c.bytes, 1024, "freed bytes must return to the budget");
+        assert!(c.claim("u1/a/1.png#512"), "the dropped claim is re-issuable");
     }
 
     /// Re-inserting a cached key must not double-count its bytes and slowly starve the cache.
