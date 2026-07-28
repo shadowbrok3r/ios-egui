@@ -501,6 +501,48 @@ const KEYCODE_DPAD_RIGHT: i32 = 22;
 const KEYCODE_DEL: i32 = 67;
 const KEYCODE_FORWARD_DEL: i32 = 112;
 
+/// egui's live selection for `focus`, or `None` when the widget has no cursor at all.
+///
+/// Unlike [`selection_chars`] this distinguishes "no cursor" from "caret at 0".
+fn live_selection(ctx: &egui::Context, focus: Option<egui::Id>) -> Option<(usize, usize)> {
+    let id = focus?;
+    let state = egui::text_edit::TextEditState::load(ctx, id)?;
+    let range = state.cursor.char_range()?.as_sorted_char_range();
+    Some((usize::from(range.start), usize::from(range.end)))
+}
+
+/// Whether egui is showing a selection the mirror provably cannot know about, so a deletion the
+/// IME planned against the mirror must be reinterpreted as "remove that selection".
+///
+/// A non-collapsed egui selection is pushed to the EditText as a bare caret at its end — see
+/// [`sync_caret_to_ime`]: a real range there puts the selectable EditText into selection mode,
+/// which dismisses the keyboard. So whenever the user selects words inside an egui `TextEdit`, the
+/// IME sees a plain caret and plans a backspace as "one character before it". Java then deletes
+/// that one character (`mirrorDeleteKey` / `deleteSurroundingText`) and reports the span, and
+/// applying that span verbatim both eats one character out of the highlighted run and replaces
+/// egui's selection with the one-char span — which reads on screen as the selection just
+/// evaporating with nothing deleted.
+///
+/// `mirror` is the span Java actually removed. When it matches egui's range the two agree (the
+/// IME really did drive the selection) and Java stays authoritative.
+fn selection_outranks_mirror(
+    ctx: &egui::Context,
+    focus: Option<egui::Id>,
+    mirror: Option<(usize, usize)>,
+) -> bool {
+    match live_selection(ctx, focus) {
+        Some((s, e)) => s != e && mirror != Some((s, e)),
+        None => false,
+    }
+}
+
+/// egui is about to delete a range the mirror does not have, so the EditText — which removed only
+/// its own one-character span — must be rebuilt from the settled buffer next frame.
+fn reseed_after_selection_delete() {
+    NEEDS_RESEED.store(true, std::sync::atomic::Ordering::Relaxed);
+    RESEED_RESTART.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Set the focused TextEdit's cursor range directly (used to anchor Region/Replace replays).
 fn set_state_selection(ctx: &egui::Context, focus: Option<egui::Id>, start: usize, end: usize) {
     let Some(id) = focus else { return };
@@ -626,6 +668,21 @@ pub fn apply_pending(
                     .lock()
                     .map(|g| g.clone())
                     .unwrap_or_default();
+                // The IME planned this deletion around a caret because that is all the mirror
+                // carries; egui's own selection is what the user actually highlighted.
+                if preedit.is_empty()
+                    && anchor.is_none_or(|(a0, a1)| a0 == a1)
+                    && selection_outranks_mirror(ctx, focus, anchor)
+                {
+                    if had_mutate {
+                        deferred.push(ImeEvent::Delete { before, after, anchor });
+                        continue;
+                    }
+                    had_mutate = true;
+                    pending_events.push(key(egui::Key::Backspace));
+                    reseed_after_selection_delete();
+                    continue;
+                }
                 // Anchored + no preedit: delete at Java's exact union bounds instead of
                 // around egui's own caret, which may have drifted from the mirror's.
                 if let Some((a0, a1)) = anchor
@@ -786,6 +843,25 @@ pub fn apply_pending(
                         text: String::new(),
                         active_range_chars: None,
                     }));
+                    continue;
+                }
+                // Java could only see the collapsed caret the mirror carries, so its one-character
+                // span is an artifact of that proxy — egui's highlighted range is the real target.
+                // Checked ahead of the `deleted == 0` edge case: a forward-delete at end-of-buffer
+                // reports nothing deleted, yet must still clear a selection.
+                if selection_outranks_mirror(ctx, focus, Some((start, start + deleted))) {
+                    if had_mutate {
+                        deferred.push(ImeEvent::KeyDelSpan { code, deleted, start });
+                        continue;
+                    }
+                    had_mutate = true;
+                    // One keypress removes a selection wholesale, either direction.
+                    pending_events.push(key(if code == KEYCODE_FORWARD_DEL {
+                        egui::Key::Delete
+                    } else {
+                        egui::Key::Backspace
+                    }));
+                    reseed_after_selection_delete();
                     continue;
                 }
                 // Java deleted nothing (doc edge): egui must not delete either.
