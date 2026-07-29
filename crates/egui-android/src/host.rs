@@ -40,6 +40,11 @@ const K_REQ_MEDIA_PERM: i32 = 105;
 const K_SHARE_MEDIA: i32 = 106;
 const K_SET_ORIENTATION: i32 = 107;
 const K_MEDIA_SCAN: i32 = 108;
+const K_NOTIFY_PROGRESS: i32 = 109;
+
+/// `K_NOTIFY_PROGRESS` int payload: a percentage, or one of these.
+const PROGRESS_INDETERMINATE: i32 = -1;
+const PROGRESS_DISMISS: i32 = -2;
 
 // ActivityInfo.SCREEN_ORIENTATION_* constants.
 const SCREEN_ORIENTATION_UNSPECIFIED: i32 = -1;
@@ -120,6 +125,11 @@ pub fn drain(host: &Host) {
                     media_scan(&path);
                 }
             }
+            K_NOTIFY_PROGRESS => notify_progress(
+                &host.drv_str_a().unwrap_or_default(),
+                &host.drv_str_b().unwrap_or_default(),
+                host.drv_int(),
+            ),
             other => log::info!("egui-android: host request kind {other} not handled"),
         }
     }
@@ -901,6 +911,147 @@ fn notify(title: &str, body: &str) {
     });
 }
 
+/// The ongoing job notification: a persistent row in the shade with a progress bar, the way a
+/// music player keeps its transport there. Its own notification id and channel, so posting and
+/// updating it never disturbs the one-shot [`notify`] messages.
+///
+/// `percent` is 0..=100, or [`PROGRESS_INDETERMINATE`] for a job with no measurable progress yet,
+/// or [`PROGRESS_DISMISS`] to take the row away.
+///
+/// The channel is `IMPORTANCE_LOW` and the builder sets `setOnlyAlertOnce`, because this is posted
+/// again on every step — at DEFAULT importance a 30-step render would buzz thirty times.
+fn notify_progress(title: &str, body: &str, percent: i32) {
+    const IMPORTANCE_LOW: i32 = 2;
+    // PendingIntent.FLAG_UPDATE_CURRENT | FLAG_IMMUTABLE (required from Android 12).
+    const PI_FLAGS: i32 = 0x0800_0000 | 0x0400_0000;
+    const NOTIF_ID: i32 = 2;
+
+    with_activity(|env, activity| {
+        let svc = env.new_string("notification")?;
+        let nm = env
+            .call_method(
+                activity,
+                "getSystemService",
+                "(Ljava/lang/String;)Ljava/lang/Object;",
+                &[(&svc).into()],
+            )?
+            .l()?;
+        if percent == PROGRESS_DISMISS {
+            env.call_method(&nm, "cancel", "(I)V", &[JValue::Int(NOTIF_ID)])?;
+            return Ok(());
+        }
+
+        let chan_id = env.new_string("egui_progress")?;
+        let chan_name = env.new_string("Progress")?;
+        let channel = env.new_object(
+            "android/app/NotificationChannel",
+            "(Ljava/lang/String;Ljava/lang/CharSequence;I)V",
+            &[(&chan_id).into(), (&chan_name).into(), JValue::Int(IMPORTANCE_LOW)],
+        )?;
+        env.call_method(
+            &nm,
+            "createNotificationChannel",
+            "(Landroid/app/NotificationChannel;)V",
+            &[(&channel).into()],
+        )?;
+
+        let app_info = env
+            .call_method(
+                activity,
+                "getApplicationInfo",
+                "()Landroid/content/pm/ApplicationInfo;",
+                &[],
+            )?
+            .l()?;
+        let icon = env.get_field(&app_info, "icon", "I")?.i()?;
+
+        let builder = env.new_object(
+            "android/app/Notification$Builder",
+            "(Landroid/content/Context;Ljava/lang/String;)V",
+            &[JValue::Object(activity), (&chan_id).into()],
+        )?;
+        let jtitle = env.new_string(title)?;
+        let jbody = env.new_string(body)?;
+        let jcat = env.new_string("progress")?;
+        let b = "Landroid/app/Notification$Builder;";
+        env.call_method(
+            &builder,
+            "setContentTitle",
+            format!("(Ljava/lang/CharSequence;){b}"),
+            &[(&jtitle).into()],
+        )?;
+        env.call_method(
+            &builder,
+            "setContentText",
+            format!("(Ljava/lang/CharSequence;){b}"),
+            &[(&jbody).into()],
+        )?;
+        env.call_method(&builder, "setSmallIcon", format!("(I){b}"), &[JValue::Int(icon)])?;
+        env.call_method(&builder, "setCategory", format!("(Ljava/lang/String;){b}"), &[(&jcat).into()])?;
+        // Ongoing + not auto-cancel: the row can't be swiped away while the job runs, which is
+        // what makes it read as a transport rather than a message.
+        env.call_method(&builder, "setOngoing", format!("(Z){b}"), &[JValue::Bool(1)])?;
+        env.call_method(&builder, "setAutoCancel", format!("(Z){b}"), &[JValue::Bool(0)])?;
+        env.call_method(&builder, "setOnlyAlertOnce", format!("(Z){b}"), &[JValue::Bool(1)])?;
+        env.call_method(&builder, "setShowWhen", format!("(Z){b}"), &[JValue::Bool(0)])?;
+        let indeterminate = i32::from(percent < 0);
+        env.call_method(
+            &builder,
+            "setProgress",
+            format!("(IIZ){b}"),
+            &[JValue::Int(100), JValue::Int(percent.clamp(0, 100)), JValue::Bool(indeterminate as u8)],
+        )?;
+
+        // Tap returns to the app, like tapping a player's notification reopens it.
+        let pm = env
+            .call_method(activity, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])?
+            .l()?;
+        let pkg = env
+            .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
+            .l()?;
+        let launch = env
+            .call_method(
+                &pm,
+                "getLaunchIntentForPackage",
+                "(Ljava/lang/String;)Landroid/content/Intent;",
+                &[(&pkg).into()],
+            )?
+            .l()?;
+        if !launch.is_null() {
+            let pi = env
+                .call_static_method(
+                    "android/app/PendingIntent",
+                    "getActivity",
+                    "(Landroid/content/Context;ILandroid/content/Intent;I)Landroid/app/PendingIntent;",
+                    &[
+                        JValue::Object(activity),
+                        JValue::Int(0),
+                        (&launch).into(),
+                        JValue::Int(PI_FLAGS),
+                    ],
+                )?
+                .l()?;
+            env.call_method(
+                &builder,
+                "setContentIntent",
+                format!("(Landroid/app/PendingIntent;){b}"),
+                &[(&pi).into()],
+            )?;
+        }
+
+        let notif = env
+            .call_method(&builder, "build", "()Landroid/app/Notification;", &[])?
+            .l()?;
+        env.call_method(
+            &nm,
+            "notify",
+            "(ILandroid/app/Notification;)V",
+            &[JValue::Int(NOTIF_ID), (&notif).into()],
+        )?;
+        Ok(())
+    });
+}
+
 // ── Permissions (poll-based; the proper callback path needs a Kotlin activity) ──
 
 fn request_permission(index: Option<usize>, perm: &str) {
@@ -1455,6 +1606,17 @@ pub trait HostExt {
     /// Rescan a file or directory into MediaStore. A directory holding `.nomedia` loses the Photos
     /// entries an earlier scan gave it, so this is how an app un-publishes its own image folder.
     fn media_scan(&self, path: impl Into<String>);
+    /// Post or update the ongoing job notification — a persistent shade row with a progress bar,
+    /// like a music player's transport. `percent` is clamped to 0..=100; `None` shows an
+    /// indeterminate bar for a job whose length isn't known yet. Tapping the row reopens the app.
+    /// Call [`notify_progress_done`](HostExt::notify_progress_done) to take it away.
+    ///
+    /// Silent by design (its own `IMPORTANCE_LOW` channel, alert-once), so calling it per step
+    /// costs nothing. Needs `POST_NOTIFICATIONS` on Android 13+ — see
+    /// [`request_notification_permission`](HostExt::request_notification_permission).
+    fn notify_progress(&self, title: impl Into<String>, body: impl Into<String>, percent: Option<u32>);
+    /// Remove the ongoing job notification.
+    fn notify_progress_done(&self);
     /// Ask the user to grant photo-gallery access. Because `ndk_context` only exposes the
     /// Application (not the Activity) under android-activity 0.6, the runtime permission dialog
     /// can't be shown from here, so this opens the app's Settings page where the user toggles
@@ -1541,6 +1703,13 @@ impl HostExt for Host {
     }
     fn media_scan(&self, path: impl Into<String>) {
         self.drv_enqueue(K_MEDIA_SCAN, Some(path.into()), None, 0);
+    }
+    fn notify_progress(&self, title: impl Into<String>, body: impl Into<String>, percent: Option<u32>) {
+        let pct = percent.map_or(PROGRESS_INDETERMINATE, |p| p.min(100) as i32);
+        self.drv_enqueue(K_NOTIFY_PROGRESS, Some(title.into()), Some(body.into()), pct);
+    }
+    fn notify_progress_done(&self) {
+        self.drv_enqueue(K_NOTIFY_PROGRESS, None, None, PROGRESS_DISMISS);
     }
     fn request_media_images_permission(&self) {
         self.drv_enqueue(K_REQ_MEDIA_PERM, None, None, 0);

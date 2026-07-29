@@ -946,6 +946,9 @@ struct ComfyApp {
     /// The last run came from the Create tab, so a failure's suggested repair may rewrite the
     /// Create selection. `Msg::GenError` carries no origin of its own.
     last_gen_create: bool,
+    /// What the ongoing progress notification currently shows, so it is only re-posted when the
+    /// text or percentage moves. `None` = no row in the shade.
+    notif_progress: Option<(String, String, Option<u32>)>,
     /// Model whose defaults editor is open, or `None`.
     model_defaults_edit: Option<String>,
     /// LoRA whose defaults editor is open, or `None`.
@@ -1676,6 +1679,7 @@ impl ComfyApp {
             model_overrides: BTreeMap::new(),
             lora_overrides: BTreeMap::new(),
             last_gen_create: false,
+            notif_progress: None,
             model_defaults_edit: None,
             lora_defaults_edit: None,
             create_pane: CreatePane::Main,
@@ -21167,6 +21171,10 @@ impl EguiApp for ComfyApp {
             });
             egui_extras::install_image_loaders(ui.ctx());
             self.load_settings(host);
+            // The manifest declares POST_NOTIFICATIONS, but Android 13+ also needs a runtime
+            // grant — without it the finished-render notification and the ongoing progress row
+            // are dropped silently. The system shows its dialog once and ignores later asks.
+            host.request_notification_permission();
             crate::theme::apply_fonts(ui.ctx(), &self.fonts);
             if !self.server_url.trim().is_empty() {
                 self.log.info("auto-connecting to saved server");
@@ -21250,6 +21258,7 @@ impl EguiApp for ComfyApp {
             self.log_lines.drain(..excess);
         }
         self.autosave_settings(ui.ctx(), host);
+        self.sync_progress_notification(host);
         bg_lap.lap("autosave");
         let bg_ms = t_bg.elapsed().as_secs_f32() * 1000.0;
         let bg_top = bg_lap.worst;
@@ -21607,6 +21616,43 @@ impl ComfyApp {
         let running = self.running;
         let log = self.log.clone();
         self.perf.observe(cpu_ms, thr_ms, msgs_ms, bg_ms, bg_top, tab, &detail, running, &log);
+    }
+
+    /// Mirror a running job into the notification shade as an ongoing progress row, so a render
+    /// stays watchable with the app in the background — the same shape a music player keeps its
+    /// transport in. Tapping the row reopens the app.
+    ///
+    /// Pushed only when the rendered text or percentage actually changes: the row is re-posted on
+    /// every update, and a no-op repost is still a JNI round trip every frame.
+    fn sync_progress_notification(&mut self, host: &Host) {
+        let desired = self.running.then(|| {
+            let (value, max) = self.progress;
+            let queued = if self.jobs_left > 1 {
+                format!(" · {} jobs left", self.jobs_left)
+            } else {
+                String::new()
+            };
+            // A single-step node (the decode and save that trail a render) reports max 1, and
+            // rendering its `Step 0/1` with an empty bar reads as the job having restarted. Only a
+            // real multi-step sampler gets a count and a percentage; everything else is a spinner.
+            let (body, pct) = match (max, value) {
+                (0, _) => (format!("Queued{queued}"), None),
+                (1, _) => (format!("Working{queued}"), None),
+                _ => (
+                    format!("Step {value}/{max}{queued}"),
+                    Some((value.saturating_mul(100) / max).min(100)),
+                ),
+            };
+            (self.create_model_label(), body, pct)
+        });
+        if desired == self.notif_progress {
+            return;
+        }
+        match &desired {
+            Some((title, body, pct)) => host.notify_progress(title, body, *pct),
+            None => host.notify_progress_done(),
+        }
+        self.notif_progress = desired;
     }
 
     /// Raise the blocking error dialog with the full text (status lines stay elided). An identical
