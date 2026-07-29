@@ -22,14 +22,34 @@ sign-in, per-user gallery + albums, server-side model filtering).
 - **Generate tab** — Text → Image and Image → Image (current result or an image URL as input,
   denoise slider), checkpoint/sampler/scheduler menus, steps, CFG, size, seed with random toggle,
   progress + preview, Save to `<app files>/comfyui/`.
-- **Prompt rewriting** — one row under the positive prompt, and the button always names the engine
-  that will run it, so a rewrite is never ambiguous about where it came from:
-  - **Expand · comfy-gate** streams `POST /api/expand` and renders the rewrite as a live diff to
+- **Per-model / per-LoRA defaults** — the server catalog's `recommended` numbers are scraped out of
+  Civitai text and are routinely wrong for a given model. **Edit defaults** on any model row (and
+  **Defaults** on any active LoRA card) opens an editor where each field is either *catalog* or
+  *yours*: tick a field to pin steps, CFG, sampler, scheduler, CLIP skip or size, and for a model
+  needing them, the text encoder(s), encoder type, VAE and weight dtype. **Copy current settings**
+  pins everything the Create tab is showing in one tap; **Clear all** goes back to the catalog. Only
+  ticked fields are stored, so untouched ones keep improving when the catalog refreshes. Overrides
+  are local, keyed by filename, and ride along in the encrypted Settings backup. A model with any
+  override is marked `• custom` in the picker, and its Details pane gains a **Yours** line.
+- **Three loader topologies.** A checkpoint carries MODEL + CLIP + VAE in one file; a diffusion
+  model under `models/diffusion_models` loads through `UNETLoader` with a separate encoder and VAE.
+  The third case is a bare diffusion model (Anima) filed under `models/checkpoints`: ComfyUI lists
+  it only under `CheckpointLoaderSimple.ckpt_name`, and loading it there yields a null CLIP and a
+  null VAE — `CLIPTextEncode` then fails with `clip input is invalid: None`. **Checkpoint + separate
+  CLIP/VAE** takes MODEL off the checkpoint loader and wires the encoder and VAE from their own
+  loaders. Anima files in the checkpoints list pick it automatically (matched on whole tokens, so
+  `animagine` and `animatediff` are untouched); the Loader radio in the defaults editor overrides
+  that either way. When a run fails on a null clip anyway, the error dialog offers the switch as a
+  one-tap fix and pins it as that model's default.
+- **Prompt rewriting** — the Expand / Variations / Rewrite buttons sit in the prompt's own header
+  row, beside the chips toggle and the history arrows. ☁ marks the server engine; the button always
+  names the engine that will run it, so a rewrite is never ambiguous about where it came from:
+  - **☁ Expand** streams comfy-gate's `POST /api/expand` and renders the rewrite as a live diff to
     accept or discard. The request carries a `dialect` so the text comes back in the family's own
     idiom: `wan-i2v` / `wan-t2v` for video, and for images the catalog family (Illustrious, Pony,
     Flux…) or, failing that, the loader filename for the gate to classify.
-  - **Rewrite · on device** runs the local Qwen rewrite pack on the phone's CPU (feature
-    `local-npu`), with the target style picked from its menu — no server needed.
+  - **✨ Rewrite** runs the local Qwen rewrite pack on the phone's CPU (feature `local-npu`), with
+    the target style picked from its menu — no server needed.
   - **⭐ Variations** (comfy-gate only) asks `POST /api/variations` for alternatives instead of a
     faithful rewrite: each option changes exactly one axis (setting, pose, lighting, wardrobe,
     mood, composition) and is shown with that label as a diff against the original, so what

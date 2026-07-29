@@ -64,29 +64,39 @@ pub fn build(
     (g.into_workflow(), out, report)
 }
 
+/// The separately-loaded text encoder for a model with no CLIP of its own: one name emits
+/// `CLIPLoader`, two emit `DualCLIPLoader`.
+fn text_encoder(g: &WorkflowGraph, p: &Params) -> ClipOut {
+    let device: Option<String> = (!p.clip_device.trim().is_empty()).then(|| p.clip_device.clone());
+    let ty = p.effective_clip_type();
+    let names = p.active_clips();
+    if names.len() >= 2 {
+        g.add(DualCLIPLoader::new(names[0].clone(), names[1].clone(), ty, device))
+    } else {
+        g.add(CLIPLoader::new(names.first().cloned().unwrap_or_default(), ty, device))
+    }
+}
+
 /// The typed base graph, ending at the VAE decode. Publishes every handle an app can reference.
 fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
     let g = WorkflowGraph::new();
 
     // Checkpoints carry MODEL+CLIP+VAE in one file; diffusion models (Anima, Flux, Qwen-Image)
-    // are bare UNETs that need the text encoder and VAE loaded alongside them.
+    // are bare UNETs that need the text encoder and VAE loaded alongside them. A bare diffusion
+    // model filed under `models/checkpoints` is the third case: the checkpoint loader reads its
+    // MODEL and returns no CLIP and no VAE, so those two come from their own loaders.
     let (base_model, base_clip, vae): (ModelOut, ClipOut, VaeOut) = match p.model_kind {
         ModelKind::Checkpoint => {
             let c = g.add(CheckpointLoaderSimple::new(p.checkpoint.clone()));
             (c.model, c.clip, c.vae)
         }
+        ModelKind::CheckpointDiffusion => {
+            let c = g.add(CheckpointLoaderSimple::new(p.checkpoint.clone()));
+            (c.model, text_encoder(&g, p), g.add(VAELoader::new(p.vae_name.clone())))
+        }
         ModelKind::Diffusion => {
             let model = g.add(UNETLoader::new(p.unet_name.clone(), p.effective_weight_dtype()));
-            let device: Option<String> =
-                (!p.clip_device.trim().is_empty()).then(|| p.clip_device.clone());
-            let ty = p.effective_clip_type();
-            let names = p.active_clips();
-            let clip = if names.len() >= 2 {
-                g.add(DualCLIPLoader::new(names[0].clone(), names[1].clone(), ty, device))
-            } else {
-                g.add(CLIPLoader::new(names.first().cloned().unwrap_or_default(), ty, device))
-            };
-            (model, clip, g.add(VAELoader::new(p.vae_name.clone())))
+            (model, text_encoder(&g, p), g.add(VAELoader::new(p.vae_name.clone())))
         }
     };
 
@@ -803,6 +813,62 @@ mod tests {
             // rucomfyui's `type_` field serializes to ComfyUI's `type` key.
             assert_eq!(wf.0[&clip].inputs["type"].as_str().unwrap(), "stable_diffusion");
         }
+    }
+
+    /// A bare diffusion model filed under `models/checkpoints` is only reachable through
+    /// `CheckpointLoaderSimple`, which returns no CLIP and no VAE — so those must come from their
+    /// own loaders instead of the checkpoint's dead outputs. Wiring the checkpoint's CLIP is what
+    /// produced ComfyUI's "clip input is invalid: None".
+    #[test]
+    fn a_clipless_checkpoint_takes_its_encoder_and_vae_from_separate_loaders() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = diffusion_params();
+        p.model_kind = ModelKind::CheckpointDiffusion;
+        p.checkpoint = "Anima/novaAnimeAM_v30.safetensors".into();
+        p.unet_name.clear();
+        let (wf, out, _) = build(&p, None, &apps, &schemas);
+
+        assert!(
+            !wf.0.values().any(|n| n.class_type == "UNETLoader"),
+            "the file is in the checkpoints list, so UNETLoader could not load it"
+        );
+
+        let dec = upstream(&wf, &out, "images");
+        let ks = upstream(&wf, &dec, "samples");
+
+        let ckpt = upstream(&wf, &ks, "model");
+        assert_eq!(class_of(&wf, &ckpt), "CheckpointLoaderSimple");
+        assert_eq!(
+            wf.0[&ckpt].inputs["ckpt_name"].as_str().unwrap(),
+            "Anima/novaAnimeAM_v30.safetensors"
+        );
+
+        let vae = upstream(&wf, &dec, "vae");
+        assert_eq!(class_of(&wf, &vae), "VAELoader");
+        assert_eq!(wf.0[&vae].inputs["vae_name"].as_str().unwrap(), "qwen_image_vae.safetensors");
+
+        for socket in ["positive", "negative"] {
+            let enc = upstream(&wf, &ks, socket);
+            let clip = upstream(&wf, &enc, "clip");
+            assert_eq!(class_of(&wf, &clip), "CLIPLoader");
+            assert_eq!(
+                wf.0[&clip].inputs["clip_name"].as_str().unwrap(),
+                "qwen_3_06b_base.safetensors"
+            );
+        }
+    }
+
+    /// CLIP skip is a checkpoint-CLIP convention; an external qwen/t5 tower has no layers to stop
+    /// at, so the split-companion checkpoint must not gain a `CLIPSetLastLayer`.
+    #[test]
+    fn a_clipless_checkpoint_skips_clip_skip() {
+        let (apps, schemas) = (AppSet::default(), SchemaSet::default());
+        let mut p = diffusion_params();
+        p.model_kind = ModelKind::CheckpointDiffusion;
+        p.checkpoint = "Anima/novaAnimeAM_v30.safetensors".into();
+        p.clip_skip = 2;
+        let (wf, _, _) = build(&p, None, &apps, &schemas);
+        assert!(!wf.0.values().any(|n| n.class_type == "CLIPSetLastLayer"));
     }
 
     /// The encode and the decode must land on one VAE node, not two competing loaders.

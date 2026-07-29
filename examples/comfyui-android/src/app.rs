@@ -2,7 +2,7 @@
 //! Gallery (server output browser with albums), and Settings (server, API key, account, logs).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,9 +34,11 @@ use crate::types::{
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
     CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, GenMode, Img2ImgSource, LoraCatalog,
-    LoraPack, Mode, TrashItem, ModelKind, Params, PromptHist, RatingFilter, RewriteEngine,
-    SamplerPack, Settings, Tombstone, VARIATION_COUNT_RANGE, VariationStrength,
-    append_negatives, checkpoint_family, fallback_vec, file_basename, is_wan_related, merge_triggers,
+    LoraEntry, LoraOverride, LoraPack, Mode, TrashItem, ModelKind, ModelOverride, Params,
+    PromptHist, RatingFilter, RewriteEngine,
+    CheckpointRecommended, SamplerPack, Settings, Tombstone, VARIATION_COUNT_RANGE, VariationStrength,
+    append_negatives, checkpoint_family, fallback_vec, file_basename, is_clipless_family,
+    is_wan_related, merge_triggers,
     pick_wan_unet_pair, push_prompt_hist, strip_injected,
 };
 #[cfg(feature = "local-npu")]
@@ -856,6 +858,16 @@ struct ErrorModal {
     detail: String,
     /// Identical repeats fold into this counter instead of stacking dialogs.
     count: u32,
+    /// A one-tap repair offered beside Dismiss when the failure has an unambiguous cause.
+    fix: Option<ErrorFix>,
+}
+
+/// A repair the error dialog can apply itself.
+#[derive(Clone, PartialEq)]
+enum ErrorFix {
+    /// Reload the named checkpoint with a separately-loaded text encoder and VAE
+    /// ([`ModelKind::CheckpointDiffusion`]), pinned as that model's default.
+    SplitCompanions(String),
 }
 
 struct ComfyApp {
@@ -926,6 +938,18 @@ struct ComfyApp {
     checkpoint_favorites: Vec<String>,
     /// Most-recently-used checkpoint filenames, newest first (persisted).
     checkpoint_recent: Vec<String>,
+    /// User-corrected model defaults keyed by loader filename (persisted), layered over the
+    /// server catalog's parsed recommendation.
+    model_overrides: BTreeMap<String, ModelOverride>,
+    /// User-corrected LoRA defaults keyed by `lora_name` (persisted).
+    lora_overrides: BTreeMap<String, LoraOverride>,
+    /// The last run came from the Create tab, so a failure's suggested repair may rewrite the
+    /// Create selection. `Msg::GenError` carries no origin of its own.
+    last_gen_create: bool,
+    /// Model whose defaults editor is open, or `None`.
+    model_defaults_edit: Option<String>,
+    /// LoRA whose defaults editor is open, or `None`.
+    lora_defaults_edit: Option<String>,
     create_pane: CreatePane,
     settings_pane: SettingsPane,
     lora_catalog: LoraCatalog,
@@ -1649,6 +1673,11 @@ impl ComfyApp {
             checkpoint_sort: CheckpointSort::Name,
             checkpoint_favorites: Vec::new(),
             checkpoint_recent: Vec::new(),
+            model_overrides: BTreeMap::new(),
+            lora_overrides: BTreeMap::new(),
+            last_gen_create: false,
+            model_defaults_edit: None,
+            lora_defaults_edit: None,
             create_pane: CreatePane::Main,
             settings_pane: SettingsPane::Server,
             lora_catalog: LoraCatalog::default(),
@@ -2514,9 +2543,10 @@ impl ComfyApp {
                 // A restored selection may not exist on this server; fall back to the first model
                 // of either kind, otherwise re-resolve the companions against what is installed.
                 let selected = self.params.model_file().to_string();
-                let known = match self.params.model_kind {
-                    ModelKind::Checkpoint => self.checkpoints.contains(&selected),
-                    ModelKind::Diffusion => self.unets.contains(&selected),
+                let known = if self.params.model_kind.is_checkpoint_file() {
+                    self.checkpoints.contains(&selected)
+                } else {
+                    self.unets.contains(&selected)
                 };
                 if selected.is_empty() || !known {
                     let first = self
@@ -2529,7 +2559,7 @@ impl ComfyApp {
                     if let Some((file, kind)) = first {
                         self.select_model(&file, Some(kind));
                     }
-                } else if self.params.model_kind == ModelKind::Diffusion {
+                } else if self.params.model_kind.needs_companions() {
                     self.resolve_companions(Companions::Repair);
                 }
                 self.status.clear();
@@ -3221,24 +3251,21 @@ impl ComfyApp {
                 }
             }
         } else {
-            match self.params.model_kind {
-                ModelKind::Checkpoint => {
-                    if missing(&self.params.checkpoint, &schemas.checkpoints()) {
-                        bad.push(format!("checkpoint '{}'", file_basename(&self.params.checkpoint)));
-                    }
+            if self.params.model_kind.is_checkpoint_file() {
+                if missing(&self.params.checkpoint, &schemas.checkpoints()) {
+                    bad.push(format!("checkpoint '{}'", file_basename(&self.params.checkpoint)));
                 }
-                ModelKind::Diffusion => {
-                    if missing(&self.params.unet_name, &schemas.unets()) {
-                        bad.push(format!("model '{}'", file_basename(&self.params.unet_name)));
-                    }
-                    if missing(&self.params.vae_name, &schemas.vaes()) {
-                        bad.push(format!("VAE '{}'", file_basename(&self.params.vae_name)));
-                    }
-                    let clips = schemas.clips();
-                    for c in self.params.active_clips() {
-                        if missing(c.as_str(), &clips) {
-                            bad.push(format!("encoder '{}'", file_basename(&c)));
-                        }
+            } else if missing(&self.params.unet_name, &schemas.unets()) {
+                bad.push(format!("model '{}'", file_basename(&self.params.unet_name)));
+            }
+            if self.params.model_kind.needs_companions() {
+                if missing(&self.params.vae_name, &schemas.vaes()) {
+                    bad.push(format!("VAE '{}'", file_basename(&self.params.vae_name)));
+                }
+                let clips = schemas.clips();
+                for c in self.params.active_clips() {
+                    if missing(c.as_str(), &clips) {
+                        bad.push(format!("encoder '{}'", file_basename(&c)));
                     }
                 }
             }
@@ -3406,6 +3433,7 @@ impl ComfyApp {
         };
         self.engine.as_mut().unwrap().generate(params, current, gcx, ui_workflow, label);
         self.last_create_fp = self.create_engine_fp();
+        self.last_gen_create = true;
         host.haptic(Haptic::Medium);
     }
 
@@ -3680,6 +3708,7 @@ impl ComfyApp {
         // A previous run's dropped-output warning must not read as this one's.
         self.enhance_note.clear();
         self.last_graph_fp = Some(fp);
+        self.last_gen_create = false;
         let schemas = self.schemas.clone().unwrap_or_default();
         self.engine.as_mut().unwrap().run_workflow(wf, Some(ui_json), schemas, label);
         host.haptic(Haptic::Medium);
@@ -4550,6 +4579,8 @@ impl ComfyApp {
                 v.sort();
                 v
             },
+            model_overrides: self.model_overrides.clone(),
+            lora_overrides: self.lora_overrides.clone(),
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -4627,6 +4658,10 @@ impl ComfyApp {
         self.variation_count = saved.variation_count.clamp(*VARIATION_COUNT_RANGE.start(), *VARIATION_COUNT_RANGE.end());
         self.variation_strength = saved.variation_strength;
         self.lora_unlinked = saved.lora_unlinked.into_iter().collect();
+        // An override that names nothing is indistinguishable from having none; drop it on load so
+        // the "customised" marker in the pickers stays truthful.
+        self.model_overrides = saved.model_overrides.into_iter().filter(|(_, o)| !o.is_empty()).collect();
+        self.lora_overrides = saved.lora_overrides.into_iter().filter(|(_, o)| !o.is_empty()).collect();
         #[cfg(feature = "local-npu")]
         {
             self.local_npu = saved.local_npu;
@@ -5737,11 +5772,12 @@ impl ComfyApp {
         }
     }
 
-    /// Positive prompt: label + chips + history nav on one row, the editor, then the rewrite row.
+    /// Positive prompt: label + chips + history nav + rewrite buttons on one row, the editor, then
+    /// the Raw opt-out and engine note.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
-        self.prompt_field_ui(ui, PromptField::Positive, "Prompt");
+        self.prompt_field_ui(ui, PromptField::Positive, "Prompt", Some(host));
         ui.horizontal(|ui| self.dup_fix_chip_ui(ui));
-        self.rewrite_controls(ui, host);
+        self.rewrite_controls(ui);
     }
 
     /// Whether comfy-gate's `/api/expand` can run right now: connected, and this server hasn't
@@ -5813,78 +5849,76 @@ impl ComfyApp {
         }
     }
 
-    /// The one place a prompt gets rewritten, under the positive field. Which engine runs is the
-    /// Settings choice (server `/api/expand` vs the on-device pack), and the button says which one
-    /// it is so a rewrite is never ambiguous about where it came from. The video-only **Raw**
-    /// checkbox is independent of that: it opts the queued prompt out of comfy-gate's *queue-time*
-    /// expander, which runs on video regardless of who wrote the text.
-    fn rewrite_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
+    /// Expand / Variations / Rewrite, drawn inline in the positive prompt's header row. Which
+    /// engines appear is the Settings choice and what can run right now; the cloud icon marks the
+    /// server engine and the bare Rewrite menu is the on-device one.
+    fn rewrite_buttons_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
         let video = self.params.mode == Mode::Video;
-        let active = self.active_rewrite_engine();
         let (show_server, show_device) = self.rewrite_controls_shown();
         let busy = self.expand_review.as_ref().is_some_and(|r| !r.done);
         let (_, dialect) = self.expand_dialect();
-        ui.horizontal_wrapped(|ui| {
-            if show_server {
-                let hover = if video {
-                    "Rewrite this terse prompt into full video prose on comfy-gate".to_string()
-                } else {
-                    format!("Rewrite this terse prompt for {dialect} on comfy-gate")
-                };
+        if show_server {
+            let hover = if video {
+                "Rewrite this terse prompt into full video prose on comfy-gate".to_string()
+            } else {
+                format!("Rewrite this terse prompt for {dialect} on comfy-gate")
+            };
+            if ui
+                .add_enabled(!busy, egui::Button::new(format!("{} Expand", icons::CLOUD)))
+                .on_hover_text(hover)
+                .clicked()
+            {
+                self.start_expand(ui.ctx(), host);
+            }
+            if busy {
+                ui.add(egui::Spinner::new());
+            }
+            // Alternatives rather than a rewrite: one axis deliberately changed per option.
+            // Server-only — the on-device pack has no equivalent.
+            if !self.variations_unsupported {
+                let vbusy = self.variations_review.as_ref().is_some_and(|r| !r.done);
                 if ui
-                    .add_enabled(
-                        !busy,
-                        egui::Button::new(format!("{} Expand · comfy-gate", icons::GENERATE)),
+                    .add_enabled(!vbusy, egui::Button::new(format!("{} Variations", icons::STAR)))
+                    .on_hover_text(
+                        "Ask comfy-gate for alternative prompts — each changes one thing \
+                         (setting, pose, lighting…) and keeps the rest",
                     )
-                    .on_hover_text(hover)
                     .clicked()
                 {
-                    self.start_expand(ui.ctx(), host);
+                    self.start_variations(ui.ctx(), host);
                 }
-                if busy {
-                    ui.add(egui::Spinner::new());
-                }
-                // Alternatives rather than a rewrite: one axis deliberately changed per option.
-                // Server-only — the on-device pack has no equivalent.
-                if !self.variations_unsupported {
-                    let vbusy = self.variations_review.as_ref().is_some_and(|r| !r.done);
-                    if ui
-                        .add_enabled(
-                            !vbusy,
-                            egui::Button::new(format!("{} Variations", icons::STAR)),
-                        )
-                        .on_hover_text(
-                            "Ask comfy-gate for alternative prompts — each changes one thing \
-                             (setting, pose, lighting…) and keeps the rest",
-                        )
-                        .clicked()
-                    {
-                        self.start_variations(ui.ctx(), host);
-                    }
-                    if vbusy {
-                        ui.add(egui::Spinner::new());
-                    }
-                }
-            }
-            if show_device {
-                self.rewrite_menu_ui(ui, host);
-                // The menu's own spinner is only visible while the menu is open; a CPU rewrite
-                // takes long enough that the row needs to show it too.
-                if self.device_rewrite_busy() {
+                if vbusy {
                     ui.add(egui::Spinner::new());
                 }
             }
-            if !show_server && !show_device {
-                let reason = self.rewrite_unavailable_reason();
-                ui.add_enabled(false, egui::Button::new(format!("{} Rewrite", icons::GENERATE)))
-                    .on_hover_text(reason);
+        }
+        if show_device {
+            self.rewrite_menu_ui(ui, host);
+            // The menu's own spinner is only visible while the menu is open; a CPU rewrite
+            // takes long enough that the row needs to show it too.
+            if self.device_rewrite_busy() {
+                ui.add(egui::Spinner::new());
             }
-            if video {
-                ui.checkbox(&mut self.params.raw_prompt, "Raw").on_hover_text(
-                    "Submit verbatim — skip comfy-gate's automatic queue-time expander",
-                );
-            }
-        });
+        }
+        if !show_server && !show_device {
+            let reason = self.rewrite_unavailable_reason();
+            ui.add_enabled(false, egui::Button::new(format!("{} Rewrite", icons::GENERATE)))
+                .on_hover_text(reason);
+        }
+    }
+
+    /// Under the positive field: the video-only **Raw** opt-out and the note naming whichever
+    /// engine [`Self::rewrite_buttons_ui`] will run. Raw is independent of that choice — it opts the
+    /// queued prompt out of comfy-gate's *queue-time* expander, which runs on video regardless of
+    /// who wrote the text.
+    fn rewrite_controls(&mut self, ui: &mut egui::Ui) {
+        let video = self.params.mode == Mode::Video;
+        let active = self.active_rewrite_engine();
+        let (_, dialect) = self.expand_dialect();
+        if video {
+            ui.checkbox(&mut self.params.raw_prompt, "Raw")
+                .on_hover_text("Submit verbatim — skip comfy-gate's automatic queue-time expander");
+        }
         match active {
             // The queue-time expander is comfy-gate's, not the rewrite button's: it runs on video
             // whichever engine wrote the text, so this line stands for both engines.
@@ -6552,13 +6586,19 @@ impl ComfyApp {
 
     /// Negative prompt: label + chip toggle, then the chip editor or text field.
     fn negative_prompt_ui(&mut self, ui: &mut egui::Ui) {
-        self.prompt_field_ui(ui, PromptField::Negative, "Negative");
+        self.prompt_field_ui(ui, PromptField::Negative, "Negative", None);
     }
 
-    /// One prompt field: a `label` + chip-view toggle (+ history nav and rewrite on positive),
-    /// then the editor.
-    fn prompt_field_ui(&mut self, ui: &mut egui::Ui, field: PromptField, label: &str) {
-        // Wrapped so the extra history buttons drop to a second line instead of clipping.
+    /// One prompt field: a `label` + chip-view toggle (+ history nav and the rewrite buttons on
+    /// positive), then the editor. `host` is only needed for those buttons.
+    fn prompt_field_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        field: PromptField,
+        label: &str,
+        host: Option<&Host>,
+    ) {
+        // Wrapped so the history / rewrite buttons drop to a second line instead of clipping.
         ui.horizontal_wrapped(|ui| {
             ui.label(label);
             let on = self.field_chips(field);
@@ -6571,6 +6611,9 @@ impl ComfyApp {
             }
             if field == PromptField::Positive {
                 self.hist_nav_ui(ui);
+                if let Some(host) = host {
+                    self.rewrite_buttons_ui(ui, host);
+                }
             }
         });
         self.prompt_editor_body(ui, field);
@@ -6899,13 +6942,9 @@ impl ComfyApp {
         self.ensure_cooc_warm(ui.ctx(), host);
         let anima = self.anima_active();
         let model_file = self.params.model_file().to_string();
-        if let Some(hint) = self
-            .checkpoint_catalog
-            .entry(&model_file)
-            .and_then(|e| e.recommended.as_ref())
-            .and_then(|r| r.short_hint())
-        {
-            ui.weak(sanitize_ui_text(ui, &format!("rec: {hint}")));
+        if let Some(hint) = self.recommended_for(&model_file).short_hint() {
+            let tag = if self.model_override(&model_file).is_some() { "yours" } else { "rec" };
+            ui.weak(sanitize_ui_text(ui, &format!("{tag}: {hint}")));
         }
         #[cfg(feature = "local-npu")]
         if self.route_local_gen() {
@@ -6936,7 +6975,7 @@ impl ComfyApp {
             return;
         }
 
-        let show_companions = self.params.model_kind == ModelKind::Diffusion;
+        let show_companions = self.params.model_kind.needs_companions();
         if show_companions {
             let setup_open = self.create_companions_open;
             let setup_title = if setup_open {
@@ -6990,13 +7029,16 @@ impl ComfyApp {
                             let mut ty = self.params.effective_clip_type();
                             combo_full(ui, "clip_type", &mut ty, &self.clip_types);
                             self.params.clip_type = ty;
-                            ui.label("Weight dtype");
-                            combo_full(
-                                ui,
-                                "weight_dtype",
-                                &mut self.params.weight_dtype,
-                                &self.weight_dtypes,
-                            );
+                            // UNETLoader's input; a checkpoint-loaded model has no such widget.
+                            if self.params.model_kind == ModelKind::Diffusion {
+                                ui.label("Weight dtype");
+                                combo_full(
+                                    ui,
+                                    "weight_dtype",
+                                    &mut self.params.weight_dtype,
+                                    &self.weight_dtypes,
+                                );
+                            }
                             if !self.clip_devices.is_empty() {
                                 ui.label("Encoder device");
                                 combo_full(
@@ -7847,6 +7889,9 @@ impl ComfyApp {
         let mut rows: Vec<ModelRow> = Vec::new();
         for (file, kind) in listed {
             let meta = self.checkpoint_catalog.entry(&file).cloned();
+            // The list a row came from is only a hint; the row shows (and picks) the loader the
+            // model will actually use, override and family promotion included.
+            let kind = self.kind_for(&file, Some(kind));
             let name = meta
                 .as_ref()
                 .map(|e| e.display_name().to_string())
@@ -7975,6 +8020,9 @@ impl ComfyApp {
         let mut pick: Option<(String, ModelKind)> = None;
         let mut toggle_fav: Option<String> = None;
         let mut examples: Option<String> = None;
+        let mut edit_defaults: Option<String> = None;
+        let overrides = self.model_overrides.clone();
+        let over_of = |f: &str| -> Option<&ModelOverride> { overrides.get(f) };
         let facets = self.facets.clone();
         let force_closed = self.checkpoints_force_collapse;
         let mut shown = 0usize;
@@ -8021,6 +8069,7 @@ impl ComfyApp {
                                         file,
                                         *kind,
                                         meta,
+                                        over_of(file),
                                         &current,
                                         true,
                                         "ckpt_fav",
@@ -8028,6 +8077,7 @@ impl ComfyApp {
                                         &mut pick,
                                         &mut toggle_fav,
                                         &mut examples,
+                                        &mut edit_defaults,
                                     );
                                     shown += 1;
                                 }
@@ -8101,6 +8151,7 @@ impl ComfyApp {
                                         file,
                                         *kind,
                                         meta,
+                                        over_of(file),
                                         &current,
                                         fav,
                                         "ckpt_ver",
@@ -8108,6 +8159,7 @@ impl ComfyApp {
                                         &mut pick,
                                         &mut toggle_fav,
                                         &mut examples,
+                                        &mut edit_defaults,
                                     );
                                     shown += 1;
                                 }
@@ -8130,6 +8182,9 @@ impl ComfyApp {
                 .map(|(n, _)| n.to_string())
                 .unwrap_or(file);
             self.open_examples(&name, false, host);
+        }
+        if let Some(file) = edit_defaults {
+            self.model_defaults_edit = Some(file);
         }
         if fav_groups.is_empty() && families.is_empty() {
             let empty = self.checkpoints.is_empty() && self.unets.is_empty();
@@ -8848,7 +8903,7 @@ impl ComfyApp {
                 out.push(f.to_string());
             }
         };
-        if self.params.model_kind == ModelKind::Checkpoint {
+        if self.params.model_kind.is_checkpoint_file() {
             push(&mut out, &self.params.checkpoint.clone());
         }
         for f in self.checkpoints.clone() {
@@ -8982,10 +9037,15 @@ impl ComfyApp {
             let file = candidates[i].clone();
             self.params = orig.clone();
             self.params.mode = Mode::Txt2Img;
-            self.params.model_kind = ModelKind::Checkpoint;
+            // Candidates all come from the checkpoints list, but one of them may still be a bare
+            // diffusion model that needs its own encoder and VAE.
+            self.params.model_kind = self.kind_for(&file, Some(ModelKind::Checkpoint));
             self.params.checkpoint = file.clone();
             // Per-candidate recommended steps/cfg/size/sampler: each model gets its best shot.
             self.apply_recommended_settings(&file);
+            if self.params.model_kind.needs_companions() {
+                self.resolve_companions(Companions::Seed);
+            }
             self.params.positive = self.taste_prompt(&identity, &file);
             // A clean, model-appropriate negative — never the stale one from whatever workflow was
             // loaded before the test (that leaked in and skewed every candidate identically).
@@ -9004,6 +9064,9 @@ impl ComfyApp {
             self.running = true;
             self.jobs_left += 1;
             let gcx = self.gen_ctx();
+            // The taste test restores `params` afterwards, so a candidate's failure is never about
+            // the Create selection.
+            self.last_gen_create = false;
             self.engine.as_mut().unwrap().generate(
                 self.params.clone(),
                 None,
@@ -9766,48 +9829,111 @@ impl ComfyApp {
         });
     }
 
-    /// Which loader a model needs: the caller's hint, else the catalog's `directory`, else which
-    /// of the server's two lists it appears in.
+    /// Which loader a model needs: the user's own override, else the caller's hint, else the
+    /// catalog's `directory`, else which of the server's two lists it appears in — with a bare-DiT
+    /// family in the checkpoints list promoted to the split-companion topology.
     fn kind_for(&self, file: &str, hint: Option<ModelKind>) -> ModelKind {
-        if let Some(k) = hint {
-            return k;
+        // A correction the user made in the model's defaults editor outranks every guess below,
+        // including the picker's hint (which is only "the list this row came from").
+        self.model_override(file)
+            .and_then(|o| o.model_kind)
+            .unwrap_or_else(|| self.inferred_kind(file, hint))
+    }
+
+    /// What [`Self::kind_for`] would decide with no user override — also what the defaults editor
+    /// labels its "Auto" choice with.
+    fn inferred_kind(&self, file: &str, hint: Option<ModelKind>) -> ModelKind {
+        let kind = hint
+            .or_else(|| self.checkpoint_catalog.entry(file).and_then(|e| e.model_kind()))
+            .unwrap_or_else(|| {
+                let known = |list: &[String]| list.iter().any(|f| f == file);
+                if known(&self.unets) && !known(&self.checkpoints) {
+                    ModelKind::Diffusion
+                } else {
+                    ModelKind::Checkpoint
+                }
+            });
+        if kind == ModelKind::Checkpoint
+            && is_clipless_family(file, &checkpoint_family(self.checkpoint_catalog.entry(file)))
+        {
+            return ModelKind::CheckpointDiffusion;
         }
-        if let Some(k) = self.checkpoint_catalog.entry(file).and_then(|e| e.model_kind()) {
-            return k;
-        }
-        let known = |list: &[String]| list.iter().any(|f| f == file);
-        if known(&self.unets) && !known(&self.checkpoints) {
-            ModelKind::Diffusion
-        } else {
-            ModelKind::Checkpoint
-        }
+        kind
     }
 
     fn select_model(&mut self, file: &str, hint: Option<ModelKind>) {
         let kind = self.kind_for(file, hint);
         self.params.model_kind = kind;
-        match kind {
-            ModelKind::Checkpoint => self.params.checkpoint = file.to_string(),
-            ModelKind::Diffusion => self.params.unet_name = file.to_string(),
+        if kind.is_checkpoint_file() {
+            self.params.checkpoint = file.to_string();
+        } else {
+            self.params.unet_name = file.to_string();
         }
         self.apply_recommended_settings(file);
-        if kind == ModelKind::Diffusion {
+        if kind.needs_companions() {
             self.resolve_companions(Companions::Seed);
         }
         self.selected_preset.clear();
         self.touch_checkpoint_recent(file);
     }
 
-    /// Overwrite sampler / steps / cfg / size from `file`'s catalog recommendation, where present.
-    fn apply_recommended_settings(&mut self, file: &str) {
-        // clip_skip is a per-model convention, not a sticky tunable: a model without a catalog
-        // recommendation reverts to off rather than inheriting the previous model's skip.
-        self.params.clip_skip = 0;
+    /// The user's stored corrections for `file`, keyed by the exact ComfyUI loader name.
+    ///
+    /// Exact only, unlike [`CheckpointCatalog::entry`]'s basename fallback: the catalog is remote
+    /// read-only metadata, whereas these are edited and deleted in place, and two models sharing a
+    /// basename in different subfolders (`Anima/nova.safetensors`, `Illustrious/nova.safetensors`)
+    /// must not read, overwrite or clear each other's settings.
+    fn model_override(&self, file: &str) -> Option<&ModelOverride> {
+        self.model_overrides.get(file)
+    }
+
+    /// The stored override for `file`, created empty on first write.
+    fn model_override_mut(&mut self, file: &str) -> &mut ModelOverride {
+        self.model_overrides.entry(file.to_string()).or_default()
+    }
+
+    /// The catalog's parsed recommendation for `file` with the user's override layered on top.
+    /// Every consumer of a model's defaults reads through here.
+    fn recommended_for(&self, file: &str) -> CheckpointRecommended {
         let rec = self
             .checkpoint_catalog
             .entry(file)
             .and_then(|e| e.recommended.as_ref())
-            .cloned();
+            .cloned()
+            .unwrap_or_default();
+        match self.model_override(file) {
+            Some(o) => o.merged(&rec),
+            None => rec,
+        }
+    }
+
+    /// The user's stored corrections for a LoRA, keyed by the exact `lora_name`.
+    fn lora_override(&self, file: &str) -> Option<&LoraOverride> {
+        self.lora_overrides.get(file)
+    }
+
+    fn lora_override_mut(&mut self, file: &str) -> &mut LoraOverride {
+        self.lora_overrides.entry(file.to_string()).or_default()
+    }
+
+    /// The catalog's LoRA row with the user's override layered on top. `None` only when neither
+    /// exists, so an uncatalogued LoRA the user has tuned still carries their numbers.
+    fn lora_entry_for(&self, file: &str) -> Option<LoraEntry> {
+        match (self.lora_catalog.entry(file), self.lora_override(file)) {
+            (Some(e), Some(o)) => Some(o.merged(e)),
+            (Some(e), None) => Some(e.clone()),
+            (None, Some(o)) => Some(o.merged(&LoraEntry::bare(file))),
+            (None, None) => None,
+        }
+    }
+
+    /// Overwrite sampler / steps / cfg / size from `file`'s effective recommendation (catalog plus
+    /// the user's override), where present.
+    fn apply_recommended_settings(&mut self, file: &str) {
+        // clip_skip is a per-model convention, not a sticky tunable: a model without a catalog
+        // recommendation reverts to off rather than inheriting the previous model's skip.
+        self.params.clip_skip = 0;
+        let rec = Some(self.recommended_for(file));
         let mut sampler_set = false;
         let mut scheduler_set = false;
         if let Some(rec) = &rec {
@@ -10073,12 +10199,7 @@ impl ComfyApp {
     /// Empty option lists mean "not connected yet", never "the server has none": those fields are
     /// left untouched rather than blanked, so an offline preset load keeps its saved companions.
     fn resolve_companions(&mut self, mode: Companions) {
-        let rec = self
-            .checkpoint_catalog
-            .entry(self.params.model_file())
-            .and_then(|e| e.recommended.as_ref())
-            .cloned()
-            .unwrap_or_default();
+        let rec = self.recommended_for(self.params.model_file());
         let model = self.params.model_file().to_string();
         let bases = self.model_bases_for(&model);
         let family = crate::types::checkpoint_family(self.checkpoint_catalog.entry(&model));
@@ -10202,13 +10323,16 @@ impl ComfyApp {
             let mut remove: Option<usize> = None;
             // `(file, was linked)` — the lock button's meaning depends on the state it was drawn in.
             let mut toggle_link: Option<(String, bool)> = None;
+            let mut edit_defaults: Option<String> = None;
             for (i, lora) in self.params.loras.clone().iter().enumerate() {
                 let title = self
                     .lora_catalog
                     .entry(&lora.file)
                     .map(|e| e.display_name().to_string())
                     .unwrap_or_else(|| lora.file.clone());
-                let meta = self.lora_catalog.entry(&lora.file).cloned();
+                let meta = self.lora_entry_for(&lora.file);
+                let over = self.lora_override(&lora.file).cloned();
+                let customised = over.is_some();
                 ui.group(|ui| {
                     ui.set_max_width(list_w - 8.0);
                     ui.horizontal(|ui| {
@@ -10275,19 +10399,27 @@ impl ComfyApp {
                             }
                         }
                         if let Some(meta) = meta.as_ref() {
+                            let tag = if customised { "yours" } else { "rec" };
                             ui.weak(sanitize_ui_text(
                                 ui,
-                                &format!("rec: {}", meta.strength_hint()),
+                                &format!("{tag}: {}", meta.strength_hint()),
                             ));
                         }
                         ui.checkbox(&mut slot.model_only, "Model only (no CLIP)");
+                    }
+                    if ui
+                        .small_button(format!("{} Defaults", icons::STYLUS))
+                        .on_hover_text("Edit this LoRA's default strengths and triggers")
+                        .clicked()
+                    {
+                        edit_defaults = Some(lora.file.clone());
                     }
                     egui::CollapsingHeader::new("Details")
                         .id_salt(("lora_active", i, lora.file.as_str()))
                         .default_open(false)
                         .show(ui, |ui| {
                             ui.set_max_width(list_w - 24.0);
-                            lora_meta_body(ui, &lora.file, meta.as_ref());
+                            lora_meta_body(ui, &lora.file, meta.as_ref(), over.as_ref());
                         });
                 });
             }
@@ -10306,6 +10438,9 @@ impl ComfyApp {
             }
             if let Some(i) = remove {
                 self.remove_lora_at(i);
+            }
+            if let Some(file) = edit_defaults {
+                self.lora_defaults_edit = Some(file);
             }
             ui.separator();
         }
@@ -10334,16 +10469,27 @@ impl ComfyApp {
                 filter.is_empty() || format!("{label} {file}").to_lowercase().contains(&filter)
             })
             .collect();
+        // Re-read each row through the override layer so the list shows the numbers Add will use.
+        let rows: Vec<(String, String, Option<crate::types::LoraEntry>)> = rows
+            .into_iter()
+            .map(|(file, label, entry)| {
+                let merged = self.lora_entry_for(&file).or(entry);
+                (file, label, merged)
+            })
+            .collect();
         let mut shown = 0usize;
         let mut hidden = 0usize;
         let mut add: Option<String> = None;
         let mut examples: Option<String> = None;
+        let mut edit_defaults: Option<String> = None;
         let facets = self.facets.clone();
+        let overrides = self.lora_overrides.clone();
         for (file, label, meta) in &rows {
             if shown >= 80 {
                 hidden += 1;
                 continue;
             }
+            let over = overrides.get(file).cloned();
             let ex = facets.lora_example(file).map(|(_, c)| c).unwrap_or(0);
             ui.horizontal(|ui| {
                 ui.set_max_width(list_w);
@@ -10365,7 +10511,14 @@ impl ComfyApp {
                             .default_open(false)
                             .show(ui, |ui| {
                                 ui.set_max_width((list_w - 56.0).max(100.0));
-                                lora_meta_body(ui, file, meta.as_ref());
+                                lora_meta_body(ui, file, meta.as_ref(), over.as_ref());
+                                if ui
+                                    .small_button(format!("{} Edit defaults", icons::STYLUS))
+                                    .on_hover_text("Correct the strengths and triggers Add will use")
+                                    .clicked()
+                                {
+                                    edit_defaults = Some(file.clone());
+                                }
                             });
                         (clicked, ex_clicked)
                     })
@@ -10378,6 +10531,9 @@ impl ComfyApp {
                 }
             });
             shown += 1;
+        }
+        if let Some(file) = edit_defaults {
+            self.lora_defaults_edit = Some(file);
         }
         if let Some(file) = add {
             self.add_lora(&file);
@@ -10795,6 +10951,299 @@ impl ComfyApp {
         }
         if let Some(v) = next {
             self.params.apps[i].values.insert(knob.id.clone(), v);
+        }
+    }
+
+    /// Correct one model's defaults. The catalog's numbers come from scraped Civitai text and are
+    /// routinely wrong; anything ticked here replaces them for good, and everything left unticked
+    /// keeps tracking the catalog.
+    ///
+    /// The loader radio is applied to the live params immediately when the edited model is the
+    /// selected one — that is the setting people come here to fix, and making them re-pick the
+    /// model to see it take effect reads as the change not having worked.
+    fn model_defaults_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(file) = self.model_defaults_edit.clone() else { return };
+        let title = self
+            .checkpoint_catalog
+            .entry(&file)
+            .map(|e| e.display_name().to_string())
+            .unwrap_or_else(|| file_basename(&file).to_string());
+        let is_current = self.params.model_file() == file;
+        let effective = self.recommended_for(&file);
+        let auto_kind = self.inferred_kind(&file, None);
+        let (samplers, schedulers) = (self.samplers.clone(), self.schedulers.clone());
+        let (clips, vaes) = (self.clip_files.clone(), self.vaes.clone());
+        let (clip_types, dtypes) = (self.clip_types.clone(), self.weight_dtypes.clone());
+        let p = self.params.clone();
+
+        let mut open = true;
+        let mut copy_current = false;
+        let mut clear_all = false;
+        let mut kind_changed = false;
+        let mut ov = self.model_override(&file).cloned().unwrap_or_default();
+
+        centered(ctx, egui::Window::new(format!("{} Defaults", icons::STYLUS)).open(&mut open)).show(
+            ctx,
+            |ui| {
+                ui.set_max_width(ui.available_width().min(420.0));
+                ui.strong(sanitize_ui_text(ui, &title));
+                ui.weak(sanitize_ui_text(ui, &file));
+                if is_current {
+                    ui.weak("This is the selected model.");
+                }
+                crate::theme::scroll_vertical().max_height(420.0).show(ui, |ui| {
+                    section_title(ui, "Loader");
+                    let mut kind = ov.model_kind;
+                    ui.horizontal_wrapped(|ui| {
+                        if crate::theme::selectable_label(ui, kind.is_none(), format!("Auto ({})", auto_kind.label()))
+                            .on_hover_text("Decide from the catalog and which list the file is in")
+                            .clicked()
+                        {
+                            kind = None;
+                        }
+                        for k in ModelKind::ALL {
+                            if crate::theme::selectable_label(ui, kind == Some(k), k.label())
+                                .on_hover_text(k.hint())
+                                .clicked()
+                            {
+                                kind = Some(k);
+                            }
+                        }
+                    });
+                    if kind != ov.model_kind {
+                        ov.model_kind = kind;
+                        kind_changed = true;
+                    }
+                    ui.weak(kind.unwrap_or(auto_kind).hint());
+
+                    section_title(ui, "Sampler");
+                    override_row(ui, "Steps", &mut ov.steps, || effective.steps.unwrap_or(p.steps),
+                        &effective.steps.map(|v| v.to_string()).unwrap_or_default(),
+                        |ui, v| num_edit_u32(ui, v, 1..=200, 1));
+                    override_row(ui, "CFG", &mut ov.cfg, || effective.cfg.unwrap_or(p.cfg),
+                        &effective.cfg.map(|v| format!("{v}")).unwrap_or_default(),
+                        |ui, v| num_edit_f32(ui, v, 0.0..=30.0, 0.5));
+                    override_row(ui, "Sampler", &mut ov.sampler,
+                        || effective.sampler.clone().unwrap_or_else(|| p.sampler.clone()),
+                        effective.sampler.as_deref().unwrap_or(""),
+                        |ui, v| combo_edit(ui, "ov_sampler", v, &samplers));
+                    override_row(ui, "Scheduler", &mut ov.scheduler,
+                        || effective.scheduler.clone().unwrap_or_else(|| p.scheduler.clone()),
+                        effective.scheduler.as_deref().unwrap_or(""),
+                        |ui, v| combo_edit(ui, "ov_scheduler", v, &schedulers));
+                    // CLIPSetLastLayer only splices onto a checkpoint's own CLIP; an external
+                    // qwen/t5 tower has no layers to stop at, so the row would pin a dead value.
+                    if kind.unwrap_or(auto_kind) == ModelKind::Checkpoint {
+                        override_row(ui, "CLIP skip", &mut ov.clip_skip,
+                            || effective.clip_skip.unwrap_or(p.clip_skip),
+                            &effective.clip_skip.map(|v| v.to_string()).unwrap_or_default(),
+                            |ui, v| num_edit_u32(ui, v, 0..=12, 1));
+                    }
+                    override_row(ui, "Width", &mut ov.width, || effective.width.unwrap_or(p.width),
+                        &effective.width.map(|v| v.to_string()).unwrap_or_default(),
+                        |ui, v| num_edit_u32(ui, v, 64..=4096, 64));
+                    override_row(ui, "Height", &mut ov.height, || effective.height.unwrap_or(p.height),
+                        &effective.height.map(|v| v.to_string()).unwrap_or_default(),
+                        |ui, v| num_edit_u32(ui, v, 64..=4096, 64));
+
+                    if kind.unwrap_or(auto_kind).needs_companions() {
+                        section_title(ui, "Text encoder / VAE");
+                        override_row(ui, "Encoder", &mut ov.clip_names,
+                            || {
+                                let cur = effective.clip_names.clone().unwrap_or_else(|| p.active_clips());
+                                if cur.is_empty() { vec![String::new()] } else { cur }
+                            },
+                            &effective.clip_names.clone().unwrap_or_default().join(" + "),
+                            |ui, v| {
+                                v.truncate(2);
+                                if v.is_empty() {
+                                    v.push(String::new());
+                                }
+                                ui.vertical(|ui| {
+                                    for (i, name) in v.iter_mut().enumerate() {
+                                        combo_edit(ui, &format!("ov_clip{i}"), name, &clips);
+                                    }
+                                });
+                            });
+                        // A second encoder switches the graph to DualCLIPLoader; keep the add/drop
+                        // outside the value editor so an empty slot never masquerades as a pick.
+                        if let Some(names) = ov.clip_names.as_mut() {
+                            ui.horizontal(|ui| {
+                                if names.len() < 2 && ui.small_button("+ second encoder").clicked() {
+                                    names.push(String::new());
+                                }
+                                if names.len() > 1 && ui.small_button("- second encoder").clicked() {
+                                    names.truncate(1);
+                                }
+                            });
+                        }
+                        override_row(ui, "Encoder type", &mut ov.clip_type,
+                            || effective.clip_type.clone().unwrap_or_else(|| p.effective_clip_type()),
+                            effective.clip_type.as_deref().unwrap_or(""),
+                            |ui, v| combo_edit(ui, "ov_clip_type", v, &clip_types));
+                        override_row(ui, "VAE", &mut ov.vae,
+                            || effective.vae.clone().unwrap_or_else(|| p.vae_name.clone()),
+                            effective.vae.as_deref().unwrap_or(""),
+                            |ui, v| combo_edit(ui, "ov_vae", v, &vaes));
+                        // UNETLoader's input only — a checkpoint-loaded model never emits one.
+                        if kind.unwrap_or(auto_kind) == ModelKind::Diffusion {
+                            override_row(ui, "Weight dtype", &mut ov.weight_dtype,
+                                || effective.weight_dtype.clone().unwrap_or_else(|| p.effective_weight_dtype()),
+                                effective.weight_dtype.as_deref().unwrap_or(""),
+                                |ui, v| combo_edit(ui, "ov_dtype", v, &dtypes));
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    copy_current = ui
+                        .add_enabled(is_current, egui::Button::new("Copy current settings"))
+                        .on_hover_text("Pin everything the Create tab is showing right now")
+                        .clicked();
+                    clear_all = ui
+                        .small_button("Clear all")
+                        .on_hover_text("Go back to the catalog's values")
+                        .clicked();
+                });
+            },
+        );
+
+        if copy_current {
+            ov = ModelOverride {
+                model_kind: Some(p.model_kind),
+                steps: Some(p.steps),
+                cfg: Some(p.cfg),
+                sampler: Some(p.sampler.clone()),
+                scheduler: Some(p.scheduler.clone()),
+                clip_skip: (p.model_kind == ModelKind::Checkpoint).then_some(p.clip_skip),
+                width: Some(p.width),
+                height: Some(p.height),
+                ..ov
+            };
+            if p.model_kind.needs_companions() {
+                ov.clip_names = Some(p.active_clips());
+                ov.clip_type = Some(p.effective_clip_type());
+                ov.vae = Some(p.vae_name.clone());
+                // UNETLoader's input; nothing reads it on the checkpoint-loaded paths.
+                ov.weight_dtype =
+                    (p.model_kind == ModelKind::Diffusion).then(|| p.effective_weight_dtype());
+            }
+            self.status = "Saved as this model's defaults".into();
+            host.haptic(Haptic::Success);
+        }
+        if clear_all {
+            ov = ModelOverride::default();
+            kind_changed = true;
+            self.status = "Back to the catalog's defaults".into();
+        }
+        if ov.is_empty() {
+            self.model_overrides.remove(&file);
+        } else {
+            *self.model_override_mut(&file) = ov;
+        }
+        // Re-selecting rewrites the loader, the sampler block and the companions in one go, which
+        // is exactly what a changed loader needs; the other fields land on the next model change.
+        if kind_changed && is_current {
+            self.select_model(&file, None);
+        }
+        if !open {
+            self.model_defaults_edit = None;
+        }
+    }
+
+    /// Correct one LoRA's catalogued strengths and trigger words.
+    fn lora_defaults_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let Some(file) = self.lora_defaults_edit.clone() else { return };
+        let title = self
+            .lora_catalog
+            .entry(&file)
+            .map(|e| e.display_name().to_string())
+            .unwrap_or_else(|| file_basename(&file).to_string());
+        let cat = self.lora_catalog.entry(&file).cloned();
+        let effective = self.lora_entry_for(&file).unwrap_or_else(|| LoraEntry::bare(&file));
+        let active = self.params.loras.iter().find(|l| l.file == file).cloned();
+
+        let mut open = true;
+        let mut copy_current = false;
+        let mut clear_all = false;
+        let mut ov = self.lora_override(&file).cloned().unwrap_or_default();
+
+        centered(ctx, egui::Window::new(format!("{} LoRA defaults", icons::STYLUS)).open(&mut open))
+            .show(ctx, |ui| {
+                ui.set_max_width(ui.available_width().min(420.0));
+                ui.strong(sanitize_ui_text(ui, &title));
+                ui.weak(sanitize_ui_text(ui, &file));
+                if cat.is_none() {
+                    ui.weak("Not in the server catalog — these are the only defaults it has.");
+                }
+                crate::theme::scroll_vertical().max_height(400.0).show(ui, |ui| {
+                    section_title(ui, "Strength on add");
+                    override_row(ui, "Model", &mut ov.strength_model,
+                        || effective.strength_model,
+                        &format!("{:.2}", cat.as_ref().map(|e| e.strength_model).unwrap_or(1.0)),
+                        |ui, v| num_edit_f32(ui, v, -4.0..=4.0, crate::types::LORA_STRENGTH_STEP));
+                    override_row(ui, "CLIP", &mut ov.strength_clip,
+                        || effective.strength_clip,
+                        &format!("{:.2}", cat.as_ref().map(|e| e.strength_clip).unwrap_or(1.0)),
+                        |ui, v| num_edit_f32(ui, v, -4.0..=4.0, crate::types::LORA_STRENGTH_STEP));
+
+                    section_title(ui, "Slider range");
+                    override_row(ui, "Min", &mut ov.strength_model_min,
+                        || effective.strength_range().0,
+                        &cat.as_ref().and_then(|e| e.strength_model_min).map(|v| format!("{v:.2}")).unwrap_or_default(),
+                        |ui, v| num_edit_f32(ui, v, -8.0..=8.0, 0.1));
+                    override_row(ui, "Max", &mut ov.strength_model_max,
+                        || effective.strength_range().1,
+                        &cat.as_ref().and_then(|e| e.strength_model_max).map(|v| format!("{v:.2}")).unwrap_or_default(),
+                        |ui, v| num_edit_f32(ui, v, -8.0..=8.0, 0.1));
+
+                    section_title(ui, "Prompt");
+                    override_row(ui, "Triggers", &mut ov.trigger_words,
+                        || effective.trigger_words.clone(),
+                        &cat.as_ref().map(|e| e.trigger_text()).unwrap_or_default(),
+                        |ui, v| words_edit(ui, "ov_lora_trig", v));
+                    override_row(ui, "Negatives", &mut ov.negative_words,
+                        || effective.negative_words.clone(),
+                        &cat.as_ref().map(|e| e.negative_text()).unwrap_or_default(),
+                        |ui, v| words_edit(ui, "ov_lora_neg", v));
+
+                    section_title(ui, "Chain");
+                    override_row(ui, "Model only", &mut ov.model_only,
+                        || active.as_ref().map(|l| l.model_only).unwrap_or(false),
+                        "off",
+                        |ui, v| {
+                            ui.checkbox(v, "skip the CLIP chain");
+                        });
+                });
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    copy_current = ui
+                        .add_enabled(active.is_some(), egui::Button::new("Copy current strengths"))
+                        .on_hover_text("Pin the numbers this LoRA is set to right now")
+                        .clicked();
+                    clear_all =
+                        ui.small_button("Clear all").on_hover_text("Go back to the catalog's values").clicked();
+                });
+            });
+
+        if let (true, Some(l)) = (copy_current, active.as_ref()) {
+            ov.strength_model = Some(l.strength_model);
+            ov.strength_clip = Some(l.strength_clip);
+            ov.model_only = Some(l.model_only);
+            self.status = "Saved as this LoRA's defaults".into();
+            host.haptic(Haptic::Success);
+        }
+        if clear_all {
+            ov = LoraOverride::default();
+            self.status = "Back to the catalog's LoRA defaults".into();
+        }
+        if ov.is_empty() {
+            self.lora_overrides.remove(&file);
+        } else {
+            *self.lora_override_mut(&file) = ov;
+        }
+        if !open {
+            self.lora_defaults_edit = None;
         }
     }
 
@@ -11422,7 +11871,7 @@ impl ComfyApp {
 
     /// Catalogued strength window per Wan stack row, positionally matching `list`.
     fn video_lora_ranges(&self, list: &[ActiveLora]) -> Vec<Option<(f32, f32)>> {
-        list.iter().map(|l| self.lora_catalog.entry(&l.file).map(|e| e.strength_range())).collect()
+        list.iter().map(|l| self.lora_entry_for(&l.file).map(|e| e.strength_range())).collect()
     }
 
     /// Apply catalog strengths/negatives for a picked Wan LoRA, then re-derive triggers.
@@ -11432,10 +11881,7 @@ impl ComfyApp {
                 let list =
                     if high { &self.params.video.loras_high } else { &self.params.video.loras_low };
                 let Some(file) = list.get(i).map(|l| l.file.clone()) else { return };
-                let entry = self
-                    .lora_catalog
-                    .entry(&file)
-                    .map(|e| (e.add_strengths(), e.negative_text()));
+                let entry = self.lora_entry_for(&file).map(|e| (e.add_strengths(), e.negative_text()));
                 if let Some(((sm, sc), neg)) = entry {
                     let list = if high {
                         &mut self.params.video.loras_high
@@ -11496,8 +11942,7 @@ impl ComfyApp {
             if l.file.trim().is_empty() {
                 continue;
             }
-            let triggers =
-                self.lora_catalog.entry(&l.file).map(|e| e.trigger_text()).unwrap_or_default();
+            let triggers = self.lora_entry_for(&l.file).map(|e| e.trigger_text()).unwrap_or_default();
             if triggers.is_empty() {
                 continue;
             }
@@ -11515,13 +11960,15 @@ impl ComfyApp {
         if self.params.loras.iter().any(|l| l.file == file) {
             return;
         }
-        let (sm, sc, triggers, negatives) = match self.lora_catalog.entry(file) {
+        let entry = self.lora_entry_for(file);
+        let (sm, sc, triggers, negatives) = match &entry {
             Some(e) => {
                 let (sm, sc) = e.add_strengths();
                 (sm, sc, e.trigger_text(), e.negative_text())
             }
             None => (1.0, 1.0, String::new(), String::new()),
         };
+        let model_only = self.lora_override(file).and_then(|o| o.model_only).unwrap_or(false);
         let injected = merge_triggers(
             &mut self.params.lora_triggers,
             &triggers,
@@ -11533,7 +11980,7 @@ impl ComfyApp {
             strength_model: sm,
             strength_clip: sc,
             injected,
-            model_only: false,
+            model_only,
         });
         self.selected_preset.clear();
     }
@@ -11679,11 +12126,26 @@ impl ComfyApp {
         // Reverse any Create-Main looks off the current positive first; a remix that keeps (rather
         // than replaces) the positive would otherwise orphan their tokens with no way to strip them.
         self.strip_main_looks();
-        // A UNET in the graph means the diffusion topology; the image's own encoders and VAE beat
-        // whatever select_model would have seeded.
         if sel.model {
-            if let Some(unet) = &meta.unet {
+            let applied = if let Some(unet) = &meta.unet {
                 self.select_model(unet, Some(ModelKind::Diffusion));
+                true
+            } else if let Some(m) = meta.models.first() {
+                // A checkpoint graph that also loaded its own encoder AND VAE is the
+                // split-companion topology — the scraped nodes are proof, so don't re-guess it.
+                // Otherwise no hint: the gate's quick summary folds UNET names into this same
+                // single "model" field, and a hard Checkpoint hint would rebuild those under the
+                // wrong loader, so let the full ladder decide.
+                let hint = (!meta.clips.is_empty() && meta.vae.is_some())
+                    .then_some(ModelKind::CheckpointDiffusion);
+                self.select_model(m, hint);
+                true
+            } else {
+                false
+            };
+            // The graph's own encoders and VAE beat whatever select_model seeded — but only for a
+            // model this remix actually applied, never the one already selected.
+            if applied && self.params.model_kind.needs_companions() {
                 if !meta.clips.is_empty() {
                     self.params.clip_names = meta.clips.clone();
                 }
@@ -11696,17 +12158,6 @@ impl ComfyApp {
                 if let Some(d) = &meta.weight_dtype {
                     self.params.weight_dtype = d.clone();
                 }
-            } else if let Some(m) = meta.models.first() {
-                // The gate's quick summary folds UNET names into the same single "model" field —
-                // a hard Checkpoint hint would rebuild those under the wrong loader topology.
-                let kind = if self.unets.iter().any(|u| u == m)
-                    && !self.checkpoints.iter().any(|c| c == m)
-                {
-                    ModelKind::Diffusion
-                } else {
-                    ModelKind::Checkpoint
-                };
-                self.select_model(m, Some(kind));
             }
         }
         if sel.positive {
@@ -11831,7 +12282,7 @@ impl ComfyApp {
         // Repair a diffusion model's companions against this server's installed files; when the
         // model row is unchecked this ports the prompt / LoRAs onto the current checkpoint. Video
         // carries its own encoders/VAE in params.video, so skip the image-companion repair.
-        if !is_video && self.params.model_kind == ModelKind::Diffusion {
+        if !is_video && self.params.model_kind.needs_companions() {
             self.resolve_companions(Companions::Repair);
         }
         // Disable seed randomization so the seed reproduces.
@@ -11915,7 +12366,7 @@ impl ComfyApp {
     /// Queue `n` full-quality jobs at seed+1..=seed+n using the image's exact meta.
     fn queue_neighbor_seeds(&mut self, ctx: &egui::Context, host: &Host, meta: &ImageMeta, n: usize) {
         self.apply_image_meta(meta);
-        if self.params.model_kind == ModelKind::Diffusion {
+        if self.params.model_kind.needs_companions() {
             self.resolve_companions(Companions::Repair);
         }
         self.params.randomize_seed = false;
@@ -12124,6 +12575,7 @@ impl ComfyApp {
             })
             .flatten();
         let schemas = self.schemas.clone().unwrap_or_default();
+        self.last_gen_create = false;
         self.engine.as_mut().unwrap().run_finish(
             sheet.video_path.clone(),
             reference,
@@ -12497,7 +12949,7 @@ impl ComfyApp {
             self.params.inpaint_mask = false;
             self.selected_preset = name.to_string();
             // A preset saved against another server may name companions this one lacks.
-            if self.params.model_kind == ModelKind::Diffusion {
+            if self.params.model_kind.needs_companions() {
                 self.resolve_companions(Companions::Repair);
             }
         }
@@ -12573,8 +13025,7 @@ impl ComfyApp {
         let mut triggers = card.triggers.trim().to_string();
         for lora in &card.loras {
             let (t, n) = self
-                .lora_catalog
-                .entry(&lora.file)
+                .lora_entry_for(&lora.file)
                 .map(|e| (e.trigger_text(), e.negative_text()))
                 .unwrap_or_default();
             triggers = join_comma(&triggers, &t);
@@ -14605,7 +15056,7 @@ impl ComfyApp {
 
     /// Apply catalog strengths (and prompt triggers when a positive CLIP encode exists).
     fn apply_lora_pick(&mut self, pick: LoraPick) {
-        let (sm, sc, triggers) = match self.lora_catalog.entry(&pick.file) {
+        let (sm, sc, triggers) = match self.lora_entry_for(&pick.file) {
             Some(e) => {
                 let (sm, sc) = e.add_strengths();
                 (sm, sc, e.trigger_text())
@@ -16397,9 +16848,11 @@ impl ComfyApp {
         let (_, dialect) = self.expand_dialect();
         match self.rewrite_controls_shown() {
             (true, true) => ui.label(format!(
-                "{} Both offered under the prompt: Expand · comfy-gate (for {dialect}) and \
-                 Rewrite · on device",
-                icons::CHECK
+                "{} Both offered beside the prompt: {} Expand on comfy-gate (for {dialect}) and \
+                 {} Rewrite on this device",
+                icons::CHECK,
+                icons::CLOUD,
+                icons::GENERATE
             )),
             (true, false) => ui.label(format!(
                 "{} Rewrites now run on comfy-gate (for {dialect})",
@@ -20047,7 +20500,7 @@ impl ComfyApp {
         }
         use local_rewrite::RewriteKind;
         let video = self.params.mode == Mode::Video;
-        ui.menu_button(format!("{} Rewrite · on device", icons::GENERATE), |ui| {
+        ui.menu_button(format!("{} Rewrite", icons::GENERATE), |ui| {
             if self.rewrite_running {
                 ui.add(egui::Spinner::new());
                 ui.label("Rewriting…");
@@ -21074,6 +21527,8 @@ impl EguiApp for ComfyApp {
             });
 
         self.app_picker_window(ui.ctx(), host);
+        self.model_defaults_window(ui.ctx(), host);
+        self.lora_defaults_window(ui.ctx(), host);
         self.publish_window(ui.ctx(), host);
         self.gallery_pick_window(ui.ctx(), host);
         self.queue_sheet_window(ui.ctx(), host);
@@ -21165,7 +21620,43 @@ impl ComfyApp {
             m.count += 1;
             return;
         }
-        self.error_modal = Some(ErrorModal { title: title.to_string(), detail, count: 1 });
+        let fix = self.error_fix_for(&detail);
+        self.error_modal = Some(ErrorModal { title: title.to_string(), detail, count: 1, fix });
+    }
+
+    /// The repair that obviously fixes `detail`, if any.
+    ///
+    /// ComfyUI reports a checkpoint carrying no text encoder as a null `clip` on the first
+    /// `CLIPTextEncode`; the file itself still loads, so nothing the app can check ahead of time
+    /// sees it. The fix is to stop reading CLIP and VAE off the checkpoint loader.
+    fn error_fix_for(&self, detail: &str) -> Option<ErrorFix> {
+        let d = detail.to_ascii_lowercase();
+        let clipless = d.contains("clip input is invalid")
+            || d.contains("no clip/text encoder weights in checkpoint")
+            || d.contains("does not contain a valid clip or text encoder model");
+        // `Msg::GenError` is the sink for every run — graph tab, finish pass, taste test — and the
+        // fix rewrites the Create selection, so it is only offered for a Create-tab failure.
+        if !clipless || !self.last_gen_create || self.params.model_kind != ModelKind::Checkpoint {
+            return None;
+        }
+        let file = self.params.checkpoint.trim();
+        (!file.is_empty()).then(|| ErrorFix::SplitCompanions(file.to_string()))
+    }
+
+    /// Apply an [`ErrorFix`], pinning it as the model's default so the next run starts correct.
+    fn apply_error_fix(&mut self, fix: ErrorFix, host: &Host) {
+        match fix {
+            ErrorFix::SplitCompanions(file) => {
+                self.model_override_mut(&file).model_kind = Some(ModelKind::CheckpointDiffusion);
+                self.select_model(&file, None);
+                self.create_companions_open = true;
+                self.status = format!(
+                    "{} now loads its text encoder and VAE separately — check they are right",
+                    file_basename(&file)
+                );
+                host.haptic(Haptic::Success);
+            }
+        }
     }
 
     /// Blocking error dialog: scrim + centered window with the full, scrollable error text.
@@ -21175,9 +21666,11 @@ impl ComfyApp {
     fn error_modal_window(&mut self, ctx: &egui::Context, host: &Host) {
         let Some(m) = &self.error_modal else { return };
         let (title, detail, count) = (m.title.clone(), m.detail.clone(), m.count);
+        let fix = m.fix.clone();
 
         let mut open = true;
         let mut close = false;
+        let mut apply_fix: Option<ErrorFix> = None;
         // Dimming click-catcher below the window: blocks the UI, tap outside closes. Tooltip
         // order (registered just before the window) so other centered() windows — which are also
         // Tooltip and would stack above a Foreground scrim — end up covered and unclickable.
@@ -21211,6 +21704,26 @@ impl ComfyApp {
                     });
                 ui.add_space(6.0);
                 ui.separator();
+                if let Some(ErrorFix::SplitCompanions(f)) = &fix {
+                    if ui
+                        .add_sized(
+                            egui::vec2(ui.available_width(), 34.0),
+                            egui::Button::new(format!(
+                                "{} Load {}'s CLIP + VAE separately",
+                                icons::STYLUS,
+                                elide(file_basename(f), 24)
+                            )),
+                        )
+                        .on_hover_text(
+                            "This checkpoint has no text encoder of its own — load one alongside it",
+                        )
+                        .clicked()
+                    {
+                        apply_fix = fix.clone();
+                        close = true;
+                    }
+                    ui.add_space(4.0);
+                }
                 ui.horizontal(|ui| {
                     const GAP: f32 = 6.0;
                     ui.spacing_mut().item_spacing.x = GAP;
@@ -21234,6 +21747,9 @@ impl ComfyApp {
             });
         if !open || close {
             self.error_modal = None;
+        }
+        if let Some(fix) = apply_fix {
+            self.apply_error_fix(fix, host);
         }
     }
 
@@ -22166,6 +22682,7 @@ fn model_version_row(
     file: &str,
     kind: ModelKind,
     meta: &Option<crate::types::CheckpointEntry>,
+    over: Option<&ModelOverride>,
     current: &str,
     favorite: bool,
     salt: &str,
@@ -22173,14 +22690,20 @@ fn model_version_row(
     pick: &mut Option<(String, ModelKind)>,
     toggle_fav: &mut Option<String>,
     examples: &mut Option<String>,
+    edit_defaults: &mut Option<String>,
 ) {
     let selected = current == file;
     let mut ver = meta
         .as_ref()
         .map(|e| e.version_label())
         .unwrap_or_else(|| file_basename(file).to_string());
-    if kind == ModelKind::Diffusion {
-        ver.push_str(" • diffusion");
+    match kind {
+        ModelKind::Diffusion => ver.push_str(" • diffusion"),
+        ModelKind::CheckpointDiffusion => ver.push_str(" • separate CLIP/VAE"),
+        ModelKind::Checkpoint => {}
+    }
+    if over.is_some() {
+        ver.push_str(" • custom");
     }
     let ver_header = if selected {
         format!("{} {ver}", icons::CHECK)
@@ -22220,7 +22743,14 @@ fn model_version_row(
                     .default_open(false)
                     .show(ui, |ui| {
                         ui.set_max_width(ui.available_width().max(40.0));
-                        checkpoint_meta_body(ui, file, meta.as_ref());
+                        checkpoint_meta_body(ui, file, meta.as_ref(), over);
+                        if ui
+                            .small_button(format!("{} Edit defaults", icons::STYLUS))
+                            .on_hover_text("Correct this model's loader, sampler and companions")
+                            .clicked()
+                        {
+                            *edit_defaults = Some(file.to_string());
+                        }
                     });
                 (use_clicked, star_clicked, ex_clicked)
             })
@@ -22242,8 +22772,12 @@ fn checkpoint_meta_body(
     ui: &mut egui::Ui,
     file: &str,
     entry: Option<&crate::types::CheckpointEntry>,
+    over: Option<&ModelOverride>,
 ) {
     wrap_meta(ui, "File", file);
+    if let Some(hint) = over.and_then(|o| o.short_hint()) {
+        wrap_meta(ui, "Yours", &hint);
+    }
     let Some(e) = entry else {
         ui.weak("No catalog metadata for this checkpoint.");
         return;
@@ -22452,8 +22986,16 @@ fn character_meta_body(ui: &mut egui::Ui, card: &CharacterCard) {
 }
 
 /// Wrapped LoRA catalog fields for a collapsing details body.
-fn lora_meta_body(ui: &mut egui::Ui, file: &str, entry: Option<&crate::types::LoraEntry>) {
+fn lora_meta_body(
+    ui: &mut egui::Ui,
+    file: &str,
+    entry: Option<&crate::types::LoraEntry>,
+    over: Option<&LoraOverride>,
+) {
     wrap_meta(ui, "File", file);
+    if let Some(hint) = over.and_then(|o| o.short_hint()) {
+        wrap_meta(ui, "Yours", &hint);
+    }
     let Some(e) = entry else {
         ui.weak("No catalog metadata for this LoRA.");
         return;
@@ -22546,7 +23088,10 @@ struct FamilyReq {
 /// label and the filename. Only an explicit match here is allowed to override a stale leftover.
 fn family_companions(model_file: &str, family: &str) -> FamilyReq {
     let fam = family.to_ascii_lowercase();
-    let name = file_basename(model_file).to_ascii_lowercase();
+    // The whole relative path, not just the basename: models are filed under a family folder
+    // (`Anima/novaAnimeAM_v30.safetensors`) whose name is often the only family signal an
+    // uncatalogued download has.
+    let name = model_file.to_ascii_lowercase();
     let is = |k: &str| fam.contains(k) || name.contains(k);
     // Anima's DiT and Qwen-Image both encode through the Qwen tower and pair with the Qwen VAE.
     if is("anima") || is("qwen") {
@@ -22566,7 +23111,8 @@ fn family_companions(model_file: &str, family: &str) -> FamilyReq {
 /// so a model switch re-seeds rather than inheriting. `None` = leave the current pick untouched.
 fn family_default_sampler(model_file: &str, family: &str) -> Option<(&'static str, &'static str)> {
     let fam = family.to_ascii_lowercase();
-    let name = file_basename(model_file).to_ascii_lowercase();
+    // Folder as well as filename — see [`family_companions`].
+    let name = model_file.to_ascii_lowercase();
     let is = |k: &str| fam.contains(k) || name.contains(k);
     // Flow-match / rectified-flow families run plain Euler on a simple schedule.
     if is("anima")
@@ -22700,6 +23246,119 @@ fn combo_full(ui: &mut egui::Ui, id: &str, current: &mut String, options: &[Stri
                 crate::theme::selectable_value(ui, current, opt.clone(), elide(&sanitize_ui_text(ui, opt), 56));
             }
         });
+}
+
+/// One row of a defaults editor: a checkbox flipping the field between the catalog's value and the
+/// user's, the editor while it is on, and the catalog's value while it is off. Ticking seeds the
+/// slot from `seed` so the first edit starts where the model already is.
+fn override_row<T>(
+    ui: &mut egui::Ui,
+    label: &str,
+    slot: &mut Option<T>,
+    seed: impl FnOnce() -> T,
+    catalog: &str,
+    edit: impl FnOnce(&mut egui::Ui, &mut T),
+) {
+    ui.horizontal(|ui| {
+        let mut on = slot.is_some();
+        if ui.checkbox(&mut on, label).on_hover_text("Set your own value").changed() {
+            *slot = on.then(seed);
+        }
+        match slot {
+            Some(v) => edit(ui, v),
+            None => {
+                let text = if catalog.trim().is_empty() { "catalog" } else { catalog };
+                ui.weak(elide_width(ui, &sanitize_ui_text(ui, text), ui.available_width().max(40.0)));
+            }
+        }
+    });
+}
+
+/// − / typed value / + on one line, for a defaults-editor row.
+fn num_edit_u32(ui: &mut egui::Ui, value: &mut u32, range: std::ops::RangeInclusive<u32>, step: u32) {
+    if ui.small_button("-").clicked() {
+        *value = (*value).saturating_sub(step).max(*range.start());
+    }
+    let mut s = value.to_string();
+    if ui
+        .add(egui::TextEdit::singleline(&mut s).desired_width(52.0).horizontal_align(egui::Align::Center))
+        .changed()
+        && let Ok(v) = s.parse::<u32>()
+    {
+        *value = v.clamp(*range.start(), *range.end());
+    }
+    if ui.small_button("+").clicked() {
+        *value = (*value).saturating_add(step).min(*range.end());
+    }
+}
+
+fn num_edit_f32(ui: &mut egui::Ui, value: &mut f32, range: std::ops::RangeInclusive<f32>, step: f32) {
+    if ui.small_button("-").clicked() {
+        *value = (*value - step).max(*range.start());
+    }
+    let mut s = format!("{value:.2}");
+    if ui
+        .add(egui::TextEdit::singleline(&mut s).desired_width(56.0).horizontal_align(egui::Align::Center))
+        .changed()
+        && let Ok(v) = s.parse::<f32>()
+    {
+        *value = v.clamp(*range.start(), *range.end());
+    }
+    if ui.small_button("+").clicked() {
+        *value = (*value + step).min(*range.end());
+    }
+}
+
+/// A combo over the server's installed options, showing basenames. A value this server doesn't
+/// list still reads back in the closed combo, and the open list says so.
+fn combo_edit(ui: &mut egui::Ui, salt: &str, value: &mut String, options: &[String]) {
+    let text = if value.trim().is_empty() {
+        "(none)".to_string()
+    } else {
+        file_basename(value).to_string()
+    };
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(elide(&sanitize_ui_text(ui, &text), 28))
+        .width(ui.available_width().clamp(90.0, 220.0))
+        .show_ui(ui, |ui| {
+            for o in options {
+                crate::theme::selectable_value(ui, value, o.clone(), file_basename(o));
+            }
+            if !options.iter().any(|o| o == value) && !value.trim().is_empty() {
+                ui.weak(format!("{} (not on this server)", file_basename(value)));
+            }
+        });
+}
+
+/// A comma-separated word list edited as one line.
+///
+/// The raw text lives in egui state rather than being re-joined from `words` each frame: parsing
+/// drops the empty tail after a typed separator, so re-joining would delete the comma the instant
+/// it was typed and a second word could never be entered. The buffer is re-seeded from `words`
+/// whenever the two disagree, so an edit made elsewhere still shows up.
+fn words_edit(ui: &mut egui::Ui, salt: &str, words: &mut Vec<String>) {
+    let id = egui::Id::new(("words_edit", salt));
+    let mut text = ui
+        .ctx()
+        .data(|d| d.get_temp::<String>(id))
+        .filter(|t| split_words(t) == *words)
+        .unwrap_or_else(|| words.join(", "));
+    let changed = ui
+        .add(
+            egui::TextEdit::singleline(&mut text)
+                .id(id.with("edit"))
+                .desired_width(ui.available_width().max(80.0)),
+        )
+        .changed();
+    if changed {
+        *words = split_words(&text);
+    }
+    ui.ctx().data_mut(|d| d.insert_temp(id, text));
+}
+
+/// Comma-separated text as trimmed, non-empty words.
+fn split_words(s: &str) -> Vec<String> {
+    s.split(',').map(|w| w.trim().to_string()).filter(|w| !w.is_empty()).collect()
 }
 
 /// Underlined section heading.

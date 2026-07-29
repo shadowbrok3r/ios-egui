@@ -23,13 +23,72 @@ pub enum Img2ImgSource {
 
 /// Which loader topology a model needs: one all-in-one checkpoint, or a bare diffusion model
 /// paired with separately-loaded text encoder(s) and VAE.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize)]
 pub enum ModelKind {
     /// `CheckpointLoaderSimple` -> MODEL + CLIP + VAE.
     #[default]
     Checkpoint,
     /// `UNETLoader` + `CLIPLoader`/`DualCLIPLoader` + `VAELoader`.
     Diffusion,
+    /// `CheckpointLoaderSimple` for the MODEL only, with `CLIPLoader` + `VAELoader` alongside.
+    ///
+    /// A bare diffusion model (Anima, Flux, Qwen-Image) that sits in `models/checkpoints` rather
+    /// than `models/diffusion_models`. ComfyUI lists it under `CheckpointLoaderSimple.ckpt_name`
+    /// and nowhere else, so [`Self::Diffusion`]'s `UNETLoader` cannot reach the file — but the
+    /// checkpoint loader reads its weights fine and simply returns no CLIP and no VAE. Wiring the
+    /// encoder and VAE separately is then the only topology that runs.
+    CheckpointDiffusion,
+}
+
+/// Hand-written so an unrecognised variant degrades to the all-in-one checkpoint instead of
+/// failing the whole settings file — a derived unit enum rejects an unknown string outright, which
+/// would take the server URL, presets and characters down with it.
+impl<'de> Deserialize<'de> for ModelKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "Diffusion" => Self::Diffusion,
+            "CheckpointDiffusion" => Self::CheckpointDiffusion,
+            _ => Self::Checkpoint,
+        })
+    }
+}
+
+impl ModelKind {
+    /// Picker order: plain checkpoint, the split-companion checkpoint, then the bare UNET.
+    pub const ALL: [ModelKind; 3] =
+        [ModelKind::Checkpoint, ModelKind::CheckpointDiffusion, ModelKind::Diffusion];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "Checkpoint",
+            Self::CheckpointDiffusion => "Checkpoint + separate CLIP/VAE",
+            Self::Diffusion => "Diffusion model",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "One file carrying MODEL + CLIP + VAE.",
+            Self::CheckpointDiffusion => {
+                "A bare diffusion model filed under models/checkpoints: the file loads through \
+                 CheckpointLoaderSimple, and the text encoder and VAE load separately."
+            }
+            Self::Diffusion => {
+                "A bare diffusion model under models/diffusion_models or models/unet, loaded by \
+                 UNETLoader with a separate text encoder and VAE."
+            }
+        }
+    }
+
+    /// Reads the file from the `CheckpointLoaderSimple` list rather than the `UNETLoader` one.
+    pub fn is_checkpoint_file(self) -> bool {
+        matches!(self, Self::Checkpoint | Self::CheckpointDiffusion)
+    }
+
+    /// Needs a separately-loaded text encoder and VAE.
+    pub fn needs_companions(self) -> bool {
+        matches!(self, Self::Diffusion | Self::CheckpointDiffusion)
+    }
 }
 
 /// One LoRA stacked on the Create-tab graph (chained `LoraLoader` after the checkpoint).
@@ -414,10 +473,7 @@ impl Params {
 
     /// The selected model's filename, whichever loader it goes through.
     pub fn model_file(&self) -> &str {
-        match self.model_kind {
-            ModelKind::Checkpoint => &self.checkpoint,
-            ModelKind::Diffusion => &self.unet_name,
-        }
+        if self.model_kind.is_checkpoint_file() { &self.checkpoint } else { &self.unet_name }
     }
 
     /// Create Main mode picker value derived from [`Self::mode`] + [`VideoParams::video_t2v`].
@@ -475,22 +531,21 @@ impl Params {
 
     /// Why the diffusion path can't be queued yet, if anything is missing.
     pub fn missing_model_part(&self) -> Option<&'static str> {
-        match self.model_kind {
-            ModelKind::Checkpoint => {
-                self.checkpoint.trim().is_empty().then_some("Pick a checkpoint first")
+        if self.model_file().trim().is_empty() {
+            return Some(match self.model_kind {
+                ModelKind::Diffusion => "Pick a diffusion model first",
+                _ => "Pick a checkpoint first",
+            });
+        }
+        if self.model_kind.needs_companions() {
+            if self.active_clips().is_empty() {
+                return Some("Pick a text encoder for this model");
             }
-            ModelKind::Diffusion => {
-                if self.unet_name.trim().is_empty() {
-                    Some("Pick a diffusion model first")
-                } else if self.active_clips().is_empty() {
-                    Some("Pick a text encoder for this model")
-                } else if self.vae_name.trim().is_empty() {
-                    Some("Pick a VAE for this model")
-                } else {
-                    None
-                }
+            if self.vae_name.trim().is_empty() {
+                return Some("Pick a VAE for this model");
             }
         }
+        None
     }
 }
 
@@ -1148,6 +1203,125 @@ impl CheckpointRecommended {
     }
 }
 
+/// A user's corrections to one model's defaults, layered over the catalog's parsed `recommended`
+/// block. Every field is `None` until the user sets it, so an override only replaces what it names
+/// and the rest keeps tracking the server catalog.
+///
+/// The catalog's numbers are scraped out of Civitai descriptions and example metadata, so they are
+/// routinely wrong for a given model; this is the local last word on them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelOverride {
+    /// Forces the loader topology when the folder the file sits in implies the wrong one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_kind: Option<ModelKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampler: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_skip: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vae: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_dtype: Option<String>,
+}
+
+impl ModelOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `rec` with every field the user set replaced by theirs.
+    pub fn merged(&self, rec: &CheckpointRecommended) -> CheckpointRecommended {
+        let mut out = rec.clone();
+        if self.steps.is_some() {
+            out.steps = self.steps;
+        }
+        if self.cfg.is_some() {
+            out.cfg = self.cfg;
+        }
+        if self.sampler.is_some() {
+            out.sampler = self.sampler.clone();
+        }
+        if self.scheduler.is_some() {
+            out.scheduler = self.scheduler.clone();
+        }
+        if self.clip_skip.is_some() {
+            out.clip_skip = self.clip_skip;
+        }
+        if self.width.is_some() {
+            out.width = self.width;
+        }
+        if self.height.is_some() {
+            out.height = self.height;
+        }
+        if self.clip_names.is_some() {
+            out.clip_names = self.clip_names.clone();
+        }
+        if self.clip_type.is_some() {
+            out.clip_type = self.clip_type.clone();
+        }
+        if self.vae.is_some() {
+            out.vae = self.vae.clone();
+        }
+        if self.weight_dtype.is_some() {
+            out.weight_dtype = self.weight_dtype.clone();
+        }
+        out
+    }
+
+    /// What the user pinned, for the model row's "Yours" line.
+    pub fn short_hint(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(k) = self.model_kind {
+            parts.push(k.label().to_string());
+        }
+        if let Some(v) = self.steps {
+            parts.push(format!("steps {v}"));
+        }
+        if let Some(v) = self.cfg {
+            parts.push(format!("CFG {v}"));
+        }
+        if let Some(s) = self.sampler.as_ref().filter(|s| !s.trim().is_empty()) {
+            parts.push(s.clone());
+        }
+        if let Some(s) = self.scheduler.as_ref().filter(|s| !s.trim().is_empty()) {
+            parts.push(s.clone());
+        }
+        if let Some(v) = self.clip_skip {
+            parts.push(format!("clip skip {v}"));
+        }
+        if let (Some(w), Some(h)) = (self.width, self.height) {
+            parts.push(format!("{w}×{h}"));
+        }
+        if let Some(v) = self.clip_names.as_ref().filter(|v| !v.is_empty()) {
+            parts.push(format!("CLIP {}", v.iter().map(|s| file_basename(s)).collect::<Vec<_>>().join(" + ")));
+        }
+        if let Some(s) = self.clip_type.as_ref().filter(|s| !s.trim().is_empty()) {
+            parts.push(format!("type {s}"));
+        }
+        if let Some(s) = self.vae.as_ref().filter(|s| !s.trim().is_empty()) {
+            parts.push(format!("VAE {}", file_basename(s)));
+        }
+        if let Some(s) = self.weight_dtype.as_ref().filter(|s| !s.trim().is_empty()) {
+            parts.push(format!("dtype {s}"));
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
 impl CheckpointEntry {
     pub fn display_name(&self) -> &str {
         if self.name.trim().is_empty() { &self.file } else { &self.name }
@@ -1359,6 +1533,33 @@ pub fn pretty_model_family(raw: &str) -> String {
     }
 }
 
+/// Whether `model_file` belongs to a family that only ever ships as a bare diffusion model, so a
+/// copy of it sitting in `models/checkpoints` still needs its text encoder and VAE loaded
+/// separately ([`ModelKind::CheckpointDiffusion`]) rather than through a `CheckpointLoaderSimple`
+/// whose CLIP and VAE outputs are null.
+///
+/// Deliberately narrow: Flux, Qwen-Image and SD3 all have real all-in-one checkpoint releases, so
+/// only Anima is listed, and a catalogued family settles it outright. Guessing from the path is a
+/// last resort for an uncatalogued download, and even then a whole `anima` token is not enough on
+/// its own — AnimaPencil XL is an SDXL merge, so an SDXL-family marker anywhere in the path vetoes
+/// the guess. Whole tokens throughout, since `animagine` and `animatediff` are ordinary
+/// checkpoints.
+pub fn is_clipless_family(model_file: &str, family: &str) -> bool {
+    let fam = family.trim();
+    if !fam.is_empty() && !fam.eq_ignore_ascii_case("Other") {
+        return fam.eq_ignore_ascii_case("Anima");
+    }
+    let tokens: Vec<&str> = model_file
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |want: &str| tokens.iter().any(|t| t.eq_ignore_ascii_case(want));
+    has("anima")
+        && !["xl", "sdxl", "sd15", "pony", "illustrious", "noobai", "flux", "wan"]
+            .iter()
+            .any(|m| has(m))
+}
+
 /// Family bucket for an installed checkpoint (catalog metadata, else `"Other"`).
 pub fn checkpoint_family(entry: Option<&CheckpointEntry>) -> String {
     entry.map(|e| e.family_label()).unwrap_or_else(|| "Other".into())
@@ -1507,7 +1708,130 @@ pub fn lora_strength_range(
     lo..=hi.max(lo + LORA_STRENGTH_STEP)
 }
 
+/// A user's corrections to one LoRA's catalogued defaults, layered over its [`LoraEntry`] the same
+/// way [`ModelOverride`] layers over [`CheckpointRecommended`]. Also stands alone for a LoRA the
+/// catalog has never heard of.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoraOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength_model: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength_clip: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength_model_min: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength_model_max: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_words: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_words: Option<Vec<String>>,
+    /// Chain through `LoraLoaderModelOnly`, leaving the CLIP untouched, whenever this LoRA is added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_only: Option<bool>,
+}
+
+impl LoraOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `entry` with every field the user set replaced by theirs.
+    pub fn merged(&self, entry: &LoraEntry) -> LoraEntry {
+        let mut out = entry.clone();
+        if let Some(v) = self.strength_model {
+            out.strength_model = v;
+        }
+        if let Some(v) = self.strength_clip {
+            out.strength_clip = v;
+        }
+        if self.strength_model_min.is_some() {
+            out.strength_model_min = self.strength_model_min;
+        }
+        if self.strength_model_max.is_some() {
+            out.strength_model_max = self.strength_model_max;
+        }
+        if let Some(v) = self.trigger_words.clone() {
+            out.trigger_words = v;
+        }
+        if let Some(v) = self.negative_words.clone() {
+            out.negative_words = v;
+        }
+        // A pinned strength is a decision, not a suggestion — widen the catalogued window to
+        // contain it so [`LoraEntry::add_strengths`]'s clamp can't pull it back on the next Add.
+        // The window is only ever a precision hint (see [`lora_strength_range`]).
+        if self.strength_model.is_some() || self.strength_clip.is_some() {
+            for v in [out.strength_model, out.strength_clip] {
+                if let Some(lo) = out.strength_model_min.as_mut()
+                    && v < *lo
+                {
+                    *lo = v;
+                }
+                if let Some(hi) = out.strength_model_max.as_mut()
+                    && v > *hi
+                {
+                    *hi = v;
+                }
+            }
+        }
+        if self.strength_model.is_some() || self.strength_model_min.is_some() {
+            out.strength_source = "yours".into();
+        }
+        out
+    }
+
+    /// What the user pinned, for the LoRA card's "Yours" line.
+    pub fn short_hint(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        match (self.strength_model, self.strength_clip) {
+            (Some(m), Some(c)) if (m - c).abs() >= 0.005 => {
+                parts.push(format!("model {m:.2} · CLIP {c:.2}"))
+            }
+            (Some(m), _) => parts.push(format!("strength {m:.2}")),
+            (None, Some(c)) => parts.push(format!("CLIP {c:.2}")),
+            (None, None) => {}
+        }
+        match (self.strength_model_min, self.strength_model_max) {
+            (Some(a), Some(b)) => parts.push(format!("{a:.2}–{b:.2}")),
+            (Some(a), None) => parts.push(format!("min {a:.2}")),
+            (None, Some(b)) => parts.push(format!("max {b:.2}")),
+            _ => {}
+        }
+        if self.trigger_words.is_some() {
+            parts.push("triggers".into());
+        }
+        if self.negative_words.is_some() {
+            parts.push("negatives".into());
+        }
+        match self.model_only {
+            Some(true) => parts.push("model only".into()),
+            Some(false) => parts.push("CLIP chain kept".into()),
+            None => {}
+        }
+        (!parts.is_empty()).then(|| parts.join(" · "))
+    }
+}
+
 impl LoraEntry {
+    /// A catalog-shaped entry for a LoRA the catalog has no row for, so an override still has a
+    /// base to merge onto.
+    pub fn bare(file: &str) -> Self {
+        Self {
+            file: file.to_string(),
+            name: String::new(),
+            bases: Vec::new(),
+            checkpoints: Vec::new(),
+            strength_model: default_lora_strength(),
+            strength_clip: default_lora_strength(),
+            strength_model_min: None,
+            strength_model_max: None,
+            strength_source: default_strength_source(),
+            trigger_words: Vec::new(),
+            negative_words: Vec::new(),
+            notes: String::new(),
+            tags: Vec::new(),
+        }
+    }
+
     pub fn display_name(&self) -> &str {
         if self.name.trim().is_empty() { &self.file } else { &self.name }
     }
@@ -2259,6 +2583,13 @@ pub struct Settings {
     /// numbers already differ reads as unlinked on its own ([`ActiveLora::strengths_linked`]).
     #[serde(default)]
     pub lora_unlinked: Vec<String>,
+    /// User-corrected model defaults, keyed by the ComfyUI loader filename. Layered over the
+    /// server catalog's parsed recommendation whenever a model is selected or reset.
+    #[serde(default)]
+    pub model_overrides: std::collections::BTreeMap<String, ModelOverride>,
+    /// User-corrected LoRA defaults, keyed by `lora_name`.
+    #[serde(default)]
+    pub lora_overrides: std::collections::BTreeMap<String, LoraOverride>,
 }
 
 pub fn default_server_output_root() -> String {
@@ -2710,6 +3041,190 @@ mod tests {
         let json = serde_json::json!({"server_url": "http://x", "params": params});
         let s: Settings = serde_json::from_value(json).unwrap();
         assert!(s.lora_unlinked.is_empty());
+    }
+
+    /// The promotion that fixes an Anima DiT filed under `models/checkpoints`, and the near-misses
+    /// it must not touch — `animagine` and `animatediff` are ordinary checkpoints whose CLIP the
+    /// graph really does read off the checkpoint loader.
+    #[test]
+    fn only_whole_token_anima_needs_separate_companions() {
+        assert!(is_clipless_family("Anima/novaAnimeAM_v30.safetensors", "Other"));
+        assert!(is_clipless_family("novaAnimeAM_v30.safetensors", "Anima"));
+        assert!(is_clipless_family("anima-nova.safetensors", "Other"));
+        assert!(is_clipless_family("nova_anima_v3.safetensors", ""));
+
+        assert!(!is_clipless_family("animagineXL_v31.safetensors", "SDXL"));
+        assert!(!is_clipless_family("AnimateDiff/mm_sd15.ckpt", "SD 1.5"));
+        assert!(!is_clipless_family("novaAnimeXL_v10.safetensors", "Illustrious"));
+        assert!(!is_clipless_family("JANKU_v777.safetensors", "Illustrious"));
+        assert!(!is_clipless_family("", ""));
+    }
+
+    /// A catalogued family settles it, and an uncatalogued SDXL merge whose name happens to carry a
+    /// standalone `anima` token must not be rebuilt under the split-companion loader — AnimaPencil
+    /// XL is a working all-in-one checkpoint.
+    #[test]
+    fn a_catalogued_family_and_an_sdxl_marker_both_veto_the_anima_guess() {
+        assert!(!is_clipless_family("Anima Pencil XL/animaPencilXL_v500.safetensors", "SDXL"));
+        assert!(!is_clipless_family("Anima_Pencil_XL_v5.safetensors", "Other"));
+        assert!(!is_clipless_family("anima pencil xl.safetensors", ""));
+        assert!(!is_clipless_family("Anima/whatever.safetensors", "Illustrious"));
+        // Still promoted when the catalog agrees, or says nothing and no other family is named.
+        assert!(is_clipless_family("Anima Pencil XL/animaPencilXL_v500.safetensors", "Anima"));
+        assert!(is_clipless_family("Anima/novaAnimeAM_v30.safetensors", ""));
+    }
+
+    /// An unknown `model_kind` (written by a newer build) degrades to a plain checkpoint instead of
+    /// failing the whole settings file and taking the server URL and presets with it.
+    #[test]
+    fn an_unknown_model_kind_loads_as_a_checkpoint() {
+        let of = |s: &str| serde_json::from_value::<ModelKind>(serde_json::json!(s)).unwrap();
+        assert_eq!(of("Checkpoint"), ModelKind::Checkpoint);
+        assert_eq!(of("Diffusion"), ModelKind::Diffusion);
+        assert_eq!(of("CheckpointDiffusion"), ModelKind::CheckpointDiffusion);
+        assert_eq!(of("SomeFutureTopology"), ModelKind::Checkpoint);
+        // And a whole Settings blob carrying one still loads.
+        let mut params = serde_json::to_value(Params::default()).unwrap();
+        params["model_kind"] = serde_json::json!("SomeFutureTopology");
+        let json = serde_json::json!({"server_url": "http://x", "params": params});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(s.params.model_kind, ModelKind::Checkpoint);
+        assert_eq!(s.server_url, "http://x");
+    }
+
+    /// Settings written before the override maps existed load with none, so every model keeps
+    /// tracking the server catalog.
+    #[test]
+    fn settings_without_overrides_default_empty() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({"server_url": "http://x", "params": params});
+        let s: Settings = serde_json::from_value(json).unwrap();
+        assert!(s.model_overrides.is_empty());
+        assert!(s.lora_overrides.is_empty());
+    }
+
+    #[test]
+    fn settings_round_trip_the_override_maps() {
+        let params = serde_json::to_value(Params::default()).unwrap();
+        let json = serde_json::json!({
+            "server_url": "", "params": params,
+            "model_overrides": {
+                "Anima/nova.safetensors": {
+                    "model_kind": "CheckpointDiffusion", "steps": 28, "cfg": 3.5,
+                    "clip_names": ["qwen_3_06b_base.safetensors"], "vae": "qwen_image_vae.safetensors",
+                },
+            },
+            "lora_overrides": {"style.safetensors": {"strength_model": 0.65, "model_only": true}},
+        });
+        let s: Settings = serde_json::from_value(json).unwrap();
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        let m = &back.model_overrides["Anima/nova.safetensors"];
+        assert_eq!(m.model_kind, Some(ModelKind::CheckpointDiffusion));
+        assert_eq!(m.steps, Some(28));
+        assert_eq!(m.cfg, Some(3.5));
+        assert_eq!(m.vae.as_deref(), Some("qwen_image_vae.safetensors"));
+        // Untouched fields stay unset rather than being pinned to a stale value.
+        assert_eq!(m.sampler, None);
+        assert_eq!(m.width, None);
+        let l = &back.lora_overrides["style.safetensors"];
+        assert_eq!(l.strength_model, Some(0.65));
+        assert_eq!(l.model_only, Some(true));
+        assert_eq!(l.strength_clip, None);
+    }
+
+    /// An override replaces only what it names; every other recommendation keeps coming from the
+    /// catalog, so a later catalog refresh still improves the untouched fields.
+    #[test]
+    fn a_model_override_replaces_only_the_fields_it_sets() {
+        let rec = CheckpointRecommended {
+            steps: Some(20),
+            cfg: Some(7.0),
+            sampler: Some("dpmpp_2m".into()),
+            width: Some(832),
+            height: Some(1216),
+            ..Default::default()
+        };
+        let ov = ModelOverride { cfg: Some(4.0), sampler: Some("euler".into()), ..Default::default() };
+        let merged = ov.merged(&rec);
+        assert_eq!(merged.cfg, Some(4.0));
+        assert_eq!(merged.sampler.as_deref(), Some("euler"));
+        assert_eq!(merged.steps, Some(20));
+        assert_eq!(merged.width, Some(832));
+        assert_eq!(merged.height, Some(1216));
+        // An empty override is a no-op.
+        assert!(ModelOverride::default().is_empty());
+        let untouched = ModelOverride::default().merged(&rec);
+        assert_eq!(untouched.cfg, Some(7.0));
+        assert_eq!(untouched.sampler.as_deref(), Some("dpmpp_2m"));
+    }
+
+    /// A LoRA the catalog has never seen still gets the user's numbers, merged onto a bare entry.
+    #[test]
+    fn a_lora_override_stands_alone_without_a_catalog_row() {
+        let ov = LoraOverride {
+            strength_model: Some(0.6),
+            strength_clip: Some(0.6),
+            trigger_words: Some(vec!["mytrigger".into()]),
+            ..Default::default()
+        };
+        let merged = ov.merged(&LoraEntry::bare("new.safetensors"));
+        assert_eq!(merged.file, "new.safetensors");
+        assert_eq!(merged.add_strengths(), (0.6, 0.6));
+        assert_eq!(merged.trigger_text(), "mytrigger");
+        assert_eq!(merged.strength_source, "yours");
+        // Over a catalogued row, unset fields keep the catalog's.
+        let cat = LoraEntry {
+            trigger_words: vec!["catalog trigger".into()],
+            negative_words: vec!["bad".into()],
+            ..LoraEntry::bare("new.safetensors")
+        };
+        let only_strength =
+            LoraOverride { strength_model: Some(0.3), ..Default::default() }.merged(&cat);
+        assert_eq!(only_strength.trigger_text(), "catalog trigger");
+        assert_eq!(only_strength.negative_text(), "bad");
+        assert_eq!(only_strength.strength_model, 0.3);
+    }
+
+    /// The catalogued range is a hint, so an override outside it must survive `add_strengths`'s
+    /// clamp rather than being pulled back to the catalog's window.
+    #[test]
+    fn a_lora_override_widens_the_range_it_needs() {
+        let cat = LoraEntry {
+            strength_model_min: Some(0.4),
+            strength_model_max: Some(0.8),
+            ..LoraEntry::bare("x.safetensors")
+        };
+        let ov = LoraOverride {
+            strength_model: Some(1.4),
+            strength_clip: Some(1.4),
+            strength_model_max: Some(1.5),
+            ..Default::default()
+        };
+        let merged = ov.merged(&cat);
+        assert_eq!(merged.add_strengths(), (1.4, 1.4));
+        assert_eq!(merged.strength_range(), (0.4, 1.5));
+    }
+
+    /// The same, without the user also widening the range by hand: `add_strengths` clamps to the
+    /// catalogued window, so a pinned strength outside it would be silently thrown away on Add.
+    #[test]
+    fn a_pinned_strength_outside_the_catalogued_window_survives_add() {
+        let cat = LoraEntry {
+            strength_model: 0.7,
+            strength_clip: 0.7,
+            strength_model_min: Some(0.4),
+            strength_model_max: Some(0.8),
+            ..LoraEntry::bare("style.safetensors")
+        };
+        let over =
+            LoraOverride { strength_model: Some(1.2), strength_clip: Some(1.2), ..Default::default() };
+        assert_eq!(over.merged(&cat).add_strengths(), (1.2, 1.2));
+        // Below the window too.
+        let under =
+            LoraOverride { strength_model: Some(0.1), strength_clip: Some(0.1), ..Default::default() };
+        assert_eq!(under.merged(&cat).add_strengths(), (0.1, 0.1));
+        // With no override the catalog's own clamp is untouched.
+        assert_eq!(LoraOverride::default().merged(&cat).add_strengths(), (0.7, 0.7));
     }
 
     fn lora_with_range(min: Option<f32>, max: Option<f32>) -> LoraEntry {

@@ -43,6 +43,7 @@ pub const STAR: &str = "⭐";
 pub const STYLUS: &str = "✏";
 pub const ERASE: &str = "🗙";
 pub const BUG: &str = "🐛";
+pub const CLOUD: &str = "☁";
 pub const FULLSCREEN: &str = "⛶";
 pub const FULLSCREEN_EXIT: &str = "⛶";
 
@@ -85,6 +86,7 @@ const ALL: &[(&str, &str)] = &[
     ("STYLUS", STYLUS),
     ("ERASE", ERASE),
     ("BUG", BUG),
+    ("CLOUD", CLOUD),
     ("FULLSCREEN", FULLSCREEN),
     ("FULLSCREEN_EXIT", FULLSCREEN_EXIT),
 ];

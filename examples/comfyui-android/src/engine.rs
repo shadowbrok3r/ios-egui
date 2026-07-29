@@ -2607,6 +2607,38 @@ async fn stream_execution(
     }
 }
 
+/// The server's own exception text for a failed prompt, read out of its `/history` status
+/// messages. `status_str` alone is just `"error"`, which sends the user to the ComfyUI console for
+/// something the app can show verbatim — including the failing node's class, which is usually the
+/// whole diagnosis (`CLIPTextEncode: ERROR: clip input is invalid: None`).
+async fn execution_error_detail(
+    authed: &Option<(String, reqwest::Client)>,
+    prompt_id: &str,
+) -> Option<String> {
+    let (base, http) = authed.as_ref()?;
+    let resp = http.get(format!("{base}/history/{prompt_id}")).send().await.ok()?;
+    let v: Value = serde_json::from_str(&resp.text().await.ok()?).ok()?;
+    Some(error_detail_from_history(&v, prompt_id)?)
+}
+
+/// The last `execution_error` message in a `/history` response, as `"<node class>: <message>"`.
+fn error_detail_from_history(v: &Value, prompt_id: &str) -> Option<String> {
+    let messages = v.get(prompt_id)?.pointer("/status/messages")?.as_array()?;
+    let data = messages
+        .iter()
+        .filter(|m| m.get(0).and_then(Value::as_str) == Some("execution_error"))
+        .filter_map(|m| m.get(1))
+        .next_back()?;
+    let msg = data.get("exception_message").and_then(Value::as_str)?.trim();
+    if msg.is_empty() {
+        return None;
+    }
+    match data.get("node_type").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        Some(node) => Some(format!("{node}: {msg}")),
+        None => Some(msg.to_string()),
+    }
+}
+
 /// Poll `/history` (gently, tolerating errors) until the prompt completes, then emit its outputs.
 async fn reconcile_from_history(
     client: &Client,
@@ -2626,7 +2658,9 @@ async fn reconcile_from_history(
                 let Some(data) = history.data.get(prompt_id) else { continue };
                 if !data.status.completed {
                     if data.status.status_str == "error" {
-                        return Err("execution failed on the server — see its console".into());
+                        return Err(execution_error_detail(authed, prompt_id).await.unwrap_or_else(
+                            || "execution failed on the server — see its console".into(),
+                        ));
                     }
                     continue;
                 }
@@ -3395,6 +3429,47 @@ mod tests {
         let h = headers("  ", "s3ss");
         assert!(h.get("x-api-key").is_none());
         assert_eq!(h.get(COOKIE).unwrap(), "cg_session=s3ss");
+    }
+
+    /// A failed prompt's real cause lives only in the history status messages; without it the app
+    /// could only say "see its console", which is where this bug hid.
+    #[test]
+    fn history_error_detail_names_the_node_and_the_exception() {
+        let v: Value = serde_json::from_str(
+            r#"{"p1": {"status": {"status_str": "error", "completed": false, "messages": [
+                ["execution_start", {"prompt_id": "p1"}],
+                ["execution_error", {"node_id": "7", "node_type": "CLIPTextEncode",
+                    "exception_type": "RuntimeError",
+                    "exception_message": "ERROR: clip input is invalid: None\n\nIf the clip is from a checkpoint loader node your checkpoint does not contain a valid clip or text encoder model."}]
+            ]}}}"#,
+        )
+        .unwrap();
+        let detail = error_detail_from_history(&v, "p1").unwrap();
+        assert!(detail.starts_with("CLIPTextEncode: ERROR: clip input is invalid: None"));
+
+        // A prompt that never errored, an unknown id, and an empty message all fall through so the
+        // caller keeps its generic wording rather than reporting a blank failure.
+        let ok: Value = serde_json::from_str(
+            r#"{"p1": {"status": {"status_str": "success", "messages": [["execution_start", {}]]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(error_detail_from_history(&ok, "p1"), None);
+        assert_eq!(error_detail_from_history(&v, "other"), None);
+        let blank: Value = serde_json::from_str(
+            r#"{"p1": {"status": {"messages": [["execution_error", {"exception_message": "  "}]]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(error_detail_from_history(&blank, "p1"), None);
+    }
+
+    /// No `node_type` (older ComfyUI): the message still comes through on its own.
+    #[test]
+    fn history_error_detail_without_a_node_type_is_the_bare_message() {
+        let v: Value = serde_json::from_str(
+            r#"{"p1": {"status": {"messages": [["execution_error", {"exception_message": "boom"}]]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(error_detail_from_history(&v, "p1").as_deref(), Some("boom"));
     }
 
     #[test]
