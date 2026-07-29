@@ -14,6 +14,8 @@ egui = "0.35"
 [package.metadata.android]
 package = "com.example.pluginsandroid"
 java_sources = "../../crates/egui-android/java"
+# Launcher icon mipmaps, rendered from icon/ic_launcher.svg by scripts/render-icons.sh.
+resources = "res"
 
 [package.metadata.android.sdk]
 min_sdk_version = 26
@@ -26,6 +28,7 @@ keystore_password = "android"
 
 [package.metadata.android.application]
 label = "Plugins Android"
+icon = "@mipmap/ic_launcher"
 has_code = true
 
 # EguiNativeActivity hosts a hidden EditText for real IME InputConnection (spacebar cursor).

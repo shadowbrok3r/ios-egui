@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <!-- Launcher icon: the app's own node-graph canvas — hot pink nodes wired by aqua
+       axis-aligned traces on the near-black canvas, matching src/theme.rs and the
+       graph editor's WireStyle::AxisAligned. Rasterized by icon/render.sh. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14101c"/>
+      <stop offset="1" stop-color="#050508"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.42" r="0.62">
+      <stop offset="0" stop-color="#ff3d8b" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#ff3d8b" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="node" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ff6ea8"/>
+      <stop offset="1" stop-color="#ff3d8b"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="192" height="192" rx="42" fill="url(#tile)"/>
+  <rect x="0" y="0" width="192" height="192" rx="42" fill="url(#glow)"/>
+
+  <!-- Traces: two producers feeding one consumer, orthogonal with rounded corners. -->
+  <g fill="none" stroke="#2be2d6" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M74 60 H96 V96 H114"/>
+    <path d="M74 132 H96 V96"/>
+  </g>
+
+  <!-- Pins where the traces meet the nodes. -->
+  <g fill="#78f0e8">
+    <circle cx="96" cy="96" r="7"/>
+  </g>
+
+  <!-- Nodes. -->
+  <g fill="url(#node)">
+    <rect x="30" y="42" width="48" height="36" rx="11"/>
+    <rect x="30" y="114" width="48" height="36" rx="11"/>
+    <rect x="112" y="70" width="52" height="52" rx="14"/>
+  </g>
+
+  <!-- A glass rim on the output node, the way the canvas paints a focused node. -->
+  <rect x="112" y="70" width="52" height="52" rx="14" fill="none" stroke="#ffd6e6" stroke-opacity="0.45" stroke-width="3"/>
+</svg>

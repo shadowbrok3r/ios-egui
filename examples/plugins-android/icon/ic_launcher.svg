@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <!-- Launcher icon: a puzzle piece — the plugin host. Indigo on egui's dark grey, kept
+       deliberately unlike comfyui-android's pink node graph so the two sideloads are told
+       apart at a glance in the launcher. Rasterized by scripts/render-icons.sh. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1c2029"/>
+      <stop offset="1" stop-color="#0b0d11"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.4" r="0.6">
+      <stop offset="0" stop-color="#8b7bff" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#8b7bff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="piece" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#a99bff"/>
+      <stop offset="1" stop-color="#6f5cf0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="192" height="192" rx="42" fill="url(#tile)"/>
+  <rect x="0" y="0" width="192" height="192" rx="42" fill="url(#glow)"/>
+
+  <!-- Body 44..126 x 51..141, offset so the right tab's bulge keeps the whole mark centred.
+       Travel is clockwise, so the tab arc sweeps 1 and the notch 0; radius 16 over a 30 chord
+       makes each a major arc, which is what pinches the neck into a knob rather than a bump. -->
+  <g>
+    <path id="pz" d="M56 51 H114 A12 12 0 0 1 126 63 V81 A16 16 0 1 1 126 111 V129
+             A12 12 0 0 1 114 141 H111 A16 16 0 1 0 81 141 H56
+             A12 12 0 0 1 44 129 V63 A12 12 0 0 1 56 51 Z"/>
+  </g>
+  <use href="#pz" fill="url(#piece)"/>
+  <use href="#pz" fill="none" stroke="#ddd7ff" stroke-opacity="0.40" stroke-width="3"/>
+</svg>

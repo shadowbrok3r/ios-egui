@@ -84,6 +84,8 @@ skrifa = "0.42"
 package = "com.example.comfyui"
 # Hidden EditText InputConnection (Gboard spacebar trackpad) — shared with egui-android.
 java_sources = "../../crates/egui-android/java"
+# Launcher icon mipmaps, rendered from icon/ic_launcher.svg by scripts/render-icons.sh.
+resources = "res"
 # QNN HTP NPU libs (qnn-rs D1). Proprietary QAIRT .so are NOT in-repo; scripts/qnn-stage-libs.sh
 # populates qnn-runtime-libs/arm64-v8a/ before deploy. cargo-apk2 bundles `<folder>/arm64-v8a/*.so`
 # into the APK's lib/arm64-v8a/. From /path/to/qairt/<ver>/:
@@ -112,6 +114,7 @@ keystore_password = "android"
 
 [package.metadata.android.application]
 label = "ComfyUI"
+icon = "@mipmap/ic_launcher"
 has_code = true
 # Unpack bundled .so to nativeLibraryDir so FastRPC can load libQnnHtpV81Skel.so from a real path.
 extract_native_libs = true
