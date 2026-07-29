@@ -64,8 +64,8 @@ serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 postcard = { version = "1", features = ["use-std"] }
 bytemuck = "1"
-wasmtime = { version = "46", default-features = false, features = ["runtime", "cranelift", "pulley", "std"] }
-wasmtime-wasi = "46"
+wasmtime = { version = "47", default-features = false, features = ["runtime", "cranelift", "pulley", "std"] }
+wasmtime-wasi = "47"
 anyhow = "1"
 log = "0.4"
 toml = "1"
