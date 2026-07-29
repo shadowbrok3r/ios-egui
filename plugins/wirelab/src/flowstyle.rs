@@ -5,11 +5,16 @@
 //! against `wirelab_core::flow::NodeKind` without the shared crate changing.
 
 use std::collections::{HashMap, HashSet};
+use std::marker::PhantomData;
 
 use egui_ios_plugin_sdk::egui;
+use egui::emath::TSTransform;
 use wirelab_flow_ui::egui_snarl::{
-    NodeId, Snarl,
-    ui::{BackgroundPattern, NodeLayout, PinPlacement, SnarlStyle, WireStyle},
+    InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
+    ui::{
+        AnyPins, BackgroundPattern, NodeLayout, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer,
+        WireStyle,
+    },
 };
 
 /// Zoom clamps, so a fit of a wide graph can't shrink nodes past legibility or blow one node up
@@ -43,6 +48,407 @@ pub fn style() -> SnarlStyle {
     // width as dead weight — which `arrange` then spaces its columns by.
     s.node_layout = Some(NodeLayout::sandwich());
     s
+}
+
+/// Base spacing (graph units) of the canvas dot grid — anchored in graph space so it scales with
+/// the nodes; coarsened by powers of two when zoomed far out.
+const DOT_SPACING: f32 = 28.0;
+const DOT_RADIUS: f32 = 1.7;
+const DOT_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 70, 74);
+
+/// A one-shot view move, applied by the next [`Styled`] pass.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ViewCmd {
+    /// Fit every node on screen.
+    FitAll,
+    /// Centre on a graph-space point, keeping the current zoom.
+    Center(egui::Pos2),
+}
+
+/// View state the wrapper reads and writes across frames: the canvas rect and transform the last
+/// pass drew with, the node bounds it measured, and a pending [`ViewCmd`].
+///
+/// Snarl owns the live transform, so a fit or a pan can only be applied from inside
+/// [`SnarlViewer::current_transform`] — which is why this is a separate object the plugin keeps
+/// beside its `FlowView` rather than something callable directly.
+pub struct Canvas {
+    cmd: Option<ViewCmd>,
+    ui_rect: egui::Rect,
+    to_global: TSTransform,
+    bounds: Option<egui::Rect>,
+}
+
+impl Default for Canvas {
+    fn default() -> Self {
+        // NOTHING, not ZERO: an empty rect reads as "never painted" for `ready`, and a fit
+        // against a zero-sized rect would divide the scale to nothing.
+        Self {
+            cmd: None,
+            ui_rect: egui::Rect::NOTHING,
+            to_global: TSTransform::IDENTITY,
+            bounds: None,
+        }
+    }
+}
+
+impl Canvas {
+    /// Fit every node on screen at the next paint.
+    pub fn fit(&mut self) {
+        self.cmd = Some(ViewCmd::FitAll);
+    }
+
+    /// Pan to the graph's first node — the leftmost (or topmost) with nothing feeding it.
+    pub fn go_to_start<T>(&mut self, snarl: &Snarl<T>, vertical: bool) {
+        if let Some(p) = first_node_pos(snarl, vertical) {
+            self.cmd = Some(ViewCmd::Center(p));
+        }
+    }
+
+    /// Whether the canvas has been painted at least once (so fit/minimap have real numbers).
+    pub fn ready(&self) -> bool {
+        self.ui_rect.is_finite() && self.ui_rect.width() > 1.0
+    }
+
+    /// The graph laid out inside a small overview panel, with the current viewport drawn on it.
+    /// Tap or drag anywhere on it to centre the canvas there.
+    pub fn minimap<T>(&mut self, ui: &mut egui::Ui, snarl: &Snarl<T>, size: egui::Vec2) {
+        let (Some(graph), true) = (self.bounds, self.ready()) else { return };
+        if graph.width() < 1.0 || graph.height() < 1.0 {
+            return;
+        }
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
+        let rect = resp.rect;
+        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(180));
+        painter.rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+            egui::StrokeKind::Inside,
+        );
+        // One uniform scale for both axes, so the overview isn't a distorted squash of the graph.
+        let pad = graph.expand(40.0);
+        let scale = (rect.width() / pad.width()).min(rect.height() / pad.height());
+        let to_map = |p: egui::Pos2| rect.center() + (p - pad.center()) * scale;
+        for (_, pos, _) in snarl.nodes_pos_ids() {
+            let r = egui::Rect::from_min_size(pos, NOMINAL_NODE);
+            painter.rect_filled(
+                egui::Rect::from_min_max(to_map(r.min), to_map(r.max)),
+                1.0,
+                egui::Color32::from_rgb(120, 140, 160),
+            );
+        }
+        // The visible canvas, back-projected into graph space.
+        let inv = self.to_global.inverse();
+        let view = egui::Rect::from_min_max(
+            inv * self.ui_rect.min,
+            inv * self.ui_rect.max,
+        );
+        painter.rect_stroke(
+            egui::Rect::from_min_max(to_map(view.min), to_map(view.max)),
+            0.0,
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(43, 226, 214)),
+            egui::StrokeKind::Inside,
+        );
+        if let Some(p) = resp.interact_pointer_pos() {
+            self.cmd = Some(ViewCmd::Center(pad.center() + (p - rect.center()) / scale));
+        }
+    }
+}
+
+/// The transform that fits `view` (graph space) into `ui_rect` (screen space), scale clamped.
+fn fit_transform(view: egui::Rect, ui_rect: egui::Rect) -> TSTransform {
+    let scale = (ui_rect.size() / view.size()).min_elem().clamp(MIN_SCALE, MAX_SCALE);
+    TSTransform::new(ui_rect.center().to_vec2() - view.center().to_vec2() * scale, scale)
+}
+
+/// Position of the graph's first node: the leftmost (topmost when `vertical`) node with nothing
+/// wired into it, falling back to the leading node overall.
+pub fn first_node_pos<T>(snarl: &Snarl<T>, vertical: bool) -> Option<egui::Pos2> {
+    let fed: HashSet<NodeId> = snarl.wires().map(|(_, to)| to.node).collect();
+    let along = |p: egui::Pos2| if vertical { p.y } else { p.x };
+    let leading = |it: &mut dyn Iterator<Item = egui::Pos2>| -> Option<egui::Pos2> {
+        it.fold(None, |best: Option<egui::Pos2>, p| match best {
+            Some(b) if along(b) <= along(p) => Some(b),
+            _ => Some(p),
+        })
+    };
+    leading(&mut snarl.nodes_pos_ids().filter(|(id, _, _)| !fed.contains(id)).map(|(_, p, _)| p))
+        .or_else(|| leading(&mut snarl.nodes_pos_ids().map(|(_, p, _)| p)))
+}
+
+/// Wraps any [`SnarlViewer`] to add the canvas chrome the node payload knows nothing about: the
+/// dot grid, and the view moves that can only be applied from inside `current_transform`.
+///
+/// Every other method forwards untouched, so the wrapped viewer keeps full control of its nodes.
+pub struct Styled<'a, T, V: SnarlViewer<T>> {
+    inner: &'a mut V,
+    canvas: &'a mut Canvas,
+    /// Node bounds measured before the pass, published back through `current_transform`.
+    bounds: Option<egui::Rect>,
+    marker: PhantomData<T>,
+}
+
+impl<'a, T, V: SnarlViewer<T>> Styled<'a, T, V> {
+    pub fn new(inner: &'a mut V, canvas: &'a mut Canvas, snarl: &Snarl<T>) -> Self {
+        let bounds = bounds(snarl);
+        Self { inner, canvas, bounds, marker: PhantomData }
+    }
+}
+
+impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
+    fn draw_background(
+        &mut self,
+        _background: Option<&BackgroundPattern>,
+        viewport: &egui::Rect,
+        _snarl_style: &SnarlStyle,
+        _style: &egui::Style,
+        painter: &egui::Painter,
+        _snarl: &Snarl<T>,
+    ) {
+        // Drawn in graph space (the layer transform sizes it to screen), so spacing and radius
+        // scale 1:1 with the nodes. Zoomed far out the spacing coarsens by powers of two, keeping
+        // the on-screen density and the dot count bounded.
+        let scale = self.canvas.to_global.scaling.max(0.001);
+        let mut spacing = DOT_SPACING;
+        while spacing * scale < 26.0 {
+            spacing *= 2.0;
+        }
+        let min_x = (viewport.min.x / spacing).floor() as i64;
+        let max_x = (viewport.max.x / spacing).ceil() as i64;
+        let min_y = (viewport.min.y / spacing).floor() as i64;
+        let max_y = (viewport.max.y / spacing).ceil() as i64;
+        // Backstop against a pathological transform.
+        if (max_x - min_x).saturating_mul(max_y - min_y) > 6500 {
+            return;
+        }
+        for xi in min_x..=max_x {
+            for yi in min_y..=max_y {
+                painter.circle_filled(
+                    egui::pos2(xi as f32 * spacing, yi as f32 * spacing),
+                    DOT_RADIUS,
+                    DOT_COLOR,
+                );
+            }
+        }
+        // The viewport arrives here in graph space, so this is also where the canvas learns the
+        // rect a fit has to land in.
+        self.canvas.ui_rect = self.canvas.to_global * *viewport;
+    }
+
+    fn current_transform(&mut self, to_global: &mut TSTransform, _snarl: &mut Snarl<T>) {
+        match self.canvas.cmd.take() {
+            Some(ViewCmd::FitAll) => {
+                if let Some(b) = self.bounds
+                    && b.is_finite()
+                    && self.canvas.ui_rect.is_finite()
+                {
+                    *to_global = fit_transform(b.expand(60.0), self.canvas.ui_rect);
+                }
+            }
+            Some(ViewCmd::Center(p)) => {
+                if p.x.is_finite() && p.y.is_finite() && self.canvas.ui_rect.is_finite() {
+                    let s = to_global.scaling;
+                    *to_global = TSTransform::new(
+                        self.canvas.ui_rect.center().to_vec2() - p.to_vec2() * s,
+                        s,
+                    );
+                }
+            }
+            None => {}
+        }
+        self.canvas.to_global = *to_global;
+        self.canvas.bounds = self.bounds;
+    }
+
+    // ── Everything below forwards to the wrapped viewer unchanged ──
+
+    fn title(&mut self, node: &T) -> String {
+        self.inner.title(node)
+    }
+    fn inputs(&mut self, node: &T) -> usize {
+        self.inner.inputs(node)
+    }
+    fn outputs(&mut self, node: &T) -> usize {
+        self.inner.outputs(node)
+    }
+    fn show_input(
+        &mut self,
+        pin: &InPin,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) -> impl SnarlPin + 'static {
+        self.inner.show_input(pin, ui, snarl)
+    }
+    fn show_output(
+        &mut self,
+        pin: &OutPin,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) -> impl SnarlPin + 'static {
+        self.inner.show_output(pin, ui, snarl)
+    }
+    fn node_frame(
+        &mut self,
+        default: egui::Frame,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        snarl: &Snarl<T>,
+    ) -> egui::Frame {
+        self.inner.node_frame(default, node, inputs, outputs, snarl)
+    }
+    fn header_frame(
+        &mut self,
+        default: egui::Frame,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        snarl: &Snarl<T>,
+    ) -> egui::Frame {
+        self.inner.header_frame(default, node, inputs, outputs, snarl)
+    }
+    fn has_node_style(
+        &mut self,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        snarl: &Snarl<T>,
+    ) -> bool {
+        self.inner.has_node_style(node, inputs, outputs, snarl)
+    }
+    fn apply_node_style(
+        &mut self,
+        style: &mut egui::Style,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        snarl: &Snarl<T>,
+    ) {
+        self.inner.apply_node_style(style, node, inputs, outputs, snarl);
+    }
+    fn node_layout(
+        &mut self,
+        default: NodeLayout,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        snarl: &Snarl<T>,
+    ) -> NodeLayout {
+        self.inner.node_layout(default, node, inputs, outputs, snarl)
+    }
+    fn show_header(
+        &mut self,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.show_header(node, inputs, outputs, ui, snarl);
+    }
+    fn has_body(&mut self, node: &T) -> bool {
+        self.inner.has_body(node)
+    }
+    fn show_body(
+        &mut self,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.show_body(node, inputs, outputs, ui, snarl);
+    }
+    fn has_footer(&mut self, node: &T) -> bool {
+        self.inner.has_footer(node)
+    }
+    fn show_footer(
+        &mut self,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.show_footer(node, inputs, outputs, ui, snarl);
+    }
+    fn final_node_rect(
+        &mut self,
+        node: NodeId,
+        rect: egui::Rect,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.final_node_rect(node, rect, ui, snarl);
+    }
+    fn has_on_hover_popup(&mut self, node: &T) -> bool {
+        self.inner.has_on_hover_popup(node)
+    }
+    fn show_on_hover_popup(
+        &mut self,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.show_on_hover_popup(node, inputs, outputs, ui, snarl);
+    }
+    fn has_wire_widget(&mut self, from: &OutPinId, to: &InPinId, snarl: &Snarl<T>) -> bool {
+        self.inner.has_wire_widget(from, to, snarl)
+    }
+    fn show_wire_widget(
+        &mut self,
+        from: &OutPin,
+        to: &InPin,
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.show_wire_widget(from, to, ui, snarl);
+    }
+    fn has_graph_menu(&mut self, pos: egui::Pos2, snarl: &mut Snarl<T>) -> bool {
+        self.inner.has_graph_menu(pos, snarl)
+    }
+    fn show_graph_menu(&mut self, pos: egui::Pos2, ui: &mut egui::Ui, snarl: &mut Snarl<T>) {
+        self.inner.show_graph_menu(pos, ui, snarl);
+    }
+    fn has_dropped_wire_menu(&mut self, src_pins: AnyPins, snarl: &mut Snarl<T>) -> bool {
+        self.inner.has_dropped_wire_menu(src_pins, snarl)
+    }
+    fn show_dropped_wire_menu(
+        &mut self,
+        pos: egui::Pos2,
+        ui: &mut egui::Ui,
+        src_pins: AnyPins,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.show_dropped_wire_menu(pos, ui, src_pins, snarl);
+    }
+    fn has_node_menu(&mut self, node: &T) -> bool {
+        self.inner.has_node_menu(node)
+    }
+    fn show_node_menu(
+        &mut self,
+        node: NodeId,
+        inputs: &[InPin],
+        outputs: &[OutPin],
+        ui: &mut egui::Ui,
+        snarl: &mut Snarl<T>,
+    ) {
+        self.inner.show_node_menu(node, inputs, outputs, ui, snarl);
+    }
+    fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<T>) {
+        self.inner.connect(from, to, snarl);
+    }
+    fn disconnect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<T>) {
+        self.inner.disconnect(from, to, snarl);
+    }
+    fn drop_outputs(&mut self, pin: &OutPin, snarl: &mut Snarl<T>) {
+        self.inner.drop_outputs(pin, snarl);
+    }
+    fn drop_inputs(&mut self, pin: &InPin, snarl: &mut Snarl<T>) {
+        self.inner.drop_inputs(pin, snarl);
+    }
 }
 
 /// Bounding box of all nodes in graph space.

@@ -69,6 +69,8 @@ pub struct ProjectView {
     pub selected_board: usize,
     /// Rebuilt when a new snapshot lands.
     flow_view: FlowView,
+    /// View state for the flow canvas (pending fit/centre, last transform, node bounds).
+    flow_canvas: crate::flowstyle::Canvas,
     flow_built_for: usize,
     last_fetch_at: f64,
     pub auto_refresh: bool,
@@ -322,6 +324,7 @@ impl Default for ProjectView {
             snapshot: None,
             selected_board: 0,
             flow_view: FlowView::default(),
+            flow_canvas: crate::flowstyle::Canvas::default(),
             flow_built_for: usize::MAX,
             last_fetch_at: -1e9,
             auto_refresh: true,
@@ -1188,20 +1191,41 @@ impl ProjectView {
             .collect();
         let mut viewer = FlowViewer::new(comp_names, None, index);
         viewer.options = ViewerOptions { editable: true };
-        // Drawn directly rather than through `wirelab_flow_ui::show`, which hard-codes a bare
-        // `SnarlStyle::new()`; `flowstyle::style` is the comfyui-android canvas look.
+
+        // Flow runs along the canvas's long axis, so a deep graph isn't a thin ribbon across it.
+        let vertical = ui.available_height() > ui.available_width();
         ui.horizontal(|ui| {
             if ui.button("Arrange").on_hover_text("Lay the flow out by execution order").clicked() {
-                let vertical = ui.available_height() > ui.available_width();
-                crate::flowstyle::arrange(
-                    &mut self.flow_view.snarl,
-                    &std::collections::HashMap::new(),
-                    vertical,
-                );
+                crate::flowstyle::arrange(&mut self.flow_view.snarl, &HashMap::new(), vertical);
+                self.flow_canvas.fit();
             }
-            ui.weak("drag a pin to wire · long-press a node for its menu");
+            if ui.button("Fit").on_hover_text("Bring every node on screen").clicked() {
+                self.flow_canvas.fit();
+            }
+            if ui.button("Start").on_hover_text("Pan to the first node").clicked() {
+                self.flow_canvas.go_to_start(&self.flow_view.snarl, vertical);
+            }
+            ui.weak("drag a pin to wire");
         });
-        self.flow_view.snarl.show(&mut viewer, &crate::flowstyle::style(), "ipad-flow", ui);
+
+        // Drawn directly rather than through `wirelab_flow_ui::show`, which hard-codes a bare
+        // `SnarlStyle::new()`. `Styled` adds the dot grid and the view moves on top of the shared
+        // viewer, which keeps full control of the nodes themselves.
+        let mut styled =
+            crate::flowstyle::Styled::new(&mut viewer, &mut self.flow_canvas, &self.flow_view.snarl);
+        self.flow_view.snarl.show(&mut styled, &crate::flowstyle::style(), "ipad-flow", ui);
+
+        // Overview only once the graph is big enough to lose your place in.
+        if self.flow_view.snarl.nodes_pos_ids().count() > 3 {
+            let canvas = ui.min_rect();
+            let (map, snarl) = (&mut self.flow_canvas, &self.flow_view.snarl);
+            egui::Area::new(egui::Id::new("flow-minimap"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(canvas.right_top() + egui::vec2(-152.0, 8.0))
+                .show(ui.ctx(), |ui| {
+                    map.minimap(ui, snarl, egui::vec2(144.0, 88.0));
+                });
+        }
 
         // Push edits once the graph has sat still for a moment.
         let graph = wirelab_flow_ui::extract_graph(&self.flow_view.snarl);
