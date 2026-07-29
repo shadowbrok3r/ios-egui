@@ -2,6 +2,7 @@
 //! over the WireLab TCP protocol and drive them live — telemetry, GPIO,
 //! analog watches, the on-board RGB LED — straight from the iPad.
 
+pub mod flowstyle;
 pub mod link;
 pub mod view;
 

@@ -1188,7 +1188,20 @@ impl ProjectView {
             .collect();
         let mut viewer = FlowViewer::new(comp_names, None, index);
         viewer.options = ViewerOptions { editable: true };
-        wirelab_flow_ui::show(&mut self.flow_view, &mut viewer, "ipad-flow", ui);
+        // Drawn directly rather than through `wirelab_flow_ui::show`, which hard-codes a bare
+        // `SnarlStyle::new()`; `flowstyle::style` is the comfyui-android canvas look.
+        ui.horizontal(|ui| {
+            if ui.button("Arrange").on_hover_text("Lay the flow out by execution order").clicked() {
+                let vertical = ui.available_height() > ui.available_width();
+                crate::flowstyle::arrange(
+                    &mut self.flow_view.snarl,
+                    &std::collections::HashMap::new(),
+                    vertical,
+                );
+            }
+            ui.weak("drag a pin to wire · long-press a node for its menu");
+        });
+        self.flow_view.snarl.show(&mut viewer, &crate::flowstyle::style(), "ipad-flow", ui);
 
         // Push edits once the graph has sat still for a moment.
         let graph = wirelab_flow_ui::extract_graph(&self.flow_view.snarl);
