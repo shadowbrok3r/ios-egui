@@ -7030,8 +7030,12 @@ impl ComfyApp {
         if self.params.mode != Mode::Video
             && let Some(hint) = self.recommended_for(&model_file).short_hint()
         {
-            let tag = if self.model_override(&model_file).is_some() { "yours" } else { "rec" };
-            ui.weak(sanitize_ui_text(ui, &format!("{tag}: {hint}")));
+            let (tag, color) = match self.model_override(&model_file).is_some() {
+                true => ("yours", crate::theme::PINK_BRIGHT),
+                false => ("rec", crate::theme::AQUA_BRIGHT),
+            };
+            let text = sanitize_ui_text(ui, &format!("{tag}: {hint}"));
+            ui.add(egui::Label::new(egui::RichText::new(text).small().color(color)).wrap());
         }
         #[cfg(feature = "local-npu")]
         if self.route_local_gen() {
@@ -10439,6 +10443,17 @@ impl ComfyApp {
                                     .small_button(icons::TRASH)
                                     .on_hover_text("Remove LoRA")
                                     .clicked();
+                                let mut pencil = egui::Button::new(icons::STYLUS).small();
+                                if customised {
+                                    pencil = pencil.fill(crate::theme::PINK);
+                                }
+                                if ui
+                                    .add(pencil)
+                                    .on_hover_text("Edit this LoRA's default strengths and triggers")
+                                    .clicked()
+                                {
+                                    edit_defaults = Some(lora.file.clone());
+                                }
                                 ui.add_space(6.0);
                                 let max_w = (ui.available_width() - 4.0).max(32.0);
                                 let title = elide_width(ui, &sanitize_ui_text(ui, &title), max_w);
@@ -10496,20 +10511,18 @@ impl ComfyApp {
                             }
                         }
                         if let Some(meta) = meta.as_ref() {
-                            let tag = if customised { "yours" } else { "rec" };
-                            ui.weak(sanitize_ui_text(
-                                ui,
-                                &format!("{tag}: {}", meta.strength_hint()),
-                            ));
+                            let (tag, color) = match customised {
+                                true => ("yours", crate::theme::PINK_BRIGHT),
+                                false => ("rec", crate::theme::AQUA_BRIGHT),
+                            };
+                            let text =
+                                sanitize_ui_text(ui, &format!("{tag}: {}", meta.strength_hint()));
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(text).small().color(color))
+                                    .wrap(),
+                            );
                         }
                         ui.checkbox(&mut slot.model_only, "Model only (no CLIP)");
-                    }
-                    if ui
-                        .small_button(format!("{} Defaults", icons::STYLUS))
-                        .on_hover_text("Edit this LoRA's default strengths and triggers")
-                        .clicked()
-                    {
-                        edit_defaults = Some(lora.file.clone());
                     }
                     egui::CollapsingHeader::new("Details")
                         .id_salt(("lora_active", i, lora.file.as_str()))
@@ -10590,7 +10603,7 @@ impl ComfyApp {
             let ex = facets.lora_example(file).map(|(_, c)| c).unwrap_or(0);
             ui.horizontal(|ui| {
                 ui.set_max_width(list_w);
-                let (clicked, ex_clicked) = ui
+                let (clicked, ex_clicked, edit_clicked) = ui
                     .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                         let clicked = ui.small_button("Add").clicked();
                         // Visual reference: this LoRA's example images.
@@ -10599,8 +10612,22 @@ impl ComfyApp {
                                 .add(egui::Button::new(format!("{} {ex}", icons::GALLERY)).small())
                                 .on_hover_text("See example images using this LoRA")
                                 .clicked();
+                        // Beside the examples button, not inside the details body — same reasoning
+                        // as the model rows. Pink once this LoRA carries corrections.
+                        let mut pencil = egui::Button::new(icons::STYLUS).small();
+                        if over.is_some() {
+                            pencil = pencil.fill(crate::theme::PINK);
+                        }
+                        let edit_clicked = ui
+                            .add(pencil)
+                            .on_hover_text(if over.is_some() {
+                                "Edit this LoRA's defaults (customised)"
+                            } else {
+                                "Edit the strengths and triggers Add will use"
+                            })
+                            .clicked();
                         ui.add_space(6.0);
-                        // Collapse arrow (~18px) + gap; keep the label clear of Add / examples.
+                        // Collapse arrow (~18px) + gap; keep the label clear of the buttons.
                         let max_w = (ui.available_width() - 22.0).max(32.0);
                         let header = elide_width(ui, &sanitize_ui_text(ui, label), max_w);
                         egui::CollapsingHeader::new(header)
@@ -10609,17 +10636,13 @@ impl ComfyApp {
                             .show(ui, |ui| {
                                 ui.set_max_width((list_w - 56.0).max(100.0));
                                 lora_meta_body(ui, file, meta.as_ref(), over.as_ref());
-                                if ui
-                                    .small_button(format!("{} Edit defaults", icons::STYLUS))
-                                    .on_hover_text("Correct the strengths and triggers Add will use")
-                                    .clicked()
-                                {
-                                    edit_defaults = Some(file.clone());
-                                }
                             });
-                        (clicked, ex_clicked)
+                        (clicked, ex_clicked, edit_clicked)
                     })
                     .inner;
+                if edit_clicked {
+                    edit_defaults = Some(file.clone());
+                }
                 if clicked {
                     add = Some(file.clone());
                 }
@@ -22887,6 +22910,49 @@ fn selection_overlay(ui: &egui::Ui, rect: egui::Rect, selected: bool) {
     }
 }
 
+/// [`wrap_meta`] in one of the two accents: aqua for what the catalog recommends, pink for what the
+/// user pinned. Matches the theme's grammar — aqua is the info marker, pink is what's been chosen —
+/// so "rec" and "yours" are told apart by colour rather than by reading the label.
+fn wrap_meta_accent(ui: &mut egui::Ui, label: &str, value: &str, color: egui::Color32) {
+    let value = sanitize_ui_text(ui, value);
+    if value.trim().is_empty() {
+        return;
+    }
+    ui.add(
+        egui::Label::new(egui::RichText::new(format!("{label}: {value}")).small().color(color))
+            .wrap(),
+    );
+}
+
+/// A metadata field whose value can run to paragraphs — Civitai descriptions and notes. Short
+/// enough to read at a glance stays inline; anything longer collapses behind a one-line preview of
+/// itself, so one verbose model can't bury every field under it (and the row below it).
+fn wrap_meta_long(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &str,
+    salt: impl std::hash::Hash + std::fmt::Debug,
+) {
+    let value = sanitize_ui_text(ui, value);
+    let text = value.trim();
+    if text.is_empty() {
+        return;
+    }
+    const INLINE_MAX: usize = 140;
+    if text.chars().count() <= INLINE_MAX {
+        wrap_meta(ui, label, text);
+        return;
+    }
+    // Whitespace-collapsed for the preview only: the blurbs carry hard newlines from their HTML.
+    let preview = elide(&text.split_whitespace().collect::<Vec<_>>().join(" "), 44);
+    egui::CollapsingHeader::new(egui::RichText::new(format!("{label}: {preview}")).small())
+        .id_salt(salt)
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(text).small()).wrap());
+        });
+}
+
 fn wrap_meta(ui: &mut egui::Ui, label: &str, value: &str) {
     let value = sanitize_ui_text(ui, value);
     if value.trim().is_empty() {
@@ -22935,7 +23001,7 @@ fn model_version_row(
         // Nested collapsing indents shrink the row — never size past what's left.
         let row_w = ui.available_width();
         ui.set_max_width(row_w);
-        let (use_clicked, star_clicked, ex_clicked) = ui
+        let (use_clicked, star_clicked, ex_clicked, edit_clicked) = ui
             .with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
                 let use_clicked = ui
                     .add_enabled(!selected, egui::Button::new("Use").small())
@@ -22956,7 +23022,22 @@ fn model_version_row(
                         .add(egui::Button::new(format!("{} {example_count}", icons::GALLERY)).small())
                         .on_hover_text("See example images made with this checkpoint")
                         .clicked();
-                // Collapse arrow (~18px); keep the label clear of Use / pin / examples.
+                // Out here beside the examples button rather than inside the details body: it is a
+                // per-model action reached often, and a collapsed row shouldn't hide it. Pink once
+                // this model carries corrections, so the row says so without being expanded.
+                let mut pencil = egui::Button::new(icons::STYLUS).small();
+                if over.is_some() {
+                    pencil = pencil.fill(crate::theme::PINK);
+                }
+                let edit_clicked = ui
+                    .add(pencil)
+                    .on_hover_text(if over.is_some() {
+                        "Edit this model's defaults (customised)"
+                    } else {
+                        "Edit this model's defaults — loader, sampler, companions"
+                    })
+                    .clicked();
+                // Collapse arrow (~18px); keep the label clear of the trailing buttons.
                 let max_w = (ui.available_width() - 22.0).max(32.0);
                 let header = elide_width(ui, &sanitize_ui_text(ui, &ver_header), max_w);
                 egui::CollapsingHeader::new(header)
@@ -22965,15 +23046,8 @@ fn model_version_row(
                     .show(ui, |ui| {
                         ui.set_max_width(ui.available_width().max(40.0));
                         checkpoint_meta_body(ui, file, meta.as_ref(), over);
-                        if ui
-                            .small_button(format!("{} Edit defaults", icons::STYLUS))
-                            .on_hover_text("Correct this model's loader, sampler and companions")
-                            .clicked()
-                        {
-                            *edit_defaults = Some(file.to_string());
-                        }
                     });
-                (use_clicked, star_clicked, ex_clicked)
+                (use_clicked, star_clicked, ex_clicked, edit_clicked)
             })
             .inner;
         if use_clicked {
@@ -22984,6 +23058,9 @@ fn model_version_row(
         }
         if ex_clicked {
             *examples = Some(file.to_string());
+        }
+        if edit_clicked {
+            *edit_defaults = Some(file.to_string());
         }
     });
 }
@@ -22997,7 +23074,7 @@ fn checkpoint_meta_body(
 ) {
     wrap_meta(ui, "File", file);
     if let Some(hint) = over.and_then(|o| o.short_hint()) {
-        wrap_meta(ui, "Yours", &hint);
+        wrap_meta_accent(ui, "Yours", &hint, crate::theme::PINK_BRIGHT);
     }
     let Some(e) = entry else {
         ui.weak("No catalog metadata for this checkpoint.");
@@ -23040,12 +23117,12 @@ fn checkpoint_meta_body(
             parts.push(format!("clip skip {v}"));
         }
         if !parts.is_empty() {
-            wrap_meta(ui, "Recommended", &parts.join(" · "));
+            wrap_meta_accent(ui, "Recommended", &parts.join(" · "), crate::theme::AQUA_BRIGHT);
         }
     }
-    wrap_meta(ui, "Notes", e.notes.trim());
+    wrap_meta_long(ui, "Notes", e.notes.trim(), ("ckpt_notes", file));
     if let Some(d) = e.description.as_ref().filter(|s| !s.trim().is_empty()) {
-        wrap_meta(ui, "Description", &strip_simple_html(d));
+        wrap_meta_long(ui, "Description", &strip_simple_html(d), ("ckpt_desc", file));
     }
     if !e.tags.is_empty() {
         wrap_meta(ui, "Tags", &e.tags.join(", "));
@@ -23259,7 +23336,7 @@ fn lora_meta_body(
 ) {
     wrap_meta(ui, "File", file);
     if let Some(hint) = over.and_then(|o| o.short_hint()) {
-        wrap_meta(ui, "Yours", &hint);
+        wrap_meta_accent(ui, "Yours", &hint, crate::theme::PINK_BRIGHT);
     }
     let Some(e) = entry else {
         ui.weak("No catalog metadata for this LoRA.");
@@ -23284,10 +23361,15 @@ fn lora_meta_body(
     if !e.strength_source.is_empty() {
         strength.push_str(&format!(" · via {}", e.strength_source));
     }
-    wrap_meta(ui, "Strength", &strength);
+    // Aqua unless the override supplied it — then "Yours" above has already said pink.
+    let strength_color = match over.is_some() {
+        true => crate::theme::PINK_BRIGHT,
+        false => crate::theme::AQUA_BRIGHT,
+    };
+    wrap_meta_accent(ui, "Strength", &strength, strength_color);
     wrap_meta(ui, "Triggers", &e.trigger_text());
     wrap_meta(ui, "Negative", &e.negative_text());
-    wrap_meta(ui, "Notes", e.notes.trim());
+    wrap_meta_long(ui, "Notes", e.notes.trim(), ("lora_notes", file));
     if !e.tags.is_empty() {
         wrap_meta(ui, "Tags", &e.tags.join(", "));
     }
