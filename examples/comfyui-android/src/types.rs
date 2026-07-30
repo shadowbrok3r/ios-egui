@@ -122,7 +122,12 @@ impl ActiveLora {
 pub const WAN_NEGATIVE: &str = "(((realistic))), ((photograph)), 色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
 /// Wan 2.2 image-to-video settings, seeded with the user's proven-working defaults.
+///
+/// Container-level `serde(default)`: a settings file written before any one of these fields existed
+/// must still load. A failed `Settings` parse blocks autosave outright, taking every saved preset,
+/// character and credential with it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VideoParams {
     /// `UNETLoader.unet_name` for the high-noise expert.
     pub unet_high: String,
@@ -3400,6 +3405,61 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let back: Params = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mode, Mode::Video);
+    }
+
+    /// A Wan i2v setup saved as a preset must come back as that Wan setup, not as whatever image
+    /// checkpoint happened to be selected — every video field lives in `params.video`.
+    #[test]
+    fn a_wan_preset_round_trips_every_video_field() {
+        let mut p = Params {
+            mode: Mode::Video,
+            checkpoint: "Illustrious/some_anime_model.safetensors".into(),
+            positive: "a cat turning its head".into(),
+            ..Default::default()
+        };
+        p.video.unet_high = "Wan/high.safetensors".into();
+        p.video.unet_low = "Wan/low.safetensors".into();
+        p.video.clip_name = "umt5.safetensors".into();
+        p.video.vae_name = "wan_vae.safetensors".into();
+        p.video.length = 65;
+        p.video.steps = 6;
+        p.video.split_step = 3;
+        p.video.cfg_high = 3.5;
+        p.video.shift = 8.0;
+        p.video.lora_triggers = "smooth motion".into();
+        p.video.rife_multiplier = 3;
+        p.video.video_t2v = true;
+        p.video.loras_low.clear();
+
+        let preset = CreatePreset { name: "wan i2v".into(), params: p.clone() };
+        let json = serde_json::to_string(&preset).expect("serialize");
+        let back: CreatePreset = serde_json::from_str(&json).expect("deserialize");
+        let v = &back.params.video;
+
+        assert_eq!(back.params.gen_mode(), GenMode::Txt2Video);
+        assert_eq!(v.unet_high, "Wan/high.safetensors");
+        assert_eq!(v.unet_low, "Wan/low.safetensors");
+        assert_eq!(v.clip_name, "umt5.safetensors");
+        assert_eq!(v.vae_name, "wan_vae.safetensors");
+        assert_eq!((v.length, v.steps, v.split_step, v.rife_multiplier), (65, 6, 3, 3));
+        assert!((v.cfg_high - 3.5).abs() < 1e-6 && (v.shift - 8.0).abs() < 1e-6);
+        assert_eq!(v.lora_triggers, "smooth motion");
+        assert_eq!(v.loras_high.len(), 2);
+        assert!(v.loras_low.is_empty(), "an emptied low stack must not resurrect its defaults");
+        // The image slot rides along untouched, for when the user switches back.
+        assert_eq!(back.params.checkpoint, "Illustrious/some_anime_model.safetensors");
+    }
+
+    /// A preset file written before a `VideoParams` field existed must still load: a failed
+    /// `Settings` parse blocks autosave, taking every preset and credential with it.
+    #[test]
+    fn video_params_tolerate_a_file_from_an_older_build() {
+        let partial = r#"{"unet_high": "Wan/high.safetensors", "length": 49}"#;
+        let v: VideoParams = serde_json::from_str(partial).expect("must not fail the whole parse");
+        assert_eq!(v.unet_high, "Wan/high.safetensors");
+        assert_eq!(v.length, 49);
+        assert_eq!(v.clip_type, VideoParams::default().clip_type, "the rest falls back");
+        assert_eq!(v.steps, VideoParams::default().steps);
     }
 
     #[test]

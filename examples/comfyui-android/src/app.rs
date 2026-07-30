@@ -368,6 +368,12 @@ struct Viewer {
     meta_open: bool,
     /// Raw embedded workflow JSON (for Copy); `None` until fetched or unavailable.
     workflow_json: Option<String>,
+    /// The gate's `/gallery/api/workflow` has answered, either way — the cue to fall back to
+    /// scanning the file's own bytes.
+    wf_fetched: bool,
+    /// The full-file download has landed or failed. With `wf_fetched`, this is when the hunt for a
+    /// workflow is over: nothing else can produce one.
+    bytes_settled: bool,
     /// Parsed prompts / LoRAs / sampler summary from the workflow.
     meta: Option<ImageMeta>,
     /// `meta` is the gate's quick summary (no LoRA strengths / encoder details) — good enough for
@@ -2998,10 +3004,16 @@ impl ComfyApp {
             // the consumer waiting on that key — a dangling pending wedges its pump forever.
             Msg::FullImageError { key, why } => {
                 self.log.warn(format!("full image {}: {}", elide(&key, 60), elide(&why, 120)));
+                let mut for_current = false;
                 if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
                     v.loading = false;
+                    v.bytes_settled = true;
+                    for_current = true;
+                }
+                if for_current {
+                    self.viewer_workflow_settled(host);
                 }
                 if self.prefetch_pending.as_deref() == Some(key.as_str()) {
                     self.prefetch_pending = None;
@@ -3093,6 +3105,8 @@ impl ComfyApp {
                     v.tex = Some(ctx.load_texture(&key, image, egui::TextureOptions::LINEAR));
                     v.bytes = Some(bytes);
                     v.loading = false;
+                    v.bytes_settled = true;
+                    self.viewer_workflow_settled(host);
                 }
             }
             Msg::ItemWorkflow { key, json } => {
@@ -3117,6 +3131,7 @@ impl ComfyApp {
                     }
                     v.meta_partial = false;
                     v.workflow_json = Some(json);
+                    v.wf_fetched = true;
                     v.item.has_workflow = true;
                     v.meta_loading = false;
                     open_sheet = self.viewer_remix_pending;
@@ -3137,18 +3152,15 @@ impl ComfyApp {
                 if let Some(v) = &mut self.viewer
                     && v.item.key() == key
                 {
-                    v.meta_loading = false;
+                    // comfy-gate scrapes stills only (415 on mp4/webm), so the file's own bytes are
+                    // the graph's only route here — `viewer_workflow_settled` keeps this loading
+                    // until the download has settled.
+                    v.wf_fetched = true;
                     for_current = true;
                     self.log.warn(format!("workflow meta {key}: {error}"));
                 }
-                if for_current && self.viewer_remix_pending {
-                    self.viewer_remix_pending = false;
-                    // The workflow fetch is gone for good — the gate's quick summary (if any)
-                    // is the best remix material this image will ever have.
-                    match self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty()) {
-                        Some(meta) => self.begin_remix(meta, host),
-                        None => self.gallery_status = "No workflow metadata to remix".into(),
-                    }
+                if for_current {
+                    self.viewer_workflow_settled(host);
                 }
             }
             Msg::VideoReady { key, bytes } => {
@@ -3159,6 +3171,7 @@ impl ComfyApp {
                 {
                     v.bytes = Some(bytes.clone());
                     v.loading = false;
+                    v.bytes_settled = true;
                     // Write the file where MediaMetadataRetriever can open it, then start playback.
                     // A fresh name per playback: the previous player's decode thread may still be
                     // winding down with its file open, and truncating that in place would yank the
@@ -3178,12 +3191,67 @@ impl ComfyApp {
                             Err(e) => self.log.error(format!("video cache write failed: {e}")),
                         }
                     }
+                    self.viewer_workflow_settled(host);
                 }
             }
             Msg::SaveToGallery { name, bytes } => {
                 self.gallery_status = self.save_bytes(host, &bytes, &name);
             }
         }
+    }
+
+    /// The workflow hunt for the open item has taken another step. The gate's answer and the file
+    /// download race each other, so this runs on whichever lands: scan the file's own bytes if the
+    /// server had nothing, and once neither can still produce a graph, settle a waiting Remix.
+    fn viewer_workflow_settled(&mut self, host: &Host) {
+        self.workflow_from_own_bytes();
+        let done = self.viewer.as_ref().is_some_and(|v| v.wf_fetched && v.bytes_settled);
+        if !done {
+            return;
+        }
+        if let Some(v) = &mut self.viewer {
+            v.meta_loading = false;
+        }
+        if !std::mem::take(&mut self.viewer_remix_pending) {
+            return;
+        }
+        match self.viewer.as_ref().and_then(|v| v.meta.clone()).filter(|m| !m.is_empty()) {
+            Some(meta) => self.begin_remix(meta, host),
+            None => self.gallery_status = "No workflow metadata to remix".into(),
+        }
+    }
+
+    /// Recover the open item's workflow from the media file itself. comfy-gate's scraper is PNG-only,
+    /// so for a video this is the only place its graph exists — and the viewer already holds the
+    /// whole file for playback.
+    fn workflow_from_own_bytes(&mut self) {
+        let Some(v) = self.viewer.as_ref() else { return };
+        if v.workflow_json.is_some() || !v.wf_fetched {
+            return;
+        }
+        let Some(bytes) = v.bytes.as_deref() else { return };
+        let filename = v.item.filename.clone();
+        let Some(json) = crate::media_meta::embedded_workflow(bytes) else {
+            self.log.info(format!("no embedded workflow in {}", elide(&filename, 48)));
+            return;
+        };
+        let meta = gallery::parse_workflow_meta_for(&json, Some(&filename));
+        self.log.info(format!(
+            "embedded workflow {}: {} bytes, {} models, {} loras",
+            elide(&filename, 48),
+            json.len(),
+            meta.models.len(),
+            meta.loras.len()
+        ));
+        let Some(v) = &mut self.viewer else { return };
+        // Same precedence as the gate's scrape: a full parse wins over the quick summary unless it
+        // found nothing at all.
+        if !meta.is_empty() || v.meta.as_ref().is_none_or(|m| m.is_empty()) {
+            v.meta = Some(meta);
+        }
+        v.meta_partial = false;
+        v.workflow_json = Some(json);
+        v.item.has_workflow = true;
     }
 
     /// Whether a Create-tab generation can be queued right now.
@@ -3304,11 +3372,22 @@ impl ComfyApp {
         if v.vae_name.trim().is_empty() {
             return Err("Pick a VAE for Wan");
         }
-        if !v.video_t2v
-            && self.params.img2img_source == Img2ImgSource::Picked
-            && self.picked_input.is_none()
-        {
-            return Err("Pick a device photo for the start image first");
+        // The engine rejects a missing start image only after the job is already accepted, so every
+        // source is checked here — an applied preset always lands on Current result (Picked bytes
+        // are session-only), which is empty until something has been generated.
+        if !v.video_t2v {
+            match self.params.img2img_source {
+                Img2ImgSource::Picked if self.picked_input.is_none() => {
+                    return Err("Pick a device photo for the start image first");
+                }
+                Img2ImgSource::Url if self.params.input_url.trim().is_empty() => {
+                    return Err("Enter a start image URL");
+                }
+                Img2ImgSource::CurrentOutput if self.result_bytes.is_none() => {
+                    return Err("Pick a start image for image-to-video first");
+                }
+                _ => {}
+            }
         }
         if !matches!(self.conn, Conn::Connected)
             && !self.engine.as_ref().is_some_and(|e| e.is_connected())
@@ -6945,8 +7024,12 @@ impl ComfyApp {
         self.ensure_tag_dict_warm(ui.ctx());
         self.ensure_cooc_warm(ui.ctx(), host);
         let anima = self.anima_active();
+        // Video runs the Wan experts in params.video, so the image checkpoint's recommended
+        // steps/CFG/size describe a model this pane isn't using.
         let model_file = self.params.model_file().to_string();
-        if let Some(hint) = self.recommended_for(&model_file).short_hint() {
+        if self.params.mode != Mode::Video
+            && let Some(hint) = self.recommended_for(&model_file).short_hint()
+        {
             let tag = if self.model_override(&model_file).is_some() { "yours" } else { "rec" };
             ui.weak(sanitize_ui_text(ui, &format!("{tag}: {hint}")));
         }
@@ -7277,6 +7360,16 @@ impl ComfyApp {
         } else {
             "Wan 2.2 i2v — describe the motion; canned defaults do the rest."
         });
+        // Name the experts this pane actually runs; the Models tab and the top bar both speak for
+        // the image checkpoint, which video never touches.
+        ui.weak(sanitize_ui_text(
+            ui,
+            &format!(
+                "{} + {}",
+                file_basename(&self.params.video.unet_high),
+                file_basename(&self.params.video.unet_low)
+            ),
+        ));
 
         if !t2v {
             let src_title = match self.params.img2img_source {
@@ -8263,9 +8356,9 @@ impl ComfyApp {
                             icons::TRASH.into(),
                             true,
                         );
-                        let use_btn = ui
-                            .add_enabled(!selected, egui::Button::new("Use").small())
-                            .clicked();
+                        // Always tappable: `selected_preset` survives every hand edit made after
+                        // applying, so greying the checked row is what blocks re-applying it.
+                        let use_btn = ui.add(egui::Button::new("Use").small()).clicked();
                         egui::CollapsingHeader::new(header)
                             .id_salt(("preset_row", preset.name.as_str()))
                             .default_open(false)
@@ -12945,17 +13038,67 @@ impl ComfyApp {
             // The preset's prompt replaces the current one wholesale; main-look bookkeeping is stale.
             self.active_main_looks.clear();
             self.params.loras = dedupe_loras(std::mem::take(&mut self.params.loras));
-            // Picked device-photo bytes are session-only; a preset can't carry them.
-            if self.params.img2img_source == Img2ImgSource::Picked {
+            let v = &mut self.params.video;
+            v.loras_high = dedupe_loras(std::mem::take(&mut v.loras_high));
+            v.loras_low = dedupe_loras(std::mem::take(&mut v.loras_low));
+            // Picked device-photo bytes are session-only; a preset can't carry them. Keep the source
+            // when a photo is still loaded, though — for i2v that field IS the start image, and
+            // dropping it renders the preset off an unrelated leftover result.
+            if self.params.img2img_source == Img2ImgSource::Picked && self.picked_input.is_none() {
                 self.params.img2img_source = Img2ImgSource::CurrentOutput;
             }
             // No Picked bytes means no masked photo, so the inpaint flag can't apply.
             self.params.inpaint_mask = false;
             self.selected_preset = name.to_string();
-            // A preset saved against another server may name companions this one lacks.
-            if self.params.model_kind.needs_companions() {
+            // A preset saved against another server may name models this one lacks. Video keeps its
+            // own models in `params.video`, which resolve_companions never touches.
+            if self.params.mode == Mode::Video {
+                self.repair_video_models();
+                self.reconcile_video_lora_triggers();
+            } else if self.params.model_kind.needs_companions() {
                 self.resolve_companions(Companions::Repair);
             }
+            // Say what landed: the Presets pane draws no model strip, so a preset that switches the
+            // whole mode otherwise changes nothing the user can see.
+            self.note = format!("{name} applied — {}", self.params.gen_mode().label());
+        }
+    }
+
+    /// Snap a Wan preset's models, encoders and LoRAs onto what this server actually publishes —
+    /// the video-mode counterpart of [`Self::resolve_companions`]. Basename matching is what fixes
+    /// the common case: the same file catalogued with or without its `Wan/` folder prefix.
+    ///
+    /// An empty option list means "not connected yet", never "the server has none", so those fields
+    /// are left alone rather than blanked.
+    fn repair_video_models(&mut self) {
+        let unets = self.unets.clone();
+        let clips = self.clip_files.clone();
+        let vaes = self.vaes.clone();
+        let loras = self.installed_loras.clone();
+        let mut fixed: Vec<String> = Vec::new();
+        {
+            let mut snap = |field: &mut String, options: &[String], what: &str| {
+                if options.is_empty() || field.trim().is_empty() {
+                    return;
+                }
+                if let Some(found) = installed_match(field, options)
+                    && found != *field
+                {
+                    fixed.push(format!("{what} {field} -> {found}"));
+                    *field = found;
+                }
+            };
+            let v = &mut self.params.video;
+            snap(&mut v.unet_high, &unets, "high noise");
+            snap(&mut v.unet_low, &unets, "low noise");
+            snap(&mut v.clip_name, &clips, "encoder");
+            snap(&mut v.vae_name, &vaes, "VAE");
+            for l in v.loras_high.iter_mut().chain(v.loras_low.iter_mut()) {
+                snap(&mut l.file, &loras, "LoRA");
+            }
+        }
+        for line in fixed {
+            self.log.info(format!("preset repair: {line}"));
         }
     }
 
@@ -16395,6 +16538,7 @@ impl ComfyApp {
             }
 
             up_menu_sized(ui, format!("{} View", icons::GALLERY), egui::vec2(68.0, 28.0), egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                crate::theme::menu_row_style(ui);
                 if ui
                     .button(format!("{} Select", icons::CHECK))
                     .on_hover_text("Multi-select — or long-press a photo")
@@ -16443,56 +16587,64 @@ impl ComfyApp {
                 egui::CollapsingHeader::new(format!("{} Sort · {}", icons::SORT, self.gallery_view.sort.label()))
                     .id_salt("gv_sort")
                     .show(ui, |ui| {
-                        for s in GallerySort::ALL {
-                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.sort, *s, s.label())
-                                .clicked();
-                        }
+                        menu_section_body(ui, |ui| {
+                            for s in GallerySort::ALL {
+                                changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.sort, *s, s.label())
+                                    .clicked();
+                            }
+                        });
                     });
 
                 egui::CollapsingHeader::new(format!("Group · {}", self.gallery_view.group.label())).id_salt("gv_group").show(ui, |ui| {
-                    for g in GalleryGroup::ALL {
-                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.group, *g, g.label())
-                            .clicked();
-                    }
-                    if self.gallery_view.group != GalleryGroup::None {
-                        ui.separator();
-                        let open_label = if self.gallery_view.groups_open {
-                            format!("{} Headers open", icons::CHECK)
-                        } else {
-                            "     Headers closed".to_string()
-                        };
-                        if crate::theme::selectable_label(ui, self.gallery_view.groups_open, open_label)
-                            .on_hover_text("Default open/closed state for group headers")
-                            .clicked()
-                        {
-                            self.gallery_view.groups_open = !self.gallery_view.groups_open;
+                    menu_section_body(ui, |ui| {
+                        for g in GalleryGroup::ALL {
+                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.group, *g, g.label())
+                                .clicked();
                         }
-                    }
+                        if self.gallery_view.group != GalleryGroup::None {
+                            ui.separator();
+                            let open_label = if self.gallery_view.groups_open {
+                                format!("{} Headers open", icons::CHECK)
+                            } else {
+                                "     Headers closed".to_string()
+                            };
+                            if crate::theme::selectable_label(ui, self.gallery_view.groups_open, open_label)
+                                .on_hover_text("Default open/closed state for group headers")
+                                .clicked()
+                            {
+                                self.gallery_view.groups_open = !self.gallery_view.groups_open;
+                            }
+                        }
+                    });
                 });
 
                 egui::CollapsingHeader::new(format!("Rating · {}", self.gallery_view.rating.label())).id_salt("gv_rating").show(ui, |ui| {
-                    for r in RatingFilter::ALL {
-                        crate::theme::selectable_value(ui, &mut self.gallery_view.rating, *r, r.label());
-                    }
-                    ui.separator();
-                    ui.weak("Unindexed images count as Safe.");
-                    ui.separator();
-                    crate::theme::selectable_value(ui, &mut self.index_filter, 0, "Indexed + not");
-                    crate::theme::selectable_value(ui, &mut self.index_filter, 1, "Indexed only");
-                    crate::theme::selectable_value(ui, &mut self.index_filter, 2, "Unindexed only");
+                    menu_section_body(ui, |ui| {
+                        for r in RatingFilter::ALL {
+                            crate::theme::selectable_value(ui, &mut self.gallery_view.rating, *r, r.label());
+                        }
+                        ui.separator();
+                        ui.weak("Unindexed images count as Safe.");
+                        ui.separator();
+                        crate::theme::selectable_value(ui, &mut self.index_filter, 0, "Indexed + not");
+                        crate::theme::selectable_value(ui, &mut self.index_filter, 1, "Indexed only");
+                        crate::theme::selectable_value(ui, &mut self.index_filter, 2, "Unindexed only");
+                    });
                 });
 
                 egui::CollapsingHeader::new(format!("Columns · {}", self.gallery_view.columns)).id_salt("gv_columns").show(ui, |ui| {
-                    for n in 1..=3usize {
-                        if crate::theme::selectable_label(ui, 
-                                self.gallery_view.columns == n,
-                                format!("{n} column{}", if n == 1 { "" } else { "s" }),
-                            )
-                            .clicked()
-                        {
-                            self.gallery_view.columns = n;
+                    menu_section_body(ui, |ui| {
+                        for n in 1..=3usize {
+                            if crate::theme::selectable_label(ui,
+                                    self.gallery_view.columns == n,
+                                    format!("{n} column{}", if n == 1 { "" } else { "s" }),
+                                )
+                                .clicked()
+                            {
+                                self.gallery_view.columns = n;
+                            }
                         }
-                    }
+                    });
                 });
 
                 let media_label = match self.gallery_view.media {
@@ -16501,10 +16653,12 @@ impl ComfyApp {
                     GalleryMedia::Videos => format!("{} Media · Videos", icons::RUN),
                 };
                 egui::CollapsingHeader::new(media_label).id_salt("gv_media").show(ui, |ui| {
-                    for m in GalleryMedia::ALL {
-                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.media, *m, m.label())
-                            .clicked();
-                    }
+                    menu_section_body(ui, |ui| {
+                        for m in GalleryMedia::ALL {
+                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.media, *m, m.label())
+                                .clicked();
+                        }
+                    });
                 });
 
                 let model_label = if self.gallery_view.model.is_empty() {
@@ -16513,25 +16667,27 @@ impl ComfyApp {
                     format!("{} Model · {}", icons::MODEL, elide(&self.gallery_view.model, 18))
                 };
                 egui::CollapsingHeader::new(model_label).id_salt("gv_model").show(ui, |ui| {
-                    crate::theme::scroll_vertical().max_height(280.0).id_salt("gv_model_scroll").show(ui, |ui| {
-                        changed |= crate::theme::selectable_value(ui,
-                                &mut self.gallery_view.model,
-                                String::new(),
-                                "All models",
-                            )
-                            .clicked();
-                        for m in &self.facets.models {
-                            let label = format!("{}  ({})", elide(&m.name, 40), m.count);
-                            changed |= crate::theme::selectable_value(ui, 
+                    menu_section_body(ui, |ui| {
+                        crate::theme::scroll_vertical().max_height(320.0).id_salt("gv_model_scroll").show(ui, |ui| {
+                            changed |= crate::theme::selectable_value(ui,
                                     &mut self.gallery_view.model,
-                                    m.name.clone(),
-                                    label,
+                                    String::new(),
+                                    "All models",
                                 )
                                 .clicked();
-                        }
-                        if self.facets.models.is_empty() {
-                            ui.weak("no models indexed yet");
-                        }
+                            for m in &self.facets.models {
+                                let label = format!("{}  ({})", elide(&m.name, 40), m.count);
+                                changed |= crate::theme::selectable_value(ui,
+                                        &mut self.gallery_view.model,
+                                        m.name.clone(),
+                                        label,
+                                    )
+                                    .clicked();
+                            }
+                            if self.facets.models.is_empty() {
+                                ui.weak("no models indexed yet");
+                            }
+                        });
                     });
                 });
 
@@ -16543,17 +16699,19 @@ impl ComfyApp {
                     format!("{} LoRA · {}", icons::MODEL, elide(file_basename(&self.gallery_view.lora), 18))
                 };
                 egui::CollapsingHeader::new(lora_label).id_salt("gv_lora").show(ui, |ui| {
-                    crate::theme::scroll_vertical().max_height(280.0).id_salt("gv_lora_scroll").show(ui, |ui| {
-                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, String::new(), "All LoRAs")
-                            .clicked();
-                        for l in &self.facets.loras {
-                            let label = format!("{}  ({})", elide(file_basename(&l.name), 40), l.count);
-                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, l.name.clone(), label)
+                    menu_section_body(ui, |ui| {
+                        crate::theme::scroll_vertical().max_height(320.0).id_salt("gv_lora_scroll").show(ui, |ui| {
+                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, String::new(), "All LoRAs")
                                 .clicked();
-                        }
-                        if self.facets.loras.is_empty() {
-                            ui.weak("no LoRAs indexed (needs an updated gate)");
-                        }
+                            for l in &self.facets.loras {
+                                let label = format!("{}  ({})", elide(file_basename(&l.name), 40), l.count);
+                                changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, l.name.clone(), label)
+                                    .clicked();
+                            }
+                            if self.facets.loras.is_empty() {
+                                ui.weak("no LoRAs indexed (needs an updated gate)");
+                            }
+                        });
                     });
                 });
 
@@ -16567,24 +16725,26 @@ impl ComfyApp {
                         .unwrap_or_else(|| format!("{} Album", icons::ALBUM)),
                 };
                 egui::CollapsingHeader::new(album_label).id_salt("gv_album").show(ui, |ui| {
-                    crate::theme::scroll_vertical().max_height(280.0).id_salt("gv_album_scroll").show(ui, |ui| {
-                        changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.album, None, "All images")
-                            .clicked();
-                        for a in &self.albums {
-                            let label =
-                                format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
-                            changed |= crate::theme::selectable_value(ui,
-                                    &mut self.gallery_view.album,
-                                    Some(a.id),
-                                    label,
-                                )
+                    menu_section_body(ui, |ui| {
+                        crate::theme::scroll_vertical().max_height(320.0).id_salt("gv_album_scroll").show(ui, |ui| {
+                            changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.album, None, "All images")
                                 .clicked();
-                        }
-                        ui.separator();
-                        if ui.button(format!("{} Manage albums…", icons::FOLDER)).clicked() {
-                            self.album_manage_open = true;
-                            ui.close();
-                        }
+                            for a in &self.albums {
+                                let label =
+                                    format!("{} {}  ({})", icons::ALBUM, elide(&a.name, 28), a.count);
+                                changed |= crate::theme::selectable_value(ui,
+                                        &mut self.gallery_view.album,
+                                        Some(a.id),
+                                        label,
+                                    )
+                                    .clicked();
+                            }
+                            ui.separator();
+                            if ui.button(format!("{} Manage albums…", icons::FOLDER)).clicked() {
+                                self.album_manage_open = true;
+                                ui.close();
+                            }
+                        });
                     });
                 });
 
@@ -18679,6 +18839,8 @@ impl ComfyApp {
             albums: None,
             meta_open: false,
             workflow_json: None,
+            wf_fetched: false,
+            bytes_settled: false,
             meta: None,
             meta_partial: false,
             meta_loading: true,
@@ -19590,8 +19752,16 @@ impl ComfyApp {
                             ui.close();
                         }
                         ui.separator();
+                        // A video's graph is read out of the file itself, so it only becomes
+                        // available once the download lands.
+                        let wf_hint = if v.item.is_video {
+                            "From the video's own metadata — available once it finishes downloading"
+                        } else {
+                            "From the image's embedded workflow"
+                        };
                         if ui
                             .add_enabled(can_open_wf, egui::Button::new(format!("{} Open workflow", icons::GRAPH)))
+                            .on_hover_text(wf_hint)
                             .clicked()
                         {
                             act = Some(Act::OpenWorkflow);
@@ -19599,6 +19769,7 @@ impl ComfyApp {
                         }
                         if ui
                             .add_enabled(can_open_wf, egui::Button::new(format!("{} Copy workflow", icons::PROPS)))
+                            .on_hover_text(wf_hint)
                             .clicked()
                         {
                             act = Some(Act::CopyWorkflow);
@@ -22527,6 +22698,10 @@ fn up_menu_sized<R>(
     crate::theme::up_menu_sized(ui, label, min_size, close_behavior, content)
 }
 
+fn menu_section_body<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    crate::theme::menu_section_body(ui, content)
+}
+
 fn down_menu<R>(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
@@ -22969,36 +23144,80 @@ fn queue_meta_body(ui: &mut egui::Ui, meta: &crate::gallery::ImageMeta) {
     }
 }
 
+/// A preset's saved settings, read out of the mode it was saved in. A Wan video preset keeps its
+/// models and sampler in `params.video`, so showing `model_file()` and the image sampler would
+/// describe an unrelated image checkpoint the preset never uses.
 fn preset_meta_body(ui: &mut egui::Ui, preset: &CreatePreset) {
     let p = &preset.params;
-    wrap_meta(ui, "Model", p.model_file());
-    wrap_meta(
-        ui,
-        "Mode",
-        match p.mode {
-            Mode::Txt2Img => "Text to Image",
-            Mode::Img2Img => "Image to Image",
-            Mode::Video => "Video",
-        },
-    );
+    wrap_meta(ui, "Mode", p.gen_mode().label());
+    if p.mode == Mode::Video {
+        let v = &p.video;
+        wrap_meta(ui, "Wan high", file_basename(&v.unet_high));
+        wrap_meta(ui, "Wan low", file_basename(&v.unet_low));
+        wrap_meta(ui, "Encoder", &format!("{} ({})", file_basename(&v.clip_name), v.clip_type));
+        wrap_meta(ui, "VAE", file_basename(&v.vae_name));
+    } else {
+        wrap_meta(ui, "Model", file_basename(p.model_file()));
+    }
     wrap_meta(ui, "Prompt", &p.positive);
     let preset_triggers = p.active_lora_triggers();
     if !preset_triggers.trim().is_empty() {
         wrap_meta(ui, "LoRA triggers", preset_triggers);
     }
     wrap_meta(ui, "Negative", &p.negative);
-    wrap_meta(
-        ui,
-        "Sampler",
-        &format!(
-            "{} steps, CFG {}, {}×{}, {}/{}",
-            p.steps, p.cfg, p.width, p.height, p.sampler, p.scheduler
-        ),
-    );
-    if !p.loras.is_empty() {
-        let names: Vec<&str> = p.loras.iter().map(|l| l.file.as_str()).collect();
-        wrap_meta(ui, "LoRAs", &names.join(", "));
+    if p.mode == Mode::Video {
+        let v = &p.video;
+        wrap_meta(ui, "Frames", &format!("{}×{}, {} frames, shift {}", v.width, v.height, v.length, fmt_weight(v.shift)));
+        wrap_meta(
+            ui,
+            "Sampler",
+            &format!(
+                "{} steps (split {}), CFG {}/{}, {}/{}",
+                v.steps,
+                v.split_step,
+                fmt_weight(v.cfg_high),
+                fmt_weight(v.cfg_low),
+                v.sampler,
+                v.scheduler
+            ),
+        );
+        if v.rife {
+            wrap_meta(ui, "RIFE", &format!("{}× {}", v.rife_multiplier, file_basename(&v.rife_ckpt)));
+        }
+        for (label, stack) in [("High LoRAs", &v.loras_high), ("Low LoRAs", &v.loras_low)] {
+            if !stack.is_empty() {
+                wrap_meta(ui, label, &lora_stack_summary(stack));
+            }
+        }
+        if !v.video_t2v {
+            wrap_meta(ui, "Start image", match p.img2img_source {
+                Img2ImgSource::CurrentOutput => "Current result",
+                Img2ImgSource::Url => "URL",
+                // Picked bytes are session-only, so applying always lands back on Current result.
+                Img2ImgSource::Picked => "Current result (re-pick a device photo after applying)",
+            });
+        }
+    } else {
+        wrap_meta(
+            ui,
+            "Sampler",
+            &format!(
+                "{} steps, CFG {}, {}×{}, {}/{}",
+                p.steps, p.cfg, p.width, p.height, p.sampler, p.scheduler
+            ),
+        );
+        if !p.loras.is_empty() {
+            wrap_meta(ui, "LoRAs", &lora_stack_summary(&p.loras));
+        }
     }
+}
+
+fn lora_stack_summary(loras: &[ActiveLora]) -> String {
+    loras
+        .iter()
+        .map(|l| format!("{} @{}", file_basename(&l.file), fmt_weight(l.strength_model)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Wrapped character-card fields for a collapsing details body.

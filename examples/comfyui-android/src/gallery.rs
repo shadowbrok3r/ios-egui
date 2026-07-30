@@ -452,7 +452,10 @@ fn fill_ui_meta(
     let mut meta = ImageMeta::default();
     let mut best_sampler: Option<(u8, u64)> = None;
 
-    for (&id, node) in by_id {
+    // Node id order, not hash order: a two-expert Wan graph has two UNETLoaders, and whichever is
+    // visited first claims `unet` and heads `models` — a scrape that changed run to run otherwise.
+    for id in sorted_ids(by_id) {
+        let node = by_id[&id];
         if keep.is_some_and(|k| !k.contains(&id)) {
             continue;
         }
@@ -508,14 +511,17 @@ fn fill_ui_meta(
                     });
                 }
             }
+            // KSampler widgets: [seed, control, steps, cfg, sampler_name, scheduler, denoise].
+            // KSamplerAdvanced leads with `add_noise`, so every widget after it sits one slot later.
             "KSampler" | "KSamplerAdvanced" => {
                 if best_sampler.as_ref().map(|(p, _)| *p).unwrap_or(0) < 2 {
                     best_sampler = Some((2, id));
-                    meta.seed = widget_num(&widgets, 0).map(|n| n as i64);
-                    meta.steps = widget_num(&widgets, 2).map(|n| n as u64);
-                    meta.cfg = widget_num(&widgets, 3);
-                    meta.sampler = widget_str(&widgets, 4);
-                    meta.scheduler = widget_str(&widgets, 5);
+                    let seed = usize::from(class == "KSamplerAdvanced");
+                    meta.seed = widget_num(&widgets, seed).map(|n| n as i64);
+                    meta.steps = widget_num(&widgets, seed + 2).map(|n| n as u64);
+                    meta.cfg = widget_num(&widgets, seed + 3);
+                    meta.sampler = widget_str(&widgets, seed + 4);
+                    meta.scheduler = widget_str(&widgets, seed + 5);
                     meta.positive = ui_input_text(by_id, link_src, id, "positive", 0);
                     meta.negative = ui_input_text(by_id, link_src, id, "negative", 0);
                 }
@@ -549,7 +555,8 @@ fn fill_ui_meta(
 
     if meta.positive.is_none() || meta.negative.is_none() {
         let mut vals = Vec::new();
-        for (&id, node) in by_id {
+        for id in sorted_ids(by_id) {
+            let node = by_id[&id];
             if keep.is_some_and(|k| !k.contains(&id)) {
                 continue;
             }
@@ -701,6 +708,12 @@ fn str_in(inputs: &Value, key: &str) -> Option<String> {
 
 fn num_in(inputs: &Value, key: &str) -> Option<f64> {
     inputs.get(key).and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+}
+
+fn sorted_ids(by_id: &HashMap<u64, &Value>) -> Vec<u64> {
+    let mut ids: Vec<u64> = by_id.keys().copied().collect();
+    ids.sort_unstable();
+    ids
 }
 
 fn widget_str(widgets: &Value, idx: usize) -> Option<String> {
@@ -1176,6 +1189,43 @@ mod tests {
         assert_eq!(meta.clips, vec!["clip_l.safetensors", "t5xxl.safetensors"]);
         assert_eq!(meta.clip_type.as_deref(), Some("flux"));
         assert_eq!(meta.vae.as_deref(), Some("ae.safetensors"));
+    }
+
+    /// A WAN video's UI graph: `KSamplerAdvanced` puts `add_noise` ahead of the seed, so reading it
+    /// on KSampler's slots hands `steps` to `cfg` and `sampler_name` to `scheduler`.
+    #[test]
+    fn ui_format_reads_ksampler_advanced_one_slot_over() {
+        let meta = parse_workflow_meta(
+            r#"{"nodes": [
+            {"id": 1, "type": "UNETLoader", "widgets_values": ["Wan/wan2.2_i2v_high_noise_14B.safetensors", "default"]},
+            {"id": 2, "type": "UNETLoader", "widgets_values": ["Wan/wan2.2_i2v_low_noise_14B.safetensors", "default"]},
+            {"id": 3, "type": "CLIPLoader", "widgets_values": ["umt5_xxl_fp8.safetensors", "wan", "cpu"]},
+            {"id": 4, "type": "KSamplerAdvanced",
+             "widgets_values": ["enable", 12345, "fixed", 8, 2.5, "euler", "simple", 0, 4, "enable"]}
+        ], "links": []}"#,
+        );
+        assert_eq!(meta.seed, Some(12345), "noise_seed sits after add_noise");
+        assert_eq!(meta.steps, Some(8));
+        assert_eq!(meta.cfg, Some(2.5));
+        assert_eq!(meta.sampler.as_deref(), Some("euler"));
+        assert_eq!(meta.scheduler.as_deref(), Some("simple"));
+        assert_eq!(meta.clip_type.as_deref(), Some("wan"));
+        assert_eq!(meta.models.len(), 2, "both Wan experts are models");
+    }
+
+    /// Plain KSampler must keep reading its own slots.
+    #[test]
+    fn ui_format_still_reads_plain_ksampler_slots() {
+        let meta = parse_workflow_meta(
+            r#"{"nodes": [
+            {"id": 1, "type": "KSampler", "widgets_values": [777, "randomize", 20, 5.0, "dpmpp_2m", "karras", 1.0]}
+        ], "links": []}"#,
+        );
+        assert_eq!(meta.seed, Some(777));
+        assert_eq!(meta.steps, Some(20));
+        assert_eq!(meta.cfg, Some(5.0));
+        assert_eq!(meta.sampler.as_deref(), Some("dpmpp_2m"));
+        assert_eq!(meta.scheduler.as_deref(), Some("karras"));
     }
 
     /// The symptom this exists for: delete the newest image, render again, and ComfyUI writes the

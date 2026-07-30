@@ -31,6 +31,8 @@ pub const PINK_BRIGHT: Color32 = Color32::from_rgb(255, 110, 168);
 pub const AQUA: Color32 = Color32::from_rgb(43, 226, 214);
 /// A lifted aqua for text where the base reads dim.
 pub const AQUA_BRIGHT: Color32 = Color32::from_rgb(120, 240, 232);
+/// Body ink — cool near-white, the default text colour on the black page.
+const INK: Color32 = Color32::from_rgb(233, 233, 239);
 
 /// Circular floating-action diameter (queue, create menu, lock, undo, inpaint tools).
 pub const FAB_SIZE: f32 = 40.0;
@@ -160,10 +162,7 @@ pub fn tag_category_fill(cat: u8) -> Option<Color32> {
 
 /// Apply the theme: a true-black AMOLED page with hot-pink primary and aqua secondary accents.
 pub fn apply(ctx: &egui::Context) {
-    let text = rgb(233, 233, 239);
-    let text_bright = rgb(248, 250, 252);
-    // Rounded-but-restrained corners read modern without going bubbly on dense touch rows.
-    let radius = CornerRadius::same(5);
+    let text = INK;
     let mut v = egui::Visuals::dark();
 
     v.override_text_color = Some(text);
@@ -201,7 +200,39 @@ pub fn apply(ctx: &egui::Context) {
     v.window_corner_radius = CornerRadius::same(8);
     v.menu_corner_radius = CornerRadius::same(8);
 
-    let w = &mut v.widgets;
+    widget_palette(&mut v.widgets);
+
+    v.striped = true;
+    // Full-width framed collapsing headers read as tappable section buttons.
+    v.collapsing_header_frame = true;
+    // A left rail down every indented region — chiefly collapsing-header bodies — so an open
+    // section's contents read as a bounded, faintly-tinted group rather than floating on black.
+    v.indent_has_left_vline = true;
+    ctx.set_visuals(v);
+
+    ctx.all_styles_mut(|s| {
+        // Modest density from the source theme, but touch targets stay usable (the desktop dump's
+        // 1px button padding / 18px interact size would be too small to tap reliably).
+        s.spacing.item_spacing = egui::vec2(6.0, 6.0);
+        s.spacing.button_padding = egui::vec2(8.0, 6.0);
+        // Solid (non-floating) bars — wider for touch; visibility is per-ScrollArea below.
+        let mut scroll = egui::style::ScrollStyle::solid();
+        scroll.bar_width = 14.0;
+        scroll.handle_min_length = 28.0;
+        scroll.bar_inner_margin = 2.0;
+        s.spacing.scroll = scroll;
+    });
+}
+
+/// The interaction grammar shared by every framed widget: rest = restrained dark glass, hover =
+/// aqua edge, press/active/selected = pink. Applied to the global visuals, and re-applied inside
+/// menus — egui's `menu_style` strips the rest-state fill and every accent rim.
+fn widget_palette(w: &mut egui::style::Widgets) {
+    let text = INK;
+    let text_bright = rgb(248, 250, 252);
+    // Rounded-but-restrained corners read modern without going bubbly on dense touch rows.
+    let radius = CornerRadius::same(5);
+
     // Non-interactive frames/labels/separators AND the indent rail beside collapsing bodies: a
     // faintly cool line so an open section's body reads as a bounded, subtly-tinted region.
     w.noninteractive.bg_fill = rgb(11, 11, 14);
@@ -239,27 +270,6 @@ pub fn apply(ctx: &egui::Context) {
     w.open.bg_stroke = Stroke::new(1.3, rgba(43, 226, 214, 205));
     w.open.fg_stroke = Stroke::new(1.0, text);
     w.open.corner_radius = radius;
-
-    v.striped = true;
-    // Full-width framed collapsing headers read as tappable section buttons.
-    v.collapsing_header_frame = true;
-    // A left rail down every indented region — chiefly collapsing-header bodies — so an open
-    // section's contents read as a bounded, faintly-tinted group rather than floating on black.
-    v.indent_has_left_vline = true;
-    ctx.set_visuals(v);
-
-    ctx.all_styles_mut(|s| {
-        // Modest density from the source theme, but touch targets stay usable (the desktop dump's
-        // 1px button padding / 18px interact size would be too small to tap reliably).
-        s.spacing.item_spacing = egui::vec2(6.0, 6.0);
-        s.spacing.button_padding = egui::vec2(8.0, 6.0);
-        // Solid (non-floating) bars — wider for touch; visibility is per-ScrollArea below.
-        let mut scroll = egui::style::ScrollStyle::solid();
-        scroll.bar_width = 14.0;
-        scroll.handle_min_length = 28.0;
-        scroll.bar_inner_margin = 2.0;
-        s.spacing.scroll = scroll;
-    });
 }
 
 /// Apply persisted font sizes onto egui's text styles.
@@ -291,6 +301,32 @@ pub fn scroll_both() -> egui::ScrollArea {
 /// Horizontal scroll area; scrollbar only when content overflows.
 pub fn scroll_horizontal() -> egui::ScrollArea {
     egui::ScrollArea::horizontal().scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
+}
+
+/// Tap height for a menu row — a framed 40px target rather than egui's 18px text line.
+pub const MENU_ROW_H: f32 = 40.0;
+
+/// Give a menu's rows a framed, touch-sized look: egui's `menu_style` strips the rest-state fill
+/// and every accent rim and squashes `button_padding` to 2×0, so an entry otherwise reads as bare
+/// text on an 18px line. Call once at the top of a popup body; children inherit it.
+pub fn menu_row_style(ui: &mut egui::Ui) {
+    let s = ui.style_mut();
+    s.spacing.button_padding = egui::vec2(10.0, 8.0);
+    s.spacing.interact_size.y = MENU_ROW_H;
+    // Tighter gaps, since the rows themselves are now more than twice as tall.
+    s.spacing.item_spacing.y = 4.0;
+    widget_palette(&mut s.visuals.widgets);
+}
+
+/// Lay a collapsing section's body out as full-width rows. egui drops the popup's justified layout
+/// inside a collapsing body, so without this the options size to their own text while the section
+/// header spans the whole menu.
+pub fn menu_section_body<R>(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope_builder(
+        egui::UiBuilder::new().layout(egui::Layout::top_down_justified(egui::Align::Min)),
+        content,
+    )
+    .inner
 }
 
 /// A menu / combo-box button whose popup opens *upward* and scrolls.
@@ -422,6 +458,86 @@ pub fn menu_popup<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `build` inside an upward menu on a phone-sized viewport, settled over several frames
+    /// (egui sizes a popup from the previous frame's area state).
+    fn in_menu(build: &mut dyn FnMut(&mut egui::Ui)) {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let screen = egui::vec2(393.0, 873.0);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen);
+        for frame in 0..8 {
+            let at = egui::pos2(40.0, screen.y - 20.0);
+            let events = if frame == 1 {
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(screen.y - 40.0);
+                    up_menu(ui, "View", |ui| build(ui));
+                });
+            });
+        }
+    }
+
+    /// Every row a menu shows — entries at the top level and options inside a section — must span
+    /// the same width and carry a full tap target. Without [`menu_row_style`] rows are 18px tall,
+    /// and without [`menu_section_body`] a section's options size to their own text (egui drops
+    /// justification in a collapsing body) while the header spans the whole menu.
+    #[test]
+    fn menu_rows_are_full_width_and_tappable() {
+        let seen: std::cell::RefCell<Vec<(&'static str, f32, f32)>> =
+            std::cell::RefCell::new(Vec::new());
+        in_menu(&mut |ui| {
+            seen.borrow_mut().clear();
+            menu_row_style(ui);
+            let rec = |k: &'static str, r: &egui::Response| {
+                seen.borrow_mut().push((k, r.rect.width(), r.rect.height()));
+            };
+            rec("entry", &ui.button("Select"));
+            let mut pick = 0usize;
+            let header = egui::CollapsingHeader::new("Sort · Newest")
+                .id_salt("sort")
+                .default_open(true)
+                .show(ui, |ui| {
+                    menu_section_body(ui, |ui| {
+                        rec("option", &selectable_value(ui, &mut pick, 0, "Newest"));
+                        rec("long option", &selectable_value(ui, &mut pick, 1, "Oldest first"));
+                        scroll_vertical().max_height(200.0).show(ui, |ui| {
+                            rec("scrolled option", &selectable_value(ui, &mut pick, 2, "Name"));
+                        });
+                    });
+                });
+            rec("section header", &header.header_response);
+        });
+
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), 5, "every probe row must have been laid out");
+        let header_w = seen.iter().find(|(k, ..)| *k == "section header").unwrap().1;
+        assert!(header_w > 300.0, "a section header should span the menu, got {header_w:.0}px");
+        for (k, w, h) in seen.iter() {
+            assert!(*h >= MENU_ROW_H, "{k} row is only {h:.0}px tall");
+            // Options sit inside the indent rail and a scrollbar, so they run a little narrower.
+            assert!(*w >= header_w - 40.0, "{k} row is {w:.0}px of the header's {header_w:.0}px");
+        }
+    }
 
     /// Drive a `down_menu` with `rows` 32px entries on a `screen`-sized viewport and return how
     /// much of the list is actually visible (the scroll viewport inside the popup).

@@ -21,6 +21,7 @@ mod icons;
 pub mod lint;
 mod logger;
 pub mod mask;
+mod media_meta;
 mod preflight;
 mod schema;
 mod sysmon;
