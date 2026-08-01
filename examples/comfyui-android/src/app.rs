@@ -1192,6 +1192,9 @@ struct ComfyApp {
     playback_seq: u64,
     /// Ignore gallery pages from queries older than this (filter changed mid auto-load chain).
     gallery_gen: u64,
+    /// Signature of the query the rows on screen were fetched with, so a refresh can tell a
+    /// re-fetch of the same listing (keep them up) from a new one (clear).
+    gallery_query_sig: Option<u64>,
     /// Server-side rows consumed by the current listing (next page offset); tombstone-filtered
     /// pages make `gallery.len()` undercount it.
     gallery_fetch_pos: u64,
@@ -1208,8 +1211,9 @@ struct ComfyApp {
     img_pick_source: ImgPickSource,
     /// Cached device gallery listing `(MediaStore id, display name)`, newest first (Android only).
     device_images: Vec<(i64, String)>,
-    /// Whether `device_images` has been queried this session (avoids re-querying every frame).
-    device_images_loaded: bool,
+    /// Which kind `device_images` holds — `Some(video)` once queried, `None` when it must be
+    /// re-read (first use, a permission grant, or a picker switching between stills and clips).
+    device_media_loaded: Option<bool>,
     /// In-flight device-image uploads: token → the LoadImage node the pick targets. The token is
     /// echoed back in the result message so a slow upload lands on the node it was chosen for.
     /// In-flight device-image uploads, keyed by request token. The node is qualified by (doc,
@@ -1294,6 +1298,10 @@ struct ComfyApp {
     gallery_pick_open: bool,
     /// Awaiting full bytes for a gallery-picked input: `(item key, filename)`.
     gallery_pick_pending: Option<(String, String)>,
+    /// Memoized newest-first index list behind every thumbnail picker, keyed by
+    /// `(generation, rows consumed, listed rows, wants video)`. The pickers redraw on every
+    /// repaint and the sort is O(n log n) over the whole listing.
+    picker_order: Option<((u64, u64, usize, bool), Vec<usize>)>,
     /// Full-screen finger-paint inpainting session (session-only, never persisted).
     inpaint: Option<InpaintState>,
     /// A Remix tap is waiting on the viewer's workflow meta before opening the diff sheet.
@@ -1818,6 +1826,7 @@ impl ComfyApp {
             player: None,
             playback_seq: 0,
             gallery_gen: 0,
+            gallery_query_sig: None,
             gallery_fetch_pos: 0,
             trash_tombstones: HashMap::new(),
             albums: Vec::new(),
@@ -1827,7 +1836,7 @@ impl ComfyApp {
             img_pick_filter: String::new(),
             img_pick_source: ImgPickSource::default(),
             device_images: Vec::new(),
-            device_images_loaded: false,
+            device_media_loaded: None,
             pending_uploads: HashMap::new(),
             next_upload_id: 0,
             node_upload_pending: None,
@@ -1868,6 +1877,7 @@ impl ComfyApp {
             picked_input_grid_open: false,
             gallery_pick_open: false,
             gallery_pick_pending: None,
+            picker_order: None,
             inpaint: None,
             viewer_remix_pending: false,
             remix_sheet: None,
@@ -2404,6 +2414,10 @@ impl ComfyApp {
             }
             Msg::InputUploaded { token, image_ref } => {
                 let target = self.pending_uploads.remove(&token);
+                // Uploads overwrite in place, so a second pick under a name already cached leaves
+                // new pixels behind an old preview. `forget` matches the `{item}#{size}` grammar
+                // by prefix and can't reach a namespaced key, hence the exact-key drop.
+                self.thumbs.forget_exact(&format!("input#{image_ref}"));
                 // Only write it back if the very same node is still there. A tab switch, an undo
                 // or a reload all invalidate the id, and writing anyway would edit a stranger.
                 let still_ours = target.is_some_and(|(doc_id, epoch, _)| {
@@ -3046,11 +3060,31 @@ impl ComfyApp {
             }
             Msg::Thumb { key, image } => {
                 let (w, h) = (image.width(), image.height());
-                if w > 0 {
-                    let item_key = key.rsplit_once('#').map(|(k, _)| k).unwrap_or(&key);
+                // Aspects are keyed by gallery item (`{subfolder}/{filename}`), which is the left
+                // side of a `{item}#{size}` thumb key. The namespaced keys (`input#…`, `dev#…`)
+                // don't follow that grammar — splitting one yields the bare word "input", which
+                // would have every server-input thumb overwrite a single junk entry.
+                if w > 0
+                    && let Some((item_key, _)) = key.rsplit_once('#')
+                    && item_key.contains('/')
+                {
                     self.thumb_aspects.insert(item_key.to_string(), h as f32 / w as f32);
                 }
                 let bytes = w * h * 4;
+                // A thumbnail is capped at 1024px on its long side, so 4 MB is the ceiling and a
+                // picker tile should be ~0.4 MB. Anything fatter means a decode escaped its clamp
+                // (or a server ignored `?size=`) and is about to evict a swathe of the cache —
+                // the failure that made the pickers reload forever, and which left no trace in a
+                // device capture because thumbnail fetches log nothing.
+                if bytes > 4 * 1024 * 1024 {
+                    self.log.warn(format!(
+                        "oversized thumb {}: {}x{} = {:.1} MB",
+                        elide(&key, 60),
+                        w,
+                        h,
+                        bytes as f32 / (1024.0 * 1024.0)
+                    ));
+                }
                 let tex = ctx.load_texture(&key, image, egui::TextureOptions::LINEAR);
                 self.thumbs.insert(key, tex, bytes);
             }
@@ -4002,18 +4036,22 @@ impl ComfyApp {
         let path = format!("{folder}/{name}");
         match std::fs::write(&path, bytes) {
             Ok(()) => {
-                self.log.info(format!("saved image: {path}"));
-                // Also copy it into the phone's Photos gallery (Pictures/ComfyUI) via MediaStore.
-                let mime = if name.to_lowercase().ends_with(".mp4") {
-                    "video/mp4"
-                } else if name.to_lowercase().ends_with(".webp") {
-                    "image/webp"
-                } else {
-                    "image/png"
-                };
-                host.save_to_gallery(&path, name, mime);
-                host.haptic(Haptic::Success);
-                "Saved to Photos (Pictures/ComfyUI)".to_string()
+                self.log.info(format!("saved file: {path}"));
+                // Then publish it to the phone's gallery. The MIME picks the collection — a video
+                // filed under images never appears — so it has to be right for every format the
+                // server can hand back, not just png/mp4.
+                match host.save_to_gallery(&path, name, graphview::media_mime(name)) {
+                    Some(folder) => {
+                        host.haptic(Haptic::Success);
+                        format!("Saved to {folder}")
+                    }
+                    None => {
+                        // The app's own copy is still on disk; only the gallery publish failed.
+                        self.log.error(format!("gallery publish failed for {name}"));
+                        host.haptic(Haptic::Warning);
+                        format!("Saved to the app folder, but the phone gallery refused it — {path}")
+                    }
+                }
             }
             Err(e) => {
                 self.log.error(format!("save failed: {e}"));
@@ -4049,9 +4087,9 @@ impl ComfyApp {
                     self.picked_input_grid_open = !self.picked_input_grid_open;
                 }
                 if self.picked_input_grid_open
-                    && let Some((id, name)) = self.device_photo_grid(ui, host)
+                    && let Some((id, name)) = self.device_photo_grid(ui, host, false)
                 {
-                    match host.load_device_image(id) {
+                    match host.load_device_media(false, id) {
                         Some(bytes) if !bytes.is_empty() => {
                             let fname =
                                 if name.is_empty() { format!("device_{id}.jpg") } else { name };
@@ -12621,9 +12659,9 @@ impl ComfyApp {
                     }
                 });
                 if open_picker
-                    && let Some((id, name)) = self.device_photo_grid(ui, host)
+                    && let Some((id, name)) = self.device_photo_grid(ui, host, false)
                 {
-                    match host.load_device_image(id) {
+                    match host.load_device_media(false, id) {
                         Some(bytes) if !bytes.is_empty() => {
                             let fname =
                                 if name.is_empty() { format!("device_{id}.jpg") } else { name };
@@ -14865,10 +14903,10 @@ impl ComfyApp {
         let loras = self.installed_loras.clone();
         // Thumbnails for the files LoadImage-style nodes point at, so a node shows the picture it
         // will load rather than a filename you'd have to go look up.
-        let input_thumbs = self.node_input_thumbs();
+        let (input_thumbs, wanted_thumbs) = self.node_input_thumbs();
         let (long_press, lora_picks, file_pick) = {
             let Some(doc) = self.active_doc_mut() else { return };
-            doc.view.set_input_thumbs(input_thumbs);
+            doc.view.set_input_thumbs(input_thumbs, &wanted_thumbs);
             let props = doc.props_node;
             doc.graph.set_live_execution(executing, progress, preview);
             if kb_edge {
@@ -15702,8 +15740,10 @@ impl ComfyApp {
     ///
     /// Videos are skipped: `/view?type=input` hands back the raw container and nothing renders a
     /// poster for input files, so there is no still to show (the node keeps its play-badge button).
-    fn node_input_thumbs(&mut self) -> HashMap<String, egui::TextureHandle> {
-        let Some(doc) = self.active_doc() else { return HashMap::new() };
+    /// Returns the thumbnails found this frame plus every name that was looked for, so the canvas
+    /// can keep showing a picture whose entry the cache happens to have missed.
+    fn node_input_thumbs(&mut self) -> (HashMap<String, egui::TextureHandle>, HashSet<String>) {
+        let Some(doc) = self.active_doc() else { return (HashMap::new(), HashSet::new()) };
         let names: Vec<String> = doc
             .graph
             .snarl
@@ -15714,8 +15754,9 @@ impl ComfyApp {
             })
             .collect();
         let mut out = HashMap::new();
+        let mut wanted = HashSet::new();
         for name in names {
-            if out.contains_key(&name) {
+            if !wanted.insert(name.clone()) {
                 continue;
             }
             // Same cache and key the picker grid uses, so a file you just chose is already warm.
@@ -15726,7 +15767,7 @@ impl ComfyApp {
                 self.engine.as_ref().unwrap().fetch_input_thumb(name);
             }
         }
-        out
+        (out, wanted)
     }
 
     /// Order gallery indices newest-first for a picker, whatever the Gallery tab is sorted by.
@@ -15750,6 +15791,25 @@ impl ComfyApp {
         indices
     }
 
+    /// Newest-first listing indices for a picker, stills or videos. Memoized: a picker redraws on
+    /// every repaint — and the prefetch pump keeps repaints coming — so sorting (and re-allocating)
+    /// the whole listing inline cost O(n log n) per frame on a listing that runs to thousands.
+    fn picker_items(&mut self, want_video: bool) -> Vec<usize> {
+        let key = (self.gallery_gen, self.gallery_fetch_pos, self.gallery.len(), want_video);
+        if self.picker_order.as_ref().map(|(k, _)| *k) != Some(key) {
+            let idx = self.newest_first(
+                self.gallery
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, it)| it.is_video == want_video)
+                    .map(|(i, _)| i)
+                    .collect(),
+            );
+            self.picker_order = Some((key, idx));
+        }
+        self.picker_order.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
+    }
+
     /// The file selector on `node`, if it has one (`LoadImage.image`, `VHS_LoadVideo.video`, …).
     fn node_media_input(&self, node: NodeId) -> Option<graphview::MediaInput> {
         let doc = self.active_doc()?;
@@ -15770,10 +15830,9 @@ impl ComfyApp {
             let what = if mi.video { "video" } else { "image" };
             ui.strong(format!("{icon} Choose {what}"));
         }
-        // Device photos are stills from MediaStore — nothing to offer a video input.
-        if mi.video && self.img_pick_source == ImgPickSource::Device {
-            self.img_pick_source = ImgPickSource::Gallery;
-        }
+        // Switching kinds invalidates the cached device listing (a video input browses the phone's
+        // clips, an image input its photos).
+        let prev_source = self.img_pick_source;
         ui.horizontal(|ui| {
             crate::theme::selectable_value(
                 ui,
@@ -15787,18 +15846,19 @@ impl ComfyApp {
                 ImgPickSource::Server,
                 "Server",
             );
-            if !mi.video {
-                crate::theme::selectable_value(
-                    ui,
-                    &mut self.img_pick_source,
-                    ImgPickSource::Device,
-                    "Device",
-                );
-            }
+            crate::theme::selectable_value(
+                ui,
+                &mut self.img_pick_source,
+                ImgPickSource::Device,
+                "Device",
+            );
             if self.node_upload_pending.is_some() || !self.pending_uploads.is_empty() {
                 ui.spinner();
             }
         });
+        if prev_source != self.img_pick_source && self.img_pick_source == ImgPickSource::Device {
+            self.device_media_loaded = None;
+        }
         // What's on the node right now — with its picture, since that's the whole point here.
         if !mi.selected.is_empty() {
             let key = format!("input#{}", mi.selected);
@@ -15807,11 +15867,31 @@ impl ComfyApp {
                 self.engine.as_ref().unwrap().fetch_input_thumb(mi.selected.clone());
             }
             ui.horizontal(|ui| {
-                if let Some(tex) = &tex {
-                    ui.add(
-                        egui::Image::new(egui::load::SizedTexture::from_handle(tex))
-                            .fit_to_exact_size(egui::vec2(44.0, 44.0)),
-                    );
+                // Fixed box whether or not the thumbnail is cached. Letting the row collapse to
+                // the label height when it isn't moved this row — and therefore the grid below
+                // it — by 26pt, which is a quarter of a tile row: enough to cross the grid's
+                // virtualization boundary, so the bottom row of tiles was laid out on alternate
+                // frames only. A tile that isn't drawn isn't marked as on screen, so the cache
+                // evicted it and the grid re-downloaded it, which blinked this thumbnail, which
+                // moved the row again. That loop is the "constantly refreshing" the user sees.
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(44.0, 44.0), egui::Sense::hover());
+                match &tex {
+                    Some(tex) => {
+                        ui.put(
+                            rect,
+                            egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                .fit_to_exact_size(egui::vec2(44.0, 44.0)),
+                        );
+                    }
+                    None => {
+                        ui.painter().rect_stroke(
+                            rect,
+                            3.0,
+                            ui.visuals().widgets.noninteractive.bg_stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                    }
                 }
                 ui.weak(format!("now: {}", graphview::elide_tail(&mi.selected, 30)));
             });
@@ -15819,7 +15899,7 @@ impl ComfyApp {
         match self.img_pick_source {
             ImgPickSource::Gallery => self.node_gallery_grid(ui, host, node, &mi),
             ImgPickSource::Server => self.loadimage_server_grid(ui, node, mi.idx, &mi.options, &mi.selected),
-            ImgPickSource::Device => self.loadimage_device_grid(ui, host, node),
+            ImgPickSource::Device => self.loadimage_device_grid(ui, host, node, mi.video),
         }
     }
 
@@ -15838,14 +15918,7 @@ impl ComfyApp {
             return;
         }
         let want_video = mi.video;
-        let items = self.newest_first(
-            self.gallery
-                .iter()
-                .enumerate()
-                .filter(|(_, it)| it.is_video == want_video)
-                .map(|(i, _)| i)
-                .collect(),
-        );
+        let items = self.picker_items(want_video);
         // Same fetched-once latch as the Gallery tab: emptiness alone would refire forever.
         if !self.gallery_fetched && !self.gallery_loading {
             self.gallery_loading = true;
@@ -16020,18 +16093,52 @@ impl ComfyApp {
 
         let (cols, tile) = Self::picker_grid_dims(ui);
         let mut picked: Option<String> = None;
-        for row in matches.chunks(cols) {
+        // Same virtualization and fetch budget as the gallery pick grid. Without them a screenful
+        // of this tab fired a dozen simultaneous `/view` downloads of ORIGINAL input files — the
+        // heaviest fetch in the app — and re-fired them every frame for as long as the cache was
+        // over budget.
+        let clip = ui.clip_rect();
+        let avail = ui.available_width();
+        let spacing_y = ui.spacing().item_spacing.y;
+        let row_h = tile + spacing_y;
+        let n_rows = matches.len().div_ceil(cols.max(1));
+        let top = ui.cursor().top();
+        let first = ((((clip.top() - top) / row_h).floor()).max(0.0) as usize).min(n_rows);
+        let last = (((((clip.bottom() - top) / row_h).floor()).max(0.0) as usize + 1).min(n_rows))
+            .max(first);
+        let first = first.saturating_sub(1);
+        let last = (last + 1).min(n_rows).max(first);
+        if first > 0 {
+            ui.allocate_space(egui::vec2(avail, first as f32 * row_h - spacing_y));
+        }
+        let mut claim_budget = 12usize;
+        for row in matches.chunks(cols).skip(first).take(last - first) {
             ui.horizontal(|ui| {
                 for name in row {
                     let key = format!("input#{name}");
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
-                    if !ui.is_rect_visible(rect) {
-                        continue;
-                    }
                     let is_sel = **name == selected;
                     let video = graphview::is_pick_video(name);
-                    match self.thumbs.get(&key) {
+                    // Claimed before the paint test — see the note in `gallery_pick_grid` about
+                    // the opening frame's sizing pass.
+                    let tex = self.thumbs.get(&key).cloned();
+                    if tex.is_none() && !video {
+                        // Never ask for a thumb of a video: /view hands back the container and
+                        // the decode fails, so the claim would just stick forever.
+                        if claim_budget == 0 {
+                            ui.ctx().request_repaint_after(Duration::from_millis(120));
+                        } else if self.thumbs.claim(&key) {
+                            claim_budget -= 1;
+                            self.engine.as_ref().unwrap().fetch_input_thumb((*name).clone());
+                        }
+                    }
+                    // See the note in `gallery_pick_grid`: a global discard must not blank
+                    // this grid.
+                    if !ui.clip_rect().intersects(rect) {
+                        continue;
+                    }
+                    match &tex {
                         Some(tex) => {
                             let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                                 .fit_to_exact_size(egui::vec2(tile, tile))
@@ -16041,11 +16148,6 @@ impl ComfyApp {
                             }
                         }
                         None => {
-                            // Never ask for a thumb of a video: /view hands back the container and
-                            // the decode fails, so the claim would just stick forever.
-                            if !video && self.thumbs.claim(&key) {
-                                self.engine.as_ref().unwrap().fetch_input_thumb((*name).clone());
-                            }
                             let label = graphview::elide_tail(name, 14);
                             if ui.put(rect, egui::Button::new(label).wrap()).clicked() {
                                 picked = Some((*name).clone());
@@ -16065,6 +16167,9 @@ impl ComfyApp {
                     }
                 }
             });
+        }
+        if last < n_rows {
+            ui.allocate_space(egui::vec2(avail, (n_rows - last) as f32 * row_h - spacing_y));
         }
         if options.len() > matches.len() {
             ui.weak(format!("… {} more — type to filter", options.len() - matches.len()));
@@ -16087,39 +16192,66 @@ impl ComfyApp {
     /// the next frames (repaint is requested while any tile is still pending).
     const DEVICE_THUMBS_PER_FRAME: usize = 2;
 
-    /// Shared device-photo grid (permission gate + MediaStore thumbnails, 2 loads/frame). Returns
-    /// the tapped `(MediaStore id, display name)`; callers decide what to do with the pick.
-    fn device_photo_grid(&mut self, ui: &mut egui::Ui, host: &Host) -> Option<(i64, String)> {
-        if !host.has_media_images_permission() {
+    /// Shared device-gallery grid (permission gate + MediaStore thumbnails, 2 loads/frame) over the
+    /// phone's photos, or its videos when `video`. Returns the tapped `(MediaStore id, display
+    /// name)`; callers decide what to do with the pick.
+    fn device_photo_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &Host,
+        video: bool,
+    ) -> Option<(i64, String)> {
+        let what = if video { "videos" } else { "photos" };
+        if !host.has_media_permission(video) {
             ui.add_space(4.0);
-            ui.label("Allow access to your photos to pick an image from this device.");
-            if ui.button(format!("{} Open settings to allow", icons::IMAGE)).clicked() {
-                host.request_media_images_permission();
-                self.device_images_loaded = false;
-            }
+            ui.label(format!("Allow access to your {what} to pick one from this device."));
+            ui.horizontal(|ui| {
+                if ui.button(format!("{} Allow access", icons::IMAGE)).clicked() {
+                    host.request_media_images_permission();
+                    self.device_media_loaded = None;
+                }
+                // Android stops showing the dialog once a permission has been denied twice, so the
+                // Settings page has to stay reachable or the grid is a dead end.
+                if ui.button("Open app settings").clicked() {
+                    host.open_app_settings();
+                    self.device_media_loaded = None;
+                }
+            });
             ui.weak("Grant “Photos and videos”, then return here.");
             // Poll (not every frame) so the grid appears when the user returns having granted it.
             ui.ctx().request_repaint_after(Duration::from_millis(400));
             return None;
         }
         // MediaStore lists by date_added descending, so this grid is already newest-first — the
-        // order every picker here uses (see `newest_first`).
-        if !self.device_images_loaded {
-            self.device_images = host.list_device_images(300);
-            self.device_images_loaded = true;
+        // order every picker here uses (see `newest_first`). Cached per kind: switching a picker
+        // between stills and clips has to re-query, not reuse the other kind's rows.
+        if self.device_media_loaded != Some(video) {
+            self.device_images = host.list_device_media(video, 300);
+            self.device_media_loaded = Some(video);
         }
+        // Android 14's "Select photos" grant shows only the items the user hand-picked; re-asking
+        // is how the system reopens that chooser, so without this the grid is stuck on whatever
+        // they picked the first time.
+        let partial = !host.has_full_media_permission(video);
         ui.horizontal(|ui| {
             if ui.button(format!("{} Refresh", icons::REFRESH)).clicked() {
                 self.thumbs.reset_pending();
-                self.device_images = host.list_device_images(300);
+                self.device_images = host.list_device_media(video, 300);
+            }
+            if partial && ui.button(format!("{} Select more", icons::IMAGE)).clicked() {
+                host.request_media_images_permission();
+                self.device_media_loaded = None;
             }
             if !self.pending_uploads.is_empty() {
                 ui.spinner();
                 ui.weak("uploading…");
             }
         });
+        if partial {
+            ui.weak(format!("Showing only the {what} you granted access to."));
+        }
         if self.device_images.is_empty() {
-            ui.weak("No photos found on this device.");
+            ui.weak(format!("No {what} found on this device."));
             return None;
         }
 
@@ -16132,7 +16264,9 @@ impl ComfyApp {
         for row in images.chunks(cols) {
             ui.horizontal(|ui| {
                 for (id, name) in row {
-                    let key = format!("dev#{id}");
+                    // Keyed by kind too: an id is unique across MediaStore, but the key also has
+                    // to say which collection the poster came from.
+                    let key = if video { format!("devv#{id}") } else { format!("dev#{id}") };
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
                     if !ui.is_rect_visible(rect) {
@@ -16155,8 +16289,15 @@ impl ComfyApp {
                             if loaded_this_frame < Self::DEVICE_THUMBS_PER_FRAME {
                                 if self.thumbs.claim(&key) {
                                     loaded_this_frame += 1;
-                                    if let Some((w, h, rgba)) = host.load_device_thumbnail(*id, 256)
+                                    if let Some((w, h, rgba)) =
+                                        host.load_device_thumbnail(video, *id, 256)
                                     {
+                                        // The 256 above is a HINT — MediaProvider serves from
+                                        // fixed buckets and can hand back 512 or 1024, and this
+                                        // is the one producer that doesn't go through
+                                        // `decode_thumb`. Clamp it so no key format can put an
+                                        // outsized entry in a cache budgeted for small ones.
+                                        let (w, h, rgba) = gallery::downscale_rgba(w, h, &rgba, 256);
                                         let image = egui::ColorImage::from_rgba_unmultiplied(
                                             [w as usize, h as usize],
                                             &rgba,
@@ -16174,11 +16315,16 @@ impl ComfyApp {
                                 // Hit the per-frame budget; this tile still wants loading.
                                 more_pending = true;
                             }
-                            let label = if name.is_empty() { "photo" } else { name.as_str() };
+                            let fallback = if video { "video" } else { "photo" };
+                            let label = if name.is_empty() { fallback } else { name.as_str() };
                             if ui.put(rect, egui::Button::new(elide(label, 12)).wrap()).clicked() {
                                 pick = Some((*id, name.clone()));
                             }
                         }
+                    }
+                    // A poster looks like a still, so mark clips the way every other grid does.
+                    if video {
+                        video_badge(ui, rect);
                     }
                 }
             });
@@ -16190,25 +16336,29 @@ impl ComfyApp {
         pick
     }
 
-    /// Graph LoadImage device picker: a pick eagerly uploads to the server for `node`.
-    fn loadimage_device_grid(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId) {
-        if let Some((id, name)) = self.device_photo_grid(ui, host) {
-            match host.load_device_image(id) {
-                Some(bytes) if !bytes.is_empty() => {
-                    let fname = if name.is_empty() { format!("device_{id}.jpg") } else { name };
-                    let token = self.next_upload_id;
-                    self.next_upload_id += 1;
-                    let owner = self.active_doc().map(|d| (d.id, d.epoch));
-                    if let Some((doc_id, epoch)) = owner {
-                        self.pending_uploads.insert(token, (doc_id, epoch, node));
-                    }
-                    self.engine.as_ref().unwrap().upload_input_image(token, fname, bytes);
-                    host.haptic(Haptic::Light);
+    /// Graph device picker: a pick eagerly uploads the phone's file to the server's `input` dir for
+    /// `node` — a loader node can only reference an input, so the bytes have to get there first.
+    /// `video` picks which half of the phone's gallery to browse.
+    fn loadimage_device_grid(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId, video: bool) {
+        let Some((id, name)) = self.device_photo_grid(ui, host, video) else { return };
+        match host.load_device_media(video, id) {
+            Some(bytes) if !bytes.is_empty() => {
+                let ext = if video { "mp4" } else { "jpg" };
+                let fname = if name.is_empty() { format!("device_{id}.{ext}") } else { name };
+                let token = self.next_upload_id;
+                self.next_upload_id += 1;
+                let owner = self.active_doc().map(|d| (d.id, d.epoch));
+                if let Some((doc_id, epoch)) = owner {
+                    self.pending_uploads.insert(token, (doc_id, epoch, node));
                 }
-                _ => {
-                    self.graph_status = "Couldn't read that photo from the device".into();
-                    host.haptic(Haptic::Error);
-                }
+                self.graph_status = format!("Uploading {}…", graphview::elide_tail(&fname, 32));
+                self.engine.as_ref().unwrap().upload_input_image(token, fname, bytes);
+                host.haptic(Haptic::Light);
+            }
+            _ => {
+                let what = if video { "video" } else { "photo" };
+                self.graph_status = format!("Couldn't read that {what} from the device");
+                host.haptic(Haptic::Error);
             }
         }
     }
@@ -16388,14 +16538,48 @@ impl ComfyApp {
         self.add_open = open;
     }
 
+    /// Everything the SERVER listing depends on. Two refreshes with the same signature return the
+    /// same rows, so the ones already on screen stay valid while the new first page is in flight.
+    fn gallery_query_sig(&self) -> u64 {
+        let mut h = DefaultHasher::new();
+        self.gallery_list_q().hash(&mut h);
+        self.gallery_view.model.hash(&mut h);
+        self.gallery_view.lora.hash(&mut h);
+        self.gallery_view.album.hash(&mut h);
+        self.gallery_view.sort.hash(&mut h);
+        self.gallery_view.group.hash(&mut h);
+        h.finish()
+    }
+
+    /// Drop rows a delete has already tombstoned, so a re-fetch that keeps the listing up doesn't
+    /// leave a deleted image on screen for the round trip.
+    fn drop_tombstoned_rows(&mut self) {
+        if self.trash_tombstones.is_empty() {
+            return;
+        }
+        let mut items = std::mem::take(&mut self.gallery);
+        items.retain(|it| !self.tombstone_hides(it));
+        self.gallery = items;
+    }
+
     /// Re-query the listing with the CURRENTLY APPLIED query (`gallery_active_q`). Background
     /// callers (post-run refresh, delete mutations, album changes) land here — they must never
     /// commit the live search buffer mid-typing. User-initiated search commits go through
     /// [`Self::refresh_gallery_commit_query`].
     fn refresh_gallery(&mut self) {
+        // Re-fetching the SAME query keeps its rows up until the fresh page lands. Clearing here
+        // is what made every open thumbnail picker blink to "No gallery images yet" and scroll
+        // back to the top — twice — each time a finished render refreshed the listing behind it.
+        let sig = self.gallery_query_sig();
+        let same_query = self.gallery_query_sig == Some(sig);
+        self.gallery_query_sig = Some(sig);
         self.gallery_fetched = false;
-        self.gallery.clear();
-        self.gallery_total = 0;
+        if same_query {
+            self.drop_tombstoned_rows();
+        } else {
+            self.gallery.clear();
+            self.gallery_total = 0;
+        }
         self.gallery_loading = true;
         self.gallery_status.clear();
         // Seeds are drawn from the gallery listing, so a new query invalidates cached centroids.
@@ -18712,14 +18896,7 @@ impl ComfyApp {
                     );
                 }
                 ui.separator();
-                let images = self.newest_first(
-                    self.gallery
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, it)| !it.is_video)
-                        .map(|(i, _)| i)
-                        .collect(),
-                );
+                let images = self.picker_items(false);
                 if images.is_empty() {
                     ui.add_space(16.0);
                     ui.vertical_centered(|ui| {
@@ -18767,7 +18944,33 @@ impl ComfyApp {
         let (cols, tile) = Self::picker_grid_dims(ui);
         let size = 320u32;
         let mut pick = None;
-        for row in indices.chunks(cols) {
+        // Tiles are square, so off-screen rows collapse into two spacers. Laying every row out
+        // (thousands of `horizontal` scopes and tile allocations, on every repaint) is what made
+        // the picker too slow to land a tap on while the listing was still filling.
+        let clip = ui.clip_rect();
+        let avail = ui.available_width();
+        let spacing_y = ui.spacing().item_spacing.y;
+        let row_h = tile + spacing_y;
+        let n_rows = indices.len().div_ceil(cols.max(1));
+        let top = ui.cursor().top();
+        let first = ((((clip.top() - top) / row_h).floor()).max(0.0) as usize).min(n_rows);
+        let last = (((((clip.bottom() - top) / row_h).floor()).max(0.0) as usize + 1).min(n_rows))
+            .max(first);
+        // One row of overscan each way. Anything above that moves `top` by less than a row —
+        // a bar appearing, a label rewrapping — would otherwise add or drop a whole row of tiles,
+        // and a tile that isn't laid out isn't marked as on screen, so the cache evicts it and the
+        // grid re-downloads it the moment it comes back. The overscan also warms the row about to
+        // scroll in.
+        let first = first.saturating_sub(1);
+        let last = (last + 1).min(n_rows).max(first);
+        if first > 0 {
+            ui.allocate_space(egui::vec2(avail, first as f32 * row_h - spacing_y));
+        }
+        // Bound fetch dispatches per frame, as the gallery grid does: a fling lands on a fresh
+        // screen of uncached tiles every frame, and unbounded claims would download whole screens
+        // the user already blew past.
+        let mut claim_budget = 12usize;
+        for row in indices.chunks(cols).skip(first).take(last - first) {
             ui.horizontal(|ui| {
                 for &idx in row {
                     let (thumb_key, subfolder, filename, is_video) = {
@@ -18781,10 +18984,36 @@ impl ComfyApp {
                     };
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(tile, tile), egui::Sense::hover());
-                    if !ui.is_rect_visible(rect) {
+                    // Look the tile up and claim it BEFORE the paint test. The frame an egui Area
+                    // is first laid out is a sizing pass with an invisible painter, where
+                    // `is_rect_visible` is false for every rect — gating the fetch on it cost the
+                    // popup its opening frame. The rows here are already virtualized, so anything
+                    // reached is on screen (or one row of overscan away) and deserves both the
+                    // cache's on-screen mark and a fetch.
+                    let tex = self.thumbs.get(&thumb_key).cloned();
+                    if tex.is_none() {
+                        if claim_budget == 0 {
+                            // Out of budget with uncached tiles still up: make sure a frame comes
+                            // to claim them even if no thumb result wakes us.
+                            ui.ctx().request_repaint_after(Duration::from_millis(120));
+                        } else if self.thumbs.claim(&thumb_key) {
+                            claim_budget -= 1;
+                            self.engine.as_ref().unwrap().fetch_thumb(
+                                subfolder,
+                                filename.clone(),
+                                size,
+                                self.full_cache_root.clone(),
+                            );
+                        }
+                    }
+                    // Geometry, not `ui.is_rect_visible`: that also answers false for the whole
+                    // viewport whenever anything has called `ctx.request_discard()` this pass —
+                    // and egui-snarl requests one whenever a node's cached layout is missing, on
+                    // the very canvas this popup is drawn over.
+                    if !ui.clip_rect().intersects(rect) {
                         continue;
                     }
-                    let clicked = match self.thumbs.get(&thumb_key) {
+                    let clicked = match &tex {
                         Some(tex) => {
                             let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
                                 .fit_to_exact_size(egui::vec2(tile, tile))
@@ -18793,14 +19022,6 @@ impl ComfyApp {
                         }
                         None => {
                             let label = graphview::elide_tail(&filename, 14);
-                            if self.thumbs.claim(&thumb_key) {
-                                self.engine.as_ref().unwrap().fetch_thumb(
-                                    subfolder,
-                                    filename,
-                                    size,
-                                    self.full_cache_root.clone(),
-                                );
-                            }
                             ui.put(rect, egui::Button::new(label).wrap()).clicked()
                         }
                     };
@@ -18814,6 +19035,9 @@ impl ComfyApp {
                     }
                 }
             });
+        }
+        if last < n_rows {
+            ui.allocate_space(egui::vec2(avail, (n_rows - last) as f32 * row_h - spacing_y));
         }
         pick
     }
@@ -21389,6 +21613,10 @@ impl EguiApp for ComfyApp {
         // Bottom bars re-measure themselves below; floating pills read the result at the end of
         // the frame, after every panel this screen draws has claimed its strip.
         self.bottom_bar_top = f32::INFINITY;
+        // Ages the thumb cache's on-screen marks. Deliberately BEFORE the message drain below:
+        // the decoded thumbnails that land there run eviction passes, and at that moment the only
+        // record of what is on screen is the previous frame's reads (this frame hasn't drawn yet).
+        self.thumbs.begin_frame();
 
         let t_msgs = std::time::Instant::now();
         for m in self.engine.as_ref().unwrap().drain() {

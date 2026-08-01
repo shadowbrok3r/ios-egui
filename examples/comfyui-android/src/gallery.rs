@@ -1,6 +1,7 @@
 //! Gallery presentation state: how listed items bucket into collapsing headers, and the decoded
 //! thumbnail cache behind the tiles.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -1083,10 +1084,66 @@ pub struct ThumbCache {
     order: VecDeque<(String, usize)>,
     bytes: usize,
     pending: HashSet<String>,
+    /// The frame each entry was last read on, so eviction can tell what is currently on screen.
+    /// Read through a shared borrow (every grid reads tiles behind `&self`), hence the `RefCell`.
+    seen: RefCell<HashMap<String, u64>>,
+    /// Bumped once per frame by [`Self::begin_frame`]; 0 when the host never calls it, which
+    /// leaves every entry looking current and degrades cleanly to insertion-order eviction.
+    frame: u64,
 }
 
 /// Roughly 16 full-width tiles, or ~150 grid tiles.
 const BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Box-downscale raw RGBA so its long side is at most `max`, returning `(w, h, rgba)` unchanged
+/// when it already fits.
+///
+/// Exists because not every producer decodes through `decode_thumb`: Android's
+/// `ContentResolver.loadThumbnail` takes its size as a HINT and serves from fixed buckets, so a
+/// request for 256 can come back at 512 or 1024. One unclamped producer is all it takes to put
+/// multi-megabyte entries in a cache sized for 0.4 MB tiles, which is what made the pickers evict
+/// and re-fetch the tiles they were drawing.
+pub fn downscale_rgba(w: u32, h: u32, rgba: &[u8], max: u32) -> (u32, u32, Vec<u8>) {
+    let long = w.max(h);
+    if long <= max || w == 0 || h == 0 || rgba.len() < (w as usize * h as usize * 4) {
+        return (w, h, rgba.to_vec());
+    }
+    // Integer box factor: cheap, and the result is a preview at a few hundred pixels.
+    let factor = long.div_ceil(max).max(2) as usize;
+    let (nw, nh) = ((w as usize / factor).max(1), (h as usize / factor).max(1));
+    let mut out = Vec::with_capacity(nw * nh * 4);
+    for y in 0..nh {
+        for x in 0..nw {
+            let (mut acc, mut n) = ([0u32; 4], 0u32);
+            for dy in 0..factor {
+                let sy = y * factor + dy;
+                if sy >= h as usize {
+                    break;
+                }
+                for dx in 0..factor {
+                    let sx = x * factor + dx;
+                    if sx >= w as usize {
+                        break;
+                    }
+                    let i = (sy * w as usize + sx) * 4;
+                    for c in 0..4 {
+                        acc[c] += rgba[i + c] as u32;
+                    }
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            for c in 0..4 {
+                out.push((acc[c] / n) as u8);
+            }
+        }
+    }
+    (nw as u32, nh as u32, out)
+}
+
+/// Cap on remembered reads. Far more than any screenful, so an on-screen entry is always covered;
+/// the bound just stops a long session accumulating keys nothing looks at any more.
+const SEEN_MAX: usize = 1024;
 
 impl Default for ThumbCache {
     fn default() -> Self {
@@ -1095,13 +1152,52 @@ impl Default for ThumbCache {
             order: VecDeque::new(),
             bytes: 0,
             pending: HashSet::new(),
+            seen: RefCell::new(HashMap::new()),
+            frame: 0,
         }
     }
 }
 
 impl ThumbCache {
     pub fn get(&self, key: &str) -> Option<&egui::TextureHandle> {
-        self.textures.get(key)
+        let tex = self.textures.get(key);
+        if tex.is_some() {
+            self.touch(key);
+        }
+        tex
+    }
+
+    /// Start a frame. Everything read on this frame or the one before counts as on screen for
+    /// [`Self::insert`]'s eviction pass; older reads stop protecting an entry.
+    ///
+    /// The previous frame has to count too, because the message drain that lands decoded
+    /// thumbnails runs BEFORE this frame's draw — at that moment the only record of what is on
+    /// screen is last frame's reads.
+    pub fn begin_frame(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// Stamp `key` as drawn on the current frame. Bounded, because over a long session the map
+    /// would otherwise fill with keys nothing looks at any more — but pruned BY AGE, never
+    /// wholesale: `touch` is reached from `get` mid-draw and from `insert` one statement before
+    /// the eviction pass, so a `clear()` here would strip the on-screen marks from tiles already
+    /// drawn this frame and the very next pass would evict them.
+    fn touch(&self, key: &str) {
+        let mut seen = self.seen.borrow_mut();
+        if seen.len() >= SEEN_MAX && !seen.contains_key(key) {
+            let frame = self.frame;
+            seen.retain(|_, f| frame.wrapping_sub(*f) <= 1);
+            // Nothing aged out (every mark is current) — drop them all rather than grow unbounded.
+            if seen.len() >= SEEN_MAX {
+                seen.clear();
+            }
+        }
+        seen.insert(key.to_string(), self.frame);
+    }
+
+    /// Was `key` drawn recently enough that evicting it would just make the grid re-fetch it?
+    fn on_screen(&self, key: &str) -> bool {
+        self.seen.borrow().get(key).is_some_and(|f| self.frame.wrapping_sub(*f) <= 1)
     }
 
     /// Claim a fetch for `key`, returning whether the caller should issue the request. Prevents a
@@ -1120,6 +1216,7 @@ impl ThumbCache {
         let prefix = format!("{key}#");
         let mut freed = 0usize;
         self.pending.retain(|k| !k.starts_with(&prefix));
+        self.seen.borrow_mut().retain(|k, _| !k.starts_with(&prefix));
         self.order.retain(|(k, cost)| {
             let stale = k.starts_with(&prefix);
             if stale {
@@ -1131,14 +1228,55 @@ impl ThumbCache {
         self.textures.retain(|k, _| !k.starts_with(&prefix));
     }
 
+    /// Drop one entry by its exact key. [`Self::forget`] matches the `{item}#{size}` grammar by
+    /// prefix, which can never reach a namespaced key like `input#name.png` — and an input file
+    /// CAN be overwritten in place (uploads pass `overwrite = true`), so its preview needs a way
+    /// to be invalidated or the node keeps painting the previous picture.
+    pub fn forget_exact(&mut self, key: &str) {
+        self.pending.remove(key);
+        self.seen.borrow_mut().remove(key);
+        if self.textures.remove(key).is_some()
+            && let Some(pos) = self.order.iter().position(|(k, _)| k == key)
+        {
+            let cost = self.order.remove(pos).map(|(_, c)| c).unwrap_or(0);
+            self.bytes = self.bytes.saturating_sub(cost);
+        }
+    }
+
     pub fn insert(&mut self, key: String, tex: egui::TextureHandle, bytes: usize) {
         self.pending.remove(&key);
+        // A tile is decoded because something is drawing it, so it counts as read.
+        self.touch(&key);
         if self.textures.insert(key.clone(), tex).is_none() {
             self.order.push_back((key, bytes));
             self.bytes += bytes;
+        } else if let Some(slot) = self.order.iter_mut().find(|(k, _)| *k == key) {
+            // Replacing a live entry: the two decodes can differ in size (a thumb's disk-cache
+            // and network paths can both land after `reset_pending` clears the claim), and
+            // keeping the first cost leaves the budget wrong for the entry's whole lifetime.
+            self.bytes = self.bytes.saturating_sub(slot.1) + bytes;
+            slot.1 = bytes;
         }
+        // Second chance: insertion order alone throws out the tile the user is looking at the
+        // moment the cache fills, and the grid re-fetches it on the very next frame — a picker
+        // scrolled over a big library sat there reloading the same thumbnails forever. An entry
+        // that is on screen goes to the back instead.
+        //
+        // The reprieve must NOT consume the on-screen mark. A message drain lands up to a dozen
+        // decoded thumbnails back to back, each running a full pass, and no draw happens in
+        // between to re-mark anything — an earlier version cleared the marks as it went, so only
+        // the first insert of the frame was protected and the other eleven evicted straight
+        // through the visible tiles. Sparing is tracked per pass instead, which is also what
+        // bounds the loop: an entry can be requeued at most once, so after at most `order.len()`
+        // requeues something is evicted or the budget is met.
+        let mut spared: HashSet<String> = HashSet::new();
         while self.bytes > BUDGET_BYTES && self.order.len() > 1 {
             let Some((old, cost)) = self.order.pop_front() else { break };
+            if self.on_screen(&old) && spared.insert(old.clone()) {
+                self.order.push_back((old, cost));
+                continue;
+            }
+            self.seen.borrow_mut().remove(&old);
             self.textures.remove(&old);
             self.bytes = self.bytes.saturating_sub(cost);
         }
@@ -1510,6 +1648,146 @@ mod tests {
         assert!(!c.claim("a#320"));
         c.reset_pending();
         assert!(c.claim("a#320"));
+    }
+
+    /// The symptom this exists for: scroll a picker over a library bigger than the budget and the
+    /// oldest-first rule evicts the tiles still on screen, which the grid then re-fetches on the
+    /// next frame — thumbnails reloading under the finger. A tile that was read survives; one that
+    /// wasn't is what pays for the new entry.
+    #[test]
+    fn a_visible_tile_outlives_one_that_scrolled_away() {
+        let ctx = egui::Context::default();
+        let tex = |name: &str| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::filled([1, 1], egui::Color32::RED),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        let mut c = ThumbCache::default();
+        // Two entries fit; the third pushes past the budget and one has to go.
+        let third = BUDGET_BYTES / 3 + 1;
+        c.insert("gone#320".into(), tex("gone"), third);
+        c.insert("onscreen#320".into(), tex("onscreen"), third);
+        // A frame passes with only the second one still on screen.
+        assert!(c.get("onscreen#320").is_some());
+        c.insert("new#320".into(), tex("new"), third);
+        assert!(c.get("onscreen#320").is_some(), "a tile being drawn must not be evicted");
+        assert!(c.get("gone#320").is_none(), "the tile that scrolled away is the one that pays");
+        assert!(c.get("new#320").is_some());
+    }
+
+    /// The bug the frame-stamped mark exists for: a message drain lands many decoded thumbnails
+    /// back to back with NO draw in between, so an eviction pass that consumed the on-screen mark
+    /// protected only the first insert of the frame and the rest evicted straight through the
+    /// visible tiles. Draw once, then insert repeatedly — the drawn tiles must all survive.
+    #[test]
+    fn a_drawn_tile_survives_a_whole_drain_of_inserts() {
+        let ctx = egui::Context::default();
+        let tex = |name: &str| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::filled([1, 1], egui::Color32::RED),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        let mut c = ThumbCache::default();
+        let tile = BUDGET_BYTES / 16; // 16 tiles fill the budget exactly
+        // Twelve tiles from earlier browsing, scrolled away several frames ago.
+        c.begin_frame();
+        for i in 0..12 {
+            c.insert(format!("stale{i}"), tex("stale"), tile);
+        }
+        for _ in 0..4 {
+            c.begin_frame();
+        }
+        // Four tiles the picker is showing now, read on this frame's draw.
+        for i in 0..4 {
+            c.insert(format!("live{i}"), tex("live"), tile);
+        }
+        for i in 0..4 {
+            assert!(c.get(&format!("live{i}")).is_some());
+        }
+        // The cache is now exactly at budget. Next frame's drain lands eight more thumbnails back
+        // to back, with no draw in between to re-mark anything.
+        c.begin_frame();
+        for i in 0..8 {
+            c.insert(format!("new{i}"), tex("new"), tile);
+        }
+        for i in 0..4 {
+            assert!(
+                c.get(&format!("live{i}")).is_some(),
+                "live{i} was evicted mid-drain — the grid would re-fetch it on the next frame"
+            );
+        }
+        assert!(c.get("stale0").is_none(), "the scrolled-away tiles are what should pay");
+        assert!(c.bytes <= BUDGET_BYTES, "the budget still has to hold");
+    }
+
+    /// A producer that ignores the size it was asked for must not be able to put a huge entry in a
+    /// cache sized for small ones — Android's `loadThumbnail` size is a hint, not a contract.
+    #[test]
+    fn an_oversized_source_is_boxed_down_to_the_cap() {
+        let (w, h) = (1024u32, 768u32);
+        let src = vec![200u8; (w * h * 4) as usize];
+        let (nw, nh, out) = downscale_rgba(w, h, &src, 256);
+        assert!(nw.max(nh) <= 256, "got {nw}x{nh}");
+        assert_eq!(out.len(), (nw * nh * 4) as usize);
+        assert!(out.iter().all(|&b| b == 200), "a flat image must stay flat through the box filter");
+        // Already small enough: handed back untouched, no allocation-shaped surprises.
+        let small = vec![7u8; 4 * 4 * 4];
+        assert_eq!(downscale_rgba(4, 4, &small, 256), (4, 4, small.clone()));
+        // Degenerate inputs must not panic or index out of bounds.
+        assert_eq!(downscale_rgba(0, 0, &[], 256), (0, 0, Vec::new()));
+        assert_eq!(downscale_rgba(9999, 9999, &small, 256), (9999, 9999, small));
+    }
+
+    /// A mark must not protect an entry forever: a tile scrolled away frames ago is exactly what
+    /// eviction should take.
+    #[test]
+    fn a_tile_stops_being_protected_once_it_leaves_the_screen() {
+        let ctx = egui::Context::default();
+        let tex = |name: &str| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::filled([1, 1], egui::Color32::RED),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        let mut c = ThumbCache::default();
+        let third = BUDGET_BYTES / 3 + 1;
+        c.begin_frame();
+        c.insert("stale".into(), tex("stale"), third);
+        assert!(c.get("stale").is_some());
+        // Several frames pass without it being drawn.
+        for _ in 0..4 {
+            c.begin_frame();
+        }
+        c.insert("a".into(), tex("a"), third);
+        c.insert("b".into(), tex("b"), third);
+        assert!(c.get("stale").is_none(), "an entry nothing has drawn for frames must be evictable");
+    }
+
+    /// Every entry read and still over budget: the pass must not spin re-queueing them forever.
+    #[test]
+    fn eviction_terminates_when_everything_is_on_screen() {
+        let ctx = egui::Context::default();
+        let tex = |name: &str| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::filled([1, 1], egui::Color32::RED),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        let mut c = ThumbCache::default();
+        let third = BUDGET_BYTES / 3 + 1;
+        c.insert("a#320".into(), tex("a"), third);
+        c.insert("b#320".into(), tex("b"), third);
+        assert!(c.get("a#320").is_some());
+        assert!(c.get("b#320").is_some());
+        c.insert("c#320".into(), tex("c"), third);
+        assert_eq!(c.len(), 2, "the budget still has to be enforced");
+        assert!(c.get("c#320").is_some(), "the tile just decoded is not the one to throw away");
     }
 
     #[test]

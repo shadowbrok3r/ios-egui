@@ -106,6 +106,29 @@ pub fn is_pick_video(name: &str) -> bool {
     PICK_VIDEO_EXT.contains(&pick_ext(name).as_str())
 }
 
+/// MIME type for a file we are handing to Android, keyed off its extension. This is what decides
+/// which MediaStore collection a save lands in, so a clip that guesses `image/png` is filed under
+/// Images and never reaches the phone's gallery. Lives next to the extension tables above so the
+/// two can't drift on what counts as a video.
+pub fn media_mime(name: &str) -> &'static str {
+    match pick_ext(name).as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "avif" => "image/avif",
+        // A gif is a still to MediaStore (Images.Media indexes it) even though the pickers offer it
+        // as a clip — filing it under Video.Media would hide it from the phone's photo grid.
+        "gif" => "image/gif",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "avi" => "video/x-msvideo",
+        _ => "image/png",
+    }
+}
+
 fn is_pick_media(name: &str) -> bool {
     let ext = pick_ext(name);
     PICK_IMAGE_EXT.contains(&ext.as_str()) || PICK_VIDEO_EXT.contains(&ext.as_str())
@@ -480,9 +503,21 @@ impl GraphView {
         self.vertical
     }
 
-    /// Hand the canvas this frame's input-file thumbnails (see [`Self::input_thumbs`]).
-    pub fn set_input_thumbs(&mut self, thumbs: HashMap<String, egui::TextureHandle>) {
-        self.input_thumbs = thumbs;
+    /// Hand the canvas this frame's input-file thumbnails (see [`Self::input_thumbs`]), keeping
+    /// the previous picture for any name this frame's map has no entry for.
+    ///
+    /// The caller builds that map from the thumbnail cache, so a name drops out of it whenever the
+    /// cache misses — an eviction, or the frames between a pick and its download landing. Assigning
+    /// wholesale also dropped the last outstanding handle, so egui freed the texture and the node
+    /// footer went blank until the refetch returned. Names no node points at any more are the only
+    /// ones removed: `wanted` is what the walk actually looked for, hit or miss.
+    pub fn set_input_thumbs(
+        &mut self,
+        thumbs: HashMap<String, egui::TextureHandle>,
+        wanted: &HashSet<String>,
+    ) {
+        self.input_thumbs.retain(|name, _| wanted.contains(name));
+        self.input_thumbs.extend(thumbs);
     }
 
     /// Render the canvas (with lock gating and pending view commands), then the minimap overlay.
@@ -2351,6 +2386,28 @@ pub fn elide_width(ui: &egui::Ui, s: &str, max_width: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The symptom this exists for: a saved video went into MediaStore's Images collection because
+    /// the MIME was guessed from a two-entry list, and a video filed under images never appears in
+    /// the phone's gallery. Every extension the pickers accept has to answer with its real type.
+    #[test]
+    fn every_pickable_extension_has_its_real_mime() {
+        for ext in PICK_VIDEO_EXT {
+            let mime = media_mime(&format!("clip.{ext}"));
+            if ext == "gif" {
+                assert_eq!(mime, "image/gif", "an animated gif is still an Images row");
+                continue;
+            }
+            assert!(mime.starts_with("video/"), "{ext} must be a video MIME, got {mime}");
+        }
+        for ext in PICK_IMAGE_EXT {
+            let mime = media_mime(&format!("still.{ext}"));
+            assert!(mime.starts_with("image/"), "{ext} must be an image MIME, got {mime}");
+        }
+        // Names the pickers annotate, and names with no extension at all, must not read as video.
+        assert_eq!(media_mime("ComfyUI_00042_.png [output]"), "image/png");
+        assert_eq!(media_mime("no-extension"), "image/png");
+    }
 
     /// The editor builds its widgets from `/object_info`, so a VideoHelperSuite node's
     /// format-dependent encoder settings have no widget to live in and are dropped on load. They

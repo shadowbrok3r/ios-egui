@@ -143,10 +143,18 @@ name = "android.permission.INTERNET"
 name = "android.permission.VIBRATE"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.POST_NOTIFICATIONS"
-# Read the device photo gallery for the LoadImage "Device" picker. READ_MEDIA_IMAGES is the
-# Android 13+ (API 33) scoped permission; READ_EXTERNAL_STORAGE covers older devices only.
+# Read the device gallery for the node pickers' "Device" source. READ_MEDIA_IMAGES/VIDEO are the
+# Android 13+ (API 33) scoped permissions — a clip loader (VHS_LoadVideo) needs the video half —
+# and READ_EXTERNAL_STORAGE covers both on older devices only.
 [[package.metadata.android.uses_permission]]
 name = "android.permission.READ_MEDIA_IMAGES"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_VIDEO"
+# Android 14+ (API 34) "Select photos": the partial grant the system hands out instead of a full
+# one. Apps targeting 34+ that ask for READ_MEDIA_IMAGES/VIDEO must declare it or the partial
+# choice reads as a denial.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.READ_EXTERNAL_STORAGE"
 max_sdk_version = 32

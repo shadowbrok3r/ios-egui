@@ -1494,8 +1494,20 @@ impl Engine {
                 }
             }
             let Some((http, url)) = net else { return };
+            // Clamped the same way the cache branch is. `?size=` is a REQUEST, not a guarantee —
+            // anything the server won't or can't downscale (an animated format, a poster frame, an
+            // error that falls back to the original) comes back full size, and storing that under
+            // a `#320` key put multi-megabyte entries in a 64 MB cache whose keys all claim to be
+            // 0.4 MB. A screenful of those exceeds the budget on its own, so every insert evicted a
+            // tile that was still on screen and the grid re-downloaded it forever. A no-op when the
+            // server did honour the size, and off-thread because a full-size PNG decode is tens of
+            // ms of pure CPU that would otherwise block a tokio worker.
             if let Ok(bytes) = get_ok_bytes(&http, url).await
-                && let Some(image) = decode(&bytes)
+                && let Some(image) =
+                    tokio::task::spawn_blocking(move || decode_thumb(&bytes, size))
+                        .await
+                        .ok()
+                        .flatten()
             {
                 let _ = tx.send(Msg::Thumb { key: thumb_key, image });
                 ctx.request_repaint();
@@ -1555,19 +1567,40 @@ impl Engine {
         });
     }
 
-    /// Fetch a server input image (for the LoadImage thumbnail picker), decoded and cached under
-    /// the key `input#<filename>`.
+    /// Fetch a server input image (for the node file pickers), decoded and cached under the key
+    /// `input#<filename>`.
+    ///
+    /// Downscaled to [`INPUT_THUMB_PX`] like every other thumbnail. `/view` hands back the
+    /// original file — a phone photo uploaded as a LoadImage input is 4000x3000, which decodes to
+    /// **48 MB of RGBA**, and this used to store that whole thing in the 64 MB [`ThumbCache`].
+    /// One such entry evicted every gallery tile around it, the tiles re-fetched, the re-fetches
+    /// pushed it out again: the picker sat there reloading forever. Nothing displays these above
+    /// 156px (the canvas node footer).
+    ///
+    /// [`ThumbCache`]: crate::gallery::ThumbCache
     pub fn fetch_input_thumb(&self, filename: String) {
+        // The node's selection is whatever ComfyUI put in the widget, and that is rarely a bare
+        // name: a comfy-gate upload leaves `<namespace>/name.png`, and a workflow loaded from a
+        // gallery PNG can carry `clipspace/foo.png [input]`. `/view` basenames whatever it is
+        // handed, so passing the decorated string as `filename` with an empty `subfolder` looks in
+        // `input/` for a file that lives in `input/<ns>/` — a 404, no `Msg::Thumb`, and a claim
+        // that never clears, i.e. a preview that is blank forever. The cache key keeps the full
+        // undecorated selection so all three lookup sites still agree.
+        let (subfolder, file) = split_input_ref(&filename);
         let Some((http, url)) = self.authed_url(
             "/view",
-            &[("type", "input"), ("subfolder", ""), ("filename", &filename)],
+            &[("type", "input"), ("subfolder", &subfolder), ("filename", &file)],
         ) else {
             return;
         };
         let (tx, ctx, _log) = self.emitters();
         self.rt.spawn(async move {
             if let Ok(bytes) = get_ok_bytes(&http, url).await
-                && let Some(image) = decode(&bytes)
+                && let Some(image) =
+                    tokio::task::spawn_blocking(move || decode_thumb(&bytes, INPUT_THUMB_PX))
+                        .await
+                        .ok()
+                        .flatten()
             {
                 let _ = tx.send(Msg::Thumb { key: format!("input#{filename}"), image });
                 ctx.request_repaint();
@@ -3000,6 +3033,30 @@ async fn fetch_bytes(
 }
 
 /// Decode encoded image bytes and downscale so the longest edge is at most `size`.
+/// Long-side pixels every `input#` thumbnail is decoded to. One size for all three consumers (the
+/// canvas node footer at 156px, the picker's `now:` row at 44px, the Server grid's ~160px tiles)
+/// so they share one cache entry rather than each holding its own copy of the same image.
+pub(crate) const INPUT_THUMB_PX: u32 = 320;
+
+/// Split a node's file selection into the `(subfolder, filename)` pair `/view` expects.
+///
+/// ComfyUI writes a file widget as `name.png`, `sub/name.png`, or either of those with a trailing
+/// ` [input]` / ` [output]` / ` [temp]` annotation; comfy-gate namespaces uploads, so a pick made
+/// on the phone comes back as `<user>/name.png`.
+pub(crate) fn split_input_ref(sel: &str) -> (String, String) {
+    let sel = sel.trim();
+    // Only a real trailing `[…]` annotation is stripped — a filename may legitimately contain
+    // " [" and must survive intact.
+    let head = match sel.rsplit_once(" [") {
+        Some((head, tail)) if tail.ends_with(']') => head,
+        _ => sel,
+    };
+    match head.rsplit_once('/') {
+        Some((sub, file)) => (sub.to_string(), file.to_string()),
+        None => (String::new(), head.to_string()),
+    }
+}
+
 pub(crate) fn decode_thumb(bytes: &[u8], size: u32) -> Option<egui::ColorImage> {
     let img = image::load_from_memory(bytes).ok()?;
     let size = size.clamp(64, 1024);
@@ -3188,6 +3245,50 @@ mod tests {
 
     fn current(id: Option<&str>) -> CurrentPrompt {
         Arc::new(Mutex::new(id.map(str::to_string)))
+    }
+
+    /// The symptom this exists for: `/view` basenames whatever `filename` it is given, so sending
+    /// a node's whole selection with an empty `subfolder` looked in `input/` for a file that lives
+    /// in `input/<ns>/`. That 404s, no `Msg::Thumb` is ever sent, and the claim never clears — a
+    /// preview blank forever. Every shape ComfyUI and comfy-gate actually write has to split.
+    #[test]
+    fn a_node_selection_splits_into_the_pair_view_expects() {
+        // comfy-gate namespaces uploads, which is every pick made from the phone.
+        assert_eq!(split_input_ref("shadowbroker/IMG_4821.jpg"), ("shadowbroker".into(), "IMG_4821.jpg".into()));
+        // ComfyUI's annotated form, as carried by a workflow loaded from a gallery PNG.
+        assert_eq!(split_input_ref("clipspace/foo.png [input]"), ("clipspace".into(), "foo.png".into()));
+        assert_eq!(split_input_ref("bare.png [output]"), (String::new(), "bare.png".into()));
+        // A plain name stays a plain name, subfolder empty.
+        assert_eq!(split_input_ref("ComfyUI_00042_.png"), (String::new(), "ComfyUI_00042_.png".into()));
+        // Nested namespaces keep everything but the last segment as the subfolder.
+        assert_eq!(split_input_ref("a/b/c.png"), ("a/b".into(), "c.png".into()));
+        // A filename may legitimately contain " [" — only a real trailing annotation is stripped.
+        assert_eq!(split_input_ref("render [wip].png"), (String::new(), "render [wip].png".into()));
+    }
+
+    /// The symptom this exists for: `input#` previews were decoded at full resolution, so one
+    /// uploaded phone photo held tens of MB of the 64 MB `ThumbCache` and evicted every tile
+    /// around it — which re-fetched, which evicted it, forever. Every path into that cache must
+    /// come out bounded, and small enough that a screenful cannot approach the budget.
+    #[test]
+    fn an_input_preview_decodes_small_enough_to_share_the_cache() {
+        let (w, h) = (1600u32, 1200u32);
+        let src = image::RgbaImage::from_pixel(w, h, image::Rgba([120, 40, 200, 255]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(src)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("encode");
+        let full = decode(png.get_ref()).expect("full decode");
+        assert_eq!(full.size, [w as usize, h as usize], "decode is deliberately full-size");
+
+        let thumb = decode_thumb(png.get_ref(), INPUT_THUMB_PX).expect("thumb decode");
+        let cap = INPUT_THUMB_PX as usize;
+        assert!(thumb.size[0] <= cap && thumb.size[1] <= cap, "got {:?}", thumb.size);
+        // What ThumbCache charges for it (w*h*4, as the Msg::Thumb handler computes).
+        let cost = thumb.size[0] * thumb.size[1] * 4;
+        let full_cost = full.size[0] * full.size[1] * 4;
+        assert!(cost <= 512 * 1024, "an input preview costs {cost} bytes");
+        assert!(full_cost > 20 * cost, "full-res was {full_cost} vs {cost} — the cap must bite");
     }
 
     /// A partial delete must lift the tombstone for the failed item only — lifting the whole
