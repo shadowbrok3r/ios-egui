@@ -1,6 +1,9 @@
 [package]
 name = "comfyui_android"
-version = "0.1.0"
+# Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
+# BUMP IT before every release build — the phone only offers an update whose code is strictly
+# greater than the installed one, so shipping twice at the same version is a silent no-op.
+version = "0.4.0"
 edition = "2024"
 publish = false
 
@@ -52,6 +55,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # Decompresses the bundled Danbooru tag dictionary (assets/tags/danbooru.csv.gz); rust_backend so it
 # cross-compiles to the NDK with no system zlib.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Verify a downloaded self-update APK against the checksum comfy-gate recorded when it was
+# published. A truncated APK otherwise reaches the package installer and fails as a bare
+# "parse error" with nothing pointing at the download.
+sha2 = { version = "0.10", default-features = false }
 # Pack import: model packs ship as zips; deflate only, pure Rust so it cross-compiles.
 zip = { version = "2", default-features = false, features = ["deflate"] }
 serde = { version = "1", features = ["derive"] }
@@ -139,6 +146,11 @@ categories = ["android.intent.category.LAUNCHER"]
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"
+# Self-update: install an APK fetched from comfy-gate. Required on API 26+ before
+# PackageInstaller.createSession will run at all; the user additionally has to grant "install
+# unknown apps" for this app, which Settings > Special app access owns (canRequestPackageInstalls).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.REQUEST_INSTALL_PACKAGES"
 [[package.metadata.android.uses_permission]]
 name = "android.permission.VIBRATE"
 [[package.metadata.android.uses_permission]]

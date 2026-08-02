@@ -15,8 +15,9 @@ use serde_json::Value;
 use crate::logger::Logger;
 use crate::schema::{self, SchemaSet};
 use crate::types::{
-    Album, AlbumList, CheckpointCatalog, Facets, GalleryPage, GalleryView, Img2ImgSource,
-    LoraCatalog, Mode, Params,
+    Album, AlbumList, CheckpointCatalog, DownloadKind, DownloadProgress, DownloadTargets,
+    DownloadVersions, Facets, GalleryPage, GalleryView, GateWriteResp, Img2ImgSource, LoraCatalog,
+    AppUpdate, LoraDetail, LoraFacets, LoraPage, Mode, Params, GATE_WIRE_VERSION,
 };
 use crate::{tags, uiwf, workflow};
 
@@ -171,6 +172,36 @@ pub enum Msg {
     LoraCatalog(LoraCatalog),
     /// Catalog missing or invalid — Create LoRAs fall back to installed names only.
     LoraCatalogError(String),
+    /// One page of the managed LoRA library. `generation` is the request generation — a filter
+    /// change bumps it, and a page answering a superseded query must be dropped (gallery's rule).
+    LoraLibrary { generation: u64, page: LoraPage },
+    /// Filter chip values for the whole managed library.
+    LoraLibraryFacets(LoraFacets),
+    /// A single LoRA's expensive extras, for the detail view.
+    LoraLibraryDetail(Box<LoraDetail>),
+    /// Any managed-library request failed; the string is show-ready.
+    LoraLibraryError(String),
+    /// The gate has no preview for this LoRA (HTTP 204) — never ask again for this id.
+    LoraThumbMissing { key: String },
+    /// Whether this account may run the gate's admin-only writes (downloads, edits).
+    LoraAdmin(bool),
+    /// Where a Civitai download of `kind` may be saved.
+    DownloadTargets { kind: DownloadKind, targets: DownloadTargets },
+    /// What a pasted Civitai link resolved to.
+    DownloadVersions { kind: DownloadKind, found: Box<DownloadVersions> },
+    /// A download was accepted and backgrounded server-side; poll `id` for progress.
+    DownloadStarted { id: String, label: String },
+    /// One poll of a running download.
+    DownloadProgress { id: String, progress: Box<DownloadProgress> },
+    /// A download request failed outright (not the transfer — the request).
+    DownloadError(String),
+    /// What build comfy-gate is offering for this app.
+    AppUpdate(Box<AppUpdate>),
+    /// Bytes downloaded so far of the update APK.
+    AppUpdateProgress { got: u64, total: u64 },
+    /// The APK is on disk and its checksum matched; ready to hand to the installer.
+    AppUpdateReady { path: String },
+    AppUpdateError(String),
     /// Server checkpoint catalog (`GET /checkpoint-catalog.json`).
     CheckpointCatalog(CheckpointCatalog),
     CheckpointCatalogError(String),
@@ -784,6 +815,460 @@ impl Engine {
         });
     }
 
+    // ---- App self-update (`/comfyui-android/update.json`, `/comfyui-android/app.apk`) ----------
+
+    /// Ask the gate what build it is offering. Quiet on failure — a gate too old to have the
+    /// endpoint is the normal case, not an error worth showing.
+    pub fn check_app_update(&self) {
+        let Some((http, url)) = self.authed_url("/comfyui-android/update.json", &[]) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<AppUpdate>(&body) {
+                    Ok(u) if wire_ok(u.version, "update.json").is_ok() => {
+                        if u.available {
+                            log.info(format!(
+                                "app update: {} (code {})",
+                                u.version_name, u.version_code
+                            ));
+                        }
+                        let _ = tx.send(Msg::AppUpdate(Box::new(u)));
+                        ctx.request_repaint();
+                    }
+                    Ok(_) => {}
+                    Err(e) => log.warn(format!("update.json decode: {e}")),
+                },
+                // A gate without the route 404s; that is a deployment state, not a failure.
+                Err(e) => log.info(format!("app update check: {e}")),
+            }
+        });
+    }
+
+    /// Stream the APK to `dest`, verifying its sha256, reporting progress as it goes.
+    ///
+    /// Streamed rather than buffered: this is a 50-200 MB file on a phone, and `get_ok_bytes`
+    /// would hold all of it in RAM alongside the copy being written. Written to `<dest>.part` and
+    /// renamed only after the hash matches, so an interrupted download can never be handed to the
+    /// package installer as a complete APK.
+    pub fn download_app_update(&self, dest: String, expect_sha256: String, expect_size: u64) {
+        let Some((http, url)) = self.authed_url("/comfyui-android/app.apk", &[]) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            use sha2::{Digest, Sha256};
+            use std::io::Write;
+
+            let part = format!("{dest}.part");
+            let _ = std::fs::remove_file(&part);
+            let mut resp = match http.get(url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    let _ = tx.send(Msg::AppUpdateError(format!("HTTP {}", r.status())));
+                    ctx.request_repaint();
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::AppUpdateError(e.to_string()));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let total = resp.content_length().unwrap_or(expect_size);
+            let mut file = match std::fs::File::create(&part) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(Msg::AppUpdateError(format!("can't write {part}: {e}")));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            let mut hasher = Sha256::new();
+            let mut got: u64 = 0;
+            let mut last_report = 0u64;
+            loop {
+                match resp.chunk().await {
+                    Ok(Some(chunk)) => {
+                        hasher.update(&chunk);
+                        if let Err(e) = file.write_all(&chunk) {
+                            let _ = tx.send(Msg::AppUpdateError(format!("write failed: {e}")));
+                            ctx.request_repaint();
+                            let _ = std::fs::remove_file(&part);
+                            return;
+                        }
+                        got += chunk.len() as u64;
+                        // Every ~1%: a message per 64 KB chunk would be thousands of repaints.
+                        if total == 0 || got - last_report > total / 100 {
+                            last_report = got;
+                            let _ = tx.send(Msg::AppUpdateProgress { got, total });
+                            ctx.request_repaint();
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Msg::AppUpdateError(e.to_string()));
+                        ctx.request_repaint();
+                        let _ = std::fs::remove_file(&part);
+                        return;
+                    }
+                }
+            }
+            drop(file);
+            let sum = hex_lower(&hasher.finalize());
+            // A truncated or corrupted APK fails the installer with a bare "parse error"; catching
+            // it here means the message names the real problem.
+            if !expect_sha256.is_empty() && sum != expect_sha256 {
+                log.error(format!("app update: sha256 {sum} != expected {expect_sha256}"));
+                let _ = std::fs::remove_file(&part);
+                let _ = tx.send(Msg::AppUpdateError(
+                    "The download didn't match its checksum — try again".into(),
+                ));
+                ctx.request_repaint();
+                return;
+            }
+            if let Err(e) = std::fs::rename(&part, &dest) {
+                let _ = tx.send(Msg::AppUpdateError(format!("can't finish the download: {e}")));
+                ctx.request_repaint();
+                return;
+            }
+            log.info(format!("app update: downloaded {got} bytes to {dest}"));
+            let _ = tx.send(Msg::AppUpdateReady { path: dest });
+            ctx.request_repaint();
+        });
+    }
+
+    // ---- The gate's managed LoRA library (`/comfyui-android/lora/*`) --------------------------
+    //
+    // Distinct from `fetch_lora_catalog` above: that is the read-only strength/trigger catalog the
+    // Create picker uses, keyed by ComfyUI `lora_name`. This is the *library manager*, keyed by the
+    // model's sha256, which is the only identifier that survives a move or a rename.
+
+    /// One page of the library. `generation` is echoed back so a page answering a superseded
+    /// filter can be dropped rather than corrupting the list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lora_list(
+        &self,
+        generation: u64,
+        page: u32,
+        page_size: u32,
+        sort_by: &str,
+        folder: &str,
+        search: &str,
+        base_model: &str,
+        tag: &str,
+    ) {
+        // The gate clamps page_size to 100 regardless; asking for more just wastes the round trip.
+        let (page_s, size_s) = (page.to_string(), page_size.clamp(1, 100).to_string());
+        let mut q: Vec<(&str, &str)> =
+            vec![("page", &page_s), ("page_size", &size_s), ("sort_by", sort_by)];
+        for (k, v) in [("folder", folder), ("search", search), ("base_model", base_model), ("tag", tag)] {
+            if !v.is_empty() {
+                q.push((k, v));
+            }
+        }
+        let Some((http, url)) = self.authed_url("/comfyui-android/lora/list", &q) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<LoraPage>(&body) {
+                    Ok(p) => match wire_ok(p.version, "lora/list") {
+                        Ok(()) => {
+                            log.info(format!("lora library: page {} of {}", p.page, p.total_pages));
+                            Msg::LoraLibrary { generation, page: p }
+                        }
+                        Err(e) => Msg::LoraLibraryError(e),
+                    },
+                    Err(e) => Msg::LoraLibraryError(format!("Couldn't read the library: {e}")),
+                },
+                Err(e) => Msg::LoraLibraryError(lora_http_hint(&e)),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Filter chip values, counted over the whole library rather than the current page.
+    pub fn lora_facets(&self) {
+        let Some((http, url)) = self.authed_url("/comfyui-android/lora/facets", &[]) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            // A failure here just leaves the chips empty; it must not block the grid.
+            match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<LoraFacets>(&body) {
+                    Ok(f) if wire_ok(f.version, "lora/facets").is_ok() => {
+                        let _ = tx.send(Msg::LoraLibraryFacets(f));
+                    }
+                    Ok(_) => {}
+                    Err(e) => log.warn(format!("lora facets decode: {e}")),
+                },
+                Err(e) => log.warn(format!("lora facets: {e}")),
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// One LoRA's trigger words / notes / description. Costs the gate a second backend call, so
+    /// this is a detail-view request — never call it per grid cell.
+    pub fn lora_detail(&self, id: String) {
+        let Some((http, url)) = self.authed_url("/comfyui-android/lora/detail", &[("id", &id)])
+        else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<LoraDetail>(&body) {
+                    Ok(d) => match wire_ok(d.version, "lora/detail") {
+                        Ok(()) => Msg::LoraLibraryDetail(Box::new(d)),
+                        Err(e) => Msg::LoraLibraryError(e),
+                    },
+                    Err(e) => Msg::LoraLibraryError(format!("Couldn't read that LoRA: {e}")),
+                },
+                Err(e) => Msg::LoraLibraryError(lora_http_hint(&e)),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// A library preview, always JPEG (the gate transcodes video previews with ffmpeg).
+    ///
+    /// Separate from [`Self::fetch_thumb`], which is hardwired to the gallery's
+    /// `subfolder`/`filename` pair and its on-disk full-image cache. A `204` here means "there is
+    /// no preview" rather than a failure, and must latch so the tile never asks again.
+    pub fn fetch_lora_thumb(&self, id: String, size: u32) {
+        let size_s = size.to_string();
+        let Some((http, url)) =
+            self.authed_url("/comfyui-android/lora/thumb", &[("id", &id), ("size", &size_s)])
+        else {
+            return;
+        };
+        let key = format!("lora#{id}#{size}");
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let resp = match http.get(url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    log.warn(format!("lora thumb {id}: {e}"));
+                    return;
+                }
+            };
+            // 204 = no preview / undecodable, 404 = unknown id. Both are permanent for this id:
+            // latch them so the grid stops re-claiming the tile every frame.
+            let status = resp.status();
+            if status == reqwest::StatusCode::NO_CONTENT || status == reqwest::StatusCode::NOT_FOUND {
+                let _ = tx.send(Msg::LoraThumbMissing { key });
+                ctx.request_repaint();
+                return;
+            }
+            if !status.is_success() {
+                log.warn(format!("lora thumb {id}: HTTP {status}"));
+                let _ = tx.send(Msg::LoraThumbMissing { key });
+                ctx.request_repaint();
+                return;
+            }
+            let Ok(bytes) = resp.bytes().await else { return };
+            // An empty 200 is the same thing as a 204 as far as the grid is concerned.
+            if bytes.is_empty() {
+                let _ = tx.send(Msg::LoraThumbMissing { key });
+                ctx.request_repaint();
+                return;
+            }
+            let bytes = bytes.to_vec();
+            // Off-thread: a full-size decode is tens of ms of CPU that would block a tokio worker,
+            // and the gate honours `size` as a bounding box rather than a guarantee.
+            let decoded =
+                tokio::task::spawn_blocking(move || decode_thumb(&bytes, size)).await.ok().flatten();
+            match decoded {
+                Some(image) => {
+                    let _ = tx.send(Msg::Thumb { key, image });
+                }
+                None => {
+                    log.warn(format!("lora thumb {id}: undecodable"));
+                    let _ = tx.send(Msg::LoraThumbMissing { key });
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
+    /// Probe whether this account may run the gate's admin-only writes.
+    ///
+    /// There is no "who am I" endpoint, so this posts a write that cannot succeed: the gate
+    /// resolves the id BEFORE validating the body, so a nonexistent id is rejected with 404 for an
+    /// admin and 403 for everyone else, and nothing is mutated either way.
+    pub fn probe_lora_admin(&self) {
+        let Some((http, url)) = self.authed_url("/comfyui-android/lora/update", &[]) else { return };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let body = serde_json::json!({ "id": "", "notes": "" });
+            let admin = match http.post(url).json(&body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    // 403 is the only definite "no". Anything else (404 unknown id, 400 validation)
+                    // means the request got past the admin gate.
+                    let admin = status != reqwest::StatusCode::FORBIDDEN
+                        && status != reqwest::StatusCode::UNAUTHORIZED;
+                    log.info(format!("lora admin probe: HTTP {status} -> admin={admin}"));
+                    admin
+                }
+                Err(e) => {
+                    log.warn(format!("lora admin probe: {e}"));
+                    return;
+                }
+            };
+            let _ = tx.send(Msg::LoraAdmin(admin));
+            ctx.request_repaint();
+        });
+    }
+
+    // ---- Civitai downloads (`/comfyui-android/download/*`) -------------------------------------
+
+    /// Where a download of `kind` may be saved. Checkpoints have three roots here and saving to the
+    /// wrong one hides the file from the loader, so the caller must not collapse the choice.
+    pub fn download_targets(&self, kind: DownloadKind) {
+        let Some((http, url)) =
+            self.authed_url("/comfyui-android/download/targets", &[("type", kind.wire())])
+        else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<DownloadTargets>(&body) {
+                    Ok(t) => match wire_ok(t.version, "download/targets") {
+                        Ok(()) => Msg::DownloadTargets { kind, targets: t },
+                        Err(e) => Msg::DownloadError(e),
+                    },
+                    Err(e) => Msg::DownloadError(format!("Couldn't read the save locations: {e}")),
+                },
+                Err(e) => Msg::DownloadError(lora_http_hint(&e)),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Resolve whatever the user pasted — a model page, a version link, or a bare id.
+    pub fn download_versions(&self, kind: DownloadKind, model: String) {
+        let Some((http, url)) = self.authed_url(
+            "/comfyui-android/download/versions",
+            &[("type", kind.wire()), ("model", &model)],
+        ) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let msg = match get_ok_text(&http, url, &log).await {
+                Ok(body) => match serde_json::from_str::<DownloadVersions>(&body) {
+                    Ok(v) => match wire_ok(v.version, "download/versions") {
+                        Ok(()) => {
+                            log.info(format!(
+                                "download versions: model={:?} selected={:?} n={}",
+                                v.model_id,
+                                v.selected_version_id,
+                                v.versions.len()
+                            ));
+                            Msg::DownloadVersions { kind, found: Box::new(v) }
+                        }
+                        Err(e) => Msg::DownloadError(e),
+                    },
+                    Err(e) => Msg::DownloadError(format!("That link didn't resolve: {e}")),
+                },
+                Err(e) => Msg::DownloadError(lora_http_hint(&e)),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Ask the gate to fetch a version. Returns as soon as the transfer is accepted — the gate
+    /// backgrounds it, so it survives the app closing, the screen locking or the link dropping.
+    pub fn download_start(
+        &self,
+        kind: DownloadKind,
+        version_id: u64,
+        root: String,
+        folder: String,
+        label: String,
+    ) {
+        let Some((http, url)) = self.authed_url("/comfyui-android/download/start", &[]) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let body = serde_json::json!({
+                "type": kind.wire(),
+                "model_version_id": version_id,
+                "root": root,
+                "folder": folder,
+            });
+            log.info(format!("POST {url} {body}"));
+            let msg = match http.post(url).json(&body).send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    match serde_json::from_str::<GateWriteResp>(&text) {
+                        // Status first, then `ok` — the gate normalises LoRA Manager's
+                        // inconsistent failures into this shape.
+                        Ok(r) if status.is_success() && r.ok => match r.download_id {
+                            Some(id) => Msg::DownloadStarted { id, label },
+                            None => Msg::DownloadError("The server accepted it but named no download".into()),
+                        },
+                        Ok(r) => Msg::DownloadError(
+                            r.error.unwrap_or_else(|| download_status_hint(status)),
+                        ),
+                        Err(_) => Msg::DownloadError(download_status_hint(status)),
+                    }
+                }
+                Err(e) => Msg::DownloadError(e.to_string()),
+            };
+            let _ = tx.send(msg);
+            ctx.request_repaint();
+        });
+    }
+
+    /// One progress poll. Cheap in-memory read server-side; call it every second or two.
+    pub fn download_progress(&self, id: String) {
+        let Some((http, url)) =
+            self.authed_url("/comfyui-android/download/progress", &[("id", &id)])
+        else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            // Deliberately quiet: this runs on a timer and a transient failure is not news.
+            let Ok(resp) = http.get(url).send().await else { return };
+            if !resp.status().is_success() {
+                return;
+            }
+            let Ok(text) = resp.text().await else { return };
+            match serde_json::from_str::<DownloadProgress>(&text) {
+                Ok(p) => {
+                    let _ = tx.send(Msg::DownloadProgress { id, progress: Box::new(p) });
+                    ctx.request_repaint();
+                }
+                Err(e) => log.warn(format!("download progress decode: {e}")),
+            }
+        });
+    }
+
+    pub fn download_cancel(&self, id: String) {
+        let Some((http, url)) = self.authed_url("/comfyui-android/download/cancel", &[]) else {
+            return;
+        };
+        let (tx, ctx, log) = self.emitters();
+        self.rt.spawn(async move {
+            let body = serde_json::json!({ "id": id });
+            log.info(format!("POST {url} {body}"));
+            if let Ok(resp) = http.post(url).json(&body).send().await
+                && !resp.status().is_success()
+            {
+                let status = resp.status();
+                let _ = tx.send(Msg::DownloadError(download_status_hint(status)));
+                ctx.request_repaint();
+            }
+        });
+    }
+
     /// Fetch checkpoint metadata (`/checkpoint-catalog.json`, then android-prefixed path).
     pub fn fetch_checkpoint_catalog(&self) {
         let Some(http) = self.http.clone() else { return };
@@ -959,13 +1444,21 @@ impl Engine {
 
     /// Fetch the raw embedded workflow JSON for the viewer's metadata panel / copy button.
     pub fn fetch_item_workflow(&self, subfolder: String, filename: String) {
+        let key = format!("{subfolder}/{filename}");
         let Some((http, url)) = self.authed_url(
             "/gallery/api/workflow",
             &[("subfolder", &subfolder), ("filename", &filename)],
         ) else {
+            // Offline. This MUST still answer: the viewer waits on `wf_fetched` before it will try
+            // to pull a graph out of the file's own bytes, so returning silently here left an
+            // offline image stuck on "loading workflow" forever with the local copy right there.
+            let _ = self.tx.send(Msg::ItemWorkflowError {
+                key,
+                error: "not connected — reading the file's own metadata".into(),
+            });
+            self.ctx.request_repaint();
             return;
         };
-        let key = format!("{subfolder}/{filename}");
         let (tx, ctx, log) = self.emitters();
         self.rt.spawn(async move {
             let msg = match get_ok_text(&http, url, &log).await {
@@ -1855,6 +2348,55 @@ async fn get_ok_text(
 }
 
 /// GET a URL and return raw bytes when 2xx (no logging: used for bulk image fetches).
+/// Lowercase hex of a digest, to compare against the gate's recorded sha256.
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// Refuse a gate payload whose wire version we don't understand rather than mis-parsing it.
+/// `0` is what a missing field deserialises to — an older gate that predates the field — and is
+/// accepted, because every response that carries data also carries `version: 1`.
+fn wire_ok(version: u32, what: &str) -> Result<(), String> {
+    if version == 0 || version == GATE_WIRE_VERSION {
+        return Ok(());
+    }
+    Err(format!(
+        "This server's {what} speaks version {version}; this app understands {GATE_WIRE_VERSION}. Update the app."
+    ))
+}
+
+/// Turn a transport error string from `get_ok_text` into something worth showing a user. The
+/// managed-library endpoints only exist on a current gate, so a 404 is a deployment answer, not a
+/// bug in the request.
+fn lora_http_hint(e: &str) -> String {
+    if e.contains("404") {
+        "This server has no LoRA manager — update comfy-gate".to_string()
+    } else if e.contains("401") {
+        "Not signed in".to_string()
+    } else if e.contains("403") {
+        "This account can't manage models".to_string()
+    } else if e.contains("502") {
+        "LoRA Manager isn't responding on the server".to_string()
+    } else {
+        e.to_string()
+    }
+}
+
+/// The same mapping for a write, which answers with a status rather than a transport error.
+fn download_status_hint(status: reqwest::StatusCode) -> String {
+    match status.as_u16() {
+        401 => "Not signed in".to_string(),
+        403 => "This account can't download models — admin only".to_string(),
+        404 => "This server has no download API — update comfy-gate".to_string(),
+        502 => "LoRA Manager isn't responding on the server".to_string(),
+        _ => format!("HTTP {status}"),
+    }
+}
+
 async fn get_ok_bytes(http: &reqwest::Client, url: reqwest::Url) -> Result<Vec<u8>, String> {
     let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {

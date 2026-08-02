@@ -1431,6 +1431,10 @@ impl RewriteEngine {
     /// The engine that will actually run, or `None` when the chosen one can't. Only `Auto` ever
     /// switches engines: an explicit pick that isn't available reports unavailable rather than
     /// quietly running the other one, so what the user chose is what the button offers.
+    ///
+    /// The UI reads `rewrite_controls_shown` (which engines to offer) rather than this; kept as
+    /// the tested statement of the resolution rule that `rewrite_controls_shown` implements.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn resolve(self, server_ok: bool, device_ok: bool) -> Option<RewriteEngine> {
         match self {
             Self::Auto if server_ok => Some(Self::Server),
@@ -2524,6 +2528,18 @@ pub struct Settings {
     /// restarts so a row the server index resurrects stays hidden instead of coming back on launch.
     #[serde(default)]
     pub trash_tombstones: Vec<Tombstone>,
+    /// Newest gallery `mtime` (unix seconds) already shown to the user. `0.0` — which is what a
+    /// settings file written before this field existed deserializes to — means "never seeded", and
+    /// the next listing adopts itself as seen instead of flagging the whole library as new.
+    #[serde(default)]
+    pub gallery_seen_at: f64,
+    /// Gallery keys not yet opened full-screen, sorted so an unchanged set serializes identically.
+    #[serde(default)]
+    pub gallery_unseen: Vec<String>,
+    /// Civitai downloads the gate is running for us. Persisted because the transfer lives on the
+    /// server and survives the app closing — the id is the only handle back to it.
+    #[serde(default)]
+    pub downloads: Vec<ActiveDownload>,
     /// Create Main: text-encoder/VAE and img2img source block is expanded.
     #[serde(default = "default_true")]
     pub create_setup_open: bool,
@@ -2621,6 +2637,363 @@ pub struct Album {
 #[derive(Clone, Debug, Deserialize)]
 pub struct AlbumList {
     pub albums: Vec<Album>,
+}
+
+/// The wire version every `/comfyui-android/*` gate response carries. A bump means a breaking
+/// shape change: refuse the payload and tell the user to update rather than mis-parsing it.
+pub const GATE_WIRE_VERSION: u32 = 1;
+
+/// One installed LoRA as the gate's managed-library API reports it
+/// (`GET /comfyui-android/lora/list`).
+///
+/// `id` is the model file's sha256 and is the ONLY key any operation takes. It survives a move or
+/// a rename, which a path does not — the gate deliberately never returns a file path.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LoraItem {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub file_name: String,
+    /// `""` is the library root.
+    #[serde(default)]
+    pub folder: String,
+    #[serde(default)]
+    pub base_model: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub favorite: bool,
+    /// LoRA Manager's 0..=32 scale, not a 0-1 flag.
+    #[serde(default)]
+    pub nsfw_level: i64,
+    #[serde(default)]
+    pub usage_count: i64,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub update_available: bool,
+    /// False means there is no preview at all — skip the thumb request entirely.
+    #[serde(default)]
+    pub has_preview: bool,
+    /// The source preview is a video; the gate still hands back a JPEG frame, this is badge-only.
+    #[serde(default)]
+    pub preview_is_video: bool,
+}
+
+impl LoraItem {
+    /// Thumb-cache key. The size rides in the key for the same reason the gallery's does, and the
+    /// `lora#` prefix keeps it out of the `subfolder/filename` namespace — `Msg::Thumb`'s aspect
+    /// bookkeeping keys off a `/` being present.
+    pub fn thumb_key(&self, size: u32) -> String {
+        format!("lora#{}#{size}", self.id)
+    }
+
+    /// What to show under the tile: the folder, or "Library root".
+    pub fn folder_label(&self) -> &str {
+        if self.folder.is_empty() { "Library root" } else { &self.folder }
+    }
+}
+
+/// `GET /comfyui-android/lora/list` — one page of the managed library.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LoraPage {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub page: u32,
+    /// What the gate actually used after clamping to 100 — kept so a future caller can tell how
+    /// far short of its request it fell.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub page_size: u32,
+    #[serde(default)]
+    pub total_pages: u32,
+    #[serde(default)]
+    pub items: Vec<LoraItem>,
+}
+
+/// One filter chip value with how many library entries carry it.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LoraFacet {
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub count: i64,
+}
+
+/// `GET /comfyui-android/lora/facets` — counted over the whole library, not the current page.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LoraFacets {
+    #[serde(default)]
+    pub version: u32,
+    /// Library size as the facet pass counted it. The grid shows `LoraPage::total` instead, which
+    /// is the count for the *current* filter.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub folders: Vec<LoraFacet>,
+    #[serde(default)]
+    pub base_models: Vec<LoraFacet>,
+    #[serde(default)]
+    pub tags: Vec<LoraFacet>,
+}
+
+/// `GET /comfyui-android/lora/detail?id=` — the list item's fields plus the expensive extras.
+/// Costs the gate a second backend call, so this is a detail-view request, never a per-tile one.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct LoraDetail {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(flatten)]
+    pub item: LoraItem,
+    #[serde(default)]
+    pub notes: String,
+    /// LoRA Manager's raw JSON string, often `"{}"`. Not surfaced: it is an internal encoding,
+    /// and everything worth reading out of it is already parsed into the read-only catalog.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub usage_tips: String,
+    #[serde(default)]
+    pub trigger_words: Vec<String>,
+    /// Civitai HTML; run it through `strip_simple_html` before display.
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub civitai_url: Option<String>,
+    #[serde(default)]
+    pub civitai_version_name: Option<String>,
+    /// Display only — never send this back.
+    #[serde(default)]
+    pub relative_path: String,
+}
+
+/// Which model library a Civitai download lands in. The gate takes this as `type`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DownloadKind {
+    Lora,
+    Checkpoint,
+    Embedding,
+}
+
+impl DownloadKind {
+    pub const ALL: [DownloadKind; 3] =
+        [DownloadKind::Lora, DownloadKind::Checkpoint, DownloadKind::Embedding];
+
+    /// The gate's `type=` value.
+    pub fn wire(self) -> &'static str {
+        match self {
+            DownloadKind::Lora => "lora",
+            DownloadKind::Checkpoint => "checkpoint",
+            DownloadKind::Embedding => "embedding",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DownloadKind::Lora => "LoRA",
+            DownloadKind::Checkpoint => "Checkpoint",
+            DownloadKind::Embedding => "Embedding",
+        }
+    }
+}
+
+/// One root directory a download may target. Checkpoints genuinely have three
+/// (`checkpoints` / `diffusion_models` / `unet`) and picking the wrong one hides the file from the
+/// loader, so the picker is never hidden unless there is exactly one.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DownloadRoot {
+    #[serde(default)]
+    pub id: String,
+}
+
+/// `GET /comfyui-android/download/targets?type=` — where a download may be saved.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DownloadTargets {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub roots: Vec<DownloadRoot>,
+    /// Existing subfolders; a new one can be typed.
+    #[serde(default)]
+    pub folders: Vec<String>,
+}
+
+/// One downloadable Civitai model version.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DownloadVersion {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub base_model: String,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Already installed — the row is greyed; re-pulling gigabytes you have is the likely misclick.
+    #[serde(default)]
+    pub exists_locally: bool,
+    #[serde(default)]
+    pub trained_words: Vec<String>,
+    /// Anything other than `"Public"` is usually Civitai early access and 401s unless the
+    /// server's account owns it.
+    #[serde(default)]
+    pub availability: String,
+}
+
+impl DownloadVersion {
+    pub fn is_public(&self) -> bool {
+        self.availability.is_empty() || self.availability.eq_ignore_ascii_case("public")
+    }
+}
+
+/// `GET /comfyui-android/download/versions?type=&model=` — what a pasted link resolves to.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DownloadVersions {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub model_id: Option<u64>,
+    /// Set when the pasted link named a version outright. `versions` is then empty and there is
+    /// nothing to pick — go straight to `start`.
+    #[serde(default)]
+    pub selected_version_id: Option<u64>,
+    #[serde(default)]
+    pub versions: Vec<DownloadVersion>,
+}
+
+/// How a backgrounded download is going. The gate owns the terminal states — LoRA Manager's own
+/// progress map has none, so "finished" and "stalled at 100%" are indistinguishable through it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DownloadStatus {
+    /// Started but no bytes yet — AND what an id that never existed reports, so time out client-side.
+    #[default]
+    Pending,
+    Progress,
+    Completed,
+    Failed,
+}
+
+impl DownloadStatus {
+    pub fn parse(s: &str) -> DownloadStatus {
+        match s {
+            "progress" => DownloadStatus::Progress,
+            "completed" => DownloadStatus::Completed,
+            "failed" => DownloadStatus::Failed,
+            _ => DownloadStatus::Pending,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, DownloadStatus::Completed | DownloadStatus::Failed)
+    }
+}
+
+/// `GET /comfyui-android/download/progress?id=`.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct DownloadProgress {
+    /// Parsed for completeness; the poll loop trusts the `start` call's version check rather than
+    /// re-validating on every tick.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub progress: f32,
+    #[serde(default)]
+    pub bytes_downloaded: u64,
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub bytes_per_second: f64,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// `GET /comfyui-android/update.json` — the app build comfy-gate is offering.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct AppUpdate {
+    #[serde(default)]
+    pub version: u32,
+    /// False when nothing has been published; the app then shows no update affordance at all.
+    #[serde(default)]
+    pub available: bool,
+    /// Android `versionCode`. Compared against our own — Android itself refuses a downgrade, so
+    /// offering one would be a dead end.
+    #[serde(default)]
+    pub version_code: u64,
+    #[serde(default)]
+    pub version_name: String,
+    #[serde(default)]
+    pub size: u64,
+    /// Lowercase hex, computed by the gate at publish time.
+    #[serde(default)]
+    pub sha256: String,
+    #[serde(default)]
+    pub notes: String,
+    /// When the build was published, unix seconds. Not shown: "build 16777472" is the number that
+    /// actually decides whether this is an upgrade, and a date beside it invites the wrong compare.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub published_at: i64,
+}
+
+/// One backgrounded Civitai download the gate is running for us. The transfer survives the app
+/// closing, the screen locking and the connection dropping, so these are persisted by id and
+/// re-attached on launch — the id is the only handle to a transfer already in flight.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ActiveDownload {
+    pub id: String,
+    /// What to call it in the list — the version name, captured at start.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub progress: f32,
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub total: u64,
+    #[serde(default)]
+    pub bps: f64,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// When this download was first seen still in `pending`. A bogus id is indistinguishable from
+    /// "started, no bytes yet", so one that never leaves `pending` has to be given up on
+    /// client-side. Not persisted: a relaunch restarts the clock.
+    #[serde(skip, default)]
+    pub pending_since: Option<f64>,
+}
+
+impl ActiveDownload {
+    pub fn state(&self) -> DownloadStatus {
+        DownloadStatus::parse(&self.status)
+    }
+}
+
+/// The gate's uniform write reply: `{"version":1,"ok":true}` or `{...,"ok":false,"error":"…"}`.
+/// LoRA Manager reports a rejected write inconsistently; the gate normalises both shapes, so a
+/// caller checks the HTTP status FIRST and then `ok`.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GateWriteResp {
+    /// As above: the read that preceded this write already established the wire version.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// `POST /download/start` only.
+    #[serde(default)]
+    pub download_id: Option<String>,
 }
 
 /// One distinct model or LoRA name across the account's gallery, with how many images used it.

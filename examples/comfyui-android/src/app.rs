@@ -30,11 +30,14 @@ use crate::{clip_index, tag_index};
 use crate::{sysmon, uiwf};
 use crate::types::{
     ActiveLora, Album, AppPack, AppStep, AppliedCharacter, CHECKPOINT_RECENT_MAX, CharacterCard,
-    AppliedMainLook, CharacterLook, CharacterPack, CheckpointCatalog, CheckpointSort, LookKind,
+    AppUpdate, AppliedMainLook, CharacterLook, CharacterPack, CheckpointCatalog, CheckpointSort,
+    LookKind,
     character_tags_from_prompt, dedupe_loras, extract_triggers_from_positive,
-    CreatePreset, FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
+    ActiveDownload, CreatePreset, DownloadKind, DownloadStatus, DownloadTargets, DownloadVersions,
+    FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, GenMode, Img2ImgSource, LoraCatalog,
-    LoraEntry, LoraOverride, LoraPack, Mode, TrashItem, ModelKind, ModelOverride, Params,
+    LoraDetail, LoraEntry, LoraFacets, LoraItem, LoraOverride, LoraPack, Mode, TrashItem,
+    ModelKind, ModelOverride, Params,
     PromptHist, RatingFilter, RewriteEngine,
     CheckpointRecommended, SamplerPack, Settings, Tombstone, VARIATION_COUNT_RANGE, VariationStrength,
     append_negatives, checkpoint_family, fallback_vec, file_basename, is_clipless_family,
@@ -46,6 +49,17 @@ use crate::types::LocalBackend;
 
 /// Ceiling on auto-loaded gallery items, so a huge namespace can't page forever.
 const GALLERY_LOAD_ALL_CAP: u64 = 5000;
+/// LoRA library page size. The gate clamps this to 100 whatever we ask for; 60 is what its
+/// handoff recommends and keeps a page under a second on a phone connection.
+const LORA_LIB_PAGE: u32 = 60;
+/// Bounding box for library preview thumbnails.
+const LORA_THUMB_PX: u32 = 256;
+/// How often a running download is polled. The gate's progress read is in-memory and cheap.
+const DOWNLOAD_POLL_SECS: f64 = 1.5;
+/// How long a download may sit in `pending` before we call it dead. The gate cannot distinguish
+/// "queued, no bytes yet" from "no such download", so both arrive as `pending` and only a
+/// client-side clock can end the wait.
+const DOWNLOAD_PENDING_TIMEOUT: f64 = 90.0;
 /// How long a deleted key stays hidden from incoming listings.
 const TOMBSTONE_TTL_SECS: f64 = 7.0 * 24.0 * 3600.0;
 /// Hiding window for a tombstone with no recorded size — long enough for a delete to settle in the
@@ -102,6 +116,130 @@ enum CreatePane {
     Enhance,
     Presets,
     Characters,
+}
+
+/// The `local-npu` settings as loaded from disk, for a build compiled without that feature.
+/// See [`ComfyApp::local_npu_passthrough`].
+#[cfg(not(feature = "local-npu"))]
+#[derive(Default)]
+struct LocalNpuSaved {
+    local_npu: bool,
+    auto_tag: bool,
+    local_backend: crate::types::LocalBackend,
+    local_pack: String,
+    local_use_server: bool,
+}
+
+/// Which facet row a chip belongs to, so one function can draw all three.
+#[derive(PartialEq, Clone, Copy)]
+enum LoraFacetKind {
+    Folder,
+    Base,
+    Tag,
+}
+
+/// `nsfw_level` at or above which a preview is covered until the user opts in. LoRA Manager's
+/// scale runs 0..=32; 4 is its own "mature" boundary.
+const LORA_NSFW_COVER: i64 = 4;
+
+/// How many chips one facet row shows. The gate sorts count-desc, so the cut is the long tail.
+const LORA_FACET_CHIPS: usize = 12;
+
+/// Which half of the Create → LoRAs pane is showing.
+#[derive(PartialEq, Clone, Copy)]
+enum LoraPane {
+    /// The LoRAs applied to this render — sliders, triggers, strengths.
+    Active,
+    /// The server's whole installed library: browse, filter, and pull new ones off Civitai.
+    Library,
+}
+
+/// Create → LoRAs → Library. The gate-managed model library, keyed throughout by the model file's
+/// sha256 — the only identifier that survives a move or a rename server-side.
+#[derive(Default)]
+struct LoraLibrary {
+    items: Vec<LoraItem>,
+    /// Bumped on every filter/search change; a page answering a superseded query is dropped.
+    generation: u64,
+    total: u64,
+    page: u32,
+    total_pages: u32,
+    loading: bool,
+    /// Show-ready failure text; empty when all is well.
+    status: String,
+    facets: LoraFacets,
+    /// Committed search text. The edit box writes `search_draft` and only commits on submit, so
+    /// every keystroke isn't a round trip.
+    search: String,
+    search_draft: String,
+    folder: String,
+    base_model: String,
+    tag: String,
+    sort: LoraSort,
+    filters_open: bool,
+    /// The tapped item, opened as a detail takeover over the grid.
+    detail: Option<Box<LoraDetail>>,
+    /// A detail request is in flight for this id (the grid tile shows a spinner).
+    detail_pending: Option<String>,
+    /// Thumb keys the gate answered 204/404 for. `ThumbCache::claim` is not durable across
+    /// `reset_pending`, so without this latch a previewless tile re-requests every frame.
+    no_preview: HashSet<String>,
+    /// Whether this account may run the gate's admin-only writes. `None` until probed.
+    admin: Option<bool>,
+    /// Show previews the server flagged as sensitive. Session-only and off by default — this grid
+    /// is one tap from the Create screen.
+    show_nsfw: bool,
+}
+
+/// How the library grid is ordered. The gate passes this straight through to LoRA Manager.
+#[derive(PartialEq, Clone, Copy, Default)]
+enum LoraSort {
+    #[default]
+    Name,
+    Date,
+    Size,
+    UsageCount,
+}
+
+impl LoraSort {
+    const ALL: [LoraSort; 4] = [LoraSort::Name, LoraSort::Date, LoraSort::Size, LoraSort::UsageCount];
+
+    fn wire(self) -> &'static str {
+        match self {
+            LoraSort::Name => "name",
+            LoraSort::Date => "date",
+            LoraSort::Size => "size",
+            LoraSort::UsageCount => "usage_count",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            LoraSort::Name => "Name",
+            LoraSort::Date => "Newest",
+            LoraSort::Size => "Size",
+            LoraSort::UsageCount => "Most used",
+        }
+    }
+}
+
+/// The "pull a model off Civitai" sheet: paste a link, pick a version, pick where it lands.
+struct DownloadSheet {
+    kind: DownloadKind,
+    /// Whatever the user pasted — a model page, a version link, or a bare id.
+    paste: String,
+    /// Where downloads of `kind` may be saved; `None` until fetched.
+    targets: Option<DownloadTargets>,
+    root: String,
+    folder: String,
+    /// A new subfolder typed rather than picked from `targets.folders`.
+    new_folder: String,
+    /// What the pasted link resolved to; `None` before the first lookup.
+    found: Option<Box<DownloadVersions>>,
+    /// A lookup or a start is in flight.
+    busy: bool,
+    /// Show-ready failure text from the last request.
+    error: String,
 }
 
 /// An in-progress character edit: which card is being replaced (by name), plus the working copy.
@@ -962,6 +1100,26 @@ struct ComfyApp {
     create_pane: CreatePane,
     settings_pane: SettingsPane,
     lora_catalog: LoraCatalog,
+    /// Which half of the Create → LoRAs pane is showing.
+    lora_pane: LoraPane,
+    /// What build comfy-gate is offering, once checked. `None` until the first check answers.
+    app_update: Option<Box<AppUpdate>>,
+    /// Bytes of the update APK fetched so far, while a download is running.
+    app_update_progress: Option<(u64, u64)>,
+    /// The verified APK, waiting to be handed to the system installer.
+    app_update_ready: Option<String>,
+    /// Show-ready failure from the last update attempt.
+    app_update_error: String,
+    /// One check per launch, on the first successful connect.
+    app_update_checked: bool,
+    /// The gate-managed library browser (Create → LoRAs → Library).
+    lora_lib: LoraLibrary,
+    /// The Civitai download sheet, open over the library.
+    download_sheet: Option<DownloadSheet>,
+    /// Downloads the gate is running for us, persisted so a relaunch re-attaches to them.
+    downloads: Vec<ActiveDownload>,
+    /// Next progress poll time (`input.time`); downloads are polled on a timer, not per frame.
+    downloads_poll_at: f64,
     checkpoint_catalog: CheckpointCatalog,
     /// Installed LoRA filenames from `object_info` (`LoraLoader.lora_name`).
     installed_loras: Vec<String>,
@@ -1085,11 +1243,8 @@ struct ComfyApp {
     result_bytes: Option<Vec<u8>>,
     /// All images from the current Create run(s), in arrival order (batch + multi-queue).
     results: Vec<(egui::TextureHandle, Vec<u8>)>,
-    /// Fullscreen Create result index into [`Self::results`].
-    result_view: Option<usize>,
     /// Texture id salt so batch frames do not overwrite each other in the egui atlas.
     result_seq: u64,
-    save_counter: u32,
     note: String,
     /// First Reset tap arms the confirm; a second within `RESET_CONFIRM_SECS` runs it.
     reset_armed_at: Option<f64>,
@@ -1242,12 +1397,6 @@ struct ComfyApp {
     delete_confirm: Option<(Vec<(String, String)>, bool)>,
     /// After a viewer delete, reopen this `(subfolder, filename)` once the list refreshes.
     viewer_after_delete: Option<(String, String)>,
-    /// The Create-tab Output window is open. Only ever set by the user: results land quietly and
-    /// are counted in `output_unseen` instead of throwing a window over whatever is being edited.
-    output_open: bool,
-    /// Results that arrived while the Output window was closed, for the launcher strip's badge.
-    /// Session-only, cleared when the window is opened or a fresh run starts.
-    output_unseen: usize,
     /// Soft keyboard is up: set at the top of `update`, so it reads as "this frame" while drawing
     /// and as "last frame" when the next frame computes the open edge.
     kb_was_open: bool,
@@ -1354,6 +1503,17 @@ struct ComfyApp {
     triage_collect: u8,
     /// Keys of recent burst results not yet triaged; drives the Triage entry chips.
     untriaged: Vec<String>,
+    /// Gallery keys that have shown up since the user last looked. The single source of truth for
+    /// both the Gallery nav-icon count and the per-thumbnail corner dot.
+    gallery_unseen: HashSet<String>,
+    /// Watermark: the newest `mtime` (unix seconds) any unfiltered listing has shown us. `0.0` is
+    /// the never-seeded sentinel — the first listing adopts its whole contents as *seen*, so an
+    /// existing library doesn't light up as thousands of new images on the first launch after this
+    /// shipped. Only items newer than the watermark are ever flagged.
+    gallery_seen_at: f64,
+    /// Browsing the on-device cache with no server. Set while the gallery renders disconnected and
+    /// a cache exists; cleared the moment a connection returns so the real listing takes over.
+    gallery_offline: bool,
     /// Re-fetch the gallery listing at this time (server indexing lag after generate).
     gallery_refresh_at: Option<f64>,
     /// A background gallery refresh deferred because a triage deck is open — clearing the listing
@@ -1481,6 +1641,13 @@ struct ComfyApp {
     rewrite_review: Option<(String, String)>,
     #[cfg(feature = "local-npu")]
     rewrite_running: bool,
+    /// The `local-npu` settings exactly as they were loaded, kept only by a build compiled WITHOUT
+    /// that feature. Such a build has no fields to hold them, and writing defaults over them would
+    /// silently destroy the user's on-device choices — the settings file is shared between builds,
+    /// so one run of a non-NPU APK would otherwise turn Local NPU and Auto-tag off for good. It
+    /// round-trips them untouched instead.
+    #[cfg(not(feature = "local-npu"))]
+    local_npu_passthrough: LocalNpuSaved,
     /// Settings: background-tag the server gallery when idle.
     #[cfg(feature = "local-npu")]
     auto_tag: bool,
@@ -1699,6 +1866,16 @@ impl ComfyApp {
             create_pane: CreatePane::Main,
             settings_pane: SettingsPane::Server,
             lora_catalog: LoraCatalog::default(),
+            lora_pane: LoraPane::Active,
+            app_update: None,
+            app_update_progress: None,
+            app_update_ready: None,
+            app_update_error: String::new(),
+            app_update_checked: false,
+            lora_lib: LoraLibrary::default(),
+            download_sheet: None,
+            downloads: Vec::new(),
+            downloads_poll_at: 0.0,
             checkpoint_catalog: CheckpointCatalog::default(),
             installed_loras: Vec::new(),
             lora_filter: String::new(),
@@ -1762,9 +1939,7 @@ impl ComfyApp {
             result: None,
             result_bytes: None,
             results: Vec::new(),
-            result_view: None,
             result_seq: 0,
-            save_counter: 0,
             note: String::new(),
             reset_armed_at: None,
             armed_confirm: None,
@@ -1849,8 +2024,6 @@ impl ComfyApp {
             confirm_gallery_delete: true,
             delete_confirm: None,
             viewer_after_delete: None,
-            output_open: false,
-            output_unseen: 0,
             kb_was_open: false,
             kb_open_edge: false,
             kb_height: 0.0,
@@ -1903,6 +2076,9 @@ impl ComfyApp {
             pending_triage_n: 0,
             triage_collect: 0,
             untriaged: Vec::new(),
+            gallery_unseen: HashSet::new(),
+            gallery_seen_at: 0.0,
+            gallery_offline: false,
             gallery_refresh_at: None,
             gallery_refresh_pending: false,
             create_fab_pos: None,
@@ -1988,6 +2164,8 @@ impl ComfyApp {
             rewrite_review: None,
             #[cfg(feature = "local-npu")]
             rewrite_running: false,
+            #[cfg(not(feature = "local-npu"))]
+            local_npu_passthrough: LocalNpuSaved::default(),
             #[cfg(feature = "local-npu")]
             auto_tag: false,
             cache_prefetch: true,
@@ -2470,6 +2648,170 @@ impl ComfyApp {
             Msg::LoraCatalogError(err) => {
                 self.log.warn(format!("lora catalog: {err}"));
             }
+            Msg::LoraLibrary { generation, page } => {
+                // A filter change bumps the generation and clears the list; pages answering the
+                // old query may still land and must not corrupt the fresh one (gallery's rule).
+                if generation != self.lora_lib.generation {
+                    return;
+                }
+                self.lora_lib.loading = false;
+                self.lora_lib.status.clear();
+                self.lora_lib.total = page.total;
+                self.lora_lib.page = page.page;
+                self.lora_lib.total_pages = page.total_pages;
+                if page.page <= 1 {
+                    self.lora_lib.items = page.items;
+                } else {
+                    // Paged in, not replaced: the gate clamps page_size to 100, so a big library
+                    // arrives over several requests and the grid grows.
+                    let seen: HashSet<String> =
+                        self.lora_lib.items.iter().map(|i| i.id.clone()).collect();
+                    self.lora_lib
+                        .items
+                        .extend(page.items.into_iter().filter(|i| !seen.contains(&i.id)));
+                }
+            }
+            Msg::AppUpdate(u) => {
+                // Android refuses a same-or-lower versionCode outright, so anything that isn't
+                // strictly newer is not an update and must not be offered.
+                let ours = self.current_version_code(host);
+                if u.available && ours > 0 && u.version_code <= ours {
+                    self.log.info(format!(
+                        "app update: server has {} (code {}), we are {ours} — nothing newer",
+                        u.version_name, u.version_code
+                    ));
+                    self.app_update = None;
+                } else {
+                    self.app_update = u.available.then_some(u);
+                }
+            }
+            Msg::AppUpdateProgress { got, total } => self.app_update_progress = Some((got, total)),
+            Msg::AppUpdateReady { path } => {
+                self.app_update_progress = None;
+                self.app_update_error.clear();
+                self.app_update_ready = Some(path.clone());
+                // Hand straight to the system installer: the user already asked for this, and
+                // Android shows its own confirm dialog before anything is written.
+                host.self_update(path);
+                self.note = "Opening the installer…".into();
+            }
+            Msg::AppUpdateError(e) => {
+                self.app_update_progress = None;
+                self.log.error(format!("app update: {e}"));
+                self.app_update_error = e;
+            }
+            Msg::LoraLibraryFacets(f) => self.lora_lib.facets = f,
+            Msg::LoraLibraryDetail(d) => {
+                self.lora_lib.detail_pending = None;
+                self.lora_lib.detail = Some(d);
+            }
+            Msg::LoraLibraryError(e) => {
+                self.lora_lib.loading = false;
+                self.lora_lib.detail_pending = None;
+                self.log.warn(format!("lora library: {e}"));
+                self.lora_lib.status = e;
+            }
+            Msg::LoraThumbMissing { key } => {
+                // Permanent for this id. The cache's own `claim` would suppress a retry too, but
+                // it is dropped wholesale by `reset_pending` on every refresh — this latch is what
+                // stops a previewless tile re-requesting for the rest of the session.
+                self.lora_lib.no_preview.insert(key);
+            }
+            Msg::LoraAdmin(admin) => {
+                self.lora_lib.admin = Some(admin);
+                if !admin {
+                    self.log.info("lora library: this account is not an admin — downloads hidden");
+                }
+            }
+            Msg::DownloadTargets { kind, targets } => {
+                if let Some(sheet) = self.download_sheet.as_mut()
+                    && sheet.kind == kind
+                {
+                    // One root means there is nothing to choose; more than one (checkpoints have
+                    // three) must stay visible — the wrong root hides the file from the loader.
+                    if sheet.root.is_empty()
+                        && let Some(first) = targets.roots.first()
+                    {
+                        sheet.root = first.id.clone();
+                    }
+                    sheet.targets = Some(targets);
+                }
+            }
+            Msg::DownloadVersions { kind, found } => {
+                if let Some(sheet) = self.download_sheet.as_mut()
+                    && sheet.kind == kind
+                {
+                    sheet.busy = false;
+                    sheet.error.clear();
+                    if found.versions.is_empty() && found.selected_version_id.is_none() {
+                        sheet.error = "No versions found for that link".into();
+                    }
+                    sheet.found = Some(found);
+                }
+            }
+            Msg::DownloadStarted { id, label } => {
+                if let Some(sheet) = self.download_sheet.as_mut() {
+                    sheet.busy = false;
+                    sheet.error.clear();
+                    sheet.paste.clear();
+                    sheet.found = None;
+                }
+                self.note = format!("Downloading {label}");
+                self.downloads.retain(|d| d.id != id);
+                self.downloads.push(ActiveDownload {
+                    id,
+                    label,
+                    status: "pending".into(),
+                    progress: 0.0,
+                    bytes: 0,
+                    total: 0,
+                    bps: 0.0,
+                    message: None,
+                    pending_since: None,
+                });
+                // Poll promptly rather than waiting out the timer.
+                self.downloads_poll_at = 0.0;
+            }
+            Msg::DownloadProgress { id, progress } => {
+                let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) else { return };
+                let was_terminal = d.state().is_terminal();
+                d.status = progress.status.clone();
+                d.progress = progress.progress;
+                d.bytes = progress.bytes_downloaded;
+                d.total = progress.total_bytes;
+                d.bps = progress.bytes_per_second;
+                d.message = progress.message.clone();
+                if d.state() != DownloadStatus::Pending {
+                    d.pending_since = None;
+                }
+                if !was_terminal && d.state().is_terminal() {
+                    let (label, failed) = (d.label.clone(), d.state() == DownloadStatus::Failed);
+                    let why = d.message.clone();
+                    if failed {
+                        self.report_error(
+                            "Download failed",
+                            why.unwrap_or_else(|| format!("{label} didn't finish")),
+                        );
+                    } else {
+                        self.note = format!("{label} downloaded");
+                        // The library and the Create picker both list what's installed; a finished
+                        // download changes that, so re-read rather than showing a stale set.
+                        self.reload_lora_library();
+                        if let Some(engine) = self.engine.as_ref() {
+                            engine.fetch_lora_catalog();
+                        }
+                    }
+                }
+            }
+            Msg::DownloadError(e) => {
+                if let Some(sheet) = self.download_sheet.as_mut() {
+                    sheet.busy = false;
+                    sheet.error = e.clone();
+                } else {
+                    self.status = e.clone();
+                }
+                self.log.warn(format!("download: {e}"));
+            }
             Msg::CheckpointCatalog(catalog) => {
                 // Feed base tags into the LoRA filter map (file + basename keys).
                 for e in &catalog.checkpoints {
@@ -2673,9 +3015,8 @@ impl ComfyApp {
                 }
             }
             Msg::Status(s) => self.status = s,
-            // Neither a preview nor a finished result opens the Output window: it's a floating
-            // window over the pane being edited, and popping it up mid-edit steals the screen. The
-            // launcher strip counts what arrived instead (`output_unseen`).
+            // A result landing is quiet on the Create pane: it goes to the server gallery, and
+            // the Gallery nav icon's unseen badge is what says "there's something new".
             Msg::Preview(ci) => {
                 self.preview = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR));
             }
@@ -2683,8 +3024,8 @@ impl ComfyApp {
                 self.result_seq = self.result_seq.wrapping_add(1);
                 let name = format!("result-{}", self.result_seq);
                 let tex = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
-                // Taste-test images belong to the wizard's blind grid, not the results strip.
-                // If the wizard closed mid-run they fall through and show up like a normal run.
+                // Taste-test images belong to the wizard's blind grid. If the wizard closed
+                // mid-run they fall through and show up like a normal run.
                 if self.wizard_take_test_image(&label, &tex) {
                     self.preview = None;
                 } else {
@@ -2693,9 +3034,6 @@ impl ComfyApp {
                     self.results.push((tex, bytes));
                     self.preview = None;
                     self.note.clear();
-                    if !self.output_open {
-                        self.output_unseen = self.output_unseen.saturating_add(1);
-                    }
                 }
             }
             Msg::NodeExecuting(node) => {
@@ -2956,6 +3294,7 @@ impl ComfyApp {
                             .filter(|it| !seen.contains(&(it.subfolder.clone(), it.filename.clone()))),
                     );
                 }
+                self.note_unseen();
                 if self.triage_collect > 0 && page.offset == 0 {
                     self.triage_collect -= 1;
                     // `collect_untriaged` drains `pre_burst_keys`; only the collect that still has it
@@ -3508,8 +3847,6 @@ impl ComfyApp {
             self.progress = (0, 0);
             self.preview = None;
             self.results.clear();
-            self.output_unseen = 0;
-            self.result_view = None;
             self.run_total = 0;
             self.run_seen.clear();
         }
@@ -3578,8 +3915,6 @@ impl ComfyApp {
             self.progress = (0, 0);
             self.preview = None;
             self.results.clear();
-            self.output_unseen = 0;
-            self.result_view = None;
             self.run_total = 0;
             self.run_seen.clear();
         }
@@ -3925,6 +4260,89 @@ impl ComfyApp {
                 host.haptic(Haptic::Error);
             }
         }
+    }
+
+    /// The mirror of [`Self::open_create_as_graph`]: read the active graph tab's nodes into the
+    /// Create params and switch to the Create tab.
+    ///
+    /// The graph is scraped through the same reader Remix uses on a gallery image's embedded
+    /// workflow, so an arbitrary node graph — a server workflow, one opened from a gallery image,
+    /// or one built by hand — lands on the Create tab with its model, prompts, LoRAs and sampler
+    /// settings filled in. It goes through [`uiwf::convert`] to the API shape first rather than
+    /// scraping the UI export directly: conversion splices out bypassed nodes and resolves
+    /// SetNode/GetNode and subgraphs, so a bypassed LoRA doesn't come back as an active one.
+    ///
+    /// Only what Create can *hold* comes over; anything else in the graph (custom nodes, extra
+    /// samplers, post-processing chains) stays in the tab, which is left untouched and still
+    /// queueable from the Graph tab.
+    ///
+    /// Deliberately does NOT make this tab Create's linked graph. The link is a two-way sync, and
+    /// its push half ([`Self::push_create_to_linked_graph`]) *replaces* the tab's workflow with a
+    /// Create-built one on the next param edit — correct for the `create.json` scratch tab Create
+    /// authored itself, destructive for a workflow the user built or downloaded.
+    fn open_graph_in_create(&mut self, host: &Host) {
+        let Some(schemas) = self.schemas.clone() else {
+            self.graph_status = "Connect to the server first".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let Some(doc) = self.active_doc() else {
+            self.graph_status = "No workflow open".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        if doc.is_empty() {
+            self.graph_status = "This tab has no nodes".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let title = doc.title();
+        let exported = doc.view.export_ui(&doc.graph, schemas.as_ref(), &doc.bypassed, &doc.seed_randomize);
+        // Fall back to reading the UI export directly if conversion fails — a graph with an
+        // unknown node still usually carries a readable checkpoint and prompt.
+        let (meta, warnings) = match crate::uiwf::convert(&exported, &schemas) {
+            Ok(converted) => match serde_json::to_value(&converted.workflow) {
+                Ok(api) => (gallery::parse_workflow_meta_value(&api), converted.warnings),
+                Err(e) => {
+                    self.log.warn(format!("open in create: serialize api workflow: {e}"));
+                    (gallery::parse_workflow_meta_value(&exported), Vec::new())
+                }
+            },
+            Err(e) => {
+                self.log.warn(format!("open in create: convert: {e}"));
+                (gallery::parse_workflow_meta_value(&exported), Vec::new())
+            }
+        };
+        if meta.is_empty() {
+            self.graph_status =
+                "Couldn't read this graph — no checkpoint, prompt or sampler found".into();
+            self.log.warn(format!("open in create: nothing readable in {title}"));
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        // Same repair Remix does: the scraped encoder / VAE names are whatever the graph's author
+        // had installed, so re-point them at this server's files before Create trusts them.
+        self.apply_image_meta(&meta);
+        if self.params.model_kind.needs_companions() {
+            self.resolve_companions(Companions::Repair);
+        }
+        // The graph names the seed it used; reproducing it is the point of importing.
+        if meta.seed.is_some() {
+            self.params.randomize_seed = false;
+        }
+        self.selected_preset.clear();
+
+        self.tab = Tab::Generate;
+        self.create_pane = CreatePane::Main;
+        self.graph_status.clear();
+        // Name what did NOT come across, so a graph with more in it than Create can hold doesn't
+        // look like it imported whole.
+        self.note = if warnings.is_empty() {
+            format!("Filled Create from {title}")
+        } else {
+            format!("Filled Create from {title} — {} node(s) didn't convert", warnings.len())
+        };
+        host.haptic(Haptic::Success);
     }
 
     /// Rebuild the Create-linked graph from current params (no tab switch).
@@ -4584,23 +5002,6 @@ impl ComfyApp {
         }
     }
 
-    fn save_result_at(&mut self, host: &Host, idx: usize) {
-        let bytes = match self.results.get(idx) {
-            Some((_, b)) => b.clone(),
-            None => match self.result_bytes.clone() {
-                Some(b) => b,
-                None => return,
-            },
-        };
-        self.save_counter += 1;
-        let name = if self.results.len() > 1 {
-            format!("output-{}-{}.png", self.save_counter, idx + 1)
-        } else {
-            format!("output-{}.png", self.save_counter)
-        };
-        self.note = self.save_bytes(host, &bytes, &name);
-    }
-
     fn settings_path(host: &Host) -> Option<String> {
         host.documents_dir().map(|d| format!("{d}/comfyui_settings.json"))
     }
@@ -4667,24 +5068,24 @@ impl ComfyApp {
             #[cfg(feature = "local-npu")]
             local_npu: self.local_npu,
             #[cfg(not(feature = "local-npu"))]
-            local_npu: false,
+            local_npu: self.local_npu_passthrough.local_npu,
             #[cfg(feature = "local-npu")]
             auto_tag: self.auto_tag,
             #[cfg(not(feature = "local-npu"))]
-            auto_tag: false,
+            auto_tag: self.local_npu_passthrough.auto_tag,
             cache_prefetch: self.cache_prefetch,
             #[cfg(feature = "local-npu")]
             local_backend: self.local_backend,
             #[cfg(not(feature = "local-npu"))]
-            local_backend: Default::default(),
+            local_backend: self.local_npu_passthrough.local_backend,
             #[cfg(feature = "local-npu")]
             local_pack: self.local_pack.clone(),
             #[cfg(not(feature = "local-npu"))]
-            local_pack: String::new(),
+            local_pack: self.local_npu_passthrough.local_pack.clone(),
             #[cfg(feature = "local-npu")]
             local_use_server: self.local_use_server,
             #[cfg(not(feature = "local-npu"))]
-            local_use_server: false,
+            local_use_server: self.local_npu_passthrough.local_use_server,
             prompt_history: self.prompt_history.clone(),
             character_denied: self.character_denied.clone(),
             character_suggestions: self.character_suggestions.clone(),
@@ -4702,6 +5103,23 @@ impl ComfyApp {
             },
             model_overrides: self.model_overrides.clone(),
             lora_overrides: self.lora_overrides.clone(),
+            gallery_seen_at: self.gallery_seen_at,
+            // Terminal rows are session-only: a finished download is news once, and the gate
+            // forgets the outcome after an hour anyway (after which it reads as `pending` again,
+            // which a restored row would then time out and mislabel as failed).
+            downloads: self
+                .downloads
+                .iter()
+                .filter(|d| !d.state().is_terminal())
+                .cloned()
+                .collect(),
+            // Sorted: the autosave diffs the serialized string, and HashSet iteration order would
+            // otherwise look like a change on every pass and write the file once a second.
+            gallery_unseen: {
+                let mut v: Vec<String> = self.gallery_unseen.iter().cloned().collect();
+                v.sort();
+                v
+            },
         };
         serde_json::to_string_pretty(&settings).ok()
     }
@@ -4771,6 +5189,10 @@ impl ComfyApp {
             .map(|t| ((t.subfolder, t.filename), Deleted { size: t.size, at: t.at }))
             .collect();
         self.prune_tombstones();
+        self.gallery_seen_at = saved.gallery_seen_at;
+        // Re-attach to transfers that were still running when the app closed.
+        self.downloads = saved.downloads;
+        self.gallery_unseen = saved.gallery_unseen.into_iter().collect();
         self.create_setup_open = saved.create_setup_open;
         self.create_companions_open = saved.create_companions_open;
         self.prompt_history = saved.prompt_history;
@@ -4790,6 +5212,16 @@ impl ComfyApp {
             self.local_backend = saved.local_backend;
             self.local_pack = saved.local_pack;
             self.local_use_server = saved.local_use_server;
+        }
+        #[cfg(not(feature = "local-npu"))]
+        {
+            self.local_npu_passthrough = LocalNpuSaved {
+                local_npu: saved.local_npu,
+                auto_tag: saved.auto_tag,
+                local_backend: saved.local_backend,
+                local_pack: saved.local_pack,
+                local_use_server: saved.local_use_server,
+            };
         }
         if let Some(json) = saved.workflow_json.filter(|s| !s.trim().is_empty()) {
             self.restore_workflow = Some((saved.workflow_name, json));
@@ -5059,6 +5491,8 @@ impl ComfyApp {
     fn settings_server_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
         crate::theme::scroll_vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(4.0);
+            // First, because a pending update is the one thing here worth acting on immediately.
+            self.app_update_section(ui, host);
             egui::CollapsingHeader::new(format!("{} Server", icons::LINK))
                 .id_salt("settings_server")
                 .default_open(true)
@@ -5897,7 +6331,7 @@ impl ComfyApp {
     /// the Raw opt-out and engine note.
     fn positive_prompt_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.prompt_field_ui(ui, PromptField::Positive, "Prompt", Some(host));
-        ui.horizontal(|ui| self.dup_fix_chip_ui(ui));
+        self.dup_fix_chip_ui(ui);
         self.rewrite_controls(ui);
     }
 
@@ -5929,13 +6363,6 @@ impl ComfyApp {
     #[cfg(not(feature = "local-npu"))]
     fn device_rewrite_busy(&self) -> bool {
         false
-    }
-
-    /// Which engine the rewrite button will use, per the Settings choice and what's available —
-    /// the *primary* one in Auto. `None` means nothing can run; see
-    /// [`Self::rewrite_unavailable_reason`].
-    fn active_rewrite_engine(&self) -> Option<RewriteEngine> {
-        self.rewrite_engine.resolve(self.server_rewrite_ok(), self.device_rewrite_ok())
     }
 
     /// `(offer comfy-gate, offer on-device)` in the rewrite row. Auto offers every engine that can
@@ -5970,96 +6397,91 @@ impl ComfyApp {
         }
     }
 
-    /// Expand / Variations / Rewrite, drawn inline in the positive prompt's header row. Which
-    /// engines appear is the Settings choice and what can run right now; the cloud icon marks the
-    /// server engine and the bare Rewrite menu is the on-device one.
+    /// The positive prompt row's ☰ menu: Expand / Variations on comfy-gate plus the on-device
+    /// rewrite targets, all behind one button so the header row stays short. Which items appear is
+    /// the Settings choice and what can run right now; the cloud icon marks the server engine.
     fn rewrite_buttons_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
-        let video = self.params.mode == Mode::Video;
         let (show_server, show_device) = self.rewrite_controls_shown();
+        if !show_server && !show_device {
+            // Kept as a visible disabled button rather than folded away: it is the only thing that
+            // says *why* there is no rewriter, and the reason line under the field is gone now.
+            let reason = self.rewrite_unavailable_reason();
+            ui.add_enabled(false, egui::Button::new(format!("{} Rewrite", icons::MENU)))
+                .on_hover_text(reason);
+            return;
+        }
+        let video = self.params.mode == Mode::Video;
         let busy = self.expand_review.as_ref().is_some_and(|r| !r.done);
+        let vbusy = self.variations_review.as_ref().is_some_and(|r| !r.done);
+        let dbusy = self.device_rewrite_busy();
         let (_, dialect) = self.expand_dialect();
-        if show_server {
-            let hover = if video {
-                "Rewrite this terse prompt into full video prose on comfy-gate".to_string()
-            } else {
-                format!("Rewrite this terse prompt for {dialect} on comfy-gate")
-            };
-            if ui
-                .add_enabled(!busy, egui::Button::new(format!("{} Expand", icons::CLOUD)))
-                .on_hover_text(hover)
-                .clicked()
-            {
-                self.start_expand(ui.ctx(), host);
-            }
-            if busy {
-                ui.add(egui::Spinner::new());
-            }
-            // Alternatives rather than a rewrite: one axis deliberately changed per option.
-            // Server-only — the on-device pack has no equivalent.
-            if !self.variations_unsupported {
-                let vbusy = self.variations_review.as_ref().is_some_and(|r| !r.done);
+        // Opens downward: the prompt header sits near the top of a scrolling pane, so an upward
+        // popup would have nowhere to go.
+        down_menu(ui, format!("{} Rewrite", icons::MENU), |ui| {
+            crate::theme::menu_row_style(ui);
+            ui.set_min_width(220.0);
+            if show_server {
+                let hover = if video {
+                    "Rewrite this terse prompt into full video prose on comfy-gate".to_string()
+                } else {
+                    format!("Rewrite this terse prompt for {dialect} on comfy-gate")
+                };
                 if ui
-                    .add_enabled(!vbusy, egui::Button::new(format!("{} Variations", icons::STAR)))
-                    .on_hover_text(
-                        "Ask comfy-gate for alternative prompts — each changes one thing \
-                         (setting, pose, lighting…) and keeps the rest",
-                    )
+                    .add_enabled(!busy, egui::Button::new(format!("{} Expand", icons::CLOUD)))
+                    .on_hover_text(hover)
                     .clicked()
+                {
+                    self.start_expand(ui.ctx(), host);
+                }
+                // Alternatives rather than a rewrite: one axis deliberately changed per option.
+                // Server-only — the on-device pack has no equivalent.
+                if !self.variations_unsupported
+                    && ui
+                        .add_enabled(
+                            !vbusy,
+                            egui::Button::new(format!("{} Variations", icons::STAR)),
+                        )
+                        .on_hover_text(
+                            "Ask comfy-gate for alternative prompts — each changes one thing \
+                             (setting, pose, lighting…) and keeps the rest",
+                        )
+                        .clicked()
                 {
                     self.start_variations(ui.ctx(), host);
                 }
-                if vbusy {
-                    ui.add(egui::Spinner::new());
-                }
             }
-        }
-        if show_device {
-            self.rewrite_menu_ui(ui, host);
-            // The menu's own spinner is only visible while the menu is open; a CPU rewrite
-            // takes long enough that the row needs to show it too.
-            if self.device_rewrite_busy() {
-                ui.add(egui::Spinner::new());
+            if show_server && show_device {
+                ui.separator();
             }
-        }
-        if !show_server && !show_device {
-            let reason = self.rewrite_unavailable_reason();
-            ui.add_enabled(false, egui::Button::new(format!("{} Rewrite", icons::GENERATE)))
-                .on_hover_text(reason);
+            if show_device {
+                self.rewrite_menu_items(ui, host);
+            }
+        });
+        // A closed menu hides its own spinner, and an expand or a CPU rewrite runs for many
+        // seconds — the row has to carry the "something is running" signal.
+        if busy || vbusy || dbusy {
+            ui.add(egui::Spinner::new());
         }
     }
 
-    /// Under the positive field: the video-only **Raw** opt-out and the note naming whichever
-    /// engine [`Self::rewrite_buttons_ui`] will run. Raw is independent of that choice — it opts the
-    /// queued prompt out of comfy-gate's *queue-time* expander, which runs on video regardless of
-    /// who wrote the text.
+    /// Under the positive field: the video-only **Raw** opt-out. Raw is independent of which
+    /// rewrite engine the ☰ menu runs — it opts the queued prompt out of comfy-gate's *queue-time*
+    /// expander, which runs on video regardless of who wrote the text.
+    ///
+    /// The per-engine explanation lines that used to live here are gone; what each item does is on
+    /// the menu item itself, and the engine choice is described in Settings → Prompt rewriting.
     fn rewrite_controls(&mut self, ui: &mut egui::Ui) {
-        let video = self.params.mode == Mode::Video;
-        let active = self.active_rewrite_engine();
-        let (_, dialect) = self.expand_dialect();
-        if video {
+        if self.params.mode != Mode::Video {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut self.params.raw_prompt, "Raw")
                 .on_hover_text("Submit verbatim — skip comfy-gate's automatic queue-time expander");
-        }
-        match active {
-            // The queue-time expander is comfy-gate's, not the rewrite button's: it runs on video
-            // whichever engine wrote the text, so this line stands for both engines.
-            _ if video => ui.weak(
-                "Auto-expanded at queue time. Keep it terse: triggers, then 2-3 short action \
-                 phrases. Over 500 chars or Raw skips it.",
-            ),
-            Some(RewriteEngine::Device) => ui.weak(
-                "Rewritten on this phone by the local pack — no server round-trip. Pick the target \
-                 style from the menu.",
-            ),
-            Some(RewriteEngine::Server) => ui.weak(format!(
-                "Image prompts are never rewritten at queue time. Expand rewrites a terse idea \
-                 for {dialect} on the server — accept it or discard it."
-            )),
-            _ => ui.weak(format!(
-                "{} — change it in Settings → Prompt rewriting.",
-                self.rewrite_unavailable_reason()
-            )),
-        };
+            ui.weak(
+                "Video prompts are auto-expanded at queue time. Keep it terse: triggers, then \
+                 2-3 short action phrases. Over 500 chars or Raw skips it.",
+            );
+        });
     }
 
     /// What to send as `/api/expand`'s `dialect`, plus a human label for the button/modal.
@@ -6648,28 +7070,44 @@ impl ComfyApp {
     /// Older / newer prompt-history buttons plus the position counter while scrubbing. The live
     /// draft is stashed as the newest slot, so stepping forward to it restores the draft; a manual
     /// edit detaches.
-    fn hist_nav_ui(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// Drawn on both prompt fields off one shared scrubber: a history entry is a positive/negative
+    /// *pair*, so stepping from either field moves both. `field` only salts the widget ids, since
+    /// the same buttons are built twice in a frame.
+    fn hist_nav_ui(&mut self, ui: &mut egui::Ui, field: PromptField) {
         if !self.hist_nav_prep() {
             return;
         }
         let total = self.prompt_history.len() + 1;
         let cur = if self.hist_stash.is_some() { self.hist_slider.clamp(1, total) } else { total };
-        if ui
-            .add_enabled(cur > 1, egui::Button::new(icons::BACK))
-            .on_hover_text("Older prompt")
-            .clicked()
-        {
-            self.scrub_to(ui.ctx(), cur - 1, total);
-        }
-        if ui
-            .add_enabled(cur < total, egui::Button::new(icons::FORWARD))
-            .on_hover_text("Newer prompt")
-            .clicked()
-        {
-            self.scrub_to(ui.ctx(), cur + 1, total);
-        }
-        if self.hist_stash.is_some() {
-            ui.weak(format!("{cur}/{total}"));
+        // Salted per field: both rows build the same two buttons in the same frame, and egui's
+        // positional auto-ids would only stay distinct as long as the two rows keep their current
+        // separate layout scopes.
+        let step = ui
+            .push_id(("hist_nav", field.disc()), |ui| {
+                let mut step: Option<usize> = None;
+                if ui
+                    .add_enabled(cur > 1, egui::Button::new(icons::BACK))
+                    .on_hover_text("Older prompt")
+                    .clicked()
+                {
+                    step = Some(cur - 1);
+                }
+                if ui
+                    .add_enabled(cur < total, egui::Button::new(icons::FORWARD))
+                    .on_hover_text("Newer prompt")
+                    .clicked()
+                {
+                    step = Some(cur + 1);
+                }
+                if self.hist_stash.is_some() {
+                    ui.weak(format!("{cur}/{total}"));
+                }
+                step
+            })
+            .inner;
+        if let Some(val) = step {
+            self.scrub_to(ui.ctx(), val, total);
         }
     }
 
@@ -6710,8 +7148,8 @@ impl ComfyApp {
         self.prompt_field_ui(ui, PromptField::Negative, "Negative", None);
     }
 
-    /// One prompt field: a `label` + chip-view toggle (+ history nav and the rewrite buttons on
-    /// positive), then the editor. `host` is only needed for those buttons.
+    /// One prompt field: a `label` + chip-view toggle, the shared history scrubber, and (positive
+    /// only) the rewrite menu, then the editor. `host` is only needed for that menu.
     fn prompt_field_ui(
         &mut self,
         ui: &mut egui::Ui,
@@ -6730,11 +7168,11 @@ impl ComfyApp {
             {
                 self.set_field_chips(field, !on);
             }
-            if field == PromptField::Positive {
-                self.hist_nav_ui(ui);
-                if let Some(host) = host {
-                    self.rewrite_buttons_ui(ui, host);
-                }
+            self.hist_nav_ui(ui, field);
+            // `host` is Some only for the positive field, which is what keeps the rewrite menu
+            // positive-only — there is nothing to rewrite a negative prompt into.
+            if let Some(host) = host {
+                self.rewrite_buttons_ui(ui, host);
             }
         });
         self.prompt_editor_body(ui, field);
@@ -6991,17 +7429,24 @@ impl ComfyApp {
         self.lint_issues = lint::lint(&self.params, ckpt, &loras);
     }
 
-    /// One wrapped row of lint chips; a fixable issue applies its fix on tap.
-    /// The duplicate-tags fix as an inline chip beside Rewrite (skipped by the lint row below).
+    /// The duplicate-tags fix, as a chip on its own row under the positive field (skipped by the
+    /// lint row below). Owns its row so nothing is allocated in the common case of no duplicates —
+    /// it stays inline rather than moving into the prompt row's menu because it only exists when
+    /// there IS something to fix, and a one-tap fix shouldn't cost two.
     fn dup_fix_chip_ui(&mut self, ui: &mut egui::Ui) {
         self.refresh_lint();
         let dup = self.lint_issues.iter().find(|i| i.msg.contains("uplicate"));
         let Some(fix) = dup.and_then(|i| i.fix.clone()) else { return };
-        if ui.button("Dedupe tags").on_hover_text("Remove duplicate tags from the prompt").clicked()
-        {
-            self.apply_fix(fix);
-            self.lint_fp = 0;
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .button("Dedupe tags")
+                .on_hover_text("Remove duplicate tags from the prompt")
+                .clicked()
+            {
+                self.apply_fix(fix);
+                self.lint_fp = 0;
+            }
+        });
     }
 
     fn lint_chips_ui(&mut self, ui: &mut egui::Ui) {
@@ -9161,7 +9606,6 @@ impl ComfyApp {
         self.progress = (0, 0);
         self.preview = None;
         self.results.clear();
-        self.result_view = None;
         // Submit in shuffled order: the setup screen just showed the lineup, and a FIFO server
         // hands results back in submission order — an unshuffled grid would be readable, not
         // blind. Candidate indices stay bound through the labels; only the order is scrambled.
@@ -10435,10 +10879,1144 @@ impl ComfyApp {
         self.lora_catalog.bases_for_checkpoint(checkpoint)
     }
 
+    /// One LoRA, full pane. Read-only: this is a library browser, and every write the gate exposes
+    /// beyond downloading is admin-only and better done at a keyboard.
+    fn lora_detail_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let Some(d) = self.lora_lib.detail.clone() else { return };
+        let mut close = false;
+        // Android Back returns to the grid rather than leaving the tab.
+        if ui.ctx().input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
+        }) {
+            close = true;
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add(egui::Button::new(icons::BACK).min_size(egui::vec2(40.0, 32.0)))
+                .on_hover_text("Back to the library")
+                .clicked()
+            {
+                close = true;
+            }
+            let name = if d.item.name.is_empty() { &d.item.file_name } else { &d.item.name };
+            ui.strong(sanitize_ui_text(ui, &elide(name, 32)));
+        });
+        ui.separator();
+
+        crate::theme::scroll_vertical().id_salt("lora-detail-scroll").auto_shrink([false, false]).show(
+            ui,
+            |ui| {
+                let key = d.item.thumb_key(LORA_THUMB_PX);
+                if let Some(tex) = self.thumbs.get(&key) {
+                    let avail = ui.available_width().min(360.0);
+                    let sized = egui::load::SizedTexture::from_handle(tex);
+                    ui.add(egui::Image::new(sized).max_size(egui::vec2(avail, avail)).corner_radius(6.0));
+                }
+                ui.add_space(6.0);
+                // Facts first: where it is, what it's for, how big.
+                wrap_meta(ui, "File", &d.item.file_name);
+                wrap_meta(ui, "Folder", d.item.folder_label());
+                if !d.relative_path.is_empty() {
+                    // Display only — every operation keys on the sha256, never on a path.
+                    wrap_meta(ui, "Path", &d.relative_path);
+                }
+                if !d.item.base_model.is_empty() {
+                    wrap_meta(ui, "Base model", &d.item.base_model);
+                }
+                wrap_meta(ui, "Size", &format_bytes(d.item.size_bytes));
+                if d.item.usage_count > 0 {
+                    wrap_meta(ui, "Used", &format!("{} times", d.item.usage_count));
+                }
+                if let Some(v) = d.civitai_version_name.as_deref().filter(|v| !v.is_empty()) {
+                    wrap_meta(ui, "Version", v);
+                }
+                if d.item.update_available {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            crate::theme::AQUA,
+                            format!("{} A newer version exists on Civitai", icons::DOT),
+                        );
+                    });
+                }
+
+                if !d.trigger_words.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label("Trigger words");
+                    ui.horizontal_wrapped(|ui| {
+                        for w in &d.trigger_words {
+                            if crate::theme::selectable_label(ui, false, w).clicked() {
+                                // The one genuinely useful action here: get it into the prompt.
+                                // `merge_triggers` is the same de-duplicating append the LoRA
+                                // picker uses, so tapping twice doesn't double the word.
+                                let neg = self.params.negative.clone();
+                                let added =
+                                    merge_triggers(&mut self.params.positive, w, &neg);
+                                self.note_prompt_edited();
+                                self.note = if added.is_empty() {
+                                    format!("\"{w}\" is already in the prompt")
+                                } else {
+                                    format!("Added \"{w}\" to the prompt")
+                                };
+                                host.haptic(Haptic::Light);
+                            }
+                        }
+                    });
+                    ui.weak("Tap a trigger to append it to the positive prompt.");
+                }
+
+                if !d.item.tags.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label("Tags");
+                    ui.horizontal_wrapped(|ui| {
+                        for t in &d.item.tags {
+                            ui.weak(format!("#{t}"));
+                        }
+                    });
+                }
+
+                if !d.notes.trim().is_empty() {
+                    ui.add_space(6.0);
+                    ui.label("Notes");
+                    ui.weak(sanitize_ui_text(ui, d.notes.trim()));
+                }
+
+                // Civitai ships HTML here; render it as text rather than leaking markup.
+                if let Some(desc) = d.description.as_deref().filter(|s| !s.trim().is_empty()) {
+                    ui.add_space(6.0);
+                    egui::CollapsingHeader::new("Description").id_salt("lora-desc").show(ui, |ui| {
+                        let text = strip_simple_html(desc);
+                        ui.weak(sanitize_ui_text(ui, elide(&text, 4000).as_str()));
+                    });
+                }
+
+                if let Some(url) = d.civitai_url.as_deref().filter(|u| !u.is_empty()) {
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button(format!("{} Open on Civitai", icons::LINK)).clicked() {
+                            host.open_url(url.to_string());
+                        }
+                        if ui.small_button("Copy link").clicked() {
+                            ui.ctx().copy_text(url.to_string());
+                            self.note = "Link copied".into();
+                        }
+                    });
+                }
+                ui.add_space(16.0);
+            },
+        );
+
+        if close {
+            self.lora_lib.detail = None;
+        }
+    }
+
+    /// A compact row per running download, above the grid. Kept until dismissed — `completed` is
+    /// the only signal the file is actually usable.
+    fn downloads_strip(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let mut cancel: Option<String> = None;
+        let mut dismiss: Option<String> = None;
+        for d in self.downloads.clone() {
+            ui.horizontal_wrapped(|ui| {
+                let state = d.state();
+                match state {
+                    DownloadStatus::Completed => {
+                        ui.colored_label(crate::theme::AQUA, icons::CHECK);
+                    }
+                    DownloadStatus::Failed => {
+                        ui.colored_label(ui.visuals().error_fg_color, icons::WARN);
+                    }
+                    _ => {
+                        ui.spinner();
+                    }
+                }
+                ui.strong(elide(&d.label, 22));
+                match state {
+                    DownloadStatus::Progress => {
+                        let frac = (d.progress / 100.0).clamp(0.0, 1.0);
+                        let speed = if d.bps > 0.0 {
+                            format!("  {}/s", format_bytes(d.bps as u64))
+                        } else {
+                            String::new()
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_width(120.0)
+                                .desired_height(12.0)
+                                .text(format!("{:.0}%{speed}", d.progress)),
+                        );
+                    }
+                    DownloadStatus::Pending => {
+                        ui.weak("waiting for the server…");
+                    }
+                    DownloadStatus::Completed => {
+                        ui.weak(format_bytes(d.total.max(d.bytes)));
+                    }
+                    DownloadStatus::Failed => {
+                        ui.weak(elide(d.message.as_deref().unwrap_or("failed"), 40));
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if state.is_terminal() {
+                        if ui.small_button(icons::CLOSE).on_hover_text("Dismiss").clicked() {
+                            dismiss = Some(d.id.clone());
+                        }
+                    } else if self.lora_lib.admin.unwrap_or(false)
+                        && ui.small_button(icons::STOP).on_hover_text("Cancel").clicked()
+                    {
+                        cancel = Some(d.id.clone());
+                    }
+                });
+            });
+        }
+        if let Some(id) = cancel {
+            if let Some(engine) = self.engine.as_ref() {
+                engine.download_cancel(id.clone());
+            }
+            if let Some(d) = self.downloads.iter_mut().find(|d| d.id == id) {
+                d.status = "failed".into();
+                d.message = Some("Cancelled".into());
+            }
+            host.haptic(Haptic::Warning);
+        }
+        if let Some(id) = dismiss {
+            self.downloads.retain(|d| d.id != id);
+        }
+        ui.separator();
+    }
+
+    fn open_download_sheet(&mut self, kind: DownloadKind, host: &Host) {
+        self.download_sheet = Some(DownloadSheet {
+            kind,
+            paste: String::new(),
+            targets: None,
+            root: String::new(),
+            folder: String::new(),
+            new_folder: String::new(),
+            found: None,
+            busy: false,
+            error: String::new(),
+        });
+        if let Some(engine) = self.engine.as_ref() {
+            engine.download_targets(kind);
+        }
+        host.haptic(Haptic::Light);
+    }
+
+    /// Paste a Civitai link → pick a version → pick where it lands → start.
+    fn download_sheet_window(&mut self, ctx: &egui::Context, host: &Host, _pane: egui::Rect) {
+        if self.download_sheet.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut lookup = false;
+        let mut start: Option<(u64, String)> = None;
+        let mut switch_kind: Option<DownloadKind> = None;
+        if modal_shield(ctx, "download-sheet-shield") {
+            open = false;
+        }
+        centered(ctx, egui::Window::new("Download a model"))
+            .collapsible(false)
+            .open(&mut open)
+            .default_size([360.0, 460.0])
+            .show(ctx, |ui| {
+                let Some(sheet) = self.download_sheet.as_mut() else { return };
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak("Into");
+                    for kind in DownloadKind::ALL {
+                        if crate::theme::selectable_label(ui, sheet.kind == kind, kind.label())
+                            .clicked()
+                            && sheet.kind != kind
+                        {
+                            switch_kind = Some(kind);
+                        }
+                    }
+                });
+                ui.separator();
+
+                ui.label("Civitai link or model id");
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 84.0).max(120.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut sheet.paste)
+                            .hint_text("civitai.com/models/…")
+                            .desired_width(w),
+                    );
+                    if ui
+                        .add_enabled(!sheet.busy && !sheet.paste.trim().is_empty(),
+                            egui::Button::new("Look up"))
+                        .clicked()
+                    {
+                        lookup = true;
+                    }
+                });
+                // Pasting a link is the intended flow, and a long-press paste into a native
+                // TextEdit is fiddly on Android — so offer it as a button.
+                if ui.small_button("Paste from clipboard").clicked()
+                    && let Some(t) = host.clipboard_text()
+                {
+                    sheet.paste = t.trim().to_string();
+                }
+                if sheet.busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Asking Civitai…");
+                    });
+                }
+                if !sheet.error.is_empty() {
+                    ui.colored_label(
+                        ui.visuals().error_fg_color,
+                        format!("{} {}", icons::WARN, sheet.error),
+                    );
+                }
+
+                // Where it lands. Checkpoints genuinely have three roots and the wrong one hides
+                // the file from every loader, so the picker is only collapsed when there is one.
+                if let Some(t) = sheet.targets.clone() {
+                    ui.separator();
+                    if t.roots.len() > 1 {
+                        ui.label("Save to");
+                        ui.horizontal_wrapped(|ui| {
+                            for r in &t.roots {
+                                crate::theme::selectable_value(
+                                    ui,
+                                    &mut sheet.root,
+                                    r.id.clone(),
+                                    &r.id,
+                                );
+                            }
+                        });
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.weak("Folder");
+                        // A combo rather than a chip per folder: a real library has dozens, and as
+                        // buttons they wrapped into a wall that pushed the version list off-screen.
+                        let current = if sheet.folder.is_empty() {
+                            "Root".to_string()
+                        } else {
+                            elide(&sheet.folder, 24)
+                        };
+                        egui::ComboBox::from_id_salt("dl_folder")
+                            .selected_text(current)
+                            .width((ui.available_width() - 8.0).max(120.0))
+                            .show_ui(ui, |ui| {
+                                crate::theme::selectable_value(
+                                    ui,
+                                    &mut sheet.folder,
+                                    String::new(),
+                                    "Root",
+                                );
+                                // Not truncated: the whole point of the combo is that it scrolls.
+                                for f in t.folders.iter().filter(|f| !f.is_empty()) {
+                                    crate::theme::selectable_value(
+                                        ui,
+                                        &mut sheet.folder,
+                                        f.clone(),
+                                        elide(f, 40),
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.weak("or new");
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut sheet.new_folder)
+                                .hint_text("subfolder")
+                                .desired_width(140.0),
+                        );
+                        // Only while the field is non-empty, and cleared back to the combo's pick
+                        // when it is emptied — otherwise typing then deleting left `folder` stuck
+                        // on the half-typed name with the combo showing something else.
+                        if !sheet.new_folder.trim().is_empty() {
+                            sheet.folder = sheet.new_folder.trim().to_string();
+                        } else if resp.changed() {
+                            sheet.folder.clear();
+                        }
+                    });
+                }
+
+                // Versions. A link that named a version outright resolves to no list at all.
+                if let Some(found) = sheet.found.clone() {
+                    ui.separator();
+                    if let Some(vid) = found.selected_version_id {
+                        ui.weak("That link names one version.");
+                        if ui
+                            .add_enabled(!sheet.busy, egui::Button::new(format!("{} Download", icons::CLOUD)))
+                            .clicked()
+                        {
+                            start = Some((vid, format!("version {vid}")));
+                        }
+                    } else {
+                        ui.label(format!("{} versions", found.versions.len()));
+                        crate::theme::scroll_vertical()
+                            .id_salt("dl-versions")
+                            .max_height(220.0)
+                            .show(ui, |ui| {
+                                for v in &found.versions {
+                                    ui.group(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.strong(elide(&v.name, 26));
+                                            if !v.base_model.is_empty() {
+                                                ui.weak(elide(&v.base_model, 18));
+                                            }
+                                            ui.weak(format_bytes(v.size_bytes));
+                                        });
+                                        if !v.file_name.is_empty() {
+                                            ui.weak(elide(&v.file_name, 40));
+                                        }
+                                        // What to actually prompt with once it lands.
+                                        if !v.trained_words.is_empty() {
+                                            ui.weak(format!(
+                                                "triggers: {}",
+                                                elide(&v.trained_words.join(", "), 48)
+                                            ));
+                                        }
+                                        // Re-pulling gigabytes you already have is the likely misclick.
+                                        if v.exists_locally {
+                                            ui.weak(format!("{} Already installed", icons::CHECK));
+                                        } else {
+                                            if !v.is_public() {
+                                                ui.colored_label(
+                                                    ui.visuals().warn_fg_color,
+                                                    format!(
+                                                        "{} {} — early access; this will fail unless the server's Civitai account owns it",
+                                                        icons::WARN, v.availability
+                                                    ),
+                                                );
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !sheet.busy,
+                                                    egui::Button::new(format!("{} Download", icons::CLOUD)),
+                                                )
+                                                .clicked()
+                                            {
+                                                start = Some((v.id, v.name.clone()));
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                    }
+                }
+            });
+
+        if let Some(kind) = switch_kind {
+            if let Some(sheet) = self.download_sheet.as_mut() {
+                sheet.kind = kind;
+                sheet.targets = None;
+                sheet.root.clear();
+                sheet.folder.clear();
+                sheet.found = None;
+                sheet.error.clear();
+            }
+            if let Some(engine) = self.engine.as_ref() {
+                engine.download_targets(kind);
+            }
+        }
+        if lookup
+            && let Some(sheet) = self.download_sheet.as_mut()
+        {
+            sheet.busy = true;
+            sheet.error.clear();
+            sheet.found = None;
+            let (kind, paste) = (sheet.kind, sheet.paste.trim().to_string());
+            if let Some(engine) = self.engine.as_ref() {
+                engine.download_versions(kind, paste);
+            }
+        }
+        if let Some((vid, label)) = start
+            && let Some(sheet) = self.download_sheet.as_mut()
+        {
+            let (kind, root, folder) =
+                (sheet.kind, sheet.root.clone(), sheet.folder.clone());
+            sheet.busy = true;
+            sheet.error.clear();
+            if let Some(engine) = self.engine.as_ref() {
+                engine.download_start(kind, vid, root, folder, label);
+            }
+            host.haptic(Haptic::Medium);
+        }
+        if !open {
+            self.download_sheet = None;
+        }
+    }
+
+    /// The Library sub-tab, drawn as a pane takeover with its own scroll so the grid can recycle.
+    fn lora_library_pane(&mut self, ui: &mut egui::Ui, host: &Host, pane: egui::Rect) {
+        self.ensure_lora_library();
+
+        // Fixed header: the sub-tab row and the filter bar stay put while the grid scrolls.
+        self.lora_subtabs(ui);
+        if self.lora_pane != LoraPane::Library {
+            return;
+        }
+        // A tapped LoRA takes the whole pane; Back returns to the grid.
+        if self.lora_lib.detail.is_some() {
+            self.lora_detail_pane(ui, host);
+            return;
+        }
+        self.lora_filter_bar(ui, host);
+        if !self.downloads.is_empty() {
+            self.downloads_strip(ui, host);
+        }
+        if !self.lora_lib.status.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{} {}", icons::WARN, self.lora_lib.status),
+                );
+                if ui.small_button("Retry").clicked() {
+                    self.reload_lora_library();
+                }
+            });
+        }
+
+        let mut open_detail: Option<String> = None;
+        crate::theme::scroll_vertical()
+            .id_salt("lora-library-scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                open_detail = self.lora_library_grid(ui);
+                // Page in when the tail comes into view, rather than making the user tap.
+                if self.lora_lib.page > 0 && self.lora_lib.page < self.lora_lib.total_pages {
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        if self.lora_lib.loading {
+                            ui.spinner();
+                        } else if ui
+                            .button(format!(
+                                "Load more ({} of {})",
+                                self.lora_lib.items.len(),
+                                self.lora_lib.total
+                            ))
+                            .clicked()
+                        {
+                            self.lora_library_next_page();
+                        }
+                    });
+                } else if self.lora_lib.loading && self.lora_lib.items.is_empty() {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| ui.spinner());
+                } else if self.lora_lib.items.is_empty() && self.lora_lib.status.is_empty() {
+                    ui.add_space(20.0);
+                    ui.vertical_centered(|ui| {
+                        ui.weak(if self.lora_filters_active() {
+                            "Nothing matches those filters"
+                        } else {
+                            "No LoRAs in the server library"
+                        });
+                    });
+                }
+                ui.add_space(12.0);
+            });
+
+        if let Some(id) = open_detail {
+            self.lora_lib.detail_pending = Some(id.clone());
+            if let Some(engine) = self.engine.as_ref() {
+                engine.lora_detail(id);
+            }
+            host.haptic(Haptic::Light);
+        }
+        self.download_sheet_window(ui.ctx(), host, pane);
+    }
+
+    /// Active / Library selector — drawn identically whichever half is showing.
+    fn lora_subtabs(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            crate::theme::selectable_value(ui, &mut self.lora_pane, LoraPane::Active, "Active");
+            crate::theme::selectable_value(
+                ui,
+                &mut self.lora_pane,
+                LoraPane::Library,
+                format!("{} Library", icons::FOLDER),
+            );
+            if self.lora_pane == LoraPane::Library {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(icons::REFRESH))
+                        .on_hover_text("Re-read the library")
+                        .clicked()
+                    {
+                        if let Some(engine) = self.engine.as_ref() {
+                            engine.lora_facets();
+                        }
+                        self.reload_lora_library();
+                    }
+                    if self.lora_lib.total > 0 {
+                        ui.weak(format!("{} LoRAs", self.lora_lib.total));
+                    }
+                });
+            }
+        });
+        ui.separator();
+    }
+
+    fn lora_filters_active(&self) -> bool {
+        !self.lora_lib.search.is_empty()
+            || !self.lora_lib.folder.is_empty()
+            || !self.lora_lib.base_model.is_empty()
+            || !self.lora_lib.tag.is_empty()
+    }
+
+    /// Search box, the Download button, and a collapsible row of facet chips.
+    fn lora_filter_bar(&mut self, ui: &mut egui::Ui, host: &Host) {
+        let mut reload = false;
+        ui.horizontal(|ui| {
+            let submitted = ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.lora_lib.search_draft)
+                        .hint_text("Search the library")
+                        .desired_width(ui.available_width() - 132.0),
+                )
+                .lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // Committed on submit, not per keystroke — every character would be a round trip.
+            if submitted && self.lora_lib.search != self.lora_lib.search_draft {
+                self.lora_lib.search = self.lora_lib.search_draft.clone();
+                reload = true;
+            }
+            if !self.lora_lib.search.is_empty()
+                && ui.small_button(icons::CLOSE).on_hover_text("Clear search").clicked()
+            {
+                self.lora_lib.search.clear();
+                self.lora_lib.search_draft.clear();
+                reload = true;
+            }
+            let n_filters = self.lora_lib.filters_open;
+            if ui
+                .add(egui::Button::new(icons::SORT).selected(n_filters))
+                .on_hover_text("Filters and sorting")
+                .clicked()
+            {
+                self.lora_lib.filters_open = !self.lora_lib.filters_open;
+            }
+            // Downloads are an admin-only write; a non-admin gets no button rather than a 403.
+            if self.lora_lib.admin.unwrap_or(false)
+                && ui
+                    .add(egui::Button::new(format!("{} Get", icons::CLOUD)))
+                    .on_hover_text("Download a model from Civitai")
+                    .clicked()
+            {
+                self.open_download_sheet(DownloadKind::Lora, host);
+            }
+        });
+
+        if self.lora_lib.filters_open {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak("Sort");
+                for sort in LoraSort::ALL {
+                    if crate::theme::selectable_label(ui, self.lora_lib.sort == sort, sort.label())
+                        .clicked()
+                        && self.lora_lib.sort != sort
+                    {
+                        self.lora_lib.sort = sort;
+                        reload = true;
+                    }
+                }
+            });
+            // Facet chips are counted over the whole library, so they don't reshuffle as you page.
+            reload |= self.lora_facet_row(ui, "Folder", LoraFacetKind::Folder);
+            reload |= self.lora_facet_row(ui, "Base", LoraFacetKind::Base);
+            reload |= self.lora_facet_row(ui, "Tag", LoraFacetKind::Tag);
+            ui.horizontal_wrapped(|ui| {
+                ui.checkbox(&mut self.lora_lib.show_nsfw, "Show sensitive previews")
+                    .on_hover_text("Covered previews are the ones the server flagged as mature");
+            });
+            if self.lora_filters_active() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("Clear filters").clicked() {
+                        self.lora_lib.folder.clear();
+                        self.lora_lib.base_model.clear();
+                        self.lora_lib.tag.clear();
+                        self.lora_lib.search.clear();
+                        self.lora_lib.search_draft.clear();
+                        reload = true;
+                    }
+                });
+            }
+        }
+        ui.separator();
+        if reload {
+            self.reload_lora_library();
+        }
+    }
+
+    /// One wrapped row of facet chips. Returns true when the selection changed.
+    fn lora_facet_row(&mut self, ui: &mut egui::Ui, label: &str, kind: LoraFacetKind) -> bool {
+        let facets = match kind {
+            LoraFacetKind::Folder => self.lora_lib.facets.folders.clone(),
+            LoraFacetKind::Base => self.lora_lib.facets.base_models.clone(),
+            LoraFacetKind::Tag => self.lora_lib.facets.tags.clone(),
+        };
+        if facets.is_empty() {
+            return false;
+        }
+        let current = match kind {
+            LoraFacetKind::Folder => self.lora_lib.folder.clone(),
+            LoraFacetKind::Base => self.lora_lib.base_model.clone(),
+            LoraFacetKind::Tag => self.lora_lib.tag.clone(),
+        };
+        let mut picked: Option<String> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(label);
+            for f in facets.iter().take(LORA_FACET_CHIPS) {
+                let on = current == f.value;
+                let text = if f.value.is_empty() {
+                    format!("Root ({})", f.count)
+                } else {
+                    format!("{} ({})", elide(&f.value, 18), f.count)
+                };
+                if crate::theme::selectable_label(ui, on, text).clicked() {
+                    // Tapping the active chip clears it — a filter you can't turn off is a trap.
+                    picked = Some(if on { String::new() } else { f.value.clone() });
+                }
+            }
+        });
+        let Some(v) = picked else { return false };
+        match kind {
+            LoraFacetKind::Folder => self.lora_lib.folder = v,
+            LoraFacetKind::Base => self.lora_lib.base_model = v,
+            LoraFacetKind::Tag => self.lora_lib.tag = v,
+        }
+        true
+    }
+
+    /// The preview grid. Virtualized the same way the gallery pickers are: fixed-height rows, a
+    /// per-frame fetch budget, and `clip_rect().intersects` rather than `is_rect_visible` (which is
+    /// false for the whole viewport on any frame something called `request_discard`).
+    fn lora_library_grid(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        let mut open: Option<String> = None;
+        let (cols, tile) = Self::picker_grid_dims(ui);
+        let clip = ui.clip_rect();
+        let spacing_y = ui.spacing().item_spacing.y;
+        // Tile + a two-line caption.
+        let cell_h = tile + 34.0;
+        let row_h = cell_h + spacing_y;
+        let n = self.lora_lib.items.len();
+        let n_rows = n.div_ceil(cols.max(1));
+        let top = ui.cursor().top();
+        let first = ((((clip.top() - top) / row_h).floor()).max(0.0) as usize).min(n_rows);
+        // One row of overscan: a caption whose height depends on the cache would otherwise move
+        // the boundary between frames and thrash the row on and off screen.
+        let last = ((((clip.bottom() - top) / row_h).floor()).max(0.0) as usize + 2).min(n_rows);
+        if first > 0 {
+            ui.allocate_space(egui::vec2(ui.available_width(), first as f32 * row_h - spacing_y));
+        }
+        let mut claim_budget = 12usize;
+        for row in 0..(last.saturating_sub(first)) {
+            let base = (first + row) * cols;
+            ui.horizontal(|ui| {
+                for c in 0..cols {
+                    let idx = base + c;
+                    if idx >= n {
+                        break;
+                    }
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(tile, cell_h), egui::Sense::click());
+                    if !clip.intersects(rect) {
+                        continue;
+                    }
+                    let img_rect =
+                        egui::Rect::from_min_size(rect.min, egui::vec2(tile, tile));
+                    let item = self.lora_lib.items[idx].clone();
+                    let key = item.thumb_key(LORA_THUMB_PX);
+                    // `has_preview == false` means the server has nothing; never ask.
+                    let known_missing =
+                        !item.has_preview || self.lora_lib.no_preview.contains(&key);
+                    // LoRA Manager's 0..=32 scale. Covered rather than blurred: egui has no cheap
+                    // blur, and a solid cover is the honest version of hiding it anyway.
+                    let covered = !self.lora_lib.show_nsfw && item.nsfw_level >= LORA_NSFW_COVER;
+                    match self.thumbs.get(&key).filter(|_| !covered) {
+                        Some(tex) => {
+                            let sized = egui::load::SizedTexture::from_handle(tex);
+                            ui.put(
+                                img_rect,
+                                egui::Image::new(sized)
+                                    .fit_to_exact_size(img_rect.size())
+                                    .corner_radius(4.0),
+                            );
+                        }
+                        None => {
+                            let p = ui.painter();
+                            p.rect_filled(img_rect, 4.0, ui.visuals().extreme_bg_color);
+                            if covered {
+                                p.text(
+                                    img_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    icons::LOCKED,
+                                    egui::FontId::new(18.0, egui::FontFamily::Proportional),
+                                    ui.visuals().weak_text_color(),
+                                );
+                            } else if known_missing {
+                                p.text(
+                                    img_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    icons::MODEL,
+                                    egui::FontId::new(20.0, egui::FontFamily::Proportional),
+                                    ui.visuals().weak_text_color(),
+                                );
+                            } else if claim_budget > 0 && self.thumbs.claim(&key) {
+                                claim_budget -= 1;
+                                if let Some(engine) = self.engine.as_ref() {
+                                    engine.fetch_lora_thumb(item.id.clone(), LORA_THUMB_PX);
+                                }
+                            } else if claim_budget == 0 {
+                                ui.ctx().request_repaint_after(Duration::from_millis(120));
+                            }
+                        }
+                    }
+                    // The gate always hands back a still; the badge is the only sign it moves.
+                    if item.preview_is_video {
+                        video_badge(ui, img_rect);
+                    }
+                    if item.favorite {
+                        let c = img_rect.right_top() + egui::vec2(-9.0, 9.0);
+                        ui.painter().text(
+                            c,
+                            egui::Align2::CENTER_CENTER,
+                            icons::STAR,
+                            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                            crate::theme::PINK,
+                        );
+                    }
+                    if item.update_available {
+                        let c = img_rect.left_top() + egui::vec2(9.0, 9.0);
+                        ui.painter().circle_filled(c, 4.0, crate::theme::AQUA);
+                    }
+                    // Caption under the tile: name, then folder + size.
+                    let cap = egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), img_rect.bottom() + 2.0),
+                        rect.max,
+                    );
+                    let name = if item.name.is_empty() { &item.file_name } else { &item.name };
+                    ui.painter().text(
+                        cap.left_top(),
+                        egui::Align2::LEFT_TOP,
+                        elide_width(ui, name, tile),
+                        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                        ui.visuals().text_color(),
+                    );
+                    ui.painter().text(
+                        cap.left_top() + egui::vec2(0.0, 14.0),
+                        egui::Align2::LEFT_TOP,
+                        elide_width(
+                            ui,
+                            &format!("{} · {}", item.folder_label(), format_bytes(item.size_bytes)),
+                            tile,
+                        ),
+                        egui::FontId::new(10.0, egui::FontFamily::Proportional),
+                        ui.visuals().weak_text_color(),
+                    );
+                    if resp.clicked() && !overlay_blocking(ui.ctx()) {
+                        open = Some(item.id.clone());
+                    }
+                }
+            });
+        }
+        if last < n_rows {
+            ui.allocate_space(egui::vec2(
+                ui.available_width(),
+                (n_rows - last) as f32 * row_h - spacing_y,
+            ));
+        }
+        open
+    }
+
+    // ---- App self-update ----------------------------------------------------------------------
+
+    /// This build's Android `versionCode`. Read from the installed package rather than
+    /// `CARGO_PKG_VERSION`, because that is what Android compares when deciding whether an install
+    /// is an upgrade — and cargo-apk2 derives it from the Cargo version by a packing rule
+    /// (`major<<16 | minor<<8 | patch`, offset by the apk id) that is easy to get wrong by hand.
+    fn current_version_code(&self, host: &Host) -> u64 {
+        let code = host.current_version_code();
+        if code > 0 { code as u64 } else { 0 }
+    }
+
+    /// Where a downloaded update lands. App-private storage is fine: `PackageInstaller` reads a
+    /// stream we open, so unlike the FileProvider route nothing else needs to see the file.
+    fn update_apk_path(&self, host: &Host) -> Option<String> {
+        let dir = host.documents_dir()?;
+        let folder = format!("{dir}/comfyui");
+        let _ = std::fs::create_dir_all(&folder);
+        Some(format!("{folder}/update.apk"))
+    }
+
+    /// One update check per launch, on the first connect. Quiet: a gate without the endpoint is
+    /// the normal case for anyone who hasn't deployed it yet.
+    fn maybe_check_app_update(&mut self) {
+        if self.app_update_checked {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else { return };
+        if !engine.is_connected() && !matches!(self.conn, Conn::Connected) {
+            return;
+        }
+        self.app_update_checked = true;
+        engine.check_app_update();
+    }
+
+    /// Drain the installer's outcome latch. The install is asynchronous — `self_update` returns as
+    /// soon as the session is handed over, and the user still has a system dialog to accept — so
+    /// the result arrives frames or minutes later.
+    fn poll_install_status(&mut self, host: &Host) {
+        // Only while an install is actually outstanding: this is a JNI round trip, and the frame
+        // profiler here budgets in fractions of a millisecond.
+        if self.app_update_ready.is_none() {
+            return;
+        }
+        match host.take_install_status() {
+            0 => {}
+            1 => {
+                self.note = "Update installed".into();
+                self.app_update = None;
+                self.app_update_ready = None;
+                // The APK is dead weight once installed; a 50-200 MB file is worth reclaiming.
+                if let Some(path) = self.update_apk_path(host) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            _ => {
+                let why = host.install_message();
+                let why = if why.is_empty() { "The installer refused it".to_string() } else { why };
+                self.log.error(format!("app update install: {why}"));
+                // Named plainly: this is the failure mode a different signing key produces, and
+                // it is not otherwise guessable from the system's wording.
+                self.app_update_error = if why.contains("INSTALL_FAILED_UPDATE_INCOMPATIBLE")
+                    || why.contains("signatures do not match")
+                {
+                    "This build is signed with a different key than the installed app. Android \
+                     can't upgrade across keys — uninstall the app first (you'll lose its \
+                     settings), then install this build."
+                        .to_string()
+                } else {
+                    why
+                };
+            }
+        }
+    }
+
+    /// Settings → App updates.
+    fn app_update_section(&mut self, ui: &mut egui::Ui, host: &Host) {
+        egui::CollapsingHeader::new(format!("{} App updates", icons::GENERATE))
+            .id_salt("settings_app_update")
+            .default_open(self.app_update.is_some())
+            .show(ui, |ui| {
+                let ours = self.current_version_code(host);
+                ui.weak(format!(
+                    "Installed: {} (build {})",
+                    env!("CARGO_PKG_VERSION"),
+                    if ours > 0 { ours.to_string() } else { "unknown".into() }
+                ));
+
+                if !self.app_update_error.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("{} {}", icons::WARN, self.app_update_error),
+                        );
+                    });
+                    if ui.small_button("Dismiss").clicked() {
+                        self.app_update_error.clear();
+                    }
+                }
+
+                // Android requires an explicit per-app grant on top of the manifest permission,
+                // and it lives in a Settings screen the user has to be sent to.
+                if !host.can_install_packages() {
+                    ui.add_space(4.0);
+                    ui.weak(
+                        "Android needs permission to install apps from here before an update can \
+                         be applied.",
+                    );
+                    if ui.button("Allow installs from this app").clicked() {
+                        host.request_install_permission();
+                    }
+                }
+
+                match (self.app_update.clone(), self.app_update_progress) {
+                    (_, Some((got, total))) => {
+                        let frac =
+                            if total > 0 { (got as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+                        ui.add(
+                            egui::ProgressBar::new(frac)
+                                .desired_height(14.0)
+                                .text(format!("{} / {}", format_bytes(got), format_bytes(total))),
+                        );
+                    }
+                    (Some(u), None) => {
+                        ui.add_space(4.0);
+                        ui.strong(format!(
+                            "{} Update available: {} (build {})",
+                            icons::CLOUD,
+                            u.version_name,
+                            u.version_code
+                        ));
+                        if !u.notes.trim().is_empty() {
+                            ui.weak(sanitize_ui_text(ui, u.notes.trim()));
+                        }
+                        ui.weak(format_bytes(u.size));
+                        ui.horizontal_wrapped(|ui| {
+                            let can = host.can_install_packages();
+                            if ui
+                                .add_enabled(can, egui::Button::new("Download and install"))
+                                .on_hover_text(if can {
+                                    "Downloads the build, then hands it to Android's installer"
+                                } else {
+                                    "Grant install permission first"
+                                })
+                                .clicked()
+                                && let Some(path) = self.update_apk_path(host)
+                                && let Some(engine) = self.engine.as_ref()
+                            {
+                                self.app_update_error.clear();
+                                self.app_update_progress = Some((0, u.size));
+                                engine.download_app_update(path, u.sha256.clone(), u.size);
+                            }
+                            if ui.small_button("Skip").clicked() {
+                                self.app_update = None;
+                            }
+                        });
+                    }
+                    (None, None) => {
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.button("Check for updates").clicked() {
+                                self.app_update_error.clear();
+                                if let Some(engine) = self.engine.as_ref() {
+                                    engine.check_app_update();
+                                }
+                            }
+                            ui.weak("Served by comfy-gate.");
+                        });
+                    }
+                }
+            });
+    }
+
+    // ---- Create → LoRAs → Library: the gate-managed model library -----------------------------
+
+    /// Re-read page 1 under the current filters. Bumps the generation so any page still in flight
+    /// for the previous query is dropped rather than merged into the fresh one.
+    fn reload_lora_library(&mut self) {
+        let Some(engine) = self.engine.as_ref() else { return };
+        self.lora_lib.generation = self.lora_lib.generation.wrapping_add(1);
+        self.lora_lib.loading = true;
+        self.lora_lib.status.clear();
+        self.lora_lib.items.clear();
+        self.lora_lib.page = 0;
+        self.lora_lib.total_pages = 0;
+        // Previewless ids stay latched across a refilter — the answer can't change without the
+        // file changing, and re-asking is exactly the storm this avoids.
+        engine.lora_list(
+            self.lora_lib.generation,
+            1,
+            LORA_LIB_PAGE,
+            self.lora_lib.sort.wire(),
+            &self.lora_lib.folder,
+            &self.lora_lib.search,
+            &self.lora_lib.base_model,
+            &self.lora_lib.tag,
+        );
+    }
+
+    /// Ask for the next page, if there is one and nothing is already in flight.
+    fn lora_library_next_page(&mut self) {
+        if self.lora_lib.loading || self.lora_lib.page == 0 {
+            return;
+        }
+        if self.lora_lib.page >= self.lora_lib.total_pages {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else { return };
+        self.lora_lib.loading = true;
+        engine.lora_list(
+            self.lora_lib.generation,
+            self.lora_lib.page + 1,
+            LORA_LIB_PAGE,
+            self.lora_lib.sort.wire(),
+            &self.lora_lib.folder,
+            &self.lora_lib.search,
+            &self.lora_lib.base_model,
+            &self.lora_lib.tag,
+        );
+    }
+
+    /// First entry into the Library sub-tab: listing, chips, and the one-off admin probe that
+    /// decides whether the download affordances appear at all.
+    fn ensure_lora_library(&mut self) {
+        if self.lora_lib.generation != 0 || self.lora_lib.loading {
+            return;
+        }
+        let Some(engine) = self.engine.as_ref() else { return };
+        engine.lora_facets();
+        if self.lora_lib.admin.is_none() {
+            engine.probe_lora_admin();
+        }
+        self.reload_lora_library();
+    }
+
+    /// Poll every download the gate is running for us. On a timer rather than per frame: it is a
+    /// cheap server-side read but still a round trip, and a stalled transfer must not spin.
+    fn poll_downloads(&mut self, ctx: &egui::Context) {
+        if self.downloads.is_empty() {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        // Something is still moving, so keep frames coming even with no input.
+        if self.downloads.iter().any(|d| !d.state().is_terminal()) {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        if now < self.downloads_poll_at {
+            return;
+        }
+        self.downloads_poll_at = now + DOWNLOAD_POLL_SECS;
+        // A bogus id and "started, no bytes yet" are the same `pending` response, so a download
+        // that never leaves pending has to be abandoned client-side or it polls forever.
+        for d in &mut self.downloads {
+            if d.state() != DownloadStatus::Pending {
+                continue;
+            }
+            let since = *d.pending_since.get_or_insert(now);
+            if now - since > DOWNLOAD_PENDING_TIMEOUT {
+                d.status = "failed".into();
+                d.message = Some("The server never started this download".into());
+            }
+        }
+        let ids: Vec<String> = self
+            .downloads
+            .iter()
+            .filter(|d| !d.state().is_terminal())
+            .map(|d| d.id.clone())
+            .collect();
+        let Some(engine) = self.engine.as_ref() else { return };
+        for id in ids {
+            engine.download_progress(id);
+        }
+    }
+
     fn create_loras_pane(&mut self, ui: &mut egui::Ui, host: &Host) {
         // ScrollArea can report infinite width; pin to the clip so trailing buttons stay visible.
         let list_w = (ui.clip_rect().width() - 12.0).clamp(160.0, ui.available_width());
         ui.set_max_width(list_w);
+
+        // Active / Library sub-tabs. Library is drawn by `create_loras_pane_body`'s caller, not
+        // here — a thumbnail grid has to own its own ScrollArea to virtualize (see the call site).
+        ui.horizontal(|ui| {
+            crate::theme::selectable_value(ui, &mut self.lora_pane, LoraPane::Active, "Active");
+            crate::theme::selectable_value(
+                ui,
+                &mut self.lora_pane,
+                LoraPane::Library,
+                format!("{} Library", icons::FOLDER),
+            );
+        });
+        ui.separator();
+        if self.lora_pane == LoraPane::Library {
+            // The body is rendered outside the shared scroll; nothing to draw here.
+            return;
+        }
         self.params.loras = dedupe_loras(std::mem::take(&mut self.params.loras));
 
         let catalog_n = self.lora_catalog.loras.len();
@@ -13805,8 +15383,13 @@ impl ComfyApp {
         }
     }
 
-    fn output(&mut self, ui: &mut egui::Ui, host: &Host) {
-        // Sampling progress is on the bottom nav; keep idle notes (errors / Done) here only.
+    /// Idle notes and the live sampler preview, drawn inline at the top of the Create pane.
+    ///
+    /// Finished results are NOT shown here: they land in the Gallery, and the Gallery nav icon
+    /// carries the unseen count (see [`Self::note_unseen`]). The in-progress preview has no
+    /// gallery equivalent — it only exists mid-sample — so it stays.
+    fn create_notes(&mut self, ui: &mut egui::Ui, host: &Host) {
+        // Sampling progress is on the top progress bar; keep idle notes (errors / Done) here only.
         if !self.running && self.queue_remaining == 0 && !self.status.is_empty() {
             ui.add_space(6.0);
             ui.label(elide(&self.status, 300));
@@ -13853,147 +15436,6 @@ impl ComfyApp {
         if let Some(tex) = &self.preview {
             image_view(ui, tex);
         }
-
-        if !self.results.is_empty() {
-            let n = self.results.len();
-            ui.horizontal(|ui| {
-                ui.label(if n == 1 {
-                    "Result".into()
-                } else {
-                    format!("Results ({n})")
-                });
-            });
-            let mut open: Option<usize> = None;
-            let mut save_idx: Option<usize> = None;
-            const THUMB: f32 = 96.0;
-            ui.horizontal_wrapped(|ui| {
-                for (i, (tex, _)) in self.results.iter().enumerate() {
-                    let sized = egui::load::SizedTexture::from_handle(tex);
-                    let resp = ui
-                        .add(
-                            egui::Image::new(sized)
-                                .max_size(egui::vec2(THUMB, THUMB))
-                                .sense(egui::Sense::click()),
-                        )
-                        .on_hover_text(format!("Open fullscreen ({}/{})", i + 1, n));
-                    if resp.clicked() {
-                        open = Some(i);
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Save last").clicked() {
-                    save_idx = Some(n - 1);
-                }
-                if n > 1 && ui.button("Save all").clicked() {
-                    for i in 0..n {
-                        self.save_result_at(host, i);
-                    }
-                }
-            });
-            if let Some(i) = open {
-                self.result_view = Some(i);
-            }
-            if let Some(i) = save_idx {
-                self.save_result_at(host, i);
-            }
-        }
-    }
-
-    /// Fullscreen Create-result viewer (Android Back / Esc returns to the thumb strip).
-    fn result_viewer(&mut self, ui: &mut egui::Ui, host: &Host) {
-        let Some(idx) = self.result_view else { return };
-        if idx >= self.results.len() {
-            self.result_view = None;
-            return;
-        }
-        if ui.ctx().input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
-                || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
-        }) {
-            self.result_view = None;
-            return;
-        }
-
-        let n = self.results.len();
-        let mut close = false;
-        let mut save = false;
-        let mut inpaint = false;
-        let mut go: Option<isize> = None;
-        ui.horizontal(|ui| {
-            if ui
-                .add(egui::Button::new(icons::BACK).min_size(egui::vec2(40.0, 36.0)))
-                .on_hover_text("Back to results")
-                .clicked()
-            {
-                close = true;
-            }
-            ui.label(format!("{}/{}", idx + 1, n));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Save").clicked() {
-                    save = true;
-                }
-                if ui
-                    .button(format!("{} Fix area", icons::MODEL))
-                    .on_hover_text("Paint a mask to inpaint")
-                    .clicked()
-                {
-                    inpaint = true;
-                }
-                if n > 1 {
-                    if ui
-                        .add_enabled(idx + 1 < n, egui::Button::new("▶"))
-                        .on_hover_text("Next")
-                        .clicked()
-                    {
-                        go = Some(1);
-                    }
-                    if ui
-                        .add_enabled(idx > 0, egui::Button::new("◀"))
-                        .on_hover_text("Previous")
-                        .clicked()
-                    {
-                        go = Some(-1);
-                    }
-                }
-            });
-        });
-        ui.separator();
-
-        let image_rect = ui.available_rect_before_wrap();
-        let avail = image_rect.size().max(egui::vec2(1.0, 1.0));
-        let sized = egui::load::SizedTexture::from_handle(&self.results[idx].0);
-        ui.scope_builder(egui::UiBuilder::new().max_rect(image_rect), |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.add(
-                    egui::Image::new(sized)
-                        .max_size(avail)
-                        .maintain_aspect_ratio(true),
-                );
-            });
-        });
-        // Swipe across the image steps the batch, same gesture as the gallery viewer.
-        if go.is_none()
-            && let Some(dir) = self.horizontal_swipe(ui, image_rect)
-        {
-            go = Some(dir as isize);
-        }
-
-        if close {
-            self.result_view = None;
-        } else if save {
-            self.save_result_at(host, idx);
-        } else if inpaint {
-            let bytes = self.results[idx].1.clone();
-            let name = format!("output-{}.png", idx + 1);
-            self.result_view = None;
-            self.open_inpaint(ui.ctx(), bytes, name);
-        } else if let Some(d) = go {
-            let next = idx as isize + d;
-            if next >= 0 && (next as usize) < n {
-                self.result_view = Some(next as usize);
-            }
-        }
     }
 
     /// While the soft keyboard is open, pin the focused field near the top of the scroll viewport,
@@ -14019,19 +15461,12 @@ impl ComfyApp {
     }
 
     fn generate_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
-        // The result filmstrip fetches thumbs; resolve the cache root before it runs.
+        // Enhance-step thumbs and the img2img picker fetch through the full cache; resolve its root.
         let _ = self.ensure_full_cache_root(host);
         #[cfg(feature = "local-npu")]
         self.rewrite_review_window(ui.ctx());
         self.expand_review_window(ui.ctx(), host);
         self.variations_window(ui.ctx(), host);
-        if self.result_view.is_some() {
-            let pane = ui.available_rect_before_wrap();
-            self.result_viewer(ui, host);
-            // Keep Queue reachable while inspecting a batch frame.
-            self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
-            return;
-        }
 
         // Above the app nav bar (Create / Graph / Gallery / Settings).
         let mut panes_open = !self.kb_editing;
@@ -14041,51 +15476,6 @@ impl ComfyApp {
             ui.add_space(2.0);
         });
         self.note_bottom_bar(bar);
-
-        // Output launcher strip above the pane bar. Deliberately a fixed 34px bar and nothing more:
-        // the results themselves live in a floating window (`output_window`). A resizable sheet
-        // here stacked three bottom panels deep, and once the soft keyboard shrank the viewport the
-        // Create pane had no room left to lay out in.
-        // Dropped entirely while text is being edited: the shrunk viewport already has to fit
-        // the nav bar, the pane bar and a top bar, and the strip is unreachable mid-edit anyway.
-        let mut output_bar_open = !self.kb_editing;
-        let bar = egui::Panel::bottom("create-output-bar").exact_size(34.0).show_collapsible(
-            ui,
-            &mut output_bar_open,
-            |ui| {
-                let title = self.output_title();
-                let unseen = self.output_unseen;
-                ui.horizontal(|ui| {
-                    ui.strong(sanitize_ui_text(ui, &title));
-                    // Results never open the window themselves, so the count is the only thing
-                    // saying "there's something new down here".
-                    if unseen > 0 {
-                        ui.colored_label(
-                            crate::theme::PINK,
-                            format!("{unseen} new"),
-                        );
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (lbl, hint) = if self.output_open {
-                            (icons::CLOSE, "Hide output")
-                        } else if unseen > 0 {
-                            (icons::IMAGE, "Show output (new results)")
-                        } else {
-                            (icons::IMAGE, "Show output")
-                        };
-                        let btn = egui::Button::new(lbl).small().selected(unseen > 0);
-                        if ui.add(btn).on_hover_text(hint).clicked() {
-                            self.output_open = !self.output_open;
-                        }
-                    });
-                });
-            },
-        );
-        self.note_bottom_bar(bar);
-        // Opening it — by the strip, or anything else that sets the flag — marks them seen.
-        if self.output_open {
-            self.output_unseen = 0;
-        }
 
         match self.create_pane {
             CreatePane::Main => {
@@ -14102,6 +15492,15 @@ impl ComfyApp {
         }
 
         let pane = ui.available_rect_before_wrap();
+        // The LoRA Library sub-tab takes the pane over instead of rendering inside the shared
+        // scroll. A virtualized grid must own its ScrollArea: nested in the column below, its clip
+        // rect is unbounded, every row counts as visible, and the recycling silently no-ops — which
+        // on a few hundred LoRAs is a few hundred tile allocations and thumb claims per frame.
+        if self.create_pane == CreatePane::Loras && self.lora_pane == LoraPane::Library {
+            self.lora_library_pane(ui, host, pane);
+            self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
+            return;
+        }
         crate::theme::scroll_vertical()
             .id_salt("create-main-scroll")
             .auto_shrink([false, false])
@@ -14118,6 +15517,9 @@ impl ComfyApp {
                     });
                     ui.separator();
                 }
+                // Notes and the live preview scroll with the pane rather than floating over it —
+                // the old Output window is gone, and finished results are the Gallery's job now.
+                self.create_notes(ui, host);
                 ui.add_enabled_ui(connected, |ui| self.controls(ui, host));
                 // Trailing space so a field low in the list can still scroll clear of the keyboard,
                 // then scroll AFTER the fields so this target beats the TextEdit's own caret-follow.
@@ -14126,68 +15528,6 @@ impl ComfyApp {
             });
         self.queue_fab(ui.ctx(), host, pane, QueueFabKind::Create);
         self.create_fab(ui.ctx(), host, pane);
-        self.output_window(ui.ctx(), host, pane);
-    }
-
-    /// "Output · N results" — shared by the launcher strip and the floating window's title.
-    fn output_title(&self) -> String {
-        let n = self.results.len();
-        if n == 0 {
-            if self.preview.is_some() {
-                "Output · preview".to_string()
-            } else {
-                "Output".to_string()
-            }
-        } else if n == 1 {
-            "Output · 1 result".to_string()
-        } else {
-            format!("Output · {n} results")
-        }
-    }
-
-    /// Floating Output window over the Create pane, opened only from the strip — a result landing
-    /// never opens it, it just bumps the strip's "N new" count.
-    /// Free-floating rather than docked: it takes no panel space, so the pane bar, the nav bar and
-    /// the soft keyboard can never squeeze the Create pane to nothing between them. egui constrains
-    /// it to `content_rect`, which already excludes the keyboard's occlusion.
-    fn output_window(&mut self, ctx: &egui::Context, host: &Host, pane: egui::Rect) {
-        if !self.output_open {
-            return;
-        }
-        let content = ctx.content_rect();
-        if !content.is_finite() || content.height() < 120.0 || content.width() < 120.0 {
-            return;
-        }
-        // Leave the FAB column clear so Queue/Cancel stay tappable with the window up.
-        let max_w = (content.width() - (crate::theme::FAB_SIZE + 24.0)).clamp(180.0, content.width());
-        // Bounded by the Create pane too, so a keyboard-shrunk pane shrinks the window (including a
-        // size the user dragged bigger on a previous, taller frame) instead of overflowing it.
-        let anchor = if pane.is_finite() && pane.width() > 80.0 { pane } else { content };
-        let max_h =
-            (content.height() * 0.55).min(anchor.height() - 16.0).clamp(120.0, 520.0);
-        // Default placement: bottom-left of the Create pane, just above the bars.
-        let default_pos = egui::pos2(anchor.left() + 8.0, anchor.bottom() - 8.0);
-        let mut open = true;
-        egui::Window::new(self.output_title())
-            .id(egui::Id::new("create-output-window"))
-            .order(egui::Order::Foreground)
-            .collapsible(false)
-            .resizable(true)
-            .open(&mut open)
-            .constrain_to(content)
-            .pivot(egui::Align2::LEFT_BOTTOM)
-            .default_pos(default_pos)
-            .default_width(max_w)
-            .max_width(max_w)
-            .max_height(max_h)
-            .show(ctx, |ui| {
-                crate::theme::scroll_vertical()
-                    .id_salt("create-output-scroll")
-                    .max_height((max_h - 44.0).max(80.0))
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| self.output(ui, host));
-            });
-        self.output_open = open;
     }
 
     /// Fixed Create Main strip: current model, generation mode, Reset.
@@ -15393,7 +16733,7 @@ impl ComfyApp {
         host.haptic(Haptic::Success);
     }
 
-    fn graph_controls(&mut self, ui: &mut egui::Ui, _host: &Host) {
+    fn graph_controls(&mut self, ui: &mut egui::Ui, host: &Host) {
         let connected = matches!(self.conn, Conn::Connected);
         let has_graph = self.has_graph_editor();
         let has_nodes = self.active_doc().is_some_and(|d| !d.is_empty());
@@ -15439,6 +16779,18 @@ impl ComfyApp {
                             "Needs a graph whose final IMAGE output is unconnected".into();
                     }
                 }
+            }
+            // The other direction of Create's "Open as graph": read this tab's nodes into the
+            // Create fields. The tab itself is left alone.
+            if ui
+                .add_enabled(
+                    has_nodes,
+                    egui::Button::new(format!("{} Open in Create", icons::GENERATE)),
+                )
+                .on_hover_text("Fill the Create tab from this graph's model, prompts and sampler")
+                .clicked()
+            {
+                self.open_graph_in_create(host);
             }
             ui.separator();
             if ui
@@ -16566,7 +17918,42 @@ impl ComfyApp {
     /// callers (post-run refresh, delete mutations, album changes) land here — they must never
     /// commit the live search buffer mid-typing. User-initiated search commits go through
     /// [`Self::refresh_gallery_commit_query`].
+    /// Populate the grid from the on-device cache so a dead server costs the listing, not the
+    /// library. Returns false when there is nothing cached (the caller then shows "connect").
+    ///
+    /// Loaded once per offline stretch: `full_cache_keys` stats every file in the cache dir, which
+    /// is far too much to repeat per frame.
+    fn enter_offline_gallery(&mut self, host: &Host) -> bool {
+        if self.gallery_offline {
+            return !self.gallery.is_empty();
+        }
+        let Some(root) = self.ensure_full_cache_root(host).map(str::to_string) else {
+            return false;
+        };
+        let items = gallery::offline_items(&root);
+        if items.is_empty() {
+            return false;
+        }
+        self.log.info(format!("gallery: offline, {} cached image(s)", items.len()));
+        self.gallery_offline = true;
+        // A tombstoned row is one the user deleted server-side; it must stay hidden offline too.
+        self.gallery = items.into_iter().filter(|it| !self.tombstone_hides(it)).collect();
+        self.gallery_total = self.gallery.len() as u64;
+        self.gallery_loading = false;
+        self.gallery_fetched = true;
+        self.gallery_status.clear();
+        // Nothing here came from a query, so the next online refresh must not think it already
+        // has the right rows for the active filters.
+        self.gallery_query_sig = None;
+        !self.gallery.is_empty()
+    }
+
     fn refresh_gallery(&mut self) {
+        // Offline the listing is the cache, and a refresh would clear it for a fetch that cannot
+        // answer — leaving an empty grid with the images still sitting on disk.
+        if self.gallery_offline {
+            return;
+        }
         // Re-fetching the SAME query keeps its rows up until the fresh page lands. Clearing here
         // is what made every open thumbnail picker blink to "No gallery images yet" and scroll
         // back to the top — twice — each time a finished render refreshed the listing behind it.
@@ -17219,17 +18606,24 @@ impl ComfyApp {
         let (_, dialect) = self.expand_dialect();
         match self.rewrite_controls_shown() {
             (true, true) => ui.label(format!(
-                "{} Both offered beside the prompt: {} Expand on comfy-gate (for {dialect}) and \
-                 {} Rewrite on this device",
+                "{} Both in the {} menu beside the prompt: {} Expand on comfy-gate (for \
+                 {dialect}) and {} Rewrite on this device",
                 icons::CHECK,
+                icons::MENU,
                 icons::CLOUD,
                 icons::GENERATE
             )),
             (true, false) => ui.label(format!(
-                "{} Rewrites now run on comfy-gate (for {dialect})",
-                icons::CHECK
+                "{} Rewrites now run on comfy-gate (for {dialect}), from the {} menu beside the \
+                 prompt",
+                icons::CHECK,
+                icons::MENU
             )),
-            (false, true) => ui.label(format!("{} Rewrites now run on this device", icons::CHECK)),
+            (false, true) => ui.label(format!(
+                "{} Rewrites now run on this device, from the {} menu beside the prompt",
+                icons::CHECK,
+                icons::MENU
+            )),
             (false, false) => {
                 let reason = self.rewrite_unavailable_reason();
                 ui.colored_label(ui.visuals().warn_fg_color, format!("{} {reason}", icons::WARN))
@@ -17806,14 +19200,35 @@ impl ComfyApp {
         ui.separator();
 
         if !connected {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.label("Connect to a server to browse its gallery.");
-                if ui.button(format!("{} Settings", icons::SETTINGS)).clicked() {
-                    self.tab = Tab::Settings;
-                }
+            // Everything already downloaded is still on this phone, and the viewer reads full
+            // images (and a graph, out of the file's own bytes) straight from that cache — so a
+            // dead server costs the listing, not the library.
+            if !self.enter_offline_gallery(host) {
+                ui.add_space(20.0);
+                ui.vertical_centered(|ui| {
+                    ui.label("Connect to a server to browse its gallery.");
+                    ui.weak("Images you've already opened stay available here offline.");
+                    if ui.button(format!("{} Settings", icons::SETTINGS)).clicked() {
+                        self.tab = Tab::Settings;
+                    }
+                });
+                return;
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    crate::theme::AQUA,
+                    format!("{} Offline — showing {} cached", icons::FOLDER, self.gallery.len()),
+                );
+                ui.weak("Browsing and workflows work; editing needs the server.");
             });
-            return;
+            ui.separator();
+        } else if self.gallery_offline {
+            // Back online: drop the cache-built listing and re-read the real one, or the grid keeps
+            // showing a subset with no paging and every server action still disabled.
+            self.gallery_offline = false;
+            self.gallery.clear();
+            self.gallery_query_sig = None;
+            self.refresh_gallery();
         }
 
         self.album_manage_window(ui.ctx());
@@ -18374,6 +19789,13 @@ impl ComfyApp {
     /// Tombstone the keys, then send the delete: a listing the server indexed mid-delete can
     /// still carry these rows, and the tombstones keep them out of the grid until it settles.
     fn send_delete_images(&mut self, items: Vec<(String, String)>) {
+        // Offline this would tombstone the rows locally — hiding them for the tombstone's whole
+        // TTL — while the server never hears about it and still holds every file. Refuse instead
+        // of pretending it worked.
+        if self.gallery_offline {
+            self.gallery_status = "Offline — deleting needs the server".into();
+            return;
+        }
         let at = unix_now();
         let root = self.full_cache_root.clone();
         // Sizes come from the listing, and tell a resurrected row apart from a new image that was
@@ -18396,6 +19818,9 @@ impl ComfyApp {
                 gallery::forget_full_cache(root, &format!("{}/{}", key.0, key.1));
             }
             self.thumbs.forget(&format!("{}/{}", key.0, key.1));
+            // Tombstones hide the row without touching the unseen set — drop it here or the nav
+            // badge keeps counting images that are gone.
+            self.gallery_unseen.remove(&format!("{}/{}", key.0, key.1));
             self.trash_tombstones.insert(key, Deleted { size, at });
         }
         self.prune_tombstones();
@@ -18803,6 +20228,15 @@ impl ComfyApp {
                         let c = rect.right_top() + egui::vec2(-7.0, 7.0);
                         ui.painter().circle_filled(c, 3.0, egui::Color32::from_rgb(120, 220, 140));
                     }
+                    // Not-yet-opened images get an aqua dot in the TOP-LEFT: the top-right corner
+                    // is already taken by the tag dot and the selection check. Hidden in select
+                    // mode, where the tile is about to be covered by the selection overlay anyway.
+                    if !select_mode && self.gallery_unseen.contains(&item_key) {
+                        let c = rect.left_top() + egui::vec2(9.0, 9.0);
+                        let p = ui.painter();
+                        p.circle_filled(c, 5.0, egui::Color32::from_black_alpha(120));
+                        p.circle_filled(c, 4.0, crate::theme::AQUA);
+                    }
                     if select_mode {
                         selection_overlay(ui, rect, selected);
                     }
@@ -19055,6 +20489,8 @@ impl ComfyApp {
 
     fn open_viewer(&mut self, idx: usize, host: &Host) {
         let Some(item) = self.gallery.get(idx).cloned() else { return };
+        // Opening it full-screen is what "seen" means — not merely scrolling past its thumbnail.
+        self.gallery_unseen.remove(&item.key());
         // Any previous item's playback ends here (drop stops the decode thread).
         self.player = None;
         let cache_dir = self.ensure_full_cache_root(host).map(|s| s.to_string());
@@ -19140,6 +20576,40 @@ impl ComfyApp {
             self.viewer_swipe_origin = None;
         }
         None
+    }
+
+    /// Fold the current listing into the unseen tracker, and advance the watermark.
+    ///
+    /// "New" is an `mtime` strictly newer than the watermark, so this is insert-only and monotone
+    /// — the auto-paging chain can call it once per page without double-counting. Skipped entirely
+    /// while a filter or a non-newest sort is active: a filtered page enumerates a subset, and
+    /// advancing the watermark past items it never listed would silently swallow them.
+    fn note_unseen(&mut self) {
+        if self.gallery_filters_active() {
+            return;
+        }
+        let newest = self
+            .gallery
+            .iter()
+            .filter_map(|it| it.mtime)
+            .filter(|m| m.is_finite() && *m > 0.0)
+            .fold(0.0f64, f64::max);
+        // No mtimes at all (an older gate): stay silent rather than flag everything.
+        if newest <= 0.0 {
+            return;
+        }
+        // First listing ever: adopt it wholesale as seen. See the field's doc comment.
+        if self.gallery_seen_at <= 0.0 {
+            self.gallery_seen_at = newest;
+            return;
+        }
+        for it in &self.gallery {
+            let Some(m) = it.mtime.filter(|m| m.is_finite() && *m > 0.0) else { continue };
+            if m > self.gallery_seen_at {
+                self.gallery_unseen.insert(it.key());
+            }
+        }
+        self.gallery_seen_at = newest;
     }
 
     /// Recompute untriaged keys: still images new since the pre-burst snapshot, else the N newest.
@@ -19235,6 +20705,10 @@ impl ComfyApp {
             return;
         }
         let deck = self.triage_deck_order(&deck_keys);
+        // A triage pass shows every card full-screen, so the whole deck counts as seen up front.
+        for k in &deck {
+            self.gallery_unseen.remove(k);
+        }
         self.tab = Tab::Gallery;
         self.viewer = None;
         self.triage_swipe_origin = None;
@@ -20913,44 +22387,39 @@ impl ComfyApp {
         }
     }
 
-    /// The Create-pane Rewrite menu: rewrite the positive prompt on the CPU LLM. Only shown when a
-    /// rewrite pack is present; each item spawns the worker in `start_rewrite`.
+    /// The on-device rewrite targets, as plain rows for the prompt row's ☰ menu.
+    ///
+    /// Items only, no menu button of its own: these are drawn *inside* the hamburger popup, and a
+    /// nested `menu_button` inside an open popup is fragile in egui (the child popup inherits the
+    /// parent's close-on-click and dismisses itself). Only shown when a rewrite pack is present;
+    /// each item spawns the worker in `start_rewrite`.
     #[cfg(feature = "local-npu")]
-    fn rewrite_menu_ui(&mut self, ui: &mut egui::Ui, host: &Host) {
+    fn rewrite_menu_items(&mut self, ui: &mut egui::Ui, host: &Host) {
         if self.rewrite_pack.is_none() {
             return;
         }
         use local_rewrite::RewriteKind;
         let video = self.params.mode == Mode::Video;
-        ui.menu_button(format!("{} Rewrite", icons::GENERATE), |ui| {
-            if self.rewrite_running {
+        ui.weak(format!("{} Rewrite on this phone", icons::GENERATE));
+        if self.rewrite_running {
+            ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new());
                 ui.label("Rewriting…");
-                return;
-            }
-            // Video prose targets the Wan i2v prompt; tags target the image models.
-            let kind = if video { RewriteKind::TagsToVideo } else { RewriteKind::ProseToTags };
+            });
+            return;
+        }
+        // Video prose targets the Wan i2v prompt; tags target the image models.
+        let kind = if video { RewriteKind::TagsToVideo } else { RewriteKind::ProseToTags };
+        for kind in [kind, RewriteKind::ToPony, RewriteKind::ToIllustrious, RewriteKind::ToAnima] {
             if ui.button(kind.label()).clicked() {
                 self.start_rewrite(ui.ctx(), host, kind);
                 ui.close();
             }
-            if ui.button(RewriteKind::ToPony.label()).clicked() {
-                self.start_rewrite(ui.ctx(), host, RewriteKind::ToPony);
-                ui.close();
-            }
-            if ui.button(RewriteKind::ToIllustrious.label()).clicked() {
-                self.start_rewrite(ui.ctx(), host, RewriteKind::ToIllustrious);
-                ui.close();
-            }
-            if ui.button(RewriteKind::ToAnima.label()).clicked() {
-                self.start_rewrite(ui.ctx(), host, RewriteKind::ToAnima);
-                ui.close();
-            }
-        });
+        }
     }
 
     #[cfg(not(feature = "local-npu"))]
-    fn rewrite_menu_ui(&mut self, _ui: &mut egui::Ui, _host: &Host) {}
+    fn rewrite_menu_items(&mut self, _ui: &mut egui::Ui, _host: &Host) {}
 
     /// Spawn the CPU prompt rewriter on a worker thread; the rewritten positive prompt returns via
     /// the channel and only replaces the field on success (see `poll_rewrite`).
@@ -21631,6 +23100,14 @@ impl EguiApp for ComfyApp {
         let now = ui.ctx().input(|i| i.time);
         self.sync_create_graph_link(now);
         bg_lap.lap("link");
+        // Server-side downloads outlive the app, so they are polled wherever you are — not just
+        // while the LoRA Library is on screen.
+        self.poll_downloads(ui.ctx());
+        bg_lap.lap("downloads");
+        self.maybe_check_app_update();
+        // The install is asynchronous and its outcome can land long after the tap.
+        self.poll_install_status(host);
+        bg_lap.lap("update");
         // Don't burn CPU decoding video nobody can see: pause while the viewer is off-screen and
         // resume where it left off on return (unless the user paused it themselves).
         if let Some(p) = &mut self.player {
@@ -21774,10 +23251,8 @@ impl EguiApp for ComfyApp {
         } else if self.character_wizard.is_some()
             && self.tab == Tab::Generate
             && self.create_pane == CreatePane::Characters
-            // Only when the wizard is the surface actually showing: the fullscreen result
-            // viewer (which owns Back itself) and the card editor both draw over it —
-            // consuming here would invisibly walk (and eventually discard) the hidden wizard.
-            && self.result_view.is_none()
+            // Only when the wizard is the surface actually showing: the card editor draws over
+            // it — consuming here would invisibly walk (and eventually discard) the hidden wizard.
             && self.character_draft.is_none()
             && ui.ctx().input_mut(|i| {
                 i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
@@ -21841,7 +23316,6 @@ impl EguiApp for ComfyApp {
             }
         } else if self.tab == Tab::Generate
             && self.create_pane != CreatePane::Main
-            && self.result_view.is_none()
             && self.character_wizard.is_none()
             && self.inpaint.is_none()
             && ui.ctx().input_mut(|i| {
@@ -21895,54 +23369,64 @@ impl EguiApp for ComfyApp {
             self.exit_graph_fullscreen(host);
         }
 
+        // Global run progress (local jobs and server-wide queue from other clients) rides at the
+        // very top, above every tab's own top bar — a status line reads as a status line up there,
+        // and it no longer shoves the nav bar down mid-run. Laid out before the nav panel so the
+        // bar it steals height from is the central content, not the tab row.
+        //
+        // Collapsible rather than a plain `if`, so it slides in and out instead of snapping the
+        // whole page up; the response is deliberately dropped — `note_bottom_bar` only tracks
+        // bottom bars, and feeding it a top panel would park the undo pill off-screen.
+        let mut progress_open = self.running || self.queue_remaining > 0;
+        egui::Panel::top("run-progress").show_collapsible(ui, &mut progress_open, |ui| {
+            let (v, m) = self.progress;
+            let (frac, label) = if m > 0 {
+                (v as f32 / m as f32, format!("{} {v}/{m}", elide(&self.status, 40)))
+            } else if self.running && self.run_total > 0 {
+                let done = self.run_seen.len().saturating_sub(1).min(self.run_total);
+                (
+                    done as f32 / self.run_total as f32,
+                    format!(
+                        "node {} of {}",
+                        self.run_seen.len().min(self.run_total),
+                        self.run_total
+                    ),
+                )
+            } else if self.queue_remaining > 0 {
+                (
+                    0.0,
+                    format!(
+                        "{} · {} in queue",
+                        elide(&self.status, 32),
+                        self.queue_remaining
+                    ),
+                )
+            } else {
+                // The slide-out frames run the body with `running == false` and `progress == (0,0)`.
+                (0.0, elide(&self.status, 48))
+            };
+            let bar = ui
+                .add(
+                    egui::ProgressBar::new(frac)
+                        .desired_height(14.0)
+                        .text(format!("{:.0}%  {label}", frac * 100.0))
+                        .animate(true),
+                )
+                .interact(egui::Sense::click())
+                .on_hover_text("Tap to see the queue");
+            if bar.clicked() {
+                self.queue_sheet_open = true;
+                self.queue_clear_arm = false;
+            }
+            ui.add_space(2.0);
+        });
+
         // Navigation sits at the bottom, within thumb reach. Panels are laid out before the
         // central content so the tab bar always keeps its height on a short screen. Slides away
         // while text is being edited, which also makes a mid-edit tab switch impossible.
         let mut nav_open = !self.kb_editing;
         let bar = egui::Panel::bottom("nav").show_collapsible(ui, &mut nav_open, |ui| {
             ui.add_space(2.0);
-            // Global run progress (local jobs and server-wide queue from other clients).
-            if self.running || self.queue_remaining > 0 {
-                let (v, m) = self.progress;
-                let (frac, label) = if m > 0 {
-                    (v as f32 / m as f32, format!("{} {v}/{m}", elide(&self.status, 40)))
-                } else if self.running && self.run_total > 0 {
-                    let done = self.run_seen.len().saturating_sub(1).min(self.run_total);
-                    (
-                        done as f32 / self.run_total as f32,
-                        format!(
-                            "node {} of {}",
-                            self.run_seen.len().min(self.run_total),
-                            self.run_total
-                        ),
-                    )
-                } else if self.queue_remaining > 0 {
-                    (
-                        0.0,
-                        format!(
-                            "{} · {} in queue",
-                            elide(&self.status, 32),
-                            self.queue_remaining
-                        ),
-                    )
-                } else {
-                    (0.0, elide(&self.status, 48))
-                };
-                let bar = ui
-                    .add(
-                        egui::ProgressBar::new(frac)
-                            .desired_height(14.0)
-                            .text(format!("{:.0}%  {label}", frac * 100.0))
-                            .animate(true),
-                    )
-                    .interact(egui::Sense::click())
-                    .on_hover_text("Tap to see the queue");
-                if bar.clicked() {
-                    self.queue_sheet_open = true;
-                    self.queue_clear_arm = false;
-                }
-                ui.add_space(2.0);
-            }
             self.nav_bar(ui);
             ui.add_space(2.0);
         });
@@ -22920,7 +24404,14 @@ impl ComfyApp {
                     let text = egui::RichText::new(*icon).size(18.0);
                     let btn = crate::theme::selectable(selected, text)
                         .min_size(egui::vec2(ICON_BTN, ROW_H));
-                    if ui.add(btn).clicked() {
+                    let resp = ui.add(btn);
+                    // How many images have landed that the user hasn't opened yet. Deliberately
+                    // NOT cleared by visiting the tab — only by actually opening an image — so it
+                    // agrees with the per-thumbnail dots the grid draws.
+                    if *tab == Tab::Gallery {
+                        count_badge(ui, resp.rect, self.gallery_unseen.len());
+                    }
+                    if resp.clicked() {
                         self.tab = *tab;
                     }
                 }
@@ -22997,6 +24488,31 @@ fn centered<'a>(ctx: &egui::Context, window: egui::Window<'a>) -> egui::Window<'
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .order(egui::Order::Tooltip)
         .max_width(cap)
+}
+
+/// A small pink count bubble over the top-right corner of `rect` — "N new" on a nav icon.
+///
+/// Painted after the button so it sits over the fill. The font size is fixed rather than taken
+/// from a `TextStyle`: the app's text scale is user-adjustable, and a scaled-up numeral would
+/// overflow the bubble.
+fn count_badge(ui: &egui::Ui, rect: egui::Rect, n: usize) {
+    if n == 0 {
+        return;
+    }
+    let label = if n > 99 { "99+".to_string() } else { n.to_string() };
+    let r = if n > 9 { 8.5 } else { 7.5 };
+    let c = rect.right_top() + egui::vec2(-r - 1.0, r + 1.0);
+    let p = ui.painter();
+    p.circle_filled(c, r, crate::theme::PINK);
+    // Dark rim so the bubble reads against a selected (filled) button as well as an empty one.
+    p.circle_stroke(c, r, egui::Stroke::new(1.0, egui::Color32::from_black_alpha(180)));
+    p.text(
+        c,
+        egui::Align2::CENTER_CENTER,
+        label,
+        egui::FontId::new(10.0, egui::FontFamily::Proportional),
+        egui::Color32::WHITE,
+    );
 }
 
 /// Draw a play-button badge centered on a tile, marking it as a video.

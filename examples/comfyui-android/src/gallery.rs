@@ -600,10 +600,23 @@ fn api_resolve_text(
 ) -> Option<String> {
     let slot = inputs.get(key)?;
     let id = link_node_id(slot)?;
-    api_node_text(nodes, &id, depth)
+    // `key` rides along as the conditioning ROLE, so a node that merely routes conditioning can be
+    // followed through the input of the same name — see the passthrough arm in `api_node_text_as`.
+    api_node_text_as(nodes, &id, key, depth)
 }
 
 fn api_node_text(nodes: &serde_json::Map<String, Value>, id: &str, depth: u8) -> Option<String> {
+    api_node_text_as(nodes, id, "", depth)
+}
+
+/// Resolve the text behind `id`, where `role` is the conditioning slot we arrived through
+/// (`"positive"` / `"negative"`, or `""` when the caller is not chasing one).
+fn api_node_text_as(
+    nodes: &serde_json::Map<String, Value>,
+    id: &str,
+    role: &str,
+    depth: u8,
+) -> Option<String> {
     if depth > 24 {
         return None;
     }
@@ -629,12 +642,27 @@ fn api_node_text(nodes: &serde_json::Map<String, Value>, id: &str, depth: u8) ->
         }
         "Reroute" => {
             let next = inputs.as_object()?.values().next()?;
-            api_node_text(nodes, &link_node_id(next)?, depth + 1)
+            api_node_text_as(nodes, &link_node_id(next)?, role, depth + 1)
         }
         _ if class.contains("Primitive") || class.contains("String") || class.contains("Text") => {
             str_in(&inputs, "value")
                 .or_else(|| str_in(&inputs, "string"))
                 .or_else(|| str_in(&inputs, "text"))
+        }
+        // A conditioning ROUTER: a node that takes positive/negative conditioning and hands it on,
+        // like `WanImageToVideo` (every Wan video graph puts one between the text encoders and the
+        // sampler) or the ControlNet apply nodes. Follow the input of the SAME name.
+        //
+        // Matching by input name rather than by output slot is deliberate: the slot index differs
+        // per class and would have to be tabulated for every one, whereas "the input called
+        // positive carries the positive conditioning" holds across all of them — including custom
+        // nodes this build has never heard of.
+        //
+        // Without this the sampler's lookup returns None for BOTH prompts and the longest-text
+        // fallback below picks them instead — which on a Wan graph reliably SWAPS them, because the
+        // stock Wan negative is a long boilerplate string and the positive is usually terse.
+        _ if matches!(role, "positive" | "negative") && inputs.get(role).is_some() => {
+            api_resolve_text(nodes, &inputs, role, depth + 1)
         }
         _ => None,
     }
@@ -656,13 +684,25 @@ fn ui_input_text(
         .get("link")
         .and_then(Value::as_u64)?;
     let src = *link_src.get(&lid)?;
-    ui_node_text(by_id, link_src, src, depth)
+    // `input` rides along as the conditioning role; see the router arm in `ui_node_text_as`.
+    ui_node_text_as(by_id, link_src, src, input, depth)
 }
 
 fn ui_node_text(
     by_id: &HashMap<u64, &Value>,
     link_src: &HashMap<u64, u64>,
     id: u64,
+    depth: u8,
+) -> Option<String> {
+    ui_node_text_as(by_id, link_src, id, "", depth)
+}
+
+/// UI-format twin of [`api_node_text_as`]: `role` is the conditioning slot we arrived through.
+fn ui_node_text_as(
+    by_id: &HashMap<u64, &Value>,
+    link_src: &HashMap<u64, u64>,
+    id: u64,
+    role: &str,
     depth: u8,
 ) -> Option<String> {
     if depth > 24 {
@@ -697,8 +737,18 @@ fn ui_node_text(
                 .first()?
                 .get("link")
                 .and_then(Value::as_u64)?;
-            ui_node_text(by_id, link_src, *link_src.get(&lid)?, depth + 1)
+            ui_node_text_as(by_id, link_src, *link_src.get(&lid)?, role, depth + 1)
         }
+        // Conditioning router (`WanImageToVideo`, ControlNet apply, …) — follow the same-named
+        // input. See the API-side arm for why this matters on Wan graphs.
+        _ if matches!(role, "positive" | "negative") => ui_input_text(
+            by_id,
+            link_src,
+            id,
+            role,
+            depth + 1,
+        )
+        .or_else(|| widget_str(&widgets, 0).filter(|s| !s.is_empty())),
         _ => widget_str(&widgets, 0).filter(|s| !s.is_empty()),
     }
 }
@@ -910,6 +960,55 @@ pub fn full_cache_keys(root: &str) -> Vec<String> {
         }
     }
     keys
+}
+
+/// Rebuild a gallery listing from what is already on disk, for browsing with no server.
+///
+/// The full-image cache is self-describing: every cached file has a `.key` sidecar holding the
+/// original `subfolder/filename`, which is all a [`GalleryItem`] needs to be addressable. Size and
+/// mtime come from the cached file itself; `mtime` is what the gallery sorts by, so an offline
+/// listing still comes back newest-first.
+///
+/// `has_workflow` is set optimistically for stills: the gate's scrape is unavailable offline, but
+/// the viewer can pull a graph out of the file's own bytes, and claiming "no workflow" up front
+/// would hide the button that does it.
+pub fn offline_items(root: &str) -> Vec<crate::types::GalleryItem> {
+    let dir = Path::new(root);
+    let mut items: Vec<crate::types::GalleryItem> = full_cache_keys(root)
+        .into_iter()
+        .map(|key| {
+            // Keys are `subfolder/filename`; a key with no slash is a bare root-level file.
+            let (subfolder, filename) = match key.rsplit_once('/') {
+                Some((s, f)) => (s.to_string(), f.to_string()),
+                None => (String::new(), key.clone()),
+            };
+            let meta = std::fs::metadata(full_cache_path(dir, &key)).ok();
+            let is_video = crate::graphview::is_pick_video(&filename);
+            crate::types::GalleryItem {
+                size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                mtime: meta
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs_f64()),
+                is_video,
+                // A video's graph lives in its container and is only readable from the bytes we
+                // already hold; a still's is in the PNG. Either way it is worth offering.
+                has_workflow: true,
+                models: Vec::new(),
+                subfolder,
+                filename,
+            }
+        })
+        .collect();
+    // Newest first, matching the server listing's default sort. Undated entries sink rather than
+    // scattering through the grid.
+    items.sort_by(|a, b| {
+        b.mtime
+            .unwrap_or(0.0)
+            .partial_cmp(&a.mtime.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    items
 }
 
 /// Count files and total bytes under the full-image cache root.
@@ -1469,6 +1568,67 @@ mod tests {
         assert_eq!(m.seed, Some(42));
     }
 
+    /// Wan video graphs route conditioning through `WanImageToVideo`, so the sampler's `positive` /
+    /// `negative` links point at that node, not at the text encoders. Before the router arm, both
+    /// lookups returned None and the longest-text fallback took over — and because the stock Wan
+    /// negative is long boilerplate while the positive is terse, that fallback put them in the
+    /// WRONG slots every time. Remixing or opening a video from the gallery showed the negative as
+    /// the prompt and vice versa.
+    #[test]
+    fn wan_conditioning_routes_through_the_image_to_video_node() {
+        // The negative is deliberately much longer than the positive, which is what made the
+        // longest-text fallback pick it as the positive.
+        let raw = r#"{
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan_i2v.safetensors"}},
+            "2": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat leaps", "clip": ["1", 1]}},
+            "3": {"class_type": "CLIPTextEncode", "inputs": {
+                "text": "overexposed, static, blurry details, subtitles, style, artwork, painting, still image, overall grey, worst quality, low quality, JPEG artifacts, ugly, deformed, extra fingers, poorly drawn hands",
+                "clip": ["1", 1]
+            }},
+            "4": {"class_type": "WanImageToVideo", "inputs": {
+                "positive": ["2", 0], "negative": ["3", 0], "width": 640, "height": 640, "length": 49
+            }},
+            "5": {"class_type": "KSamplerAdvanced", "inputs": {
+                "noise_seed": 7, "steps": 20, "cfg": 3.5, "sampler_name": "euler", "scheduler": "simple",
+                "positive": ["4", 0], "negative": ["4", 1], "model": ["1", 0], "latent_image": ["4", 2]
+            }}
+        }"#;
+        let m = parse_workflow_meta(raw);
+        assert_eq!(m.positive.as_deref(), Some("a cat leaps"), "positive must not be the boilerplate negative");
+        assert!(
+            m.negative.as_deref().is_some_and(|n| n.starts_with("overexposed")),
+            "negative must be the boilerplate, got {:?}",
+            m.negative
+        );
+        assert_eq!(m.seed, Some(7));
+    }
+
+    /// The same graph in UI format — video metadata scraped out of a container can arrive either way.
+    #[test]
+    fn wan_conditioning_routes_through_image_to_video_in_ui_format() {
+        let raw = r#"{
+            "nodes": [
+                {"id": 2, "type": "CLIPTextEncode", "widgets_values": ["a cat leaps"],
+                 "inputs": [], "outputs": [{"name": "CONDITIONING", "links": [20]}]},
+                {"id": 3, "type": "CLIPTextEncode",
+                 "widgets_values": ["overexposed, static, blurry details, subtitles, worst quality, low quality, JPEG artifacts, ugly, deformed"],
+                 "inputs": [], "outputs": [{"name": "CONDITIONING", "links": [21]}]},
+                {"id": 4, "type": "WanImageToVideo", "widgets_values": [640, 640, 49],
+                 "inputs": [{"name": "positive", "link": 20}, {"name": "negative", "link": 21}],
+                 "outputs": [{"name": "positive", "links": [30]}, {"name": "negative", "links": [31]}]},
+                {"id": 5, "type": "KSamplerAdvanced",
+                 "widgets_values": ["enable", 7, 20, 3.5, "euler", "simple"],
+                 "inputs": [{"name": "positive", "link": 30}, {"name": "negative", "link": 31}],
+                 "outputs": []}
+            ],
+            "links": [[20, 2, 0, 4, 0, "CONDITIONING"], [21, 3, 0, 4, 1, "CONDITIONING"],
+                      [30, 4, 0, 5, 0, "CONDITIONING"], [31, 4, 1, 5, 1, "CONDITIONING"]]
+        }"#;
+        let m = parse_workflow_meta(raw);
+        assert_eq!(m.positive.as_deref(), Some("a cat leaps"));
+        assert!(m.negative.as_deref().is_some_and(|n| n.starts_with("overexposed")));
+    }
+
     #[test]
     fn parse_ui_concat_and_save_filename_scope() {
         // Minimal multi-column UI workflow: shared subject + per-column prefix via StringConcatenate.
@@ -1648,6 +1808,40 @@ mod tests {
         assert!(!c.claim("a#320"));
         c.reset_pending();
         assert!(c.claim("a#320"));
+    }
+
+    /// The offline listing is rebuilt purely from the cache's `.key` sidecars, so the key -> item
+    /// mapping is the whole feature: get the split wrong and every offline row addresses the wrong
+    /// file (or none), and `is_video` decides whether the viewer tries to play it or decode it.
+    #[test]
+    fn offline_items_rebuild_from_cache_sidecars() {
+        let root = std::env::temp_dir().join(format!("cg-offline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let r = root.to_str().unwrap();
+
+        write_full_cache(r, "ns/sub/dir/a.png", b"still");
+        write_full_cache(r, "ns/clip.mp4", b"video");
+        // A sidecar whose image never landed must not become a row that opens to nothing.
+        std::fs::write(root.join("orphan.key"), b"ns/missing.png").unwrap();
+
+        let items = offline_items(r);
+        assert_eq!(items.len(), 2, "the orphaned sidecar must be skipped: {items:?}");
+
+        let png = items.iter().find(|i| i.filename == "a.png").expect("no a.png");
+        // Only the LAST slash separates the filename; nested subfolders stay intact or the key
+        // won't round-trip back to the same cache file.
+        assert_eq!(png.subfolder, "ns/sub/dir");
+        assert_eq!(png.key(), "ns/sub/dir/a.png");
+        assert!(!png.is_video);
+        assert!(png.has_workflow, "a still must still offer its embedded graph");
+        assert!(png.size > 0);
+
+        let mp4 = items.iter().find(|i| i.filename == "clip.mp4").expect("no clip.mp4");
+        assert!(mp4.is_video, "extension decides playback offline");
+        assert_eq!(mp4.subfolder, "ns");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The symptom this exists for: scroll a picker over a library bigger than the budget and the

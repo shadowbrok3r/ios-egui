@@ -41,9 +41,12 @@ sign-in, per-user gallery + albums, server-side model filtering).
   `animagine` and `animatediff` are untouched); the Loader radio in the defaults editor overrides
   that either way. When a run fails on a null clip anyway, the error dialog offers the switch as a
   one-tap fix and pins it as that model's default.
-- **Prompt rewriting** — the Expand / Variations / Rewrite buttons sit in the prompt's own header
-  row, beside the chips toggle and the history arrows. ☁ marks the server engine; the button always
-  names the engine that will run it, so a rewrite is never ambiguous about where it came from:
+- **Prompt rewriting** — Expand / Variations / Rewrite live behind a single ☰ **Rewrite** menu in
+  the prompt's own header row, beside the chips toggle and the history arrows. (Those arrows are on
+  *both* prompt fields and drive one shared scrubber — a history entry is a positive/negative pair,
+  so stepping from either field moves both.) ☁ marks the server engine, so a rewrite is never
+  ambiguous about where it came from. A spinner sits beside the menu
+  button while any of them is running, since a closed popup can't show its own:
   - **☁ Expand** streams comfy-gate's `POST /api/expand` and renders the rewrite as a live diff to
     accept or discard. The request carries a `dialect` so the text comes back in the family's own
     idiom: `wan-i2v` / `wan-t2v` for video, and for images the catalog family (Illustrious, Pony,
@@ -66,9 +69,48 @@ sign-in, per-user gallery + albums, server-side model filtering).
   - Video prompts are *also* rewritten automatically by comfy-gate at queue time whichever engine
     you use, so accepting a server rewrite turns **Raw** on (a `raw:` marker) to stop it being
     rewritten twice; image prompts are never touched at queue time.
-- **Create output** — finished images land in a floating **Output** window that only opens when you
-  tap it in the launcher strip; new results while it's closed show up as a "N new" count rather
-  than throwing a window over whatever you were editing.
+- **Create output** — finished images go to the Gallery rather than a panel on the Create tab. The
+  Gallery nav icon carries a count of images you haven't opened yet, and each of those tiles gets an
+  aqua dot in its top-left corner until you open it full-screen; the count and the dots read the
+  same set, so they never disagree. The count is seeded from an mtime watermark, so an existing
+  library doesn't light up as new the first time this runs. Create itself keeps only the live
+  sampler preview and its status / warning notes, inline at the top of the pane.
+- **Offline gallery** — with no server reachable, the Gallery falls back to whatever is already in
+  the on-device full-image cache instead of an empty "connect to a server" screen. The cache is
+  self-describing (every file has a `.key` sidecar naming its `subfolder/filename`), so the listing
+  is rebuilt from disk, newest-first. Full images come from the cache, and a workflow is recovered
+  from the file's **own bytes** — the PNG's embedded graph, or a video container's — so Copy
+  workflow, Open workflow and Remix all still work with the server down. Editing does not: deleting
+  offline would tombstone rows locally for the tombstone's whole TTL while the server still held
+  every file, so it refuses rather than pretending. Reconnecting drops the cache-built listing and
+  re-reads the real one.
+- **LoRA library** — Create → LoRAs has an **Active / Library** sub-tab. Library is the server's
+  whole installed set, served by comfy-gate's `/comfyui-android/lora/*` (see that repo's
+  `HANDOFF-android-lora-manager.md`): a virtualized preview grid, search, and folder / base-model /
+  tag filter chips counted over the whole library. Everything keys on the model's **sha256**, which
+  is the only id that survives a move or rename server-side — no path ever crosses the wire. The
+  gate transcodes video previews to JPEG with ffmpeg, so the third of a typical library whose
+  preview is an `.mp4` still shows a thumbnail; a `204` latches per id so a previewless tile never
+  re-asks. Tapping one opens a detail view — trigger words (tap to append to the prompt), tags,
+  notes, Civitai description and link. Previews the server flagged as mature are covered until you
+  opt in.
+  - **Get** pulls a model straight off Civitai (`/comfyui-android/download/*`), for LoRAs,
+    checkpoints or embeddings. Paste a model link, a version link or a bare id; already-installed
+    versions are greyed out and early-access ones warn before they 401. The **root** picker is
+    deliberately not hidden for checkpoints — they have three (`checkpoints` / `diffusion_models` /
+    `unet`) and the wrong one hides the file from every loader.
+  - The transfer runs **server-side**, so it survives the app closing, the screen locking or the
+    connection dropping; the app persists the download id and re-attaches on launch. A download
+    that never leaves `pending` is timed out client-side, because the gate cannot tell "queued, no
+    bytes yet" from "no such download".
+  - Downloads are **admin-only** on the gate. A non-admin gets no Get button rather than a 403.
+- **App updates** — Settings → App updates checks comfy-gate for a newer build and installs it.
+  The APK is streamed to app-private storage, verified against the sha256 the gate recorded at
+  publish time, and handed to Android's `PackageInstaller`; the system shows its own confirm
+  dialog. Android additionally needs a per-app "install unknown apps" grant, which the section
+  offers a button for. Publish a build with `scripts/publish-apk.sh` from the repo root. An update
+  only appears when its `versionCode` is **greater** than the installed one, and that derives from
+  `version` in this crate's `Cargo.toml` — bump it before a release build.
 - **Graph tab** — a full node editor (`rucomfyui_node_graph`, egui-snarl) over the server's real
   node catalog:
   - **Workflows** lists the server's saved workflows (`/userdata?dir=workflows`); tap one to open
@@ -83,6 +125,13 @@ sign-in, per-user gallery + albums, server-side model filtering).
     pans to the workflow's first node (leftmost node with no incoming wires), and a **minimap**
     in the corner shows every node plus the current viewport — tap or drag it to jump anywhere.
   - **Find** searches the loaded workflow by node title/type and jumps to the match.
+  - **File → Open in Create** reads the open tab's nodes back into the Create fields — the mirror of
+    Create's "Open as graph". The graph is converted to API form first (so bypassed nodes are
+    spliced out and SetNode/GetNode and subgraphs are resolved), then scraped by the same reader
+    Remix uses on a gallery image's embedded workflow: model, encoders/VAE, LoRAs, both prompts,
+    sampler/scheduler/steps/cfg and the seed. Companions are re-pointed at this server's installed
+    files. Anything Create can't hold stays in the tab, which is left untouched and still queueable
+    from the Graph tab.
   - **Save** writes the graph back to the server as a UI-format workflow file
     (`POST /userdata/workflows%2F<name>?overwrite=true`) — keep the name to overwrite, change
     it to save a copy. Positions survive, so it round-trips with the website.
@@ -103,8 +152,8 @@ sign-in, per-user gallery + albums, server-side model filtering).
   type/category/description, every input (connection source, or an editable value widget), and
   outputs. **Show in graph** jumps back to the node on the canvas. Values stay editable here
   even in View only mode.
-- **Global progress bar** — while anything runs, a bar with percentage sits under the tab row on
-  every tab. The engine keeps its own authenticated WebSocket to `/ws` (rucomfyui's ws transport
+- **Global progress bar** — while anything runs, a bar with percentage slides in at the very top
+  of the screen, above every tab's own header. The engine keeps its own authenticated WebSocket to `/ws` (rucomfyui's ws transport
   can't send auth headers, so we run our own alongside the polling execution), which supplies
   real per-step sampler progress, the executing-node highlight, and live previews; if the socket
   can't connect, the bar falls back to executed-node count and everything else still works.
