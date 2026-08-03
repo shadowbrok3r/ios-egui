@@ -23,16 +23,17 @@
 //!    full strength for the length of the fade.
 
 #[cfg(target_os = "android")]
-pub use android::glass_panes;
+pub use android::{glass_panes, glass_rects};
 
 #[cfg(not(target_os = "android"))]
 #[allow(unused_imports)]
-pub use stub::glass_panes;
+pub use stub::{glass_panes, glass_rects};
 
-/// Off Android there is no GL context, so this is a no-op and the translucent fills stand alone.
+/// Off Android there is no GL context, so these are no-ops and the translucent fills stand alone.
 #[cfg(not(target_os = "android"))]
 mod stub {
     pub fn glass_panes(_ctx: &egui::Context) {}
+    pub fn glass_rects(_ui: &egui::Ui, _rects: &[egui::Rect], _corner: f32, _scale: f32) {}
 }
 
 #[cfg(target_os = "android")]
@@ -53,7 +54,12 @@ mod android {
     /// text on it, which washes the blur out and drops label contrast; this is a dark smoked film
     /// that leaves most of the blur visible and pairs with the translucent `window_fill` painted
     /// over it (the two alphas multiply — see `theme::apply`).
-    const TINT: [u8; 4] = [8, 11, 16, 90];
+    ///
+    /// Faintly violet rather than neutral: a colourless smoke reads as grey plastic no matter what
+    /// is behind it. The cast is deliberately slight — the colour in a pane is supposed to arrive
+    /// through the blur, from the page, and a film strong enough to notice on its own is a film
+    /// that has replaced the backdrop instead of revealing it.
+    const TINT: [u8; 4] = [11, 9, 19, 92];
     const BLUR: f32 = 24.0;
     /// Matches `menu_corner_radius` / `window_corner_radius`.
     const CORNER: f32 = 8.0;
@@ -167,6 +173,52 @@ mod android {
         // `DidNotFire` is the wiring/version-skew signal and worth a line in logcat.
         if renderer.take_frost_outcome() == FrostOutcome::DidNotFire {
             log::debug!("comfyui: frost callback did not fire this frame");
+        }
+    }
+
+    /// Below this on-screen scale a graph node is too small for a blur to be legible, and there are
+    /// usually many of them — so the whole pass is skipped rather than paid for invisibly.
+    const MIN_NODE_SCALE: f32 = 0.55;
+    /// Ceiling on frosted rects in one pass. Each is a framebuffer grab plus a blur, so an unbounded
+    /// count would let a big graph decide the frame budget. The nearest ones win; the rest keep
+    /// their translucent fill, which is the same fallback as a device with no GL context.
+    const MAX_NODE_PANES: usize = 12;
+
+    /// Frost an explicit list of rects on `ui`'s own layer.
+    ///
+    /// [`glass_panes`] finds its panes in egui's area store, which only knows about areas. The
+    /// graph's nodes are child `Ui`s inside snarl's single transformed layer, so they are invisible
+    /// to it and have to hand their rects over themselves.
+    ///
+    /// `rects` are in that layer's own (pre-transform) coordinates: egui applies a layer transform
+    /// to a paint callback's rect exactly as it does to any other shape, so passing graph-space
+    /// rects is both correct and the only thing that stays correct while the canvas is panned. What
+    /// the transform does *not* scale is `corner`, which is why `scale` is taken separately — a
+    /// corner radius fixed in screen pixels reads as a wildly over-rounded node when zoomed out.
+    pub fn glass_rects(ui: &egui::Ui, rects: &[egui::Rect], corner: f32, scale: f32) {
+        let Some(renderer) = renderer() else { return };
+        if scale < MIN_NODE_SCALE || rects.is_empty() {
+            return;
+        }
+        let tint = Tint::from_srgb_unmultiplied(TINT);
+        let moving = ui.ctx().input(|i| i.pointer.any_down() || i.any_touches() || i.is_scrolling());
+        let repaint = if moving {
+            RepaintPolicy::Live
+        } else {
+            RepaintPolicy::Bounded(Duration::from_millis(400))
+        };
+        for rect in rects.iter().take(MAX_NODE_PANES) {
+            renderer.frost(
+                ui,
+                Surface {
+                    rect: *rect,
+                    blur_radius: BlurRadius::new(BLUR),
+                    tint,
+                    corner_radius: CornerRadius::new(corner * scale),
+                    presence: Presence::new(1.0),
+                    repaint,
+                },
+            );
         }
     }
 }

@@ -19,7 +19,7 @@ use crate::engine::{
     Engine, ExpandMsg, GenCtx, Msg, QueueJob, Variation, Variations, VariationsMsg, VariationsReq,
 };
 use crate::gallery::{self, ImageMeta, RemixDiffRow, RemixField, ThumbCache};
-use crate::graphview::{self, GraphView, LongPress, LoraPick, elide, elide_width, sanitize_ui_text};
+use crate::graphview::{self, GraphView, LongPress, ModelPick, elide, elide_width, sanitize_ui_text};
 use crate::icons;
 use crate::mask;
 use crate::{cooc, lint, tags};
@@ -1059,6 +1059,10 @@ struct ComfyApp {
     session: String,
     signing_in: bool,
     auth_note: String,
+    /// The server has refused our credentials since the last connect. Both transports report it
+    /// independently, and only the first report can still see the session it cleared — so later
+    /// ones must not overwrite its wording with something vaguer. Cleared by connect and sign-in.
+    auth_rejected: bool,
     conn: Conn,
     schemas: Option<Arc<SchemaSet>>,
     checkpoints: Vec<String>,
@@ -1840,6 +1844,7 @@ impl ComfyApp {
             session: String::new(),
             signing_in: false,
             auth_note: String::new(),
+            auth_rejected: false,
             conn: Conn::Disconnected,
             schemas: None,
             checkpoints: Vec::new(),
@@ -2436,6 +2441,31 @@ impl ComfyApp {
             Msg::AuthError(e) => {
                 self.signing_in = false;
                 self.auth_note = elide(&e, 160);
+                host.haptic(Haptic::Error);
+            }
+            // The session token is the one credential that dies on its own — comfy-gate expires it
+            // and nothing renews it — so a refusal means it is spent. Holding on to it would keep
+            // every later request 401ing with no way for the user to tell why, so it goes, and the
+            // note names the remaining credential rather than just reporting failure. The autosave
+            // diff picks the clear up within the second, so a dead token is not reloaded next launch.
+            Msg::Unauthorized if self.auth_rejected => {}
+            Msg::Unauthorized => {
+                self.signing_in = false;
+                self.auth_rejected = true;
+                let had_session = !std::mem::take(&mut self.session).is_empty();
+                if had_session {
+                    self.albums.clear();
+                }
+                let has_key = !self.api_key.trim().is_empty();
+                self.auth_note = match (had_session, has_key) {
+                    (true, true) => "Session expired and was cleared — your API key still works.".into(),
+                    (true, false) => {
+                        "Session expired — sign in again, or set an API key (those don't expire).".into()
+                    }
+                    (false, true) => "The server rejected this API key — check it in Settings.".into(),
+                    (false, false) => "Not authenticated — sign in, or set an API key.".into(),
+                };
+                self.log.warn(format!("auth: {}", self.auth_note));
                 host.haptic(Haptic::Error);
             }
             Msg::Albums(albums) => {
@@ -5435,6 +5465,8 @@ impl ComfyApp {
     fn connect(&mut self, host: &Host) {
         self.conn = Conn::Connecting;
         self.status.clear();
+        // Whatever was refused last time, this attempt gets to report its own verdict.
+        self.auth_rejected = false;
         // A different server (or the same one redeployed) gets a fresh verdict on the rewrite
         // endpoints.
         self.expand_unsupported = false;
@@ -16246,7 +16278,7 @@ impl ComfyApp {
         // Thumbnails for the files LoadImage-style nodes point at, so a node shows the picture it
         // will load rather than a filename you'd have to go look up.
         let (input_thumbs, wanted_thumbs) = self.node_input_thumbs();
-        let (long_press, lora_picks, file_pick) = {
+        let (long_press, model_picks, file_pick) = {
             let Some(doc) = self.active_doc_mut() else { return };
             doc.view.set_input_thumbs(input_thumbs, &wanted_thumbs);
             let props = doc.props_node;
@@ -16271,12 +16303,12 @@ impl ComfyApp {
             }
             (
                 doc.view.take_long_press(),
-                doc.view.take_lora_picks(),
+                doc.view.take_model_picks(),
                 doc.view.take_file_pick(),
             )
         };
-        for pick in lora_picks {
-            self.apply_lora_pick(pick);
+        for pick in model_picks {
+            self.apply_model_pick(pick);
         }
         // Tapping a node's file widget opens the thumbnail picker over the canvas.
         if let Some(node) = file_pick {
@@ -16605,7 +16637,111 @@ impl ComfyApp {
     }
 
     /// Apply catalog strengths (and prompt triggers when a positive CLIP encode exists).
-    fn apply_lora_pick(&mut self, pick: LoraPick) {
+    /// React to a model-file combo changing on the canvas or in the properties panel.
+    ///
+    /// This is what makes the graph behave like the Create tab: picking a LoRA seeds its catalog
+    /// strengths and triggers, and picking a checkpoint or diffusion model seeds that model's
+    /// recommended sampler settings. Both read the same catalog-plus-override the Create tab does,
+    /// so the two tabs cannot disagree about what a model wants.
+    fn apply_model_pick(&mut self, pick: ModelPick) {
+        match pick.input {
+            "lora_name" => self.apply_lora_pick(pick),
+            _ => self.apply_model_defaults(&pick.file),
+        }
+    }
+
+    /// Seed the graph from a checkpoint's recommendation, the Create tab's
+    /// [`Self::apply_recommended_settings`] pointed at nodes instead of at `params`.
+    fn apply_model_defaults(&mut self, file: &str) {
+        let rec = self.recommended_for(file);
+        let family = crate::types::checkpoint_family(self.checkpoint_catalog.entry(file));
+        // Same precedence as the Create tab: an explicit catalog sampler wins, else the family
+        // default, so a known family whose catalog left it blank still swaps off the last model's.
+        let fam = family_default_sampler(file, &family);
+        let sampler = rec
+            .sampler
+            .as_ref()
+            .and_then(|s| match_sampler_name(s, &self.samplers))
+            .or_else(|| fam.and_then(|(s, _)| match_sampler_name(s, &self.samplers)));
+        let scheduler = rec
+            .scheduler
+            .as_ref()
+            .and_then(|s| match_sampler_name(s, &self.schedulers))
+            .or_else(|| fam.and_then(|(_, s)| match_sampler_name(s, &self.schedulers)));
+        let defaults = graphview::GraphDefaults {
+            steps: rec.steps,
+            cfg: rec.cfg,
+            width: rec.width,
+            height: rec.height,
+            sampler: sampler.as_deref(),
+            scheduler: scheduler.as_deref(),
+            clip_skip: rec.clip_skip,
+        };
+        let Some(doc) = self.active_doc_mut() else { return };
+        let changed = graphview::apply_defaults(&mut doc.graph.snarl, &defaults);
+        let name = elide(file, 34);
+        self.graph_status = if changed.is_empty() {
+            // Not a failure worth a warning: plenty of models have no catalog row, and the graph
+            // is simply left as the user built it.
+            format!("{name} — no recommended settings")
+        } else {
+            format!("{name} — applied {}", changed.join(" · "))
+        };
+    }
+
+    /// Write the model family's quality block into the graph's prompt nodes — the manual form of
+    /// the Create tab's "This model expects quality tags" lint fix.
+    ///
+    /// Not automatic on a model change, unlike the sampler defaults: prompts are the user's own
+    /// writing, and silently editing them on a combo change would be a very unwelcome surprise.
+    fn apply_graph_quality_tags(&mut self, host: &Host) {
+        let Some(file) = self.active_doc().and_then(|d| graphview::graph_model_file(&d.graph.snarl))
+        else {
+            self.graph_status = "No checkpoint node in this graph".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let (positive, negative) = self.family_quality(&file);
+        let Some(doc) = self.active_doc_mut() else { return };
+        let (pos_node, neg_node) = graphview::prompt_nodes(&doc.graph.snarl);
+        let mut done: Vec<&str> = Vec::new();
+        // The quality prefix leads the prompt, matching the lint's fix and the convention the tags
+        // themselves assume; negatives simply accumulate.
+        if !positive.is_empty()
+            && let Some(node) = pos_node
+            && let Some(current) = graphview::prompt_text(&doc.graph.snarl, node)
+        {
+            let mut missing = String::new();
+            crate::types::merge_triggers(&mut missing, positive, &current);
+            if !missing.is_empty() {
+                let merged = if current.trim().is_empty() {
+                    missing
+                } else {
+                    format!("{missing}, {current}")
+                };
+                graphview::set_prompt_text(&mut doc.graph.snarl, node, merged);
+                done.push("positive");
+            }
+        }
+        if let Some(node) = neg_node
+            && let Some(current) = graphview::prompt_text(&doc.graph.snarl, node)
+        {
+            let mut merged = current.clone();
+            if !crate::types::merge_triggers(&mut merged, negative, "").is_empty() {
+                graphview::set_prompt_text(&mut doc.graph.snarl, node, merged);
+                done.push("negative");
+            }
+        }
+        self.graph_status = match (done.is_empty(), pos_node.or(neg_node)) {
+            (false, _) => format!("Applied {} quality tags for {}", done.join(" + "), elide(&file, 28)),
+            // Nothing added and the nodes were found: the prompts already carry the block.
+            (true, Some(_)) => "Quality tags already present".into(),
+            (true, None) => "No prompt nodes wired to a sampler".into(),
+        };
+        host.haptic(if done.is_empty() { Haptic::Warning } else { Haptic::Success });
+    }
+
+    fn apply_lora_pick(&mut self, pick: ModelPick) {
         let (sm, sc, triggers) = match self.lora_entry_for(&pick.file) {
             Some(e) => {
                 let (sm, sc) = e.add_strengths();
@@ -16702,7 +16838,7 @@ impl ComfyApp {
         }
 
         if let Some(file) = lora_file {
-            self.apply_lora_pick(LoraPick { node: nid, file });
+            self.apply_model_pick(ModelPick { node: nid, input: "lora_name", file });
         }
 
         if wired == 0 {
@@ -16839,6 +16975,25 @@ impl ComfyApp {
                 if let Some(doc) = self.active_doc_mut() {
                     doc.view.request_arrange();
                 }
+            }
+            ui.separator();
+            // Both of these happen on their own when you change a model *combo* — these are for
+            // the graph you loaded from a file, where nothing was ever picked.
+            let model = self.active_doc().and_then(|d| graphview::graph_model_file(&d.graph.snarl));
+            if ui
+                .add_enabled(model.is_some() && !locked, egui::Button::new("Apply model defaults"))
+                .on_hover_text("Re-seed steps, CFG, sampler, size and CLIP skip from this model")
+                .clicked()
+                && let Some(file) = model.clone()
+            {
+                self.apply_model_defaults(&file);
+            }
+            if ui
+                .add_enabled(model.is_some() && !locked, egui::Button::new("Apply recommended tags"))
+                .on_hover_text("Add this model family's quality tags to the prompt nodes")
+                .clicked()
+            {
+                self.apply_graph_quality_tags(host);
             }
         });
 
@@ -17053,7 +17208,7 @@ impl ComfyApp {
         let content_width = ui.available_width();
         let mut exists = true;
         let loras = self.installed_loras.clone();
-        let mut lora_picks = Vec::new();
+        let mut model_picks = Vec::new();
         crate::theme::scroll_vertical()
             .auto_shrink([false, false])
             .max_width(content_width)
@@ -17067,7 +17222,7 @@ impl ComfyApp {
                         node,
                         false,
                         &loras,
-                        &mut lora_picks,
+                        &mut model_picks,
                         &mut doc.seed_randomize,
                     );
                 }
@@ -17078,8 +17233,8 @@ impl ComfyApp {
                 ui.add_space(if self.kb_was_open { self.kb_height.max(160.0) } else { 12.0 });
                 self.scroll_focus_into_view(ui);
             });
-        for pick in lora_picks {
-            self.apply_lora_pick(pick);
+        for pick in model_picks {
+            self.apply_model_pick(pick);
         }
         if !exists
             && let Some(doc) = self.active_doc_mut()
@@ -17881,7 +18036,7 @@ impl ComfyApp {
                     })
                 })
             }) {
-                self.apply_lora_pick(LoraPick { node: nid, file });
+                self.apply_model_pick(ModelPick { node: nid, input: "lora_name", file });
             }
             self.add_pos += egui::vec2(48.0, 48.0);
             if self.add_pos.y > 800.0 {
@@ -23131,6 +23286,9 @@ impl EguiApp for ComfyApp {
         // Blurs the page under last frame's windows, menus and sheets. Position in `update` does
         // not matter — it paints into its own layer, ordered above the panels and below every pane
         // it frosts — but it has to run before the early returns below.
+        // The lamps go down first: `glass_panes` blurs what is already in the framebuffer, so the
+        // page has to be lit before it runs or there is nothing for the glass to pick up.
+        crate::theme::page_ambience(ui.ctx());
         crate::frost::glass_panes(ui.ctx());
 
         let t_msgs = std::time::Instant::now();

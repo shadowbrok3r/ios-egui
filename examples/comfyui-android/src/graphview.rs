@@ -35,11 +35,21 @@ pub enum LongPress {
     Node(NodeId),
 }
 
-/// A `lora_name` combo selection that changed this frame (canvas or properties).
-pub struct LoraPick {
+/// A model-file combo selection that changed this frame (canvas or properties).
+///
+/// `lora_name` drives recommended strengths and trigger injection; `ckpt_name` / `unet_name` drive
+/// the checkpoint's recommended sampler settings, so swapping a model on the canvas re-seeds the
+/// graph the way it already re-seeds the Create tab.
+pub struct ModelPick {
     pub node: NodeId,
+    /// Which input changed — one of [`PICK_INPUTS`].
+    pub input: &'static str,
     pub file: String,
 }
+
+/// The file inputs a [`ModelPick`] is raised for. A node carries at most one of them, so the first
+/// match wins and the order is only a probe order.
+pub const PICK_INPUTS: [&str; 3] = ["lora_name", "ckpt_name", "unet_name"];
 
 /// View state and overlays for the graph canvas.
 pub struct GraphView {
@@ -56,6 +66,10 @@ pub struct GraphView {
     /// Auto-arrange requested by a load, waiting for the canvas to paint before running.
     needs_auto_arrange: bool,
     sizes: HashMap<NodeId, egui::Vec2>,
+    /// Last frame's node rects in graph space, for the backdrop blur behind each node. Kept on the
+    /// view rather than rebuilt per frame because the glass has to be painted before the nodes that
+    /// define it — see `Wrapper::frost_nodes`.
+    node_rects: Vec<egui::Rect>,
     /// `sizes` as of the previous frame: a queued arrange waits for two frames to agree, since a
     /// node's first measure is taken before egui has settled its content.
     prev_sizes: HashMap<NodeId, egui::Vec2>,
@@ -77,7 +91,7 @@ pub struct GraphView {
     /// Long-press this frame (canvas add-menu or node menu).
     long_press: Option<LongPress>,
     /// `lora_name` picks this frame (recommended strengths applied by the app).
-    lora_picks: Vec<LoraPick>,
+    model_picks: Vec<ModelPick>,
     /// A file-selector widget was tapped on the canvas this frame; the app opens its picker.
     file_pick: Option<NodeId>,
     /// Lay the graph out top-to-bottom rather than left-to-right, chosen from the canvas shape so
@@ -361,6 +375,7 @@ impl GraphView {
             arrange_settling: 0,
             needs_auto_arrange: false,
             sizes: HashMap::new(),
+            node_rects: Vec::new(),
             prev_sizes: HashMap::new(),
             arranged_sizes: HashMap::new(),
             refine_left: 0,
@@ -370,7 +385,7 @@ impl GraphView {
             press: None,
             long_fired: false,
             long_press: None,
-            lora_picks: Vec::new(),
+            model_picks: Vec::new(),
             file_pick: None,
             vertical: false,
             input_thumbs: HashMap::new(),
@@ -393,7 +408,7 @@ impl GraphView {
         self.press = None;
         self.long_fired = false;
         self.long_press = None;
-        self.lora_picks.clear();
+        self.model_picks.clear();
         self.file_pick = None;
         self.input_thumbs.clear();
         self.pending_pan = egui::Vec2::ZERO;
@@ -489,8 +504,8 @@ impl GraphView {
     }
 
     /// `lora_name` selections made while rendering the canvas this frame.
-    pub fn take_lora_picks(&mut self) -> Vec<LoraPick> {
-        std::mem::take(&mut self.lora_picks)
+    pub fn take_model_picks(&mut self) -> Vec<ModelPick> {
+        std::mem::take(&mut self.model_picks)
     }
 
     /// The node whose file selector was tapped on the canvas this frame.
@@ -545,7 +560,7 @@ impl GraphView {
         }
         self.vertical = self.view_rect.height() > self.view_rect.width() * 1.15;
         self.arrange_settling = self.arrange_settling.saturating_sub(1);
-        self.lora_picks.clear();
+        self.model_picks.clear();
         self.file_pick = None;
         // Keep file combos populated even when a single loader class shipped an empty list.
         for data in g.snarl.nodes_mut() {
@@ -626,7 +641,7 @@ impl GraphView {
             locked: self.locked,
             focus,
             bypassed,
-            lora_picks: &mut self.lora_picks,
+            model_picks: &mut self.model_picks,
             file_pick: &mut self.file_pick,
             input_thumbs: &self.input_thumbs,
             seed_randomize,
@@ -636,6 +651,7 @@ impl GraphView {
             ui_rect: self.view_rect,
             sizes: &mut self.sizes,
             out_transform: &mut self.to_global,
+            node_rects: &mut self.node_rects,
         };
         SnarlWidget::new()
             .id(self.widget_id)
@@ -1014,7 +1030,14 @@ fn style() -> SnarlStyle {
 }
 
 /// A node body: dark glass a step above the black canvas; the rim comes from [`Wrapper::node_frame`].
-const NODE_FILL: egui::Color32 = egui::Color32::from_rgb(17, 18, 23);
+///
+/// Translucent, so the blur `Wrapper::frost_nodes` lays down behind each node reaches the eye. An
+/// opaque fill here would hide it completely and the whole pass would be paid for and never seen.
+/// Premultiplied because only that constructor is `const`; this is `(22, 21, 34)` at alpha 190.
+const NODE_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(16, 16, 25, 190);
+/// Node corner radius, kept in one place because the frosted rect behind a node has to round to
+/// the same figure — a mismatch shows up as bright corners poking out from under the glass.
+const NODE_CORNER: f32 = 8.0;
 /// Base spacing (graph units) of the canvas dot grid — anchored in graph space so it scales with
 /// the nodes; coarsened by powers of two when zoomed far out.
 const DOT_SPACING: f32 = 28.0;
@@ -1022,8 +1045,8 @@ const DOT_SPACING: f32 = 28.0;
 const DOT_RADIUS: f32 = 1.7;
 /// Dim teal ink for the dot grid — reads as a faint field because the dots are small.
 const DOT_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 70, 74);
-/// Cool rim on a resting node — a subtle glass edge against the black canvas.
-const NODE_RIM: egui::Color32 = egui::Color32::from_rgb(54, 84, 92);
+/// Resting-node edge — the same dim white hairline every other surface carries. See `theme::RIM`.
+const NODE_RIM: egui::Color32 = crate::theme::RIM_BRIGHT;
 
 /// Do two measure snapshots describe the same canvas — same nodes, no size moved by more than a
 /// unit? Tells a settled layout from one egui is still converging.
@@ -1394,7 +1417,7 @@ struct Wrapper<'a> {
     locked: bool,
     focus: Option<NodeId>,
     bypassed: &'a HashSet<NodeId>,
-    lora_picks: &'a mut Vec<LoraPick>,
+    model_picks: &'a mut Vec<ModelPick>,
     file_pick: &'a mut Option<NodeId>,
     input_thumbs: &'a HashMap<String, egui::TextureHandle>,
     seed_randomize: &'a mut HashMap<(NodeId, String), bool>,
@@ -1405,6 +1428,33 @@ struct Wrapper<'a> {
     ui_rect: egui::Rect,
     sizes: &'a mut HashMap<NodeId, egui::Vec2>,
     out_transform: &'a mut TSTransform,
+    /// Node rects in GRAPH space, for the backdrop blur. Written by `final_node_rect` as the nodes
+    /// lay out and read by the *next* frame's `draw_background` — the same one-frame staleness the
+    /// `frost` module already lives with, and for the same reason: a pane's rect is not known until
+    /// it has laid out, but the glass has to be painted before it.
+    node_rects: &'a mut Vec<egui::Rect>,
+}
+
+impl Wrapper<'_> {
+    /// Blur the canvas behind every node laid out last frame, then clear the list for this one.
+    ///
+    /// Called at the end of `draw_background` because that is the only point in snarl's frame that
+    /// is after the grid and before any node: the grab-pass composites whatever is already in the
+    /// framebuffer at its rect, so anywhere later would blur the nodes into themselves. Snarl keeps
+    /// the whole canvas in one transformed layer, so the callbacks are added to `painter`'s layer
+    /// in graph coordinates and egui's layer transform puts them on screen.
+    fn frost_nodes(&mut self, painter: &egui::Painter, viewport: &egui::Rect, scale: f32) {
+        let mut ui = egui::Ui::new(
+            painter.ctx().clone(),
+            egui::Id::new("graph-node-frost"),
+            egui::UiBuilder::new().layer_id(painter.layer_id()).max_rect(*viewport),
+        );
+        // The callback grabs `viewport ∩ clip_rect`, and this ui has no content of its own to
+        // derive a useful clip from — so it is set to the visible canvas explicitly.
+        ui.set_clip_rect(*viewport);
+        crate::frost::glass_rects(&ui, self.node_rects, NODE_CORNER, scale);
+        self.node_rects.clear();
+    }
 }
 
 impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
@@ -1427,7 +1477,7 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<FlowNodeData>,
     ) -> PinInfo {
-        let before = lora_name_selected(snarl, pin.id.node);
+        let before = picked_file(snarl, pin.id.node);
         let seed = snarl
             .get_node(pin.id.node)
             .and_then(|n| n.inputs.get(pin.id.input))
@@ -1474,8 +1524,10 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
                 }
             })
             .inner;
-        if let Some(file) = lora_name_changed(snarl, pin.id.node, before.as_deref()) {
-            self.lora_picks.push(LoraPick { node: pin.id.node, file });
+        if let Some(pick) =
+            pick_changed(pin.id.node, before.as_ref(), picked_file(snarl, pin.id.node))
+        {
+            self.model_picks.push(pick);
         }
         info
     }
@@ -1498,7 +1550,11 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         outputs: &[OutPin],
         snarl: &Snarl<FlowNodeData>,
     ) -> egui::Frame {
-        let mut frame = self.inner.node_frame(default, node, inputs, outputs, snarl).fill(NODE_FILL);
+        let mut frame = self
+            .inner
+            .node_frame(default, node, inputs, outputs, snarl)
+            .fill(NODE_FILL)
+            .corner_radius(NODE_CORNER);
         // The inner viewer paints a green 2px stroke on the executing node; anything below 2px is
         // just its default hairline, so we only override our own rims when the width is < 2.
         let inner_width = frame.stroke.width;
@@ -1532,6 +1588,11 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         // the dot count stay bounded, and dots shrink toward sub-pixel (like the nodes) so a very
         // zoomed-out canvas isn't cluttered.
         let scale = self.out_transform.scaling.max(0.001);
+        // Light first, then the grid, then the glass — the node frost grabs the framebuffer, so
+        // anything it should reveal has to be painted before `frost_nodes` at the end of this fn.
+        // Anchored to the viewport rather than to graph space, so the canvas stays evenly lit
+        // instead of the light sliding away as you pan.
+        crate::theme::ambience(painter, *viewport, 3);
         let mut spacing = DOT_SPACING;
         while spacing * scale < 26.0 {
             spacing *= 2.0;
@@ -1550,6 +1611,7 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
                 painter.circle_filled(p, DOT_RADIUS, DOT_COLOR);
             }
         }
+        self.frost_nodes(painter, viewport, scale);
     }
 
     fn has_body(&mut self, node: &FlowNodeData) -> bool {
@@ -1599,6 +1661,7 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         _snarl: &mut Snarl<FlowNodeData>,
     ) {
         self.sizes.insert(node, clamp_measure(rect.size()));
+        self.node_rects.push(rect);
     }
 
     fn connect(&mut self, from: &OutPin, to: &InPin, snarl: &mut Snarl<FlowNodeData>) {
@@ -2049,24 +2112,203 @@ fn numeric_option(options: &[String], value: &str) -> Option<String> {
     options.iter().find(|o| o.trim().parse::<f64>().is_ok_and(|f| f == n)).cloned()
 }
 
-fn lora_name_selected(snarl: &Snarl<FlowNodeData>, node: NodeId) -> Option<String> {
-    let data = snarl.get_node(node)?;
-    data.inputs.iter().find(|i| i.name == "lora_name").and_then(|i| match &i.value {
-        FlowValueType::Array { selected, .. } => Some(selected.clone()),
+/// Whichever of [`PICK_INPUTS`] this node carries, and its current selection.
+fn picked_file_of(data: &FlowNodeData) -> Option<(&'static str, String)> {
+    PICK_INPUTS.iter().find_map(|name| {
+        let i = data.inputs.iter().find(|i| i.name == *name)?;
+        match &i.value {
+            FlowValueType::Array { selected, .. } => Some((*name, selected.clone())),
+            _ => None,
+        }
+    })
+}
+
+fn picked_file(snarl: &Snarl<FlowNodeData>, node: NodeId) -> Option<(&'static str, String)> {
+    picked_file_of(snarl.get_node(node)?)
+}
+
+/// A pick, when this frame's selection differs from `before`. An empty selection raises nothing —
+/// clearing a combo is not a request to re-seed the graph from a model that is no longer chosen.
+fn pick_changed(
+    node: NodeId,
+    before: Option<&(&'static str, String)>,
+    after: Option<(&'static str, String)>,
+) -> Option<ModelPick> {
+    let (input, file) = after?;
+    if before.map(|(_, f)| f.as_str()) == Some(file.as_str()) || file.is_empty() {
+        return None;
+    }
+    Some(ModelPick { node, input, file })
+}
+
+/// A checkpoint's recommended settings, already resolved against this server's option lists.
+///
+/// Name matching stays with the caller: only the Create tab knows the live `samplers`/`schedulers`,
+/// and a name this server does not offer must be dropped rather than written into a combo whose
+/// options do not contain it.
+#[derive(Default)]
+pub struct GraphDefaults<'a> {
+    pub steps: Option<u32>,
+    pub cfg: Option<f32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub sampler: Option<&'a str>,
+    pub scheduler: Option<&'a str>,
+    pub clip_skip: Option<u32>,
+}
+
+/// Apply `d` across the graph the way the Create tab applies it to its params, and report what
+/// actually moved so the caller can say so rather than claiming a silent success.
+///
+/// Sizes are written only to latent *sources*. `width`/`height` are common input names — an upscale
+/// node has them too — and seeding a 896×1152 recommendation into an upscale would quietly resize
+/// the wrong stage of the pipeline.
+pub fn apply_defaults(snarl: &mut Snarl<FlowNodeData>, d: &GraphDefaults<'_>) -> Vec<String> {
+    let mut changed: Vec<String> = Vec::new();
+    let mut note = |s: String| {
+        if !changed.contains(&s) {
+            changed.push(s);
+        }
+    };
+    for data in snarl.nodes_mut() {
+        let class = data.object.name.clone();
+        let is_latent_source = class.starts_with("Empty") && class.contains("Latent");
+        for input in &mut data.inputs {
+            let hit = match input.name.as_str() {
+                "steps" => d.steps.filter(|v| set_int_input(&mut input.value, *v as i64)).map(|v| format!("steps {v}")),
+                "width" if is_latent_source => d
+                    .width
+                    .filter(|v| set_int_input(&mut input.value, *v as i64))
+                    .map(|v| format!("width {v}")),
+                "height" if is_latent_source => d
+                    .height
+                    .filter(|v| set_int_input(&mut input.value, *v as i64))
+                    .map(|v| format!("height {v}")),
+                // The graph stores what ComfyUI stores: a NEGATIVE layer index. `clip_skip` counts
+                // back from the end, so 2 means `-2` — see `workflow::build`.
+                "stop_at_clip_layer" => d
+                    .clip_skip
+                    .filter(|v| *v >= 1 && set_int_input(&mut input.value, -((*v).min(24) as i64)))
+                    .map(|v| format!("CLIP skip {v}")),
+                "cfg" => match (&d.cfg, &mut input.value) {
+                    (Some(v), FlowValueType::Float { value, min, max, .. }) => {
+                        *value = (*v as f64).clamp(*min, *max);
+                        Some(format!("CFG {v}"))
+                    }
+                    _ => None,
+                },
+                "sampler_name" => set_option(&mut input.value, d.sampler).map(|v| format!("sampler {v}")),
+                "scheduler" => set_option(&mut input.value, d.scheduler).map(|v| format!("scheduler {v}")),
+                _ => None,
+            };
+            if let Some(msg) = hit {
+                note(msg);
+            }
+        }
+    }
+    changed
+}
+
+/// Write `n` into whichever integer variant this input uses, clamped to its own range. `false` when
+/// the input is not an integer at all, which is how a name collision on another node is skipped.
+fn set_int_input(value: &mut FlowValueType, n: i64) -> bool {
+    match value {
+        FlowValueType::UnsignedInt { value, min, max, .. } => {
+            *value = (n.max(0) as u64).clamp(*min, *max);
+            true
+        }
+        FlowValueType::SignedInt { value, min, max, .. } => {
+            *value = n.clamp(*min, *max);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Select `want` on an enum input, but only if this server actually offers it — writing a name
+/// that is not in `options` leaves a combo displaying a value it cannot round-trip.
+fn set_option<'a>(value: &mut FlowValueType, want: Option<&'a str>) -> Option<&'a str> {
+    let want = want?;
+    match value {
+        FlowValueType::Array { options, selected } if options.iter().any(|o| o == want) => {
+            *selected = want.to_string();
+            Some(want)
+        }
+        _ => None,
+    }
+}
+
+/// The checkpoint or diffusion model this graph loads, if a loader has one selected. LoRAs are
+/// excluded: they are not what a model recommendation or a family quality block keys off.
+pub fn graph_model_file(snarl: &Snarl<FlowNodeData>) -> Option<String> {
+    snarl.nodes_pos_ids().find_map(|(_, _, data)| match picked_file_of(data) {
+        Some((input, file)) if input != "lora_name" && !file.is_empty() => Some(file),
         _ => None,
     })
 }
 
-fn lora_name_changed(
-    snarl: &Snarl<FlowNodeData>,
-    node: NodeId,
-    before: Option<&str>,
-) -> Option<String> {
-    let after = lora_name_selected(snarl, node)?;
-    if before == Some(after.as_str()) {
-        return None;
+/// The `(positive, negative)` prompt nodes a sampler reads.
+///
+/// Found by walking the sampler's conditioning inputs back to the first node upstream carrying a
+/// `text` widget, rather than by taking the first two `CLIPTextEncode`s in the graph: which encode
+/// is positive is a wiring fact, and guessing it puts quality tags in the negative prompt.
+pub fn prompt_nodes(snarl: &Snarl<FlowNodeData>) -> (Option<NodeId>, Option<NodeId>) {
+    /// Conditioning can pass through combiners/controlnets before the encode; bounded so a cycle
+    /// or a long chain cannot spin.
+    const MAX_HOPS: usize = 8;
+    let walk = |start: NodeId, input: &str| -> Option<NodeId> {
+        let mut node = start;
+        let mut want = input.to_string();
+        for _ in 0..MAX_HOPS {
+            let data = snarl.get_node(node)?;
+            let idx = data.inputs.iter().position(|i| i.name == want)?;
+            let remote = *snarl.in_pin(InPinId { node, input: idx }).remotes.first()?;
+            let src = snarl.get_node(remote.node)?;
+            if src.inputs.iter().any(|i| {
+                i.name == "text" && matches!(i.value, FlowValueType::String { .. })
+            }) {
+                return Some(remote.node);
+            }
+            // Keep climbing the first conditioning input this node has.
+            let next = src
+                .inputs
+                .iter()
+                .find(|i| i.name.starts_with("conditioning") || i.name == "positive")?;
+            want = next.name.clone();
+            node = remote.node;
+        }
+        None
+    };
+    let sampler = snarl.nodes_pos_ids().find(|(_, _, d)| {
+        d.inputs.iter().any(|i| i.name == "positive") && d.inputs.iter().any(|i| i.name == "negative")
+    });
+    match sampler {
+        Some((id, _, _)) => (walk(id, "positive"), walk(id, "negative")),
+        None => (None, None),
     }
-    (!after.is_empty()).then_some(after)
+}
+
+/// Read a node's `text` widget.
+pub fn prompt_text(snarl: &Snarl<FlowNodeData>, node: NodeId) -> Option<String> {
+    let data = snarl.get_node(node)?;
+    data.inputs.iter().find(|i| i.name == "text").and_then(|i| match &i.value {
+        FlowValueType::String { value, .. } => Some(value.clone()),
+        _ => None,
+    })
+}
+
+/// Overwrite a node's `text` widget. `false` when the node has none.
+pub fn set_prompt_text(snarl: &mut Snarl<FlowNodeData>, node: NodeId, text: String) -> bool {
+    let Some(data) = snarl.get_node_mut(node) else { return false };
+    for input in &mut data.inputs {
+        if input.name == "text"
+            && let FlowValueType::String { value, .. } = &mut input.value
+        {
+            *value = text;
+            return true;
+        }
+    }
+    false
 }
 
 /// Write catalog strengths onto a LoRA node's strength widgets.
@@ -2088,17 +2330,19 @@ pub fn apply_lora_strengths(data: &mut FlowNodeData, strength_model: f32, streng
 
 /// Inspector for one node: type/category header, every input (connection source or editable
 /// value), and outputs. Returns `false` when the node no longer exists.
-/// `lora_picks` collects `lora_name` changes for recommended-strength application.
+/// `model_picks` collects model-file changes for recommended-settings application.
 pub fn node_properties(
     ui: &mut egui::Ui,
     g: &mut ComfyUiNodeGraph,
     node: NodeId,
     locked: bool,
     lora_files: &[String],
-    lora_picks: &mut Vec<LoraPick>,
+    model_picks: &mut Vec<ModelPick>,
     seed_randomize: &mut HashMap<(NodeId, String), bool>,
 ) -> bool {
     let Some(data) = g.snarl.get_node(node) else { return false };
+    // Captured before the editors run, so a change made below can be told from a repaint.
+    let before = picked_file_of(data);
 
     // Connection sources, resolved before taking the node mutably.
     let sources: Vec<Option<String>> = (0..data.inputs.len())
@@ -2143,22 +2387,14 @@ pub fn node_properties(
                 });
             }
             None => {
-                let before = match &input.value {
-                    FlowValueType::Array { selected, .. } if input.name == "lora_name" => {
-                        Some(selected.clone())
-                    }
-                    _ => None,
-                };
                 value_editor(ui, egui::Id::new((node, i)), node, input, locked, seed_randomize);
-                if input.name == "lora_name"
-                    && let FlowValueType::Array { selected, .. } = &input.value
-                    && before.as_deref() != Some(selected.as_str())
-                    && !selected.is_empty()
-                {
-                    lora_picks.push(LoraPick { node, file: selected.clone() });
-                }
             }
         }
+    }
+    // One check for the whole node rather than one per input: the editors above have run, so this
+    // sees the settled selection, and a node carries at most one model-file input anyway.
+    if let Some(pick) = pick_changed(node, before.as_ref(), picked_file_of(data)) {
+        model_picks.push(pick);
     }
 
     if !data.outputs.is_empty() {
@@ -2288,6 +2524,11 @@ fn option_combo(
     // graph's horizontal span).
     egui::ComboBox::from_id_salt(salt)
         .selected_text(elide_width(ui, &sanitize_ui_text(ui, selected), max_w))
+        // egui defaults a ComboBox popup to `CloseOnClick`, which counts a click on the filter
+        // field as a click and shuts the popup the instant you try to type in it — leaving the
+        // list stuck on whatever its first screenful happens to be. Close on an outside click
+        // instead, and close explicitly below when an option is actually chosen.
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show_ui(ui, |ui| {
             let filter_id = salt.with("filter");
             let mut filter: String =
@@ -2297,20 +2538,30 @@ fn option_combo(
                 ui.ctx().data_mut(|d| d.insert_temp(filter_id, filter.clone()));
             }
             let f = filter.to_lowercase();
-            let mut shown = 0usize;
-            for opt in options {
-                if !f.is_empty() && !opt.to_lowercase().contains(&f) {
-                    continue;
-                }
-                if shown >= 200 {
-                    ui.weak("… type to narrow down");
-                    break;
-                }
-                shown += 1;
-                crate::theme::selectable_value(ui, selected, opt.clone(), elide(&sanitize_ui_text(ui, opt), 48));
-            }
-            if shown == 0 {
+            let matches: Vec<&String> = options
+                .iter()
+                .filter(|o| f.is_empty() || o.to_lowercase().contains(&f))
+                .collect();
+            if matches.is_empty() {
                 ui.weak("no matches");
+                return;
+            }
+            // Every match is reachable — the old 200-row cap silently hid the tail of a big model
+            // library, and with the filter broken there was no way to reach past it. Showing a
+            // count makes a long list legible rather than merely long.
+            if matches.len() > 12 {
+                ui.weak(format!("{} of {}", matches.len(), options.len()));
+            }
+            for opt in matches {
+                let row = crate::theme::selectable_value(
+                    ui,
+                    selected,
+                    opt.clone(),
+                    elide(&sanitize_ui_text(ui, opt), 48),
+                );
+                if row.clicked() {
+                    ui.close();
+                }
             }
         });
 }
@@ -2530,6 +2781,99 @@ mod tests {
         crate::preflight::retype_combo_values(&mut wf, &schemas);
         let rife = wf.0.values().find(|n| n.class_type == "RIFE VFI").expect("no RIFE");
         assert_eq!(rife.inputs["scale_factor"], WorkflowInput::F64(1.0));
+    }
+
+    /// A model recommendation seeds the sampler, but `width`/`height` are not sampler-specific
+    /// names — an upscale node has them too, and writing a 896×1152 recommendation into one would
+    /// silently resize the wrong stage of the pipeline. Sizes must reach latent *sources* only.
+    ///
+    /// Also pins the CLIP-skip sign: the graph stores ComfyUI's negative layer index, so a
+    /// recommendation of `2` has to land as `-2`.
+    #[test]
+    fn recommended_defaults_reach_the_sampler_and_the_latent_but_not_an_upscale() {
+        let schemas = crate::schema::parse(
+            &serde_json::from_str(
+                r#"{
+                  "KSampler": {"input": {"required": {
+                    "steps": ["INT", {"default": 20, "min": 1, "max": 200}],
+                    "cfg": ["FLOAT", {"default": 8.0, "min": 0.0, "max": 100.0}],
+                    "sampler_name": [["euler", "dpmpp_2m"]],
+                    "scheduler": [["normal", "karras"]]
+                  }}, "output": ["LATENT"], "output_name": ["LATENT"], "output_is_list": [false]},
+                  "EmptyLatentImage": {"input": {"required": {
+                    "width": ["INT", {"default": 512, "min": 16, "max": 4096}],
+                    "height": ["INT", {"default": 512, "min": 16, "max": 4096}]
+                  }}, "output": ["LATENT"], "output_name": ["LATENT"], "output_is_list": [false]},
+                  "ImageScale": {"input": {"required": {
+                    "width": ["INT", {"default": 1024, "min": 16, "max": 4096}],
+                    "height": ["INT", {"default": 1024, "min": 16, "max": 4096}]
+                  }}, "output": ["IMAGE"], "output_name": ["IMAGE"], "output_is_list": [false]},
+                  "CLIPSetLastLayer": {"input": {"required": {
+                    "stop_at_clip_layer": ["INT", {"default": -1, "min": -24, "max": -1}]
+                  }}, "output": ["CLIP"], "output_name": ["CLIP"], "output_is_list": [false]}
+                }"#,
+            )
+            .unwrap(),
+        );
+        let oi = crate::schema::to_object_info(&schemas);
+        let mut snarl: Snarl<FlowNodeData> = Snarl::new();
+        for class in ["KSampler", "EmptyLatentImage", "ImageScale", "CLIPSetLastLayer"] {
+            snarl.insert_node(egui::pos2(0.0, 0.0), FlowNodeData::new(oi[class].clone()));
+        }
+        let changed = apply_defaults(
+            &mut snarl,
+            &GraphDefaults {
+                steps: Some(36),
+                cfg: Some(6.5),
+                width: Some(896),
+                height: Some(1152),
+                sampler: Some("dpmpp_2m"),
+                scheduler: Some("karras"),
+                clip_skip: Some(2),
+            },
+        );
+
+        fn value_of(snarl: &Snarl<FlowNodeData>, class: &str, input: &str) -> FlowValueType {
+            snarl
+                .nodes_pos_ids()
+                .find(|(_, _, d)| d.object.name == class)
+                .and_then(|(_, _, d)| d.inputs.iter().find(|i| i.name == input))
+                .map(|i| i.value.clone())
+                .expect("missing input")
+        }
+        let int_of = |snarl: &Snarl<FlowNodeData>, class: &str, input: &str| -> i64 {
+            match value_of(snarl, class, input) {
+                FlowValueType::UnsignedInt { value, .. } => value as i64,
+                FlowValueType::SignedInt { value, .. } => value,
+                other => panic!("{class}.{input} is {other:?}"),
+            }
+        };
+
+        assert_eq!(int_of(&snarl, "KSampler", "steps"), 36);
+        assert_eq!(int_of(&snarl, "EmptyLatentImage", "width"), 896);
+        assert_eq!(int_of(&snarl, "EmptyLatentImage", "height"), 1152);
+        // The whole point: the upscale keeps its own size.
+        assert_eq!(int_of(&snarl, "ImageScale", "width"), 1024);
+        assert_eq!(int_of(&snarl, "ImageScale", "height"), 1024);
+        assert_eq!(int_of(&snarl, "CLIPSetLastLayer", "stop_at_clip_layer"), -2);
+        match value_of(&snarl, "KSampler", "sampler_name") {
+            FlowValueType::Array { selected, .. } => assert_eq!(selected, "dpmpp_2m"),
+            other => panic!("sampler_name is {other:?}"),
+        }
+
+        // A sampler this server does not offer is dropped rather than written into the combo.
+        let none = apply_defaults(
+            &mut snarl,
+            &GraphDefaults { sampler: Some("res_multistep"), ..Default::default() },
+        );
+        assert!(none.is_empty(), "unknown sampler was written: {none:?}");
+        match value_of(&snarl, "KSampler", "sampler_name") {
+            FlowValueType::Array { selected, .. } => assert_eq!(selected, "dpmpp_2m"),
+            other => panic!("sampler_name is {other:?}"),
+        }
+        // The report names what moved, so the status line cannot claim a silent success.
+        assert!(changed.iter().any(|c| c.contains("steps 36")), "{changed:?}");
+        assert!(changed.iter().any(|c| c.contains("CLIP skip 2")), "{changed:?}");
     }
 
     /// `ensure_file_combos` runs over every node every frame, so a value it does not recognise is

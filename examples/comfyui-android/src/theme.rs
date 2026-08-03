@@ -1,9 +1,25 @@
-//! AMOLED synthwave theme: a true-black page carrying two accents.
+//! AMOLED galactic theme: a true-black page, violet glass, and two neon accents.
 //!
-//! Hot pink ([`PINK`]) is the primary — anything selected, pressed, or active — and aqua ([`AQUA`])
-//! is the secondary — hover feedback, links, and live/info markers. Everything else is near-black
-//! with cool near-white text, so the two accents stay signals rather than noise. The interaction
-//! grammar is: rest = restrained dark surface, hover = aqua edge, press/active/selected = pink.
+//! Two of the colours are *signals*. Hot pink ([`PINK`]) is the primary — anything selected,
+//! pressed, or active — and aqua ([`AQUA`]) is the secondary — hover feedback, links, and live/info
+//! markers. The interaction grammar is unchanged: rest = surface, hover = aqua edge,
+//! press/active/selected = pink.
+//!
+//! Violet ([`VIOLET`]) is the third colour and works differently: it is *light*, not a state. It
+//! appears as one of [`ambience`]'s pools and as the faint cast on every floating surface. It says
+//! nothing about interaction, which is exactly why it can be everywhere without competing with the
+//! two accents that do.
+//!
+//! **Edges are white, never coloured.** A hued outline is what stops a surface reading as glass —
+//! real glass has no colour at its edge, only light catching the bevel. See [`RIM`].
+//!
+//! Two things make the glass work, and both are easy to undo by accident:
+//!
+//! 1. **Surfaces are translucent.** `frost` blurs the page behind a floating pane, so an opaque
+//!    fill anywhere inside that pane hides the very thing it was blurred for — see `widget_palette`.
+//! 2. **The page is lit.** A blur can only reveal what is behind it, and this page is black; without
+//!    [`ambience`] the frost has nothing to find and every pane reads as flat dark plastic.
+//!
 //! Spacing stays touch-sized rather than desktop density.
 
 use egui::containers::scroll_area::ScrollBarVisibility;
@@ -19,9 +35,11 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
-// AMOLED synthwave palette: a pure-black page carries two accents — hot pink is the primary
-// (selection, pressed/active widgets, primary ink, progress) and aqua is the secondary (hover,
-// links, live/info markers). Kept to two so each one stays a signal instead of noise.
+// AMOLED galactic palette: a pure-black page carries two *interaction* accents — hot pink is the
+// primary (selection, pressed/active widgets, primary ink, progress) and aqua is the secondary
+// (hover, links, live/info markers). Kept to two so each one stays a signal instead of noise.
+// Violet is not a third signal; it is the colour of every surface, which is why it can be
+// everywhere. See the module docs.
 
 /// Primary accent — hot pink. The loudest colour in the app; reserved for what's active or chosen.
 pub const PINK: Color32 = Color32::from_rgb(255, 61, 139);
@@ -31,6 +49,23 @@ pub const PINK_BRIGHT: Color32 = Color32::from_rgb(255, 110, 168);
 pub const AQUA: Color32 = Color32::from_rgb(43, 226, 214);
 /// A lifted aqua for text where the base reads dim.
 pub const AQUA_BRIGHT: Color32 = Color32::from_rgb(120, 240, 232);
+/// Third colour — violet. Deliberately *not* an interaction signal like [`PINK`]/[`AQUA`]: it is
+/// ambient light. It appears as one of [`ambience`]'s pools and as the faint cast on every surface,
+/// so panes read as lit rather than grey, while the two accents keep their meaning because nothing
+/// competes with them for "this is what you touched".
+pub const VIOLET: Color32 = Color32::from_rgb(163, 140, 255);
+
+/// The edge of a pane — a dim white hairline, not a coloured one.
+///
+/// A *hued* outline is what stops a surface reading as glass. Real glass has no colour at its
+/// edge; what you see there is light catching the bevel, which is white and faint whatever the
+/// glass is tinted. A saturated rim instead reads as a drawn border — the Material/plastic idiom —
+/// and it fights the tint behind it, because two different colours meet at one pixel. Neutral
+/// white also stays correct over any backdrop the blur happens to pick up, which a violet rim
+/// cannot: over the aqua pool it went muddy.
+pub const RIM: Color32 = Color32::from_rgba_premultiplied(46, 46, 52, 46);
+/// A slightly brighter hairline for the surfaces meant to sit closest to the eye.
+pub const RIM_BRIGHT: Color32 = Color32::from_rgba_premultiplied(72, 72, 80, 72);
 /// Body ink — cool near-white, the default text colour on the black page.
 const INK: Color32 = Color32::from_rgb(233, 233, 239);
 
@@ -46,9 +81,9 @@ pub fn fab_icon() -> Color32 {
     PINK
 }
 
-/// Default translucent FAB disc — faint aqua-tinted glass over the AMOLED page.
+/// Default translucent FAB disc — faint violet-tinted glass over the AMOLED page.
 pub fn fab_bg() -> Color32 {
-    rgba(7, 16, 18, 208)
+    rgba(14, 10, 28, 208)
 }
 
 /// Selected / open FAB disc (pink-tinted, the primary "active" wash).
@@ -147,6 +182,65 @@ fn fab_with_sense(
     resp
 }
 
+/// Soft coloured light, for the glass to have something to find.
+///
+/// A backdrop blur can only reveal what is behind it, and every surface in this app stands on pure
+/// black — so a frosted pane came out looking like flat dark plastic however the film was tuned.
+/// These are the lamps: three wide, very low-alpha pools, one per accent, spaced so they stay
+/// separate rather than muddying into grey where they meet.
+///
+/// Concentric circles rather than a gradient because egui has no radial-gradient shape. The ring
+/// alphas composite toward the centre, which at these radii reads as a smooth falloff — and the
+/// cost is a fixed 48 circles regardless of screen size, which is why it can run every frame.
+///
+/// `ring_alpha` is per-ring, not the total: 16 rings at alpha `a` composite to `1-(1-a/255)^16` at
+/// the centre, which climbs much faster than it looks — `5` already reads as a painted background
+/// rather than as light. Useful values are 1–3.
+///
+/// The radii keep black between the pools on purpose. Light everywhere is just a tinted page; the
+/// glass only reads as glass when a pane can span lit and unlit ground at once.
+pub fn ambience(painter: &egui::Painter, rect: egui::Rect, ring_alpha: u8) {
+    let d = rect.width().min(rect.height()).max(1.0);
+    for (fx, fy, fr, color) in [
+        (0.12, 0.14, 0.46, VIOLET),
+        (0.94, 0.38, 0.38, AQUA),
+        (0.46, 0.97, 0.42, PINK),
+    ] {
+        light_pool(painter, rect.lerp_inside(egui::vec2(fx, fy)), d * fr, color, ring_alpha);
+    }
+}
+
+/// Paint [`ambience`] beneath every panel, so the page is lit and the blur behind a menu or modal
+/// has colour to reveal. Ordered `Background` — which is why `panel_fill` is not fully opaque.
+pub fn page_ambience(ctx: &egui::Context) {
+    let screen = ctx.content_rect();
+    egui::Area::new(egui::Id::new("page-ambience"))
+        .order(egui::Order::Background)
+        .fixed_pos(screen.min)
+        .movable(false)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.set_clip_rect(screen);
+            ambience(ui.painter(), screen, 1);
+        });
+}
+
+/// One pool of light: nested discs of a constant low alpha, largest first.
+fn light_pool(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    color: Color32,
+    ring_alpha: u8,
+) {
+    const RINGS: usize = 16;
+    let fill = rgba(color.r(), color.g(), color.b(), ring_alpha);
+    for i in 0..RINGS {
+        let t = 1.0 - i as f32 / RINGS as f32;
+        painter.circle_filled(center, radius * t, fill);
+    }
+}
+
 /// Subtle dark fill tinting a tag chip/suggestion by Danbooru category, or `None` for unknown.
 /// 0 general, 1 artist, 3 copyright, 4 character, 5 meta; light text stays readable on each.
 pub fn tag_category_fill(cat: u8) -> Option<Color32> {
@@ -168,18 +262,20 @@ pub fn apply(ctx: &egui::Context) {
     v.override_text_color = Some(text);
     // The page is pure black (AMOLED); windows/menus lift a few points so they read as raised
     // panes, and text wells sink below the page. Separators come from the strokes below.
-    v.panel_fill = rgb(0, 0, 0);
+    // Not quite opaque: [`page_ambience`] paints below every panel, and a solid page would hide it.
+    // The residual black still dominates, so the page reads as AMOLED rather than tinted.
+    v.panel_fill = rgba(0, 0, 0, 232);
     // Menus / dropdowns / modals share window_fill: a cool, faintly teal-tinted glass panel that
     // lifts off the black page, with a visible cool rim so the container itself reads as glass
     // even before you touch an item (the accent hover/press then lights up individual rows).
     // Translucent, because `frost` blurs the page behind these panes and an opaque fill would hide
     // it. The two alphas multiply: this one over the frost's film leaves roughly a third of the
     // blurred backdrop showing, which is glass that light text still reads on.
-    v.window_fill = rgba(18, 21, 27, 120);
-    v.window_stroke = Stroke::new(1.2, rgba(72, 146, 156, 190));
-    v.faint_bg_color = rgb(10, 10, 13); // striped-row alternate — barely there on black
-    v.extreme_bg_color = rgb(7, 7, 10); // TextEdit / deep wells sink below the page
-    v.code_bg_color = rgb(5, 5, 7);
+    v.window_fill = rgba(19, 17, 30, 120);
+    v.window_stroke = Stroke::new(1.2, RIM);
+    v.faint_bg_color = rgb(11, 10, 16); // striped-row alternate — barely there on black
+    v.extreme_bg_color = rgb(8, 7, 13); // TextEdit / deep wells sink below the page
+    v.code_bg_color = rgb(6, 5, 10);
     v.hyperlink_color = AQUA;
     v.warn_fg_color = AQUA_BRIGHT;
     v.error_fg_color = PINK;
@@ -237,19 +333,24 @@ fn widget_palette(w: &mut egui::style::Widgets) {
     let radius = CornerRadius::same(5);
 
     // Non-interactive frames/labels/separators AND the indent rail beside collapsing bodies: a
-    // faintly cool line so an open section's body reads as a bounded, subtly-tinted region.
-    w.noninteractive.bg_fill = rgb(11, 11, 14);
-    w.noninteractive.weak_bg_fill = rgb(8, 8, 11);
-    w.noninteractive.bg_stroke = Stroke::new(1.0, rgba(58, 84, 96, 165));
+    // faint violet line so an open section's body reads as a bounded, subtly-lit region.
+    w.noninteractive.bg_fill = rgba(18, 16, 28, 132);
+    w.noninteractive.weak_bg_fill = rgba(14, 12, 22, 120);
+    w.noninteractive.bg_stroke = Stroke::new(1.0, RIM);
     w.noninteractive.fg_stroke = Stroke::new(1.0, text);
     w.noninteractive.corner_radius = radius;
 
-    // At rest — buttons and (framed) collapsing headers: a restrained dark-glass panel just above
-    // the page (nudged a touch lighter than the first pass) with a faint cool rim, so the neon
-    // accents on hover/press carry the interaction.
-    w.inactive.bg_fill = rgb(22, 22, 27);
-    w.inactive.weak_bg_fill = rgb(18, 18, 22);
-    w.inactive.bg_stroke = Stroke::new(1.0, rgba(66, 68, 88, 155));
+    // At rest — buttons and (framed) collapsing headers: a violet-lit glass panel just above the
+    // page under a faint violet rim, so the neon accents on hover/press carry the interaction.
+    //
+    // Translucent, and that is the whole point: these fills sit *inside* the panes `frost` blurs,
+    // so an opaque one punches a matte hole straight through the glass it is standing on — the
+    // blur ends up visible only in the margins between widgets, which reads as no glass at all.
+    // The base colours are raised to compensate, since alpha over the black page darkens them:
+    // each lands a little brighter than the opaque greys it replaces, not dimmer.
+    w.inactive.bg_fill = rgba(31, 28, 47, 165);
+    w.inactive.weak_bg_fill = rgba(25, 23, 38, 150);
+    w.inactive.bg_stroke = Stroke::new(1.0, RIM_BRIGHT);
     w.inactive.fg_stroke = Stroke::new(1.0, text);
     w.inactive.corner_radius = radius;
 
@@ -268,8 +369,8 @@ fn widget_palette(w: &mut egui::style::Widgets) {
     w.active.corner_radius = radius;
 
     // Open (expanded combo / menu source): the rest panel under a bright aqua "open" rim.
-    w.open.bg_fill = rgb(22, 22, 27);
-    w.open.weak_bg_fill = rgb(18, 18, 22);
+    w.open.bg_fill = rgba(31, 28, 47, 165);
+    w.open.weak_bg_fill = rgba(25, 23, 38, 150);
     w.open.bg_stroke = Stroke::new(1.3, rgba(43, 226, 214, 205));
     w.open.fg_stroke = Stroke::new(1.0, text);
     w.open.corner_radius = radius;
@@ -496,6 +597,48 @@ pub fn menu_popup<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blur is only visible where what sits on top of it lets it through. An opaque fill inside
+    /// a frosted pane hides the very thing the pane was blurred for, leaving the glass showing only
+    /// in the gaps between widgets — which is indistinguishable from having no glass at all, and is
+    /// how this theme looked before. Anything that floats has to stay translucent.
+    #[test]
+    fn floating_surfaces_stay_translucent_so_the_blur_reads_through() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let v = ctx.style_of(egui::Theme::Dark).visuals.clone();
+        for (what, c) in [
+            ("window_fill", v.window_fill),
+            ("widget rest", v.widgets.inactive.bg_fill),
+            ("widget rest (weak)", v.widgets.inactive.weak_bg_fill),
+            ("combo/menu open", v.widgets.open.bg_fill),
+            ("noninteractive frame", v.widgets.noninteractive.bg_fill),
+        ] {
+            assert!(c.a() < 255, "{what} is opaque ({c:?}) — it punches a hole through the frost");
+            assert!(c.a() > 0, "{what} is fully transparent ({c:?}) — the surface would vanish");
+        }
+    }
+
+    /// Violet is the glass. It carries no interaction meaning, so the check is that surfaces are
+    /// actually *cast* in it rather than the neutral grey they used to be — blue leading red
+    /// leading green, at every alpha.
+    #[test]
+    fn surfaces_carry_the_violet_cast() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let v = ctx.style_of(egui::Theme::Dark).visuals.clone();
+        for (what, c) in [
+            ("window_fill", v.window_fill),
+            ("widget rest", v.widgets.inactive.bg_fill),
+            ("noninteractive frame", v.widgets.noninteractive.bg_fill),
+            ("text well", v.extreme_bg_color),
+        ] {
+            assert!(c.b() > c.r() && c.r() >= c.g(), "{what} ({c:?}) is not violet-cast");
+        }
+        // The two interaction accents keep their own hues — violet must not have eaten them.
+        assert_eq!(v.error_fg_color, PINK);
+        assert_eq!(v.hyperlink_color, AQUA);
+    }
 
     /// Run `build` inside an upward menu on a phone-sized viewport, settled over several frames
     /// (egui sizes a popup from the previous frame's area state).

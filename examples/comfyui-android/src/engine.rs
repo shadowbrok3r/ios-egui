@@ -135,6 +135,10 @@ pub enum Msg {
     SignedIn { username: String, session: String },
     SignedOut,
     AuthError(String),
+    /// The server refused our credentials (401/403). Both transports carry the same ones, so this
+    /// is about the account, not about one request — the UI clears a dead session on it rather than
+    /// presenting the same rejected token forever.
+    Unauthorized,
     /// The account's albums (`GET /gallery/api/albums`).
     Albums(Vec<Album>),
     /// Distinct model names across the account's gallery (`GET /gallery/api/facets`).
@@ -397,7 +401,16 @@ impl Engine {
         let key_note = if api_key.trim().is_empty() { "no API key" } else { "with API key" };
         let sess_note = if session.trim().is_empty() { "" } else { " + signed-in session" };
         log.info(format!("connect: {base} ({key_note}{sess_note})"));
-        let http = match apply_auth(tls_builder(READ_TIMEOUT), &api_key, &session).build() {
+        // Built once, then shared by both transports, so live progress can never authenticate
+        // differently from polling — the two disagreeing is invisible until one of them 401s.
+        let (creds, rejected) = auth_credentials(&api_key, &session);
+        for what in rejected {
+            log.error(format!(
+                "{what} contains a character an HTTP header cannot carry, so it will NOT be sent — \
+                 re-enter it (a line break left in the middle by a paste is the usual cause)"
+            ));
+        }
+        let http = match apply_auth(tls_builder(READ_TIMEOUT), &creds).build() {
             Ok(c) => c,
             Err(e) => {
                 log.error(format!("HTTP client build failed: {e}"));
@@ -408,7 +421,7 @@ impl Engine {
         };
         // Same auth, a long read timeout: the gate holds POST /prompt and /api/expand open well
         // past the 30 s browsing timeout. A build failure here only loses the long-hold headroom.
-        self.queue_http = apply_auth(tls_builder(QUEUE_READ_TIMEOUT), &api_key, &session).build().ok();
+        self.queue_http = apply_auth(tls_builder(QUEUE_READ_TIMEOUT), &creds).build().ok();
         let client = Client::new_with_client(base.clone(), http.clone());
         // The ws MUST use the same clientId the client queues prompts with — ComfyUI routes
         // executing/progress events only to the socket whose clientId matches the prompt's, so a
@@ -425,8 +438,7 @@ impl Engine {
         }
         self.ws_task = Some(self.rt.spawn(ws_listener(
             base.clone(),
-            api_key.clone(),
-            session.clone(),
+            creds.clone(),
             client_id,
             self.tx.clone(),
             self.ctx.clone(),
@@ -465,6 +477,11 @@ impl Engine {
                 }
                 Err(e) => {
                     log.error(format!("connect failed: {e}"));
+                    // A refused credential is worth saying as such, not as "connect failed": the
+                    // server is reachable and answering, and the fix is a sign-in, not a retry.
+                    if e.contains("HTTP 401") || e.contains("HTTP 403") {
+                        let _ = tx.send(Msg::Unauthorized);
+                    }
                     Msg::ConnectError(e)
                 }
             };
@@ -1544,8 +1561,11 @@ impl Engine {
     pub fn sign_out(&self, url: String, session: String) {
         let base = normalize_url(&url);
         let (tx, ctx, log) = self.emitters();
-        let http = apply_auth(tls_builder(READ_TIMEOUT).redirect(reqwest::redirect::Policy::none()), "", &session)
-            .build();
+        let http = apply_auth(
+            tls_builder(READ_TIMEOUT).redirect(reqwest::redirect::Policy::none()),
+            &auth_credentials("", &session).0,
+        )
+        .build();
         self.rt.spawn(async move {
             if let Ok(http) = http {
                 let endpoint = format!("{base}/logout");
@@ -3357,8 +3377,7 @@ fn looks_like_image(bytes: &[u8]) -> bool {
 /// cap, and reconnects forever with exponential backoff. Ends when the UI drops its receiver.
 async fn ws_listener(
     base: String,
-    api_key: String,
-    session: String,
+    creds: Vec<AuthHeader>,
     client_id: String,
     tx: Sender<Msg>,
     ctx: egui::Context,
@@ -3386,20 +3405,8 @@ async fn ws_listener(
                 return;
             }
         };
-        let key = api_key.trim();
-        if !key.is_empty() {
-            if let Ok(v) = key.parse() {
-                request.headers_mut().insert("x-api-key", v);
-            }
-            if let Ok(v) = format!("Bearer {key}").parse() {
-                request.headers_mut().insert("authorization", v);
-            }
-        }
-        let sess = session.trim();
-        if !sess.is_empty()
-            && let Ok(v) = format!("{SESSION_COOKIE}={sess}").parse()
-        {
-            request.headers_mut().insert("cookie", v);
+        for (name, value) in &creds {
+            request.headers_mut().insert(*name, value.clone());
         }
         match tokio_tungstenite::connect_async(request).await {
             Ok((stream, _)) => {
@@ -3473,17 +3480,45 @@ async fn ws_listener(
                 }
             }
             Err(e) => {
+                // A refused credential is refused identically forever, so retrying only burns
+                // battery and buries the cause under reconnect noise. Stop and report it — and do
+                // not claim polling is unaffected: it carries these same credentials, so if the
+                // handshake was rejected every HTTP call is being rejected too.
+                if let Some(status) = ws_refusal_status(&e) {
+                    log.error(format!(
+                        "ws: the server rejected our credentials (HTTP {status}). Polling uses the \
+                         same credentials, so it is failing too — not just live progress."
+                    ));
+                    let _ = tx.send(Msg::Unauthorized);
+                    ctx.request_repaint();
+                    return;
+                }
                 if ever_ok {
                     log.warn(format!("ws: reconnect failed ({e}); retry in {backoff:?}"));
                 } else {
                     log.warn(format!(
-                        "ws: connect failed ({e}) — live progress off until reconnect, polling still works"
+                        "ws: connect failed ({e}); retry in {backoff:?} — live progress is off \
+                         until it succeeds"
                     ));
                 }
             }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff.saturating_mul(2)).min(MAX_BACKOFF);
+    }
+}
+
+/// The status a handshake was *refused* with, when the refusal is about who we are.
+///
+/// Only 401/403 qualify: they are verdicts on the credential and will not change on a retry. Every
+/// other HTTP answer (a 502 from a restarting backend, a 429, a tunnel hiccup) is transient and
+/// belongs in the ordinary reconnect loop.
+fn ws_refusal_status(e: &tokio_tungstenite::tungstenite::Error) -> Option<u16> {
+    match e {
+        tokio_tungstenite::tungstenite::Error::Http(resp) => {
+            matches!(resp.status().as_u16(), 401 | 403).then(|| resp.status().as_u16())
+        }
+        _ => None,
     }
 }
 
@@ -3628,35 +3663,59 @@ pub(crate) fn decode(bytes: &[u8]) -> Option<egui::ColorImage> {
 /// expired credential into an error we can report instead of a login page parsed as a workflow.
 ///
 /// Both credentials only ever ride on the connected server's own origin, never a third-party host.
-fn apply_auth(builder: reqwest::ClientBuilder, api_key: &str, session: &str) -> reqwest::ClientBuilder {
-    builder.default_headers(auth_headers(api_key, session))
+fn apply_auth(builder: reqwest::ClientBuilder, creds: &[AuthHeader]) -> reqwest::ClientBuilder {
+    builder.default_headers(header_map(creds))
 }
 
-/// The default header set [`apply_auth`] installs.
-fn auth_headers(api_key: &str, session: &str) -> reqwest::header::HeaderMap {
-    use reqwest::header::{ACCEPT, AUTHORIZATION, COOKIE, HeaderMap, HeaderValue};
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json, */*"));
+/// One credential header, ready to install on either transport. `http` is a single version across
+/// reqwest and tungstenite, so the same `HeaderValue` serves both.
+type AuthHeader = (&'static str, reqwest::header::HeaderValue);
+
+/// The credential headers for an API key and/or a signed-in session, plus a label for each one that
+/// could not be built.
+///
+/// The rejects are handed back rather than skipped because a credential `HeaderValue` refuses used
+/// to be dropped here in silence: the request then went out unauthenticated and came back a bare
+/// 401, with nothing in the log connecting the two. What it refuses is a control character — the
+/// realistic case is a line break surviving in the middle of a multi-line paste, since `trim` only
+/// takes the ends. High bytes pass, so an accented or non-Latin key is fine.
+fn auth_credentials(api_key: &str, session: &str) -> (Vec<AuthHeader>, Vec<&'static str>) {
+    use reqwest::header::HeaderValue;
+    let (mut creds, mut rejected) = (Vec::new(), Vec::new());
+    let mut push = |name: &'static str, value: String, label: &'static str| {
+        match HeaderValue::from_str(&value) {
+            Ok(mut v) => {
+                v.set_sensitive(true);
+                creds.push((name, v));
+            }
+            Err(_) => rejected.push(label),
+        }
+    };
     let key = api_key.trim();
     if !key.is_empty() {
-        if let Ok(mut v) = HeaderValue::from_str(key) {
-            v.set_sensitive(true);
-            headers.insert("x-api-key", v);
-        }
-        if let Ok(mut v) = HeaderValue::from_str(&format!("Bearer {key}")) {
-            v.set_sensitive(true);
-            headers.insert(AUTHORIZATION, v);
-        }
+        push("x-api-key", key.to_string(), "API key");
+        push("authorization", format!("Bearer {key}"), "API key");
     }
     let session = session.trim();
-    if !session.is_empty()
-        && let Ok(mut v) = HeaderValue::from_str(&format!("{SESSION_COOKIE}={session}"))
-    {
-        v.set_sensitive(true);
-        headers.insert(COOKIE, v);
+    if !session.is_empty() {
+        push("cookie", format!("{SESSION_COOKIE}={session}"), "session token");
+    }
+    // Both API-key spellings fail together; the user has one key, so name it once.
+    rejected.dedup();
+    (creds, rejected)
+}
+
+/// The default header set [`apply_auth`] installs: the credentials plus a JSON `Accept`.
+fn header_map(creds: &[AuthHeader]) -> reqwest::header::HeaderMap {
+    use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json, */*"));
+    for (name, value) in creds {
+        headers.insert(*name, value.clone());
     }
     headers
 }
+
 
 /// Parse a `GET /queue` body into `(running, pending)` job lists, tolerating missing/extra fields.
 fn parse_queue(v: &Value) -> (Vec<QueueJob>, Vec<QueueJob>) {
@@ -4049,6 +4108,11 @@ mod tests {
         );
     }
 
+    /// The header set for a credential pair — what [`apply_auth`] installs, minus the plumbing.
+    fn auth_headers(api_key: &str, session: &str) -> reqwest::header::HeaderMap {
+        header_map(&auth_credentials(api_key, session).0)
+    }
+
     /// Auth rides only on default headers, so a client built without either credential must still
     /// ask for JSON — that is what keeps a 401 from arriving as an HTML login page.
     #[test]
@@ -4072,6 +4136,64 @@ mod tests {
         let h = headers("  ", "s3ss");
         assert!(h.get("x-api-key").is_none());
         assert_eq!(h.get(COOKIE).unwrap(), "cg_session=s3ss");
+    }
+
+    /// The bug this exists for: a key carrying a character `HeaderValue` refuses was dropped in
+    /// silence, so the request went out unauthenticated and the 401 that came back named nothing.
+    /// It must still be dropped — it cannot go on the wire — but never without saying so.
+    #[test]
+    fn a_credential_that_cannot_be_a_header_is_reported_not_swallowed() {
+        // An embedded line break: `trim` only takes the ends, so a multi-line paste keeps this.
+        let (creds, rejected) = auth_credentials("k3\ny", "");
+        assert!(creds.is_empty());
+        assert_eq!(rejected, vec!["API key"], "both key spellings fail; the user has one key");
+
+        let (creds, rejected) = auth_credentials("", "s3ss\rmore");
+        assert!(creds.is_empty());
+        assert_eq!(rejected, vec!["session token"]);
+
+        // One good credential is not held back by the other being unusable.
+        let (creds, rejected) = auth_credentials("k3y", "s3ss\nmore");
+        assert_eq!(creds.len(), 2, "x-api-key + authorization");
+        assert_eq!(rejected, vec!["session token"]);
+
+        // Nothing configured is not a rejection — there is simply nothing to send.
+        assert_eq!(auth_credentials("", "").1, Vec::<&str>::new());
+
+        // High bytes are legal in a header value, so a non-Latin key must NOT be reported.
+        let (creds, rejected) = auth_credentials("kéy- züri", "");
+        assert_eq!(creds.len(), 2);
+        assert!(rejected.is_empty());
+    }
+
+    /// Both transports must authenticate identically; the whole 401 hunt started with the
+    /// possibility that they did not.
+    #[test]
+    fn credentials_are_the_same_set_the_http_client_installs() {
+        let (creds, _) = auth_credentials("k3y", "s3ss");
+        let names: Vec<&str> = creds.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["x-api-key", "authorization", "cookie"]);
+        // header_map is what reqwest gets; the ws handshake inserts `creds` verbatim.
+        let h = header_map(&creds);
+        for (name, value) in &creds {
+            assert_eq!(h.get(*name).unwrap(), value);
+        }
+    }
+
+    /// Only a verdict on the credential ends the reconnect loop. A 502 from a restarting backend
+    /// must stay retryable, or a blip would kill live progress until the app is relaunched.
+    #[test]
+    fn only_401_and_403_stop_the_ws_reconnect_loop() {
+        use tokio_tungstenite::tungstenite::{Error, http::Response};
+        let refused = |code: u16| {
+            let resp = Response::builder().status(code).body(None).unwrap();
+            ws_refusal_status(&Error::Http(resp))
+        };
+        assert_eq!(refused(401), Some(401));
+        assert_eq!(refused(403), Some(403));
+        assert_eq!(refused(502), None);
+        assert_eq!(refused(429), None);
+        assert_eq!(ws_refusal_status(&Error::ConnectionClosed), None);
     }
 
     /// A failed prompt's real cause lives only in the history status messages; without it the app
