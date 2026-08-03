@@ -1,0 +1,37 @@
+[package]
+name = "backdrop-blur-egui"
+version = "0.3.0"
+description = "egui adapter for backdrop-blur: frosted glass via the grab-pass path (eframe-on-glow, grab the live framebuffer in a paint callback, blur, composite)."
+readme = "README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+backdrop-blur-core = { workspace = true }
+egui = { workspace = true }
+# Grab-pass (eframe-on-glow) backend deps.
+backdrop-blur-glow = { workspace = true, optional = true }
+egui_glow = { workspace = true, optional = true }
+# The adapter names glow::Context in its public API (GrabPassRenderer::new/destroy); the same 0.17
+# backdrop-blur-glow + egui_glow use, so there is one glow in the graph.
+glow = { workspace = true, optional = true }
+# Best-effort warning when a grab-pass frost fails inside a paint callback.
+log = { workspace = true, optional = true }
+
+[dev-dependencies]
+egui_kittest = { workspace = true }
+
+[features]
+default = ["grab-pass"]
+# The grab-pass path: the eframe-on-glow adapter (GrabPassRenderer).
+grab-pass = ["dep:backdrop-blur-glow", "dep:egui_glow", "dep:glow", "dep:log"]
+# Gates the adapter's real-GL control-flow tests (GrabPassRenderer new/destroy/poison/outcome).
+gl-snapshots = ["grab-pass", "backdrop-blur-glow/gl-snapshots"]

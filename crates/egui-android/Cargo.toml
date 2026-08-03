@@ -9,11 +9,18 @@ repository.workspace = true
 [dependencies]
 egui.workspace = true
 egui-mobile-core.workspace = true
+# BOTH renderers are compiled and the choice is made at RUNTIME, never by a cargo feature: a
+# workspace-wide check unifies features, and a cfg-based choice would then build one egui-android
+# rlib with glow selected — silently blanking comfyui and every plugin viewport. `wgpu` must stay
+# on regardless, because the `plugins` block names `CreationContext::wgpu_render_state`.
 eframe = { version = "0.35", default-features = false, features = [
     "android-native-activity",
     "wgpu",
+    "glow",
     "default_fonts",
 ] }
+# Same 0.17 that egui_glow 0.35 pins, so there is one glow in the graph.
+glow = "0.17"
 android-activity = { version = "0.6", features = ["native-activity"] }
 # Capability bridge: call Android APIs from Rust. jni 0.21 (stable, well-documented) drives the
 # calls; the raw JavaVM/Activity come from ndk-context (version-agnostic), so android-activity's

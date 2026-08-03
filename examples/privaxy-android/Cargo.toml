@@ -1,0 +1,151 @@
+[package]
+name = "privaxy_android"
+# Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
+# Bump before every release build — the phone only offers an update whose code is strictly greater.
+version = "0.5.0"
+edition = "2024"
+publish = false
+
+[lib]
+# rlib alongside cdylib so `cargo test` can link the crate on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+egui-mobile = { path = "../../crates/egui-mobile" }
+egui = "0.35"
+# Collapsible, syntax-coloured JSON for request and response bodies. Vendored fork of 0.16 —
+# see patches/egui-json-tree; upstream senses drag on every token, which steals the scroll.
+egui_json_tree = { path = "../../patches/egui-json-tree", features = ["serde_json"] }
+
+
+# Proxy core.
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "macros", "io-util"] }
+
+# TLS termination for MITM. default-features off keeps aws-lc-rs (cmake + C) out of the NDK build;
+# ring cross-compiles with the CC_/AR_ paths in .cargo/config.toml.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = "1"
+
+# CA + per-host leaf certificates. Replaces privaxy's openssl(vendored), which needs a full
+# OpenSSL build against the NDK sysroot. ring backend, ECDSA P-256 keys.
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring", "x509-parser"] }
+
+# Filter engine — same crate the desktop build uses; its whole tree is pure Rust.
+adblock = { version = "0.12", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling"] }
+
+# Upstream client. rustls-no-provider avoids rustls-platform-verifier, which needs Android Java
+# helper classes we do not bundle and panics uninitialized; roots come from webpki-roots instead.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+    "gzip",
+    "brotli",
+    "deflate",
+    "json",
+    "stream",
+] }
+webpki-roots = "1"
+
+# Cosmetic filtering: collect ids/classes and inject the hiding stylesheet.
+lol_html = "2"
+
+# VpnService capture: a userspace TCP/IP stack over the tun descriptor. Chosen over `tun2proxy`,
+# which is a CLI application shipped as a library (clap, daemonize, ctrlc2, env_logger and a second
+# jni/android_logger stack are all non-optional) and owns the tun device itself. ipstack is what
+# tun2proxy uses underneath: ahash, etherparse, log, rand, thiserror, tokio — pure Rust, no cmake.
+ipstack = "1"
+# Nonblocking + read/write on the tun descriptor handed down from Java.
+libc = "0.2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+# rcgen states certificate validity as time::OffsetDateTime.
+time = "0.3"
+# CA fingerprint, so the certificate installed in Settings can be checked against the app.
+sha2 = { version = "0.10", default-features = false }
+regex = "1"
+futures = "0.3"
+uluru = "3"
+thiserror = "2"
+# Log lines mirror to logcat (egui-android installs android_logger); `adb logcat -s privaxy`.
+log = "0.4"
+
+# Real backdrop blur: a grab-pass that samples the live framebuffer inside an egui paint callback,
+# blurs it and composites the frosted pane back. Vendored fork of
+# github.com/abdu-benayad/backdrop-blur bumped to egui 0.35 — see patches/backdrop-blur. Only the
+# glow path exists, which is why this app runs on Backend::Glow.
+[target.'cfg(target_os = "android")'.dependencies]
+backdrop-blur-egui = { path = "../../patches/backdrop-blur/crates/backdrop-blur-egui", default-features = false, features = [
+    "grab-pass",
+] }
+
+# cargo-apk2 reads this to generate the APK manifest.
+[package.metadata.android]
+package = "com.privaxy.android"
+# Hidden EditText InputConnection (Gboard spacebar trackpad) — shared with egui-android.
+java_sources = "../../crates/egui-android/java"
+# Launcher icon mipmaps, rendered from icon/ic_launcher.svg by scripts/render-icons.sh.
+resources = "res"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+# Release installs are personal sideloads; sign with the auto-generated debug keystore.
+[package.metadata.android.signing.release]
+path = "/home/shadowbroker/.android/debug.keystore"
+keystore_password = "android"
+
+[package.metadata.android.application]
+label = "Privaxy"
+icon = "@mipmap/ic_launcher"
+has_code = true
+# The proxy terminates TLS itself and talks plaintext HTTP to origins on port 80.
+uses_cleartext_traffic = true
+
+# EguiNativeActivity hosts a hidden EditText for real IME InputConnection (spacebar cursor).
+[[package.metadata.android.application.activity]]
+name = "com.github.egui_mobile.EguiNativeActivity"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
+window_soft_input_mode = "adjustResize"
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "privaxy_android"
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
+
+# Transparent capture, and the foreground notification that keeps the proxy's process alive.
+# BIND_VPN_SERVICE is held by the system, not requested: it is what stops other apps binding this.
+# There is no VPN foreground-service type; systemExempted is reserved for an app the user has
+# already selected in Settings > VPN, so it would throw for the notification-only mode.
+[[package.metadata.android.application.service]]
+name = "com.github.egui_mobile.EguiVpnService"
+permission = "android.permission.BIND_VPN_SERVICE"
+exported = false
+foreground_service_type = "specialUse"
+[[package.metadata.android.application.service.intent_filter]]
+actions = ["android.net.VpnService"]
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.FOREGROUND_SERVICE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.VIBRATE"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.POST_NOTIFICATIONS"
+# Writing the CA certificate somewhere Settings' "Install from storage" picker can reach it.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32

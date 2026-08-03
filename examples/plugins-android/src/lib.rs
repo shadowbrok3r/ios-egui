@@ -2,6 +2,8 @@
 //! as `plugins-ios`, built as an Android cdylib. Plugins are WASM, so a plugin built for iOS runs
 //! here unchanged.
 
+mod store;
+
 use std::sync::Arc;
 
 use egui_android::egui;
@@ -12,6 +14,8 @@ struct App {
     ops: Arc<AndroidOps>,
     manager: Option<PluginManager>,
     manager_ui: PluginManagerUi,
+    store: store::Store,
+    show_store: bool,
     selected: usize,
     show_manager: bool,
     wants_keyboard: bool,
@@ -23,6 +27,8 @@ impl App {
             ops: AndroidOps::new(),
             manager: None,
             manager_ui: PluginManagerUi::default(),
+            store: store::Store::new(),
+            show_store: false,
             selected: 0,
             show_manager: true,
             wants_keyboard: false,
@@ -46,6 +52,7 @@ impl EguiApp for App {
                 ) {
                     Ok(mut manager) => {
                         manager.scan(ui.ctx());
+                        self.store.bind_root(manager.root());
                         self.manager = Some(manager);
                     }
                     Err(e) => {
@@ -76,8 +83,12 @@ impl EguiApp for App {
             let mut pick: Option<Option<usize>> = None;
             ui.menu_button(current, |ui| {
                 egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                    if ui.selectable_label(self.show_manager, "Manager").clicked() {
+                    if ui.selectable_label(self.show_manager && !self.show_store, "Manager").clicked() {
                         pick = Some(None);
+                        ui.close();
+                    }
+                    if ui.selectable_label(self.show_store, "Plugin store").clicked() {
+                        pick = Some(Some(usize::MAX));
                         ui.close();
                     }
                     if !manager.plugins.is_empty() {
@@ -94,10 +105,19 @@ impl EguiApp for App {
             });
             if let Some(sel) = pick {
                 match sel {
-                    None => self.show_manager = true,
+                    None => {
+                        self.show_manager = true;
+                        self.show_store = false;
+                    }
+                    // usize::MAX is the store sentinel; it is not a plugin index.
+                    Some(usize::MAX) => {
+                        self.show_manager = true;
+                        self.show_store = true;
+                    }
                     Some(i) => {
                         self.selected = i;
                         self.show_manager = false;
+                        self.show_store = false;
                     }
                 }
             }
@@ -109,7 +129,10 @@ impl EguiApp for App {
 
         // Desired keyboard state this frame; the manager view never wants it.
         let mut wants_keyboard = false;
-        if self.show_manager || manager.plugins.is_empty() {
+        if self.show_store {
+            self.store.poll(manager, ui.ctx());
+            show_store_ui(ui, &mut self.store, manager);
+        } else if self.show_manager || manager.plugins.is_empty() {
             self.manager_ui.ui(ui, manager);
             if manager.plugins.is_empty() {
                 ui.separator();
@@ -145,6 +168,92 @@ impl EguiApp for App {
         // Apply queued plugin ops (haptics, notifications, …) via the Android host bridge.
         self.ops.drain_into(host);
         ui.ctx().request_repaint();
+    }
+}
+
+/// Catalog browser: server settings, the plugin list, and per-row install/update.
+fn show_store_ui(ui: &mut egui::Ui, store: &mut store::Store, manager: &PluginManager) {
+    ui.horizontal(|ui| {
+        ui.label("Store");
+        ui.add(
+            egui::TextEdit::singleline(&mut store.settings.url)
+                .hint_text("appstore.example.com")
+                .desired_width(200.0),
+        );
+        if ui.button("Save").clicked() {
+            store.save_settings();
+            store.refresh(ui.ctx());
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Key");
+        ui.add(
+            egui::TextEdit::singleline(&mut store.settings.key)
+                .password(true)
+                .desired_width(200.0),
+        );
+        if ui.add_enabled(!store.busy, egui::Button::new("Refresh")).clicked() {
+            store.refresh(ui.ctx());
+        }
+        if store.busy {
+            ui.spinner();
+        }
+    });
+    if !store.status.is_empty() {
+        ui.label(egui::RichText::new(&store.status).small());
+    }
+    ui.separator();
+
+    let mut install: Option<String> = None;
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for p in &store.plugins {
+            let installed = manager.plugins.iter().find(|lp| lp.manifest.id == p.id);
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(&p.name).strong());
+                    ui.label(egui::RichText::new(format!("v{}", p.version)).small());
+                });
+                ui.label(egui::RichText::new(&p.id).small().color(egui::Color32::from_gray(140)));
+                if !p.description.is_empty() {
+                    ui.label(egui::RichText::new(&p.description).small());
+                }
+                if !p.permissions.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("permissions: {}", p.permissions.join(", ")))
+                            .small()
+                            .color(egui::Color32::from_gray(150)),
+                    );
+                }
+                ui.horizontal(|ui| {
+                    let label = match installed {
+                        Some(lp) if lp.manifest.version == p.version => "Reinstall",
+                        Some(_) => "Update",
+                        None => "Install",
+                    };
+                    if let Some(lp) = installed {
+                        ui.label(
+                            egui::RichText::new(format!("installed v{}", lp.manifest.version))
+                                .small()
+                                .color(egui::Color32::from_rgb(90, 220, 120)),
+                        );
+                    }
+                    let busy_here = store.installing.as_deref() == Some(p.id.as_str());
+                    if ui.add_enabled(!store.busy, egui::Button::new(label)).clicked() {
+                        install = Some(p.id.clone());
+                    }
+                    if busy_here {
+                        ui.spinner();
+                    }
+                });
+            });
+        }
+        if store.plugins.is_empty() && !store.busy {
+            ui.label(egui::RichText::new("no plugins — set the URL and key, then Refresh").weak());
+        }
+    });
+    if let Some(id) = install {
+        store.install(&id, ui.ctx());
     }
 }
 

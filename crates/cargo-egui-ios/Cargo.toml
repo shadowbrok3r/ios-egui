@@ -11,6 +11,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 toml.workspace = true
+# Publishing built plugins to the appstore (rustls by default; host-side tool, so TLS is free).
+ureq = "2"
 
 [[bin]]
 name = "cargo-egui-ios"

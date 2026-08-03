@@ -172,7 +172,10 @@ pub fn apply(ctx: &egui::Context) {
     // Menus / dropdowns / modals share window_fill: a cool, faintly teal-tinted glass panel that
     // lifts off the black page, with a visible cool rim so the container itself reads as glass
     // even before you touch an item (the accent hover/press then lights up individual rows).
-    v.window_fill = rgb(18, 21, 27);
+    // Translucent, because `frost` blurs the page behind these panes and an opaque fill would hide
+    // it. The two alphas multiply: this one over the frost's film leaves roughly a third of the
+    // blurred backdrop showing, which is glass that light text still reads on.
+    v.window_fill = rgba(18, 21, 27, 120);
     v.window_stroke = Stroke::new(1.2, rgba(72, 146, 156, 190));
     v.faint_bg_color = rgb(10, 10, 13); // striped-row alternate — barely there on black
     v.extreme_bg_color = rgb(7, 7, 10); // TextEdit / deep wells sink below the page
@@ -403,10 +406,33 @@ pub fn menu_height_cap(ctx: &egui::Context, anchor: egui::Rect, align: egui::Rec
         egui::Align::Min => (above, below),
         egui::Align::Center => (screen.height(), screen.height()),
     };
-    // Frame padding + the gap, so the scroll area itself stops short of the screen edge.
-    (room.max(flipped) - 24.0).clamp(160.0, screen.height())
+    // Frame padding + the gap, so the scroll area itself stops short of the screen edge. The floor
+    // is `min`'d rather than clamped: a landscape phone with the keyboard up leaves the content rect
+    // under 160pt tall, and `f32::clamp` panics outright on min > max.
+    let floor = 160.0_f32.min(screen.height());
+    (room.max(flipped) - 24.0).clamp(floor, screen.height().max(floor))
 }
 
+/// How wide a popup may grow. egui clips a popup's painting at `content_rect` but never shrinks it,
+/// so a row wider than the screen cuts the menu — frame and all — off at the right edge instead of
+/// wrapping or scrolling.
+pub fn menu_width_cap(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().width() - 24.0).max(160.0)
+}
+
+/// How tall a scrollable list *inside* a menu section may grow. The popup's own cap already tracks
+/// the room on screen; a nested list used to take a flat 320pt of it, which on a phone showed a
+/// handful of albums under a menu with hundreds of points to spare.
+pub fn menu_list_height(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() * 0.66).clamp(260.0, 720.0)
+}
+
+/// A menu button whose popup is bounded to the screen on both axes.
+///
+/// Width note for callers: egui measures a popup's natural width on a one-off sizing pass the first
+/// time it opens, and rows here truncate rather than extend, so a menu built from a list that is
+/// still loading keeps the width it was born with. Give such a menu an explicit
+/// `ui.set_min_width(..)` — the album pickers do.
 pub fn menu_popup<R>(
     ui: &mut egui::Ui,
     label: impl Into<egui::WidgetText>,
@@ -425,6 +451,7 @@ pub fn menu_popup<R>(
     let config = MenuConfig::default().close_behavior(close_behavior);
     // Grow with the screen so a full menu fits without an inner scrollbar.
     let cap = menu_height_cap(ui.ctx(), response.rect, align);
+    let width_cap = menu_width_cap(ui.ctx());
     egui::Popup::menu(&response)
         .align(align)
         .align_alternatives(alternatives)
@@ -444,10 +471,21 @@ pub fn menu_popup<R>(
             if ui.is_sizing_pass() {
                 ui.set_min_height(cap);
             }
+            // `set_max_width` *sets* the width rather than capping it, and `Popup::menu` lays out
+            // justified — handed the cap outright, a two-item menu would stretch across the whole
+            // phone. Clamped against the Area's own width, this only ever shrinks: the sizing pass
+            // measures against the cap (so a long row truncates instead of widening the popup past
+            // the screen, where egui clips it), and every later frame keeps the width that
+            // measured.
+            let width = (width_cap - ui.spacing().menu_margin.sum().x).min(ui.max_rect().width());
+            ui.set_max_width(width);
             scroll_vertical()
                 .max_height(cap)
+                .max_width(width)
                 .show(ui, |ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+                    // Truncate rather than Extend: rows still never wrap to a second line, but a
+                    // long one now ends in an ellipsis instead of pushing the menu off-screen.
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                     content(ui)
                 })
                 .inner
@@ -537,6 +575,117 @@ mod tests {
             // Options sit inside the indent rail and a scrollbar, so they run a little narrower.
             assert!(*w >= header_w - 40.0, "{k} row is {w:.0}px of the header's {header_w:.0}px");
         }
+    }
+
+    /// A menu must never grow wider than the screen, and must still hug its content when it is
+    /// narrow. egui clips a popup's painting at `content_rect` but never shrinks it, so a row wider
+    /// than the phone cut the whole menu — frame, rim and all — off at the right edge; the worst
+    /// case is the gallery's View button, which sits hard against the right margin with a model
+    /// list of full checkpoint names under it. Capping that with a bare `set_max_width` swings the
+    /// other way, because it *sets* the width and the popup lays out justified: both halves are
+    /// asserted here.
+    #[test]
+    fn menu_never_grows_past_the_screen() {
+        let screen = egui::vec2(393.0, 873.0);
+        let long = "sdxl_a_very_long_checkpoint_filename_v12_pruned.safetensors".repeat(3);
+        let (left, right) = menu_row_span(screen, &long);
+        println!("long rows span {left:.0}..{right:.0} of a {:.0}px screen", screen.x);
+        assert!(right <= screen.x, "a menu row runs to {right:.0}px past the right edge");
+        assert!(left >= 0.0, "a menu row starts at {left:.0}px, off the left edge");
+
+        let (left, right) = menu_row_span(screen, "Short");
+        println!("short rows span {left:.0}..{right:.0}");
+        assert!(right - left < screen.x * 0.6, "a 6-row \"Short\" menu is {:.0}px wide", right - left);
+    }
+
+    /// `menu_height_cap` must survive a viewport shorter than its own floor. A landscape phone with
+    /// the keyboard up leaves the content rect well under 160pt, and `f32::clamp` panics on
+    /// min > max rather than saturating.
+    #[test]
+    fn menu_height_cap_survives_a_squashed_viewport() {
+        let ctx = egui::Context::default();
+        for height in [400.0, 160.0, 159.0, 140.0, 40.0, 1.0] {
+            let rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(873.0, height));
+            let _ = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(rect), ..Default::default() },
+                |ctx| {
+                    let anchor = egui::Rect::from_min_size(
+                        egui::pos2(40.0, (height - 30.0).max(0.0)),
+                        egui::vec2(68.0, 28.0),
+                    );
+                    let cap = menu_height_cap(ctx, anchor, egui::RectAlign::TOP_START);
+                    assert!(cap > 0.0 && cap.is_finite(), "cap {cap} at height {height}");
+                    assert!(cap <= height.max(160.0), "cap {cap} exceeds a {height}pt screen");
+                },
+            );
+        }
+    }
+
+    /// Open an upward menu from a right-aligned button and return the left/right extent its rows
+    /// reached on the settled frame.
+    fn menu_row_span(screen: egui::Vec2, label: &str) -> (f32, f32) {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, screen);
+        let long = label;
+        let button = std::cell::Cell::new(egui::Rect::NOTHING);
+        let span = std::cell::Cell::new(None::<(f32, f32)>);
+        for frame in 0..8 {
+            // Frame 0 lays the button out; frame 1 taps where it landed.
+            let events = if frame == 1 {
+                let at = button.get().center();
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let input = egui::RawInput { screen_rect: Some(viewport), events, ..Default::default() };
+            let _ = ctx.run_ui(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(screen.y - 40.0);
+                    span.set(None);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let resp = up_menu_sized(
+                                ui,
+                                "View",
+                                egui::vec2(68.0, 28.0),
+                                egui::PopupCloseBehavior::CloseOnClickOutside,
+                                |ui| {
+                                    menu_row_style(ui);
+                                    let mut seen: Option<(f32, f32)> = None;
+                                    for row in 0..6 {
+                                        let r = ui.button(format!("{row} {long}")).rect;
+                                        seen = Some(match seen {
+                                            Some((l, x)) => (l.min(r.left()), x.max(r.right())),
+                                            None => (r.left(), r.right()),
+                                        });
+                                    }
+                                    span.set(seen);
+                                },
+                            );
+                            button.set(resp.rect);
+                        });
+                    });
+                });
+            });
+        }
+
+        span.get().expect("the menu never opened")
     }
 
     /// Drive a `down_menu` with `rows` 32px entries on a `screen`-sized viewport and return how

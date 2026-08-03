@@ -14,6 +14,7 @@ mod apps;
 mod backup;
 mod cooc;
 mod engine;
+mod frost;
 mod gallery;
 mod graphview;
 mod history;

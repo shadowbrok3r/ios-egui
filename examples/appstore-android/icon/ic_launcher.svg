@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8a82d6"/>
+      <stop offset="1" stop-color="#5b53a3"/>
+    </linearGradient>
+  </defs>
+  <rect width="192" height="192" rx="42" fill="url(#bg)"/>
+  <!-- Storefront awning: three bays over a shopfront. -->
+  <path d="M34 60h124l10 26H24z" fill="#efeefb"/>
+  <path d="M65 60h20l-6 26H59z M107 60h20l6 26h-20z" fill="#cfcaf0"/>
+  <rect x="40" y="92" width="112" height="66" rx="8" fill="#efeefb"/>
+  <!-- Download arrow: the store's whole job. -->
+  <path d="M96 104v30" stroke="#5b53a3" stroke-width="12" stroke-linecap="round"/>
+  <path d="M78 124l18 20 18-20" fill="none" stroke="#5b53a3" stroke-width="12"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

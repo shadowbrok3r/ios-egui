@@ -1,9 +1,14 @@
 package com.github.egui_mobile;
 
 import android.app.NativeActivity;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ActivityInfo;
+import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.text.Editable;
@@ -56,6 +61,144 @@ public class EguiNativeActivity extends NativeActivity {
             // nativeImeWake stays unresolved; Rust falls back to polling while the IME is up.
         }
         super.onCreate(savedInstanceState);
+        registerInstallReceiver();
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (installReceiver != null) {
+            try {
+                unregisterReceiver(installReceiver);
+            } catch (Throwable ignored) {
+                // Already gone; unregistering twice throws.
+            }
+            installReceiver = null;
+        }
+        super.onDestroy();
+    }
+
+    // ── PackageInstaller result ──────────────────────────────────────────────
+    //
+    // `HostExt::self_update` commits its session against a `com.egui.SELF_UPDATE` broadcast
+    // PendingIntent. Without a receiver the install is fire-and-forget: the confirm dialog never
+    // appears (STATUS_PENDING_USER_ACTION is delivered as a broadcast, not raised by the system),
+    // and a refusal is silent. This latches the outcome for Rust to drain.
+
+    /** Broadcast the install session reports its outcome on. Matches `self_update` in host.rs. */
+    private static final String INSTALL_ACTION = "com.egui.SELF_UPDATE";
+
+    private BroadcastReceiver installReceiver;
+    /** 0 nothing since the last drain, 1 installed, 2 failed. */
+    private volatile int installStatus;
+    /** Why it failed; kept past the status drain so Rust can read it second. */
+    private volatile String installMessage = "";
+
+    private void registerInstallReceiver() {
+        installReceiver =
+                new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        int status =
+                                intent.getIntExtra(
+                                        PackageInstaller.EXTRA_STATUS,
+                                        PackageInstaller.STATUS_FAILURE);
+                        if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                            // The system's confirm dialog. It arrives as an Intent to launch, and
+                            // the install stalls forever if nobody launches it.
+                            Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+                            if (confirm != null) {
+                                confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                                try {
+                                    startActivity(confirm);
+                                } catch (Throwable t) {
+                                    installStatus = 2;
+                                    installMessage = "Could not show the install dialog: " + t;
+                                }
+                            }
+                            return;
+                        }
+                        String detail = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                        if (status == PackageInstaller.STATUS_SUCCESS) {
+                            installStatus = 1;
+                            installMessage = "";
+                        } else {
+                            installStatus = 2;
+                            // The message carries INSTALL_FAILED_* for the cases worth naming (a
+                            // signing-key mismatch above all), so it is passed through verbatim.
+                            installMessage =
+                                    detail != null && !detail.isEmpty()
+                                            ? detail
+                                            : "Install failed (status " + status + ")";
+                        }
+                    }
+                };
+        IntentFilter filter = new IntentFilter(INSTALL_ACTION);
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                // Fired by our own PendingIntent, so it is app-internal; targetSdk 34+ rejects a
+                // registration that does not say so.
+                registerReceiver(installReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(installReceiver, filter);
+            }
+        } catch (Throwable t) {
+            installReceiver = null;
+            Log.w("EguiHost", "install receiver not registered: " + t);
+        }
+    }
+
+    /**
+     * Raise the system's photos-and-videos permission dialog.
+     *
+     * <p>Both kinds at once, because a picker switches between them and asking twice would mean two
+     * dialogs. On Android 14+ {@code READ_MEDIA_VISUAL_USER_SELECTED} rides along: left out of the
+     * ask, the system's "Select photos" choice comes back as a flat denial.
+     *
+     * <p>Lives here rather than in Rust so it runs on the UI thread — {@code requestPermissions}
+     * goes through {@code startActivityForResult}, which the render thread must not drive. There is
+     * no result callback; the caller polls {@code checkSelfPermission}.
+     */
+    public void requestMediaPermissions() {
+        final String[] perms;
+        if (Build.VERSION.SDK_INT >= 34) {
+            perms =
+                    new String[] {
+                        "android.permission.READ_MEDIA_IMAGES",
+                        "android.permission.READ_MEDIA_VIDEO",
+                        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+                    };
+        } else if (Build.VERSION.SDK_INT >= 33) {
+            perms =
+                    new String[] {
+                        "android.permission.READ_MEDIA_IMAGES", "android.permission.READ_MEDIA_VIDEO",
+                    };
+        } else {
+            perms = new String[] {"android.permission.READ_EXTERNAL_STORAGE"};
+        }
+        runOnUiThread(
+                () -> {
+                    try {
+                        requestPermissions(perms, REQUEST_MEDIA_PERMS);
+                    } catch (Throwable t) {
+                        Log.w("EguiHost", "media permission dialog failed: " + t);
+                    }
+                });
+    }
+
+    /** `requestPermissions` code. The result is polled via checkSelfPermission, not dispatched. */
+    public static final int REQUEST_MEDIA_PERMS = 0x5671;
+
+    /** Read and clear the install outcome: 0 nothing, 1 installed, 2 failed. */
+    public int takeInstallStatus() {
+        int was = installStatus;
+        installStatus = 0;
+        return was;
+    }
+
+    /** Why the last install failed, or "". Read after {@link #takeInstallStatus()}. */
+    public String getInstallMessage() {
+        String msg = installMessage;
+        return msg == null ? "" : msg;
     }
 
     /** Suppress Android's selection/insertion ActionMode — it dismisses the soft keyboard. */
@@ -170,6 +313,26 @@ public class EguiNativeActivity extends NativeActivity {
                 nativeWakeBroken = true;
             }
         }
+    }
+
+    /** VpnService.prepare() consent request code, and the latched result: 0 none, 1 ok, 2 denied. */
+    public static final int REQUEST_VPN_CONSENT = 0x5670;
+
+    private volatile int vpnConsent;
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQUEST_VPN_CONSENT) {
+            vpnConsent = resultCode == RESULT_OK ? 1 : 2;
+        }
+    }
+
+    /** Read and clear the VPN consent result. */
+    public int takeVpnConsent() {
+        int was = vpnConsent;
+        vpnConsent = 0;
+        return was;
     }
 
     /** Read and clear the external-dismissal latch. */

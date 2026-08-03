@@ -1,0 +1,65 @@
+name: Publish plugins
+
+# Builds every WASM UI plugin under plugins/ and publishes it to the plugin store.
+# Plugins are wasm32-wasip1 modules — no Android SDK, no signing, so this is much
+# lighter than the APK workflow.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "plugins/**"
+      - ".github/workflows/publish-plugins.yml"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Stage plugin bundles
+        run: |
+          mkdir -p dist-plugins
+          shopt -s nullglob
+          for dir in plugins/*/; do
+            [ -f "$dir/Cargo.toml" ] || continue
+            [ -f "$dir/manifest.toml" ] || continue
+            id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$dir/manifest.toml" | head -1)
+            [ -n "$id" ] || continue
+            echo "== building $id"
+            ( cd "$dir" && cargo build --release --target wasm32-wasip1 )
+            crate=$(sed -n 's/^name *= *"\(.*\)".*/\1/p' "$dir/Cargo.toml" | head -1)
+            wasm=""
+            for base in "$dir/target" target; do
+              cand="$base/wasm32-wasip1/release/${crate//-/_}.wasm"
+              [ -f "$cand" ] && wasm="$cand" && break
+            done
+            if [ -z "$wasm" ]; then
+              echo "   no .wasm found for $crate — skipping" >&2
+              continue
+            fi
+            mkdir -p "dist-plugins/$id"
+            cp "$wasm" "dist-plugins/$id/plugin.wasm"
+            cp "$dir/manifest.toml" "dist-plugins/$id/manifest.toml"
+          done
+          ls -la dist-plugins/ || true
+
+      # No .cwasm here on purpose: an AOT artifact is only loadable by the exact
+      # wasmtime build that produced it, so it must be compiled by the host, not CI.
+      - name: Publish
+        env:
+          AS_URL: ${{ secrets.AS_URL }}
+          AS_KEY: ${{ secrets.AS_KEY }}
+        run: |
+          if [ -z "$(ls -A dist-plugins 2>/dev/null)" ]; then
+            echo "no plugins staged; nothing to do"
+            exit 0
+          fi
+          notes=$(git log -1 --pretty=%s)
+          scripts/publish-plugin.sh --all dist-plugins "$notes"

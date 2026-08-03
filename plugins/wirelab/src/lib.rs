@@ -2,8 +2,12 @@
 //! over the WireLab TCP protocol and drive them live — telemetry, GPIO,
 //! analog watches, the on-board RGB LED — straight from the iPad.
 
+pub mod docs;
 pub mod flowstyle;
 pub mod link;
+pub mod rules;
+pub mod runner;
+pub mod snippets;
 pub mod view;
 
 use std::time::Duration;
@@ -94,6 +98,7 @@ enum Tab {
     Canvas,
     Flow,
     Script,
+    Rules,
 }
 
 /// Draft parameters for the behavior editor row.
@@ -129,6 +134,9 @@ fn behavior_label(b: &Behavior) -> String {
 /// Disk key for settings that must survive a full app restart (not just a
 /// hot reload, which `save_state`/`restore_state` already covers).
 const STATE_KEY_STR: &str = "settings";
+/// Separate disk key for locally edited rules, so the settings blob keeps its
+/// postcard shape (positional — appending a field breaks old saves).
+const PROGRAMS_KEY_STR: &str = "programs";
 
 struct App {
     saved: Persisted,
@@ -150,6 +158,13 @@ struct App {
     behavior_draft: BehaviorDraft,
     uart_open: bool,
     uart_input: String,
+    docs: docs::DocsState,
+    /// On-device live session: scripts + rules against the linked board.
+    runner: runner::LiveRunner,
+    /// Rules edited on this device, keyed by board id. The desktop has no
+    /// program-push endpoint, so these run locally and shadow its copy.
+    local_programs: std::collections::BTreeMap<u64, wirelab_core::program::Program>,
+    programs_dirty: bool,
 }
 
 impl App {
@@ -170,7 +185,19 @@ impl App {
             behavior_draft: BehaviorDraft::default(),
             uart_open: false,
             uart_input: String::new(),
+            docs: docs::DocsState::default(),
+            runner: runner::LiveRunner::default(),
+            local_programs: Default::default(),
+            programs_dirty: false,
         }
+    }
+
+    /// The rules to run for a board: the local override, else the desktop's.
+    fn program_for(&self, board_id: u64) -> Option<wirelab_core::program::Program> {
+        if let Some(p) = self.local_programs.get(&board_id) {
+            return Some(p.clone());
+        }
+        self.project.board_tab().map(|t| t.program.clone())
     }
 
     /// Forget all per-connection control state (used on disconnect).
@@ -180,6 +207,7 @@ impl App {
         self.pwm_on = None;
         self.behaviors.clear();
         self.uart_open = false;
+        self.runner = runner::LiveRunner::default();
     }
 }
 
@@ -198,6 +226,14 @@ impl PluginApp for App {
             {
                 self.saved = s;
             }
+            // JSON, not postcard: Trigger/Action are internally tagged, which
+            // postcard serializes but cannot deserialize.
+            if let Ok(bytes) = host.call("state.get", PROGRAMS_KEY_STR.as_bytes())
+                && let Ok(Some(data)) = abi::decode::<Option<Vec<u8>>>(&bytes)
+                && let Ok(p) = serde_json::from_slice(&data)
+            {
+                self.local_programs = p;
+            }
             self.tab = self.saved.tab;
             self.last_persisted = abi::encode(&self.saved);
         }
@@ -215,6 +251,37 @@ impl PluginApp for App {
         }
         self.project.desktop_addr = std::mem::take(&mut self.saved.desktop_addr);
         self.project.poll(&ops, now);
+
+        // The on-device live session, fed by the link and the mirrored project.
+        self.project.ensure_model();
+        if self.runner.active {
+            let mut log = Vec::new();
+            if let (Some(model), Some(tab)) = (self.project.model_ref(), self.project.board_tab())
+            {
+                self.runner.tick(
+                    &ops,
+                    &mut self.link,
+                    model,
+                    tab,
+                    (now * 1000.0) as u64,
+                    &mut log,
+                );
+            } else {
+                // The board vanished from the snapshot: don't let captured
+                // events pile up (and later replay) while nothing consumes them.
+                self.link.capture_events = false;
+                let _ = self.link.take_events();
+            }
+            for line in log {
+                self.link.push_log(line);
+            }
+        }
+        self.project.live_warnings = self
+            .runner
+            .live_output
+            .as_ref()
+            .map(|o| o.warnings.clone())
+            .unwrap_or_default();
         // Sockets are host-side; keep frames coming while anything is live.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
@@ -224,13 +291,29 @@ impl PluginApp for App {
                 (Tab::Canvas, "🗺 Canvas"),
                 (Tab::Flow, "⛓ Flow"),
                 (Tab::Script, "📜 Script"),
+                (Tab::Rules, "🛠 Rules"),
             ] {
                 if ui.selectable_label(self.tab == tab, label).clicked() {
                     self.tab = tab;
                     self.saved.tab = tab;
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.menu_button("?", |ui| {
+                    // Finger-sized rows (egui 0.35 menus default to ~18px).
+                    ui.style_mut().spacing.button_padding = egui::vec2(10.0, 8.0);
+                    if ui.button("Script reference").clicked() {
+                        self.docs.open = Some(docs::DocKind::Script);
+                        ui.close();
+                    }
+                    if ui.button("Wiring guide").clicked() {
+                        self.docs.open = Some(docs::DocKind::Wiring);
+                        ui.close();
+                    }
+                });
+            });
         });
+        self.docs.show(ui.ctx());
         ui.separator();
 
         match self.tab {
@@ -243,17 +326,33 @@ impl PluginApp for App {
             }
             Tab::Canvas => {
                 if self.project.header(ui, &ops, now) {
-                    self.project.show_canvas(ui, &ops, now);
+                    self.project.show_canvas(
+                        ui,
+                        &ops,
+                        now,
+                        self.runner.live_output.as_ref(),
+                        self.runner.bank.as_ref(),
+                    );
                 }
             }
             Tab::Flow => {
                 if self.project.header(ui, &ops, now) {
-                    self.project.show_flow(ui, &ops, now);
+                    // Live node values ride the wires while the runner is on.
+                    let values = self
+                        .runner
+                        .active
+                        .then(|| self.runner.scripts.flow_state().into_iter().collect());
+                    self.project.show_flow(ui, &ops, now, values);
                 }
             }
             Tab::Script => {
                 if self.project.header(ui, &ops, now) {
                     self.project.show_script(ui, &ops, now);
+                }
+            }
+            Tab::Rules => {
+                if self.project.header(ui, &ops, now) {
+                    self.rules_tab(ui, &ops, now);
                 }
             }
         }
@@ -266,14 +365,25 @@ impl PluginApp for App {
             let _ = host.call("state.set", &abi::encode(&(STATE_KEY_STR.to_string(), cur.clone())));
             self.last_persisted = cur;
         }
+        if self.programs_dirty {
+            self.programs_dirty = false;
+            let json = serde_json::to_vec(&self.local_programs).unwrap_or_default();
+            let _ = host.call("state.set", &abi::encode(&(PROGRAMS_KEY_STR.to_string(), json)));
+        }
     }
 
     fn save_state(&self) -> Vec<u8> {
-        abi::encode(&self.saved)
+        let json = serde_json::to_vec(&self.local_programs).unwrap_or_default();
+        abi::encode(&(&self.saved, json))
     }
 
     fn restore_state(&mut self, bytes: &[u8]) {
-        if let Ok(saved) = abi::decode::<Persisted>(bytes) {
+        if let Ok((saved, json)) = abi::decode::<(Persisted, Vec<u8>)>(bytes) {
+            self.saved = saved;
+            if let Ok(p) = serde_json::from_slice(&json) {
+                self.local_programs = p;
+            }
+        } else if let Ok(saved) = abi::decode::<Persisted>(bytes) {
             self.saved = saved;
         }
     }
@@ -521,6 +631,9 @@ impl App {
             self.behaviors_section(ui, ops);
 
             ui.add_space(10.0);
+            self.live_section(ui, ops);
+
+            ui.add_space(10.0);
             self.uart_section(ui, ops);
 
             ui.add_space(10.0);
@@ -642,6 +755,101 @@ impl App {
         });
     }
 
+    fn live_section(&mut self, ui: &mut egui::Ui, ops: &dyn Ops) {
+        ui.label(
+            egui::RichText::new("Project live — run its scripts + rules from this device")
+                .color(ACCENT)
+                .small(),
+        );
+        let Some((board_id, board_name)) =
+            self.project.board_tab().map(|t| (t.id, t.name.clone()))
+        else {
+            ui.label(
+                egui::RichText::new(
+                    "fetch the desktop project in the Canvas tab first — its scripts, \
+                     flow and rules can then run right here, desktop off",
+                )
+                .color(DIM)
+                .small(),
+            );
+            return;
+        };
+        if self.project.model_ref().is_none() {
+            ui.label(egui::RichText::new("board profile missing from snapshot").color(ERR).small());
+            return;
+        }
+        if !self.runner.active {
+            ui.horizontal(|ui| {
+                if ui.button("Start live").clicked() {
+                    self.runner.start();
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "configures pins from '{board_name}' wiring, then scripts + flow go live"
+                    ))
+                    .color(DIM)
+                    .small(),
+                );
+            });
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("• live").color(OK));
+            let scripted = self.runner.scripts.scripted().len();
+            let errors = self.runner.scripts.errors.len();
+            ui.label(egui::RichText::new(format!("{scripted} script(s)")).color(DIM).small());
+            if errors > 0 {
+                ui.label(egui::RichText::new(format!("{errors} error(s)")).color(ERR).small());
+            }
+            if ui.button("Stop").clicked() {
+                self.runner.stop(ops, &mut self.link);
+                // The Reset just cleared every commanded pin, behavior slot,
+                // UART and analog watch on the board.
+                self.driven.clear();
+                self.pwm_on = None;
+                self.behaviors.clear();
+                self.uart_open = false;
+                self.watching = None;
+                return;
+            }
+        });
+        if let Some((comp, err)) = self.runner.scripts.errors.iter().next() {
+            let who = self.runner.scripts.name_of(*comp).unwrap_or("script").to_string();
+            ui.label(egui::RichText::new(format!("✖ {who}: {err}")).color(ERR).small());
+        }
+        let rules = self.program_for(board_id).map(|p| p.rules.len()).unwrap_or(0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "rules: {rules}{}",
+                    if self.local_programs.contains_key(&board_id) { " (local copy)" } else { "" }
+                ))
+                .color(DIM)
+                .small(),
+            );
+            if !self.runner.program_running {
+                if ui.add_enabled(rules > 0, egui::Button::new("Run rules")).clicked()
+                    && let Some(program) = self.program_for(board_id)
+                    && let Some(model) = self.project.model_ref()
+                {
+                    let now_ms = ui.input(|i| i.time) * 1000.0;
+                    self.runner.start_program(
+                        ops,
+                        &mut self.link,
+                        &program,
+                        model,
+                        now_ms as u64,
+                    );
+                }
+            } else if ui.button("Stop rules").clicked() {
+                self.runner.stop_program();
+            }
+            if self.runner.program_running {
+                ui.label(egui::RichText::new("running").color(HIGH).small());
+            }
+        });
+    }
+
     fn uart_section(&mut self, ui: &mut egui::Ui, ops: &dyn Ops) {
         ui.label(egui::RichText::new("UART").color(ACCENT).small());
         ui.horizontal_wrapped(|ui| {
@@ -708,6 +916,101 @@ impl App {
                 }
             }
         });
+    }
+
+    /// The Rules tab: the desktop's trigger -> action program editor over the
+    /// local copy, with run controls when a board is live.
+    fn rules_tab(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) {
+        let Some((board_id, desktop_program)) =
+            self.project.board_tab().map(|t| (t.id, t.program.clone()))
+        else {
+            return;
+        };
+        let cat = match (self.project.model_ref(), self.project.board_tab()) {
+            (Some(m), Some(tab)) => rules::CompCatalog::build(&tab.circuit, &m.lib),
+            _ => {
+                ui.label(egui::RichText::new("board profile missing from snapshot").color(ERR));
+                return;
+            }
+        };
+        let local = self.local_programs.contains_key(&board_id);
+        let base = self
+            .local_programs
+            .get(&board_id)
+            .cloned()
+            .unwrap_or_else(|| desktop_program.clone());
+
+        let mut reset = false;
+        ui.horizontal_wrapped(|ui| {
+            if local {
+                ui.label(
+                    egui::RichText::new("local copy — runs from this device; the desktop keeps its own")
+                        .small()
+                        .color(HIGH),
+                );
+                reset = ui.small_button("reset to desktop").clicked();
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "the desktop's rules — editing makes a local copy that runs from this device",
+                    )
+                    .small()
+                    .color(DIM),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.runner.program_running {
+                    if ui.small_button("Stop rules").clicked() {
+                        self.runner.stop_program();
+                    }
+                    ui.label(egui::RichText::new("• running").color(OK).small());
+                } else if self.runner.active
+                    && self.link.state == link::LinkState::Ready
+                    && ui.small_button("Run rules").clicked()
+                    && let Some(program) = self.program_for(board_id)
+                    && let Some(model) = self.project.model_ref()
+                {
+                    self.runner.start_program(
+                        ops,
+                        &mut self.link,
+                        &program,
+                        model,
+                        (now * 1000.0) as u64,
+                    );
+                } else if !self.runner.active {
+                    ui.label(
+                        egui::RichText::new("start live on the Board tab to run")
+                            .color(DIM)
+                            .small(),
+                    );
+                }
+            });
+        });
+        ui.add_space(4.0);
+
+        let now_ms = (now * 1000.0) as u64;
+        let recent: Vec<usize> = if self.runner.program_running {
+            self.runner
+                .engine
+                .firings
+                .iter()
+                .filter(|f| now_ms.saturating_sub(f.at_ms) < 500)
+                .map(|f| f.rule_idx)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut prog = base.clone();
+        egui::ScrollArea::vertical().id_salt("rules").show(ui, |ui| {
+            rules::show(ui, &mut prog, &cat, &recent);
+        });
+        if reset {
+            self.local_programs.remove(&board_id);
+            self.programs_dirty = true;
+        } else if prog != base {
+            self.local_programs.insert(board_id, prog);
+            self.programs_dirty = true;
+        }
     }
 
     fn console(&mut self, ui: &mut egui::Ui) {

@@ -1,0 +1,30 @@
+# Grab-pass-only fork of backdrop-blur, bumped to egui 0.35 / egui_glow 0.35.
+# backdrop-blur-wgpu and the own-loop feature are gone; wgpu/egui-wgpu pins dropped.
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+# MSRV = max(1.85 edition-2024 floor, 1.92 egui/egui_glow 0.35) = 1.92.
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/abdu-benayad/backdrop-blur"
+authors = ["Abdu Benayad <abdu.benayad@gmail.com>"]
+keywords = ["blur", "backdrop", "frosted-glass", "vibrancy", "gpu"]
+categories = ["graphics", "gui", "rendering", "wasm"]
+
+[workspace.dependencies]
+backdrop-blur-core = { path = "crates/backdrop-blur-core", version = "0.3.0" }
+backdrop-blur-glow = { path = "crates/backdrop-blur-glow", version = "0.3.0" }
+
+thiserror = "2"
+
+egui = "0.35"
+# default-features = false keeps egui-winit (and winit) out of the library build.
+# egui_glow 0.35 pins glow 0.17 — the same major our backend uses.
+egui_glow = { version = "0.35", default-features = false }
+egui_kittest = "0.35"
+glow = "0.17"
+log = "0.4"

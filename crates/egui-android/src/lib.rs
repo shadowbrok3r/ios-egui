@@ -533,7 +533,35 @@ impl Adapter {
 
 /// Entry point invoked by [`app!`]. Boots logging, installs a panic logger, and runs eframe with
 /// the Android app handle and the wgpu renderer.
-pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn EguiApp> + 'static) {
+pub fn run(app: AndroidApp, factory: impl FnMut(&CreateContext) -> Box<dyn EguiApp> + 'static) {
+    run_with(app, Backend::default(), factory);
+}
+
+/// Which renderer eframe drives.
+///
+/// Chosen at runtime rather than by a cargo feature — see the note on the eframe dependency.
+/// `Glow` exists for apps that need an OpenGL paint callback (backdrop blur grabs the live
+/// framebuffer, which wgpu cannot do from inside eframe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    #[default]
+    Wgpu,
+    Glow,
+}
+
+static GLOW_CONTEXT: std::sync::OnceLock<std::sync::Arc<glow::Context>> =
+    std::sync::OnceLock::new();
+
+/// The live `glow` context, once the app is running on [`Backend::Glow`]. `None` on wgpu.
+pub fn glow_context() -> Option<std::sync::Arc<glow::Context>> {
+    GLOW_CONTEXT.get().cloned()
+}
+
+pub fn run_with(
+    app: AndroidApp,
+    backend: Backend,
+    mut factory: impl FnMut(&CreateContext) -> Box<dyn EguiApp> + 'static,
+) {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
@@ -544,15 +572,33 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
     host::set_android_app(app.clone());
     ime_bridge::register_natives();
 
+    // Under glow, egui's wgpu paint callbacks are silently skipped rather than failing — the
+    // painter logs "Unsupported render callback" and draws nothing — so a plugin viewport would
+    // just be blank. Say so once, loudly, instead of leaving it to be discovered.
+    #[cfg(feature = "plugins")]
+    if backend == Backend::Glow {
+        log::error!(
+            "egui-android: the `plugins` feature draws through a wgpu paint callback, which the \
+             glow renderer ignores. Plugin viewports will render blank."
+        );
+    }
+
     let mut options = eframe::NativeOptions::default();
     options.android_app = Some(app);
-    options.renderer = eframe::Renderer::Wgpu;
+    options.renderer = match backend {
+        Backend::Wgpu => eframe::Renderer::Wgpu,
+        Backend::Glow => eframe::Renderer::Glow,
+    };
+    log::info!("egui-android: renderer {backend:?}");
 
     let result = eframe::run_native(
         "egui-android",
         options,
         Box::new(move |cc| {
             crate::ime_bridge::set_wake_context(&cc.egui_ctx);
+            if let Some(gl) = cc.gl.clone() {
+                let _ = GLOW_CONTEXT.set(gl);
+            }
             // Install the plugin paint callback into eframe's wgpu renderer (feature `plugins`).
             #[cfg(feature = "plugins")]
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
@@ -598,6 +644,7 @@ pub fn run(app: AndroidApp, mut factory: impl FnMut(&CreateContext) -> Box<dyn E
 pub mod host;
 pub mod ime_bridge;
 pub mod video;
+pub mod vpn;
 pub use host::{HostExt, ScreenOrientation, device_orientation_deg};
 
 #[cfg(feature = "plugins")]
@@ -612,6 +659,13 @@ macro_rules! app {
         #[unsafe(no_mangle)]
         fn android_main(app: $crate::AndroidApp) {
             $crate::run(app, |cc| ::std::boxed::Box::new($factory(cc)));
+        }
+    };
+    // Second form picks the renderer, e.g. `app!(MyApp::new, Backend::Glow)`.
+    ($factory:path, $backend:expr) => {
+        #[unsafe(no_mangle)]
+        fn android_main(app: $crate::AndroidApp) {
+            $crate::run_with(app, $backend, |cc| ::std::boxed::Box::new($factory(cc)));
         }
     };
 }

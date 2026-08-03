@@ -19,6 +19,8 @@ use wirelab_proto::frame::{Decoder, encode};
 use wirelab_proto::{HostMsg, MAX_FRAME};
 
 use wirelab_panel::link::{BoardLink, LinkState, Ops, Scanner};
+use wirelab_panel::runner::LiveRunner;
+use wirelab_panel::view::BoardModel;
 
 /// `NetOps` as the plugin's op surface, matching the host-call contract
 /// (`None` = op not owned by this backend).
@@ -141,6 +143,115 @@ fn plugin_link_drives_a_simulated_board_over_real_sockets() {
     link.send(&ops, &HostMsg::WriteDigital { pin: 2, high: true });
     drive_until(&mut link, &ops, "GPIO2 high", |l| l.levels & (1 << 2) != 0);
 
+    link.disconnect(&ops);
+    stop.store(true, Ordering::Relaxed);
+}
+
+/// The on-device live runner against a real simulated board: auto-wire an
+/// LED, run its script and a rules program, and watch the GPIO go high over
+/// the production socket path.
+#[test]
+fn runner_drives_scripts_and_rules_against_a_simulated_board() {
+    use wirelab_core::circuit::PlacedComponent;
+    use wirelab_core::component::CompState;
+    use wirelab_core::program::{Action, Program, Rule, Trigger};
+
+    let assets = assets_dir();
+    let lib = Library::load(&assets.join("boards"), &assets.join("components"))
+        .expect("assets load");
+    let board = lib.board("esp32-c5-devkitc-1").expect("board").clone();
+
+    // A scripted LED plus its series resistor, hooked up by the auto-wirer.
+    let mut circuit = Circuit::new(&board.id);
+    let part = |def_id: &str, pos: [f32; 2], script: Option<&str>| PlacedComponent {
+        id: wirelab_core::circuit::CompId(0),
+        def_id: def_id.into(),
+        pos,
+        rotation: 0,
+        label: String::new(),
+        props: Default::default(),
+        state: CompState::None,
+        script: script.map(str::to_string),
+    };
+    let led = circuit.add_component(part("led-red", [30.0, 10.0], Some("fn on_start() { me.on(); }")));
+    let res = circuit.add_component(part("resistor-220", [20.0, 10.0], None));
+    let plan = wirelab_core::autowire::auto_wire(&circuit, &board, &lib, &[led, res]);
+    assert!(!plan.wires.is_empty(), "auto-wire found hookups");
+    for (a, b) in plan.wires {
+        circuit.add_wire(a, b, [200, 200, 200]);
+    }
+
+    let netlist = wirelab_core::netlist::Netlist::build(&circuit, &board, &lib);
+    let (_, bindings) = wirelab_core::engine::plan_setup(&circuit, &board, &lib, &netlist);
+    let led_gpio = bindings.gpio_of(led).expect("LED bound to a GPIO");
+    let lints = wirelab_core::validate::validate(&circuit, &board, &lib, &netlist);
+    // Any stable non-MAX keys: the runner only reacts to them changing.
+    let model = BoardModel {
+        lib: lib.clone(),
+        board,
+        netlist,
+        bindings,
+        lints,
+        setup_key: 1,
+        scripts_key: 2,
+        flow_key: 3,
+    };
+    let tab = wirelab_core::project::BoardTab {
+        id: 1,
+        name: "test".into(),
+        circuit,
+        program: Program::default(),
+        flow: Default::default(),
+    };
+
+    let (addr, stop) = spawn_board();
+    let ops = NetOpsShim(NetOps::new());
+    let mut link = BoardLink::default();
+    link.connect(&ops, &addr);
+    drive_until(&mut link, &ops, "Ready", |l| l.state == LinkState::Ready);
+
+    let mut runner = LiveRunner::default();
+    runner.start();
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(6);
+    let mut log = Vec::new();
+    while Instant::now() < deadline && link.levels & (1 << led_gpio) == 0 {
+        let now_ms = start.elapsed().as_millis() as u64;
+        link.poll(&ops, now_ms as f64 / 1000.0);
+        runner.tick(&ops, &mut link, &model, &tab, now_ms, &mut log);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        link.levels & (1 << led_gpio) != 0,
+        "the LED script drove GPIO{led_gpio} high; log: {log:?}"
+    );
+    assert!(runner.scripts.errors.is_empty(), "script errors: {:?}", runner.scripts.errors);
+    assert!(runner.live_output.is_some(), "solve produced live paint state");
+
+    // Rules: on start, configure a spare pin and drive it high through the
+    // engine (mode first — WriteDigital only sticks on an Output pin).
+    let program = Program {
+        rules: vec![Rule {
+            name: "boot".into(),
+            enabled: true,
+            trigger: Trigger::OnStart,
+            actions: vec![
+                Action::SetPinMode { gpio: 4, mode: wirelab_proto::PinMode::Output },
+                Action::SetPin { gpio: 4, high: true },
+            ],
+        }],
+    };
+    runner.start_program(&ops, &mut link, &program, &model, start.elapsed().as_millis() as u64);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline && link.levels & (1 << 4) == 0 {
+        let now_ms = start.elapsed().as_millis() as u64;
+        link.poll(&ops, now_ms as f64 / 1000.0);
+        runner.tick(&ops, &mut link, &model, &tab, now_ms, &mut log);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(link.levels & (1 << 4) != 0, "the rules program drove GPIO4 high; log: {log:?}");
+
+    runner.stop(&ops, &mut link);
     link.disconnect(&ops);
     stop.store(true, Ordering::Relaxed);
 }

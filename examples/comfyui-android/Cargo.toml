@@ -3,7 +3,7 @@ name = "comfyui_android"
 # Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
 # BUMP IT before every release build — the phone only offers an update whose code is strictly
 # greater than the installed one, so shipping twice at the same version is a silent no-op.
-version = "0.4.0"
+version = "0.5.1"
 edition = "2024"
 publish = false
 
@@ -82,6 +82,15 @@ local-wd14 = { path = "../../crates/local-wd14", optional = true }
 local-clip = { path = "../../crates/local-clip", optional = true }
 # On-device CPU prompt rewriter (feature `local-npu`): a `rewrite/` GGUF pack run via candle CPU.
 local-rewrite = { path = "../../crates/local-rewrite", optional = true }
+
+# Real backdrop blur: a grab-pass that samples the live framebuffer inside an egui paint callback,
+# blurs it and composites the frosted pane back. Vendored fork of
+# github.com/abdu-benayad/backdrop-blur bumped to egui 0.35 — see patches/backdrop-blur. Only the
+# glow path exists, which is why this app runs on Backend::Glow.
+[target.'cfg(target_os = "android")'.dependencies]
+backdrop-blur-egui = { path = "../../patches/backdrop-blur/crates/backdrop-blur-egui", default-features = false, features = [
+    "grab-pass",
+] }
 
 [dev-dependencies]
 skrifa = "0.42"

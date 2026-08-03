@@ -14475,6 +14475,9 @@ impl ComfyApp {
             Clear,
             UsePrompt(String),
         }
+        // Blocks the page under the sheet: without it a scroll over the gallery still tripped its
+        // pull-to-refresh, which reads raw pointer state rather than an egui interaction.
+        let mut close = modal_shield(ctx, "queue-sheet-scrim");
         let mut open = true;
         let mut act: Option<QAct> = None;
         let mut clear_arm = self.queue_clear_arm;
@@ -14491,7 +14494,6 @@ impl ComfyApp {
             }
         };
         let total = running.len() + pending.len();
-        let mut close = false;
         let max_h = (ctx.content_rect().height() * 0.5).clamp(160.0, 360.0);
         centered(ctx, egui::Window::new(format!("{} Queue", icons::RUN)))
             .collapsible(false)
@@ -18133,6 +18135,8 @@ impl ComfyApp {
 
             up_menu_sized(ui, format!("{} View", icons::GALLERY), egui::vec2(68.0, 28.0), egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                 crate::theme::menu_row_style(ui);
+                // Facet lists take the room the popup actually has instead of a flat 320pt.
+                let list_h = crate::theme::menu_list_height(ui.ctx());
                 if ui
                     .button(format!("{} Select", icons::CHECK))
                     .on_hover_text("Multi-select — or long-press a photo")
@@ -18262,7 +18266,7 @@ impl ComfyApp {
                 };
                 egui::CollapsingHeader::new(model_label).id_salt("gv_model").show(ui, |ui| {
                     menu_section_body(ui, |ui| {
-                        crate::theme::scroll_vertical().max_height(320.0).id_salt("gv_model_scroll").show(ui, |ui| {
+                        crate::theme::scroll_vertical().max_height(list_h).id_salt("gv_model_scroll").show(ui, |ui| {
                             changed |= crate::theme::selectable_value(ui,
                                     &mut self.gallery_view.model,
                                     String::new(),
@@ -18294,7 +18298,7 @@ impl ComfyApp {
                 };
                 egui::CollapsingHeader::new(lora_label).id_salt("gv_lora").show(ui, |ui| {
                     menu_section_body(ui, |ui| {
-                        crate::theme::scroll_vertical().max_height(320.0).id_salt("gv_lora_scroll").show(ui, |ui| {
+                        crate::theme::scroll_vertical().max_height(list_h).id_salt("gv_lora_scroll").show(ui, |ui| {
                             changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.lora, String::new(), "All LoRAs")
                                 .clicked();
                             for l in &self.facets.loras {
@@ -18320,7 +18324,7 @@ impl ComfyApp {
                 };
                 egui::CollapsingHeader::new(album_label).id_salt("gv_album").show(ui, |ui| {
                     menu_section_body(ui, |ui| {
-                        crate::theme::scroll_vertical().max_height(320.0).id_salt("gv_album_scroll").show(ui, |ui| {
+                        crate::theme::scroll_vertical().max_height(list_h).id_salt("gv_album_scroll").show(ui, |ui| {
                             changed |= crate::theme::selectable_value(ui, &mut self.gallery_view.album, None, "All images")
                                 .clicked();
                             for a in &self.albums {
@@ -19633,6 +19637,9 @@ impl ComfyApp {
             ui.add_enabled_ui(n > 0, |ui| {
                 let album_label = format!("{}{}", icons::ALBUM, icons::ADD);
                 up_menu_sized(ui, album_label, egui::vec2(ICON + 8.0, ICON), egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                    // Room for an album name up front: a menu opened before the list lands keeps
+                    // the width it was first measured at (see `theme::menu_popup`).
+                    ui.set_min_width(240.0);
                     if ui
                         .button(format!("{} New album…", icons::ADD))
                         .on_hover_text("Create an album and add the selection")
@@ -20552,6 +20559,12 @@ impl ComfyApp {
     /// egui clears `press_origin` on the release frame, so the press is tracked in
     /// [`Self::viewer_swipe_origin`].
     fn horizontal_swipe(&mut self, ui: &egui::Ui, rect: egui::Rect) -> Option<i32> {
+        // A sheet, menu or the metadata panel over the image owns the pointer: this reads raw
+        // pointer state, so egui's own modal-layer blocking never reaches it.
+        if overlay_blocking(ui.ctx()) {
+            self.viewer_swipe_origin = None;
+            return None;
+        }
         let (pressed, released, down, pos) = ui.input(|i| {
             (
                 i.pointer.any_pressed(),
@@ -21050,6 +21063,9 @@ impl ComfyApp {
                                 .map(|a| elide(&a.name, 20))
                                 .unwrap_or_else(|| "gallery only".into());
                             up_menu(ui, label, |ui| {
+                                // Same as the selection bar's picker: sized for a name the list may
+                                // not have handed over yet.
+                                ui.set_min_width(240.0);
                                 if crate::theme::selectable_label(ui, album.is_none(), "Gallery only").clicked() {
                                     act = Some(TA::SetAlbum(None));
                                     ui.close();
@@ -21206,6 +21222,7 @@ impl ComfyApp {
             OpenWorkflow,
             CopyWorkflow,
             ToggleMeta,
+            CloseMeta,
             AlbumAdd(i64),
             AlbumRemove(i64),
             AlbumCreate,
@@ -21221,12 +21238,19 @@ impl ComfyApp {
         let finish_disabled = self.finish_disabled_reason();
         #[cfg(feature = "local-npu")]
         self.ensure_local_packs(host, false);
-        // Android system Back / Esc returns to the gallery list.
+        // Android system Back / Esc returns to the gallery list — but the metadata panel owns the
+        // press first, the way every other sheet in the app does.
         if ui.ctx().input_mut(|i| {
             i.consume_key(egui::Modifiers::NONE, egui::Key::BrowserBack)
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)
         }) {
-            act = Some(Act::Close);
+            // `CloseMeta`, not `ToggleMeta`: a Back press landing on the same frame as a tap on the
+            // scrim would otherwise toggle the panel straight back open.
+            act = Some(if self.viewer.as_ref().is_some_and(|v| v.meta_open) {
+                Act::CloseMeta
+            } else {
+                Act::Close
+            });
         }
         // Move decoded frames into the texture before anything samples it this frame.
         if let Some(p) = &mut self.player {
@@ -21594,9 +21618,12 @@ impl ComfyApp {
                     });
                 });
             }
-            // Horizontal swipe changes the picture (dominant X drag from the image area).
+            // Horizontal swipe changes the picture (dominant X drag from the image area). The
+            // metadata panel is checked directly as well as through `overlay_blocking`: it claims
+            // the modal layer only from the frame after it opens.
             if act.is_none()
                 && self.remix_sheet.is_none()
+                && !self.viewer.as_ref().is_some_and(|v| v.meta_open)
                 && let Some(dir) = self.horizontal_swipe(ui, image_rect)
             {
                 let cur = self.viewer.as_ref().unwrap().idx;
@@ -21622,6 +21649,11 @@ impl ComfyApp {
             Some(Act::ToggleMeta) => {
                 if let Some(v) = &mut self.viewer {
                     v.meta_open = !v.meta_open;
+                }
+            }
+            Some(Act::CloseMeta) => {
+                if let Some(v) = &mut self.viewer {
+                    v.meta_open = false;
                 }
             }
             Some(Act::CopyWorkflow) => {
@@ -21906,8 +21938,17 @@ impl ComfyApp {
                 });
             });
         };
-        let area = egui::Area::new(egui::Id::new("viewer-meta-overlay"))
-            .order(egui::Order::Foreground)
+        // Nothing behind the panel may be touched while it is open — a sideways drag over the image
+        // used to swipe to the next picture, and the filmstrip scrolled under it. This is the same
+        // full-screen catcher every other sheet uses; `set_modal_layer` alone would not do it,
+        // because in egui 0.35 the modal layer gates keyboard focus and hit-testing helpers, not
+        // the click a `Button` reports. Tapping it — including on the header toggle it now covers —
+        // closes the panel.
+        let tapped_out = modal_shield(ctx, "viewer-meta-scrim");
+        // `Tooltip` rather than `Foreground`, because the catcher is on `Foreground` and order
+        // *within* a band is by age — which the panel, older than the catcher, would lose.
+        egui::Area::new(egui::Id::new("viewer-meta-overlay"))
+            .order(egui::Order::Tooltip)
             .fixed_pos(egui::pos2(left, anchor.bottom() + 2.0))
             .constrain_to(screen.shrink(margin))
             .show(ctx, |ui| {
@@ -22036,15 +22077,8 @@ impl ComfyApp {
                         });
                     });
             });
-        // Tap outside the panel (and outside the header toggle) closes it.
-        if ctx.input(|i| i.pointer.any_click())
-            && let Some(pos) = ctx.pointer_interact_pos()
-            && !area.response.rect.contains(pos)
-            && !anchor.contains(pos)
-        {
-            if let Some(v) = &mut self.viewer {
-                v.meta_open = false;
-            }
+        if tapped_out && let Some(v) = &mut self.viewer {
+            v.meta_open = false;
         }
         if copy_sampler {
             if let Some(meta) = self.viewer.as_ref().and_then(|v| v.meta.clone()) {
@@ -22074,10 +22108,18 @@ impl ComfyApp {
         let mut picked = None;
         let mut centered = false;
         let mut strip_open = !self.kb_editing;
+        // A drag belongs to whatever sheet or menu is over the viewer, not to the strip under it.
+        let mut strip = crate::theme::scroll_horizontal()
+            .id_salt("viewer_filmstrip")
+            .auto_shrink([false, false]);
+        if overlay_blocking(ui.ctx()) {
+            use egui::containers::scroll_area::{DragScroll, ScrollSource};
+            strip = strip.scroll_source(ScrollSource { drag: DragScroll::Never, ..Default::default() });
+        }
         let bar = egui::Panel::bottom("filmstrip")
             .exact_size(FRAME + 12.0)
             .show_collapsible(ui, &mut strip_open, |ui| {
-                crate::theme::scroll_horizontal().id_salt("viewer_filmstrip").auto_shrink([false, false]).show(
+                strip.show(
                     ui,
                     |ui| {
                         ui.horizontal(|ui| {
@@ -23086,6 +23128,10 @@ impl EguiApp for ComfyApp {
         // the decoded thumbnails that land there run eviction passes, and at that moment the only
         // record of what is on screen is the previous frame's reads (this frame hasn't drawn yet).
         self.thumbs.begin_frame();
+        // Blurs the page under last frame's windows, menus and sheets. Position in `update` does
+        // not matter — it paints into its own layer, ordered above the panels and below every pane
+        // it frosts — but it has to run before the early returns below.
+        crate::frost::glass_panes(ui.ctx());
 
         let t_msgs = std::time::Instant::now();
         for m in self.engine.as_ref().unwrap().drain() {
@@ -23881,7 +23927,9 @@ impl ComfyApp {
         if !self.trash_open {
             return;
         }
-        let mut open = true;
+        // Opened from the gallery's View menu, so the grid is directly behind it: shield it, or a
+        // scroll over the grid still pulls-to-refresh.
+        let mut open = !modal_shield(ctx, "trash-scrim");
         let mut restore: Option<i64> = None;
         let mut purge: Option<i64> = None;
         let mut restore_all = false;
@@ -25977,4 +26025,7 @@ fn inject_lora_triggers(snarl: &mut egui_snarl::Snarl<FlowNodeData>, triggers: &
     }
 }
 
-app!(ComfyApp::new);
+// Glow rather than the default wgpu: the frosted panes grab the live framebuffer from inside an
+// egui paint callback, and only egui_glow dispatches those. This app hosts no plugin viewports, so
+// it gives up nothing by switching.
+app!(ComfyApp::new, egui_mobile::Backend::Glow);

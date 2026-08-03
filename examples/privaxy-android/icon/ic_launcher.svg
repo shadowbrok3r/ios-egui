@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192">
+  <!-- Launcher icon: a shield with the block bar across it, in the app's own accent purple
+       (src/ui/mod.rs ACCENT) on the near-black panel fill. Rasterized by
+       scripts/render-icons.sh examples/privaxy-android. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#191526"/>
+      <stop offset="1" stop-color="#07070c"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.38" r="0.64">
+      <stop offset="0" stop-color="#a855f7" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#a855f7" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#c084fc"/>
+      <stop offset="1" stop-color="#8b3ff0"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="192" height="192" rx="42" fill="url(#tile)"/>
+  <rect x="0" y="0" width="192" height="192" rx="42" fill="url(#glow)"/>
+
+  <!-- Shield. -->
+  <path d="M96 28 L152 50 V101 C152 131 128 154 96 166 C64 154 40 131 40 101 V50 Z"
+        fill="url(#shield)" stroke-linejoin="round"/>
+  <path d="M96 28 L152 50 V101 C152 131 128 154 96 166 C64 154 40 131 40 101 V50 Z"
+        fill="none" stroke="#e9d5ff" stroke-opacity="0.45" stroke-width="4" stroke-linejoin="round"/>
+
+  <!-- The block bar: what a refused request looks like. -->
+  <rect x="62" y="88" width="68" height="17" rx="8.5" fill="#f6efff"/>
+</svg>

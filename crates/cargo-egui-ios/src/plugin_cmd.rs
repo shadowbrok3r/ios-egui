@@ -48,6 +48,16 @@ pub struct PluginBuildArgs {
     /// Staging directory (default: `<path>/dist`).
     #[arg(long)]
     out: Option<PathBuf>,
+    /// Also publish to an appstore plugin store. Serve publishes on every successful
+    /// rebuild, so the store tracks the dev loop.
+    #[arg(long)]
+    publish: bool,
+    /// Store base URL (default: $AS_URL).
+    #[arg(long)]
+    store_url: Option<String>,
+    /// Store admin API key (default: $AS_KEY).
+    #[arg(long)]
+    store_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -63,6 +73,23 @@ pub struct PluginServeArgs {
     /// Build without --release.
     #[arg(long)]
     debug: bool,
+    /// Also publish to an appstore plugin store. Serve publishes on every successful
+    /// rebuild, so the store tracks the dev loop.
+    #[arg(long)]
+    publish: bool,
+    /// Store base URL (default: $AS_URL).
+    #[arg(long)]
+    store_url: Option<String>,
+    /// Store admin API key (default: $AS_KEY).
+    #[arg(long)]
+    store_key: Option<String>,
+}
+
+/// Resolve the publish target, explaining the two ways to supply it.
+fn store_target(url: Option<String>, key: Option<String>) -> Result<crate::store::StoreTarget> {
+    crate::store::StoreTarget::resolve(url, key).context(
+        "--publish needs a store URL and key: pass --store-url/--store-key or set AS_URL/AS_KEY",
+    )
 }
 
 pub fn run(cmd: PluginCmd) -> Result<()> {
@@ -70,9 +97,13 @@ pub fn run(cmd: PluginCmd) -> Result<()> {
         PluginCmd::New { name, id, display_name } => cmd_new(&name, id, display_name),
         PluginCmd::Build(args) => {
             let built = build_plugin(&args.path, args.debug)?;
-            let out = args.out.unwrap_or_else(|| args.path.join("dist"));
+            let out = args.out.clone().unwrap_or_else(|| args.path.join("dist"));
             let staged = stage(&built, &out)?;
             println!("staged {}", staged.display());
+            if args.publish {
+                let target = store_target(args.store_url.clone(), args.store_key.clone())?;
+                crate::store::publish(&target, &built.id, &built.manifest, &built.wasm, "")?;
+            }
             Ok(())
         }
         PluginCmd::Serve(args) => cmd_serve(&args),
@@ -260,6 +291,16 @@ fn cmd_serve(args: &PluginServeArgs) -> Result<()> {
         .collect();
     println!("serving {} plugin(s): {}", paths.len(), names.join(", "));
 
+    // Resolved before the socket binds so a missing key fails fast rather than on the
+    // first rebuild, minutes later.
+    let store = if args.publish {
+        let t = store_target(args.store_url.clone(), args.store_key.clone())?;
+        println!("publishing every successful build to {}", t.url);
+        Some(t)
+    } else {
+        None
+    };
+
     let state: ServeState = Arc::new(Mutex::new(HashMap::new()));
 
     // Build in the background so the server is reachable at once; each plugin is pushed
@@ -267,14 +308,15 @@ fn cmd_serve(args: &PluginServeArgs) -> Result<()> {
     {
         let debug = args.debug;
         let state = Arc::clone(&state);
+        let store = store.clone();
         std::thread::spawn(move || {
             for path in &paths {
                 match build_plugin(path, debug) {
-                    Ok(b) => insert(&state, b),
+                    Ok(b) => insert(&state, b, store.as_ref()),
                     Err(e) => eprintln!("initial build failed for {}: {e:#}", path.display()),
                 }
             }
-            watch_loop(&paths, debug, &state);
+            watch_loop(&paths, debug, &state, store.as_ref());
         });
     }
 
@@ -303,16 +345,28 @@ fn cmd_serve(args: &PluginServeArgs) -> Result<()> {
     Ok(())
 }
 
-fn insert(state: &ServeState, built: Built) {
+fn insert(state: &ServeState, built: Built, store: Option<&crate::store::StoreTarget>) {
     let hash = format!("{:016x}", fnv1a64(&built.wasm));
     println!("plugin {} ready ({} KiB, {hash})", built.id, built.wasm.len() / 1024);
+    // Publish before moving the bytes into the map, but never let a store error stop
+    // the dev loop — devices still hot-reload from this process.
+    if let Some(target) = store
+        && let Err(e) = crate::store::publish(target, &built.id, &built.manifest, &built.wasm, "dev build")
+    {
+        eprintln!("publish failed for {}: {e:#}", built.id);
+    }
     state.lock().unwrap().insert(
         built.id.clone(),
         Served { manifest: built.manifest, wasm: built.wasm, hash },
     );
 }
 
-fn watch_loop(paths: &[PathBuf], debug: bool, state: &ServeState) {
+fn watch_loop(
+    paths: &[PathBuf],
+    debug: bool,
+    state: &ServeState,
+    store: Option<&crate::store::StoreTarget>,
+) {
     let mut stamps: HashMap<PathBuf, u64> = HashMap::new();
     for p in paths {
         stamps.insert(p.clone(), tree_stamp(p));
@@ -325,7 +379,7 @@ fn watch_loop(paths: &[PathBuf], debug: bool, state: &ServeState) {
                 stamps.insert(p.clone(), stamp);
                 println!("change detected in {}, rebuilding…", p.display());
                 match build_plugin(p, debug) {
-                    Ok(b) => insert(state, b),
+                    Ok(b) => insert(state, b, store),
                     Err(e) => eprintln!("rebuild failed: {e:#}"),
                 }
             }

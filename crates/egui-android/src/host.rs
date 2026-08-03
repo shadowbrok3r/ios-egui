@@ -35,12 +35,15 @@ const K_SELF_UPDATE: i32 = 100;
 const K_REQ_INSTALL_PERM: i32 = 101;
 const K_REQ_OVERLAY_PERM: i32 = 102;
 const K_REQ_NOTIF_PERM: i32 = 103;
-const K_SAVE_GALLERY: i32 = 104;
+// 104 was K_SAVE_GALLERY, now a synchronous call — it has to hand the folder back to its caller.
 const K_REQ_MEDIA_PERM: i32 = 105;
 const K_SHARE_MEDIA: i32 = 106;
 const K_SET_ORIENTATION: i32 = 107;
 const K_MEDIA_SCAN: i32 = 108;
 const K_NOTIFY_PROGRESS: i32 = 109;
+const K_INSTALL_CA: i32 = 110;
+const K_OPEN_SETTINGS: i32 = 111;
+const K_OPEN_APP_SETTINGS: i32 = 112;
 
 /// `K_NOTIFY_PROGRESS` int payload: a percentage, or one of these.
 const PROGRESS_INDETERMINATE: i32 = -1;
@@ -100,23 +103,14 @@ pub fn drain(host: &Host) {
             K_REQ_INSTALL_PERM => request_install_permission(),
             K_REQ_OVERLAY_PERM => request_overlay_permission(),
             K_REQ_NOTIF_PERM => request_permission(None, "android.permission.POST_NOTIFICATIONS"),
-            K_SAVE_GALLERY => {
-                if let (Some(path), Some(meta)) = (host.drv_str_a(), host.drv_str_b()) {
-                    let (name, mime) = meta.split_once('\t').unwrap_or((meta.as_str(), "image/png"));
-                    save_to_gallery(&path, name, mime);
-                }
-            }
             K_SHARE_MEDIA => {
                 if let (Some(path), Some(meta)) = (host.drv_str_a(), host.drv_str_b()) {
                     let (name, mime) = meta.split_once('\t').unwrap_or((meta.as_str(), "image/png"));
                     share_media(&path, name, mime);
                 }
             }
-            // The runtime permission dialog needs the Activity, but `ndk_context` only exposes the
-            // Application here (android-activity 0.6 keeps the Activity private), so
-            // `requestPermissions` throws NoSuchMethodError. Send the user to the app's Settings
-            // page to grant Photos access instead — the same fallback used for install/overlay perms.
-            K_REQ_MEDIA_PERM => {
+            K_REQ_MEDIA_PERM => request_media_permission(),
+            K_OPEN_APP_SETTINGS => {
                 start_settings_for_package("android.settings.APPLICATION_DETAILS_SETTINGS")
             }
             K_SET_ORIENTATION => jni_set_orientation(host.drv_int()),
@@ -130,24 +124,52 @@ pub fn drain(host: &Host) {
                 &host.drv_str_b().unwrap_or_default(),
                 host.drv_int(),
             ),
+            K_OPEN_SETTINGS => {
+                if let Some(action) = host.drv_str_a() {
+                    open_settings_action(&action);
+                }
+            }
+            K_INSTALL_CA => {
+                if let Some(hex) = host.drv_str_a() {
+                    let label = host.drv_str_b().unwrap_or_default();
+                    match decode_hex(&hex) {
+                        Some(der) => install_ca_certificate(&der, &label),
+                        None => log::error!("install_ca_certificate: payload was not hex"),
+                    }
+                }
+            }
             other => log::info!("egui-android: host request kind {other} not handled"),
         }
     }
 }
 
+/// How many local references a helper's frame reserves. A minimum, not a cap — JNI grows past it —
+/// but it covers every helper here without a resize.
+const JNI_FRAME: i32 = 16;
+
 /// Run `f` with a JNIEnv attached to the current thread and the real `Activity`.
 ///
 /// Prefer this over [`ndk_context`]: android-activity stores the `Application` there, not the
 /// `Activity`, so `instanceof EguiNativeActivity` and Activity-only APIs fail.
+///
+/// The closure runs inside a **local frame**, which is load-bearing rather than tidy: the render
+/// thread is attached for the whole process (android-activity attaches `android_main` and never
+/// detaches), and `jni`'s object wrappers have no `Drop`, so every `new_string` / `new_object` /
+/// returned object ref would otherwise stay a GC root until exit. The thumbnail path alone leaks a
+/// `Bitmap` plus a `w*h` `int[]` per tile that way. Nothing may return a `JObject` out of `f` —
+/// popping the frame frees it.
 pub(crate) fn with_native_activity<R>(
     f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jni::errors::Result<R>,
 ) -> Option<R> {
     let app = ANDROID_APP.get()?;
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
-    // Unowned JNI global ref from AndroidApp — must not DeleteLocalRef on drop.
+    // Unowned JNI global ref from AndroidApp — must not DeleteLocalRef on drop. Made before the
+    // frame so popping it leaves the reference alone.
     let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
-    let out = match f(&mut env, &activity) {
+    let out = match env.with_local_frame::<_, R, jni::errors::Error>(JNI_FRAME, |env| {
+        f(env, &activity)
+    }) {
         Ok(r) => Some(r),
         Err(e) => {
             if env.exception_check().unwrap_or(false) {
@@ -174,7 +196,10 @@ fn with_activity<R>(
     let vm = unsafe { JavaVM::from_raw(ctx.vm().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
     let activity = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let out = match f(&mut env, &activity) {
+    // Framed for the same reason as above — see `with_native_activity`.
+    let out = match env.with_local_frame::<_, R, jni::errors::Error>(JNI_FRAME, |env| {
+        f(env, &activity)
+    }) {
         Ok(r) => Some(r),
         Err(e) => {
             // Surface the Java exception's stack to logcat, then clear it so it can't poison the
@@ -412,8 +437,24 @@ fn share_text(text: &str) {
     });
 }
 
-/// Insert `path`'s bytes into MediaStore under `Pictures/ComfyUI` and return the `content://` URI.
-/// Scoped-storage insert (API 29+), so no runtime storage permission is needed.
+/// MediaStore collection and relative path for a MIME.
+///
+/// The images collection rejects anything that is not `image/*` — MediaProvider throws
+/// `IllegalArgumentException` — so a certificate, a log or a backup has to go to Downloads, which
+/// accepts any type. Everything non-media used to be inserted as an image and failed silently.
+fn media_target(mime: &str) -> (&'static str, &'static str) {
+    if mime.starts_with("image/") {
+        ("android/provider/MediaStore$Images$Media", "Pictures/ComfyUI")
+    } else if mime.starts_with("video/") {
+        ("android/provider/MediaStore$Video$Media", "Movies/ComfyUI")
+    } else {
+        ("android/provider/MediaStore$Downloads", "Download")
+    }
+}
+
+/// Insert `path`'s bytes into MediaStore — the gallery for media, Downloads for everything else —
+/// and return the `content://` URI. Scoped-storage insert (API 29+), so no runtime storage
+/// permission is needed.
 fn insert_into_media_store<'l>(
     env: &mut jni::JNIEnv<'l>,
     activity: &JObject,
@@ -432,9 +473,11 @@ fn insert_into_media_store<'l>(
         .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
         .l()?;
 
+    let (collection_class, relative_path) = media_target(mime);
+
     let values = env.new_object("android/content/ContentValues", "()V", &[])?;
     for (key, val) in
-        [("_display_name", name), ("mime_type", mime), ("relative_path", "Pictures/ComfyUI")]
+        [("_display_name", name), ("mime_type", mime), ("relative_path", relative_path)]
     {
         let k = env.new_string(key)?;
         let v = env.new_string(val)?;
@@ -456,11 +499,7 @@ fn insert_into_media_store<'l>(
     )?;
 
     let collection = env
-        .get_static_field(
-            "android/provider/MediaStore$Images$Media",
-            "EXTERNAL_CONTENT_URI",
-            "Landroid/net/Uri;",
-        )?
+        .get_static_field(collection_class, "EXTERNAL_CONTENT_URI", "Landroid/net/Uri;")?
         .l()?;
     let uri = env
         .call_method(
@@ -507,19 +546,51 @@ fn insert_into_media_store<'l>(
     Ok(uri)
 }
 
-/// Copy `path`'s bytes into the shared Photos gallery under `Pictures/ComfyUI` via MediaStore.
-/// Best-effort: failures are logged and swallowed, never crashing the render loop.
-fn save_to_gallery(path: &str, name: &str, mime: &str) {
-    let done = with_activity(|env, activity| {
+/// Copy `path`'s bytes into the shared gallery via MediaStore, and report the folder it landed in
+/// (`Pictures/ComfyUI`, `Movies/ComfyUI` or `Download`, per the MIME) so the caller can name it.
+/// `None` when the insert failed — the caller's own copy on disk is unaffected either way.
+///
+/// Synchronous rather than queued through `drv_enqueue`: the caller needs the folder back, and a
+/// ContentResolver insert has no UI-thread requirement (the device-media reads below do the same).
+fn save_to_gallery(path: &str, name: &str, mime: &str) -> Option<String> {
+    let folder = media_target(mime).1;
+    let ok = with_activity(|env, activity| {
         let uri = insert_into_media_store(env, activity, path, name, mime)?;
-        if !uri.is_null() {
-            log::info!("save_to_gallery: {name} -> Pictures/ComfyUI");
-        }
-        Ok(())
+        Ok(!uri.is_null())
     });
-    if done.is_none() {
-        log::error!("save_to_gallery: JNI call failed for {name}");
+    match ok {
+        Some(true) => {
+            log::info!("save_to_gallery: {name} -> {folder}");
+            Some(folder.to_string())
+        }
+        Some(false) => None,
+        None => {
+            log::error!("save_to_gallery: JNI call failed for {name}");
+            None
+        }
     }
+}
+
+/// Read and clear the installer's outcome latch: `0` nothing since the last drain, `1` installed,
+/// `2` failed. See `EguiNativeActivity.takeInstallStatus`, which the commit broadcast feeds.
+fn jni_take_install_status() -> Option<i32> {
+    with_native_activity(|env, activity| {
+        env.call_method(activity, "takeInstallStatus", "()I", &[])?.i()
+    })
+}
+
+/// Why the last install failed (the system's `EXTRA_STATUS_MESSAGE`), or empty.
+fn jni_install_message() -> Option<String> {
+    with_native_activity(|env, activity| {
+        let msg = env
+            .call_method(activity, "getInstallMessage", "()Ljava/lang/String;", &[])?
+            .l()?;
+        if msg.is_null() {
+            return Ok(String::new());
+        }
+        let s: JString = msg.into();
+        Ok(env.get_string(&s)?.into())
+    })
 }
 
 /// Insert `path` into MediaStore, then present the system share sheet for the resulting URI.
@@ -612,6 +683,112 @@ fn media_scan(path: &str) {
     }
 }
 
+/// Hand a DER-encoded certificate to Android's own certificate installer.
+///
+/// **Android 11+ refuses CA certificates through this path**: `CertInstaller` answers with
+/// "Can't install CA certificates — this certificate must be installed in Settings" unless the
+/// caller is a device or profile owner. Verified on Android 17. It remains the right call for a
+/// *client* certificate, and for CA installs below API 30 — for a CA on a modern device, write the
+/// file (which now lands in `Download/`) and send the user to Settings.
+fn install_ca_certificate(der: &[u8], label: &str) {
+    let done = with_activity(|env, activity| {
+        let intent = env
+            .call_static_method(
+                "android/security/KeyChain",
+                "createInstallIntent",
+                "()Landroid/content/Intent;",
+                &[],
+            )?
+            .l()?;
+
+        let extra_certificate = env
+            .get_static_field(
+                "android/security/KeyChain",
+                "EXTRA_CERTIFICATE",
+                "Ljava/lang/String;",
+            )?
+            .l()?;
+        let bytes = env.byte_array_from_slice(der)?;
+        env.call_method(
+            &intent,
+            "putExtra",
+            "(Ljava/lang/String;[B)Landroid/content/Intent;",
+            &[(&extra_certificate).into(), (&bytes).into()],
+        )?;
+
+        if !label.is_empty() {
+            let extra_name = env
+                .get_static_field("android/security/KeyChain", "EXTRA_NAME", "Ljava/lang/String;")?
+                .l()?;
+            let jlabel = env.new_string(label)?;
+            env.call_method(
+                &intent,
+                "putExtra",
+                "(Ljava/lang/String;Ljava/lang/String;)Landroid/content/Intent;",
+                &[(&extra_name).into(), (&jlabel).into()],
+            )?;
+        }
+
+        env.call_method(
+            activity,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[(&intent).into()],
+        )?;
+        Ok(())
+    });
+
+    if done.is_none() {
+        log::error!("install_ca_certificate: JNI call failed");
+    }
+}
+
+/// Open a system Settings screen by action, e.g. `android.settings.SECURITY_SETTINGS`.
+fn open_settings_action(action: &str) {
+    let done = with_activity(|env, activity| {
+        let jaction = env.new_string(action)?;
+        let intent = env.new_object(
+            "android/content/Intent",
+            "(Ljava/lang/String;)V",
+            &[(&jaction).into()],
+        )?;
+        // FLAG_ACTIVITY_NEW_TASK, so this also works from the Application context.
+        env.call_method(
+            &intent,
+            "addFlags",
+            "(I)Landroid/content/Intent;",
+            &[JValue::Int(0x1000_0000)],
+        )?;
+        env.call_method(
+            activity,
+            "startActivity",
+            "(Landroid/content/Intent;)V",
+            &[(&intent).into()],
+        )?;
+        Ok(())
+    });
+
+    if done.is_none() {
+        log::error!("open_settings: no activity answered {action}");
+    }
+}
+
+/// Bytes from a lowercase hex string. The request queue carries strings, and a certificate is
+/// binary.
+fn decode_hex(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(input.len() / 2);
+    for pair in bytes.chunks(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        out.push((high * 16 + low) as u8);
+    }
+    Some(out)
+}
+
 /// Display name and MIME for a shared file path, keyed off the extension.
 fn share_name_and_mime(path: &str) -> (String, &'static str) {
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path).to_string();
@@ -622,42 +799,78 @@ fn share_name_and_mime(path: &str) -> (String, &'static str) {
         "webp" => "image/webp",
         "gif" => "image/gif",
         "mp4" => "video/mp4",
+        // MediaProvider renames a file whose extension disagrees with its MIME, so anything the
+        // app shares by name needs its real type here.
+        "crt" | "cer" | "der" => "application/x-x509-ca-cert",
+        "pem" => "application/x-pem-file",
+        "json" => "application/json",
+        // Deliberately NOT application/json: MediaProvider rewrites the extension to the one
+        // canonical for the MIME, which turned `.har` into `.har.json` and hid the file from
+        // DevTools' Import HAR picker. Android knows no MIME for .har, so octet-stream is what
+        // leaves the name alone.
+        "har" => "application/octet-stream",
+        "txt" | "log" => "text/plain",
         _ => "application/octet-stream",
     };
     (name, mime)
 }
 
-/// The runtime permission that gates reading the shared image gallery: scoped
-/// `READ_MEDIA_IMAGES` on Android 13+ (API 33), the broad `READ_EXTERNAL_STORAGE` below.
-fn media_images_permission() -> &'static str {
-    let sdk = with_activity(|env, _| {
-        env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i()
-    })
-    .unwrap_or(0);
-    if sdk >= 33 {
-        "android.permission.READ_MEDIA_IMAGES"
+fn sdk_int() -> i32 {
+    with_activity(|env, _| env.get_static_field("android/os/Build$VERSION", "SDK_INT", "I")?.i())
+        .unwrap_or(0)
+}
+
+/// The runtime permission that gates reading the shared gallery: scoped `READ_MEDIA_IMAGES` /
+/// `READ_MEDIA_VIDEO` on Android 13+ (API 33), the broad `READ_EXTERNAL_STORAGE` below.
+fn media_permission(video: bool) -> &'static str {
+    if sdk_int() >= 33 {
+        if video {
+            "android.permission.READ_MEDIA_VIDEO"
+        } else {
+            "android.permission.READ_MEDIA_IMAGES"
+        }
     } else {
         "android.permission.READ_EXTERNAL_STORAGE"
     }
 }
 
-fn jni_has_media_permission() -> Option<bool> {
-    check_permission(media_images_permission())
+/// Whether the gallery can be read at all — including through Android 14's partial "Select photos"
+/// grant, which denies the full permission and grants `READ_MEDIA_VISUAL_USER_SELECTED` instead.
+/// MediaStore then lists only the hand-picked items rather than refusing the query.
+fn jni_has_media_permission(video: bool) -> Option<bool> {
+    if check_permission(media_permission(video)) == Some(true) {
+        return Some(true);
+    }
+    if sdk_int() >= 34 {
+        return check_permission("android.permission.READ_MEDIA_VISUAL_USER_SELECTED");
+    }
+    Some(false)
 }
 
-/// List the most recent device gallery images as `(MediaStore id, display name)`, newest first,
-/// capped at `limit`.
-fn jni_list_device_images(limit: i32) -> Option<Vec<(i64, String)>> {
+/// Whether the whole gallery is readable, as opposed to the partial Android 14+ selection. Drives
+/// the "Select more" affordance: re-asking is the only way to reopen the system's photo chooser.
+fn jni_has_full_media_permission(video: bool) -> Option<bool> {
+    check_permission(media_permission(video))
+}
+
+/// MediaStore collection for the kind being browsed.
+fn media_collection(video: bool) -> &'static str {
+    if video {
+        "android/provider/MediaStore$Video$Media"
+    } else {
+        "android/provider/MediaStore$Images$Media"
+    }
+}
+
+/// List the most recent device gallery entries as `(MediaStore id, display name)`, newest first,
+/// capped at `limit`. `video` picks the clips collection instead of the stills one.
+fn jni_list_device_media(video: bool, limit: i32) -> Option<Vec<(i64, String)>> {
     with_activity(|env, activity| {
         let resolver = env
             .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
             .l()?;
         let collection = env
-            .get_static_field(
-                "android/provider/MediaStore$Images$Media",
-                "EXTERNAL_CONTENT_URI",
-                "Landroid/net/Uri;",
-            )?
+            .get_static_field(media_collection(video), "EXTERNAL_CONTENT_URI", "Landroid/net/Uri;")?
             .l()?;
         // Projection [_id, _display_name]; MediaStore sorts by date_added descending (newest first).
         let col_id = env.new_string("_id")?;
@@ -710,17 +923,14 @@ fn jni_list_device_images(limit: i32) -> Option<Vec<(i64, String)>> {
     })
 }
 
-/// `content://` URI for a MediaStore image id.
-fn image_uri<'a>(
+/// `content://` URI for a MediaStore id in the stills or clips collection.
+fn media_uri<'a>(
     env: &mut jni::JNIEnv<'a>,
+    video: bool,
     id: i64,
 ) -> jni::errors::Result<JObject<'a>> {
     let base = env
-        .get_static_field(
-            "android/provider/MediaStore$Images$Media",
-            "EXTERNAL_CONTENT_URI",
-            "Landroid/net/Uri;",
-        )?
+        .get_static_field(media_collection(video), "EXTERNAL_CONTENT_URI", "Landroid/net/Uri;")?
         .l()?;
     env.call_static_method(
         "android/content/ContentUris",
@@ -731,15 +941,15 @@ fn image_uri<'a>(
     .l()
 }
 
-/// A device image's thumbnail as raw RGBA pixels `(width, height, rgba)` (≈ `size`×`size`).
-/// `loadThumbnail` needs API 29+. Returns pixels directly (no PNG round-trip) so the caller can
-/// build a texture without a re-decode.
-fn jni_load_device_thumb(id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)> {
+/// A device image or video frame's thumbnail as raw RGBA pixels `(width, height, rgba)`
+/// (≈ `size`×`size`). `loadThumbnail` needs API 29+ and covers both collections. Returns pixels
+/// directly (no PNG round-trip) so the caller can build a texture without a re-decode.
+fn jni_load_device_thumb(video: bool, id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)> {
     with_activity(|env, activity| {
         let resolver = env
             .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
             .l()?;
-        let uri = image_uri(env, id)?;
+        let uri = media_uri(env, video, id)?;
         let size_obj =
             env.new_object("android/util/Size", "(II)V", &[JValue::Int(size), JValue::Int(size)])?;
         let null = JObject::null();
@@ -751,7 +961,11 @@ fn jni_load_device_thumb(id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)> {
                 &[(&uri).into(), (&size_obj).into(), (&null).into()],
             )?
             .l()?;
-        bitmap_to_rgba(env, &bitmap)
+        let out = bitmap_to_rgba(env, &bitmap);
+        // The pixels are copied out by now, and a grid pulls hundreds of these: recycle frees the
+        // native buffer immediately rather than leaving it to the next GC.
+        let _ = env.call_method(&bitmap, "recycle", "()V", &[]);
+        out
     })
 }
 
@@ -789,13 +1003,13 @@ pub(crate) fn bitmap_to_rgba(env: &mut jni::JNIEnv, bitmap: &JObject) -> jni::er
     Ok((w as u32, h as u32, rgba))
 }
 
-/// A device image's full file bytes (for upload to ComfyUI).
-fn jni_load_device_bytes(id: i64) -> Option<Vec<u8>> {
+/// A device image or video's full file bytes (for upload).
+fn jni_load_device_bytes(video: bool, id: i64) -> Option<Vec<u8>> {
     with_activity(|env, activity| {
         let resolver = env
             .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
             .l()?;
-        let uri = image_uri(env, id)?;
+        let uri = media_uri(env, video, id)?;
         let stream = env
             .call_method(
                 &resolver,
@@ -1405,6 +1619,18 @@ fn self_update(apk_path: &str) {
             "(Ljava/lang/String;)V",
             &[(&act).into()],
         )?;
+        // Explicit, via the package. FLAG_MUTABLE is mandatory here — PackageInstaller delivers
+        // EXTRA_STATUS / EXTRA_STATUS_MESSAGE / EXTRA_INTENT as fill-in extras, which an immutable
+        // PendingIntent drops — and from targetSdk 34 the system *throws* on a mutable PendingIntent
+        // whose Intent names neither a component nor a package, which killed the whole commit.
+        let pkg = package_name(env, activity)?;
+        let jpkg = env.new_string(pkg)?;
+        env.call_method(
+            &intent,
+            "setPackage",
+            "(Ljava/lang/String;)Landroid/content/Intent;",
+            &[(&jpkg).into()],
+        )?;
         // FLAG_MUTABLE (1<<25) | FLAG_UPDATE_CURRENT (1<<27)
         let flags = 0x0200_0000 | 0x0800_0000;
         let pi = env
@@ -1469,6 +1695,24 @@ fn start_settings_for_package(action: &str) {
 
 fn request_install_permission() {
     start_settings_for_package("android.settings.MANAGE_UNKNOWN_APP_SOURCES");
+}
+
+/// Raise the system's photos-and-videos permission dialog.
+///
+/// The permission list and the dialog call live in `EguiNativeActivity.requestMediaPermissions`,
+/// which marshals onto the UI thread — `requestPermissions` runs through `startActivityForResult`,
+/// which the render thread must not drive. An app on a plain `NativeActivity` has no such method,
+/// so this falls back to the Settings page, which is also where a twice-denied permission has to be
+/// granted from.
+fn request_media_permission() {
+    let asked = with_native_activity(|env, activity| {
+        env.call_method(activity, "requestMediaPermissions", "()V", &[])?;
+        Ok(())
+    });
+    if asked.is_none() {
+        log::warn!("request_media_permission: no dialog, falling back to app settings");
+        start_settings_for_package("android.settings.APPLICATION_DETAILS_SETTINGS");
+    }
 }
 
 fn request_overlay_permission() {
@@ -1566,6 +1810,32 @@ fn jni_version_code() -> Option<i64> {
     })
 }
 
+/// `versionCode` of an arbitrary installed package; the NameNotFoundException of a package that
+/// is not installed surfaces as `None` via `with_activity`'s exception handling. Seeing other
+/// packages on API 30+ needs `QUERY_ALL_PACKAGES` (or a `<queries>` entry) in the caller's APK.
+fn jni_installed_version_code(pkg: &str) -> Option<i64> {
+    with_activity(|env, activity| {
+        let pm = env
+            .call_method(
+                activity,
+                "getPackageManager",
+                "()Landroid/content/pm/PackageManager;",
+                &[],
+            )?
+            .l()?;
+        let jpkg = env.new_string(pkg)?;
+        let info = env
+            .call_method(
+                &pm,
+                "getPackageInfo",
+                "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;",
+                &[(&jpkg).into(), JValue::Int(0)],
+            )?
+            .l()?;
+        Ok(env.call_method(&info, "getLongVersionCode", "()J", &[])?.j()?)
+    })
+}
+
 /// Screen-orientation request.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ScreenOrientation {
@@ -1582,7 +1852,13 @@ pub trait HostExt {
     /// Lock or release the screen orientation. See [`ScreenOrientation`].
     fn set_screen_orientation(&self, o: ScreenOrientation);
     /// Install an APK on disk (self-update / sideload). Requires `REQUEST_INSTALL_PACKAGES` and
-    /// the same signing key + `versionCode >=` current. Shows the system confirm dialog.
+    /// the same signing key + `versionCode >=` current.
+    ///
+    /// Asynchronous, and the confirm dialog is not raised by the system: the session reports
+    /// `STATUS_PENDING_USER_ACTION` to a broadcast that `EguiNativeActivity`'s receiver turns into
+    /// the dialog, then latches the outcome for
+    /// [`take_install_status`](HostExt::take_install_status). An app on a plain `NativeActivity`
+    /// gets no dialog and no result.
     fn self_update(&self, apk_path: impl Into<String>);
     /// Open Settings to grant "install unknown apps" for this app.
     fn request_install_permission(&self);
@@ -1590,16 +1866,29 @@ pub trait HostExt {
     fn can_install_packages(&self) -> bool;
     /// This app's `versionCode` (for update checks).
     fn current_version_code(&self) -> i64;
+    /// `versionCode` of another installed package, `None` when it is not installed (or not
+    /// visible — API 30+ package visibility needs `QUERY_ALL_PACKAGES` or a `<queries>` entry).
+    fn installed_version_code(&self, package: &str) -> Option<i64> {
+        let _ = package;
+        None
+    }
     /// Open Settings to grant "draw over other apps" (overlays).
     fn request_overlay_permission(&self);
     /// Whether this app may draw overlays right now.
     fn can_draw_overlays(&self) -> bool;
     /// Request the runtime `POST_NOTIFICATIONS` permission (Android 13+).
     fn request_notification_permission(&self);
-    /// Copy an image file on disk into the shared Photos gallery (`Pictures/<subdir>`) via
-    /// MediaStore. Scoped-storage insert — needs no runtime permission on Android 10+. `mime` is
-    /// e.g. `"image/png"` or `"video/mp4"`.
-    fn save_to_gallery(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>);
+    /// Copy a media file on disk into the shared gallery via MediaStore, returning the folder it
+    /// landed in (`Pictures/ComfyUI`, `Movies/ComfyUI` or `Download`, chosen by `mime`) or `None`
+    /// if the insert failed. Scoped-storage insert — needs no runtime permission on Android 10+.
+    /// `mime` is e.g. `"image/png"` or `"video/mp4"`, and must match the file: MediaProvider
+    /// renames anything whose extension disagrees with it.
+    fn save_to_gallery(
+        &self,
+        path: impl Into<String>,
+        display_name: impl Into<String>,
+        mime: impl Into<String>,
+    ) -> Option<String>;
     /// Insert an image/video file into MediaStore, then present the system share sheet for it.
     /// `mime` is e.g. `"image/png"` or `"video/mp4"`.
     fn share_media(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>);
@@ -1617,22 +1906,46 @@ pub trait HostExt {
     fn notify_progress(&self, title: impl Into<String>, body: impl Into<String>, percent: Option<u32>);
     /// Remove the ongoing job notification.
     fn notify_progress_done(&self);
-    /// Ask the user to grant photo-gallery access. Because `ndk_context` only exposes the
-    /// Application (not the Activity) under android-activity 0.6, the runtime permission dialog
-    /// can't be shown from here, so this opens the app's Settings page where the user toggles
-    /// Photos access. Poll [`has_media_images_permission`](HostExt::has_media_images_permission)
-    /// (checkable on the Application context) for the result on return.
+    /// Open Android's certificate installer on a DER-encoded certificate. `label` pre-fills the
+    /// name the system dialog asks for.
+    ///
+    /// Android 11+ **refuses CA certificates** here unless the app is a device or profile owner;
+    /// it shows "Can't install CA certificates". Use it for client certificates, and send CA
+    /// installs through a file plus [`open_settings`](HostExt::open_settings).
+    fn install_ca_certificate(&self, der: &[u8], label: impl Into<String>);
+    /// Open a Settings screen by action string, e.g. `android.settings.SECURITY_SETTINGS`.
+    fn open_settings(&self, action: impl Into<String>);
+    /// Raise the system's photos-and-videos permission dialog (both kinds, plus Android 14's
+    /// partial-access permission). There is no result callback — poll
+    /// [`has_media_permission`](HostExt::has_media_permission) for the answer. Android stops
+    /// showing the dialog after two denials, so pair this with
+    /// [`open_app_settings`](HostExt::open_app_settings).
     fn request_media_images_permission(&self);
-    /// Whether this app may currently read the device photo gallery.
-    fn has_media_images_permission(&self) -> bool;
-    /// Recent device gallery images as `(MediaStore id, display name)`, newest first, capped at
-    /// `limit`. Empty when the permission is denied or there are none.
-    fn list_device_images(&self, limit: i32) -> Vec<(i64, String)>;
-    /// A device image's thumbnail as raw RGBA pixels `(width, height, rgba)` (≈ `size`×`size`),
-    /// or `None` on failure.
-    fn load_device_thumbnail(&self, id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)>;
-    /// A device image's full file bytes (for upload), or `None` on failure.
-    fn load_device_image(&self, id: i64) -> Option<Vec<u8>>;
+    /// Open this app's page in Settings, where a twice-denied permission can still be granted.
+    fn open_app_settings(&self);
+    /// Whether the device gallery can be read at all — `true` under Android 14's partial
+    /// "Select photos" grant too, which lists only the hand-picked items.
+    fn has_media_permission(&self, video: bool) -> bool;
+    /// Whether the *whole* gallery is readable, as opposed to Android 14's partial selection.
+    /// When this is false but [`has_media_permission`](HostExt::has_media_permission) is true,
+    /// re-requesting is what reopens the system's photo chooser.
+    fn has_full_media_permission(&self, video: bool) -> bool;
+    /// Recent device gallery entries as `(MediaStore id, display name)`, newest first, capped at
+    /// `limit`. `video` lists clips instead of stills. Empty when denied or there are none.
+    fn list_device_media(&self, video: bool, limit: i32) -> Vec<(i64, String)>;
+    /// A device image or video's thumbnail as raw RGBA pixels `(width, height, rgba)`
+    /// (≈ `size`×`size`), or `None` on failure.
+    fn load_device_thumbnail(&self, video: bool, id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)>;
+    /// A device image or video's full file bytes (for upload), or `None` on failure.
+    fn load_device_media(&self, video: bool, id: i64) -> Option<Vec<u8>>;
+    /// Read and clear the outcome of a [`self_update`](HostExt::self_update): `0` nothing has
+    /// happened since the last call, `1` installed, anything else failed — the install is
+    /// asynchronous and the user still has a system dialog to accept, so the answer arrives frames
+    /// or minutes later. Read [`install_message`](HostExt::install_message) after a failure.
+    fn take_install_status(&self) -> i32;
+    /// Why the last install failed — the system's own `EXTRA_STATUS_MESSAGE`, which names
+    /// `INSTALL_FAILED_UPDATE_INCOMPATIBLE` for the signing-key mismatch — or empty.
+    fn install_message(&self) -> String;
     /// Current system clipboard text, if any (requires app focus).
     fn clipboard_text(&self) -> Option<String>;
     /// Whether the primary clip exists (no string copy — safe to poll every frame).
@@ -1682,6 +1995,9 @@ impl HostExt for Host {
     fn current_version_code(&self) -> i64 {
         jni_version_code().unwrap_or(0)
     }
+    fn installed_version_code(&self, package: &str) -> Option<i64> {
+        jni_installed_version_code(package)
+    }
     fn request_overlay_permission(&self) {
         self.drv_enqueue(K_REQ_OVERLAY_PERM, None, None, 0);
     }
@@ -1691,10 +2007,13 @@ impl HostExt for Host {
     fn request_notification_permission(&self) {
         self.drv_enqueue(K_REQ_NOTIF_PERM, None, None, 0);
     }
-    fn save_to_gallery(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>) {
-        // path in str_a, "name\tmime" in str_b (the request channel carries only two strings).
-        let meta = format!("{}\t{}", display_name.into(), mime.into());
-        self.drv_enqueue(K_SAVE_GALLERY, Some(path.into()), Some(meta), 0);
+    fn save_to_gallery(
+        &self,
+        path: impl Into<String>,
+        display_name: impl Into<String>,
+        mime: impl Into<String>,
+    ) -> Option<String> {
+        save_to_gallery(&path.into(), &display_name.into(), &mime.into())
     }
     fn share_media(&self, path: impl Into<String>, display_name: impl Into<String>, mime: impl Into<String>) {
         // Same tab-packed meta as save_to_gallery: path in str_a, "name\tmime" in str_b.
@@ -1711,20 +2030,40 @@ impl HostExt for Host {
     fn notify_progress_done(&self) {
         self.drv_enqueue(K_NOTIFY_PROGRESS, None, None, PROGRESS_DISMISS);
     }
+    fn install_ca_certificate(&self, der: &[u8], label: impl Into<String>) {
+        // The request queue carries strings; hex keeps the certificate intact across it.
+        let hex: String = der.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.drv_enqueue(K_INSTALL_CA, Some(hex), Some(label.into()), 0);
+    }
+    fn open_settings(&self, action: impl Into<String>) {
+        self.drv_enqueue(K_OPEN_SETTINGS, Some(action.into()), None, 0);
+    }
     fn request_media_images_permission(&self) {
         self.drv_enqueue(K_REQ_MEDIA_PERM, None, None, 0);
     }
-    fn has_media_images_permission(&self) -> bool {
-        jni_has_media_permission().unwrap_or(false)
+    fn open_app_settings(&self) {
+        self.drv_enqueue(K_OPEN_APP_SETTINGS, None, None, 0);
     }
-    fn list_device_images(&self, limit: i32) -> Vec<(i64, String)> {
-        jni_list_device_images(limit).unwrap_or_default()
+    fn has_media_permission(&self, video: bool) -> bool {
+        jni_has_media_permission(video).unwrap_or(false)
     }
-    fn load_device_thumbnail(&self, id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)> {
-        jni_load_device_thumb(id, size)
+    fn has_full_media_permission(&self, video: bool) -> bool {
+        jni_has_full_media_permission(video).unwrap_or(false)
     }
-    fn load_device_image(&self, id: i64) -> Option<Vec<u8>> {
-        jni_load_device_bytes(id)
+    fn list_device_media(&self, video: bool, limit: i32) -> Vec<(i64, String)> {
+        jni_list_device_media(video, limit).unwrap_or_default()
+    }
+    fn load_device_thumbnail(&self, video: bool, id: i64, size: i32) -> Option<(u32, u32, Vec<u8>)> {
+        jni_load_device_thumb(video, id, size)
+    }
+    fn load_device_media(&self, video: bool, id: i64) -> Option<Vec<u8>> {
+        jni_load_device_bytes(video, id)
+    }
+    fn take_install_status(&self) -> i32 {
+        jni_take_install_status().unwrap_or(0)
+    }
+    fn install_message(&self) -> String {
+        jni_install_message().unwrap_or_default()
     }
     fn clipboard_text(&self) -> Option<String> {
         read_clipboard_text()

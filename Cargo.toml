@@ -8,6 +8,8 @@ members = [
     "examples/android-hello",
     "examples/plugins-android",
     "examples/comfyui-android",
+    "examples/privaxy-android",
+    "examples/appstore-android",
     "crates/cargo-egui-ios",
     "crates/cargo-egui-android",
     "crates/cargo-egui-mobile",
@@ -24,7 +26,16 @@ members = [
     "examples/desktop-host",
     "examples/plugins-ios/rust",
 ]
-exclude = ["template", "template-plugin", "plugins", "patches/ndk-build2", "patches/cargo-apk2"]
+exclude = [
+    "template",
+    "template-plugin",
+    "plugins",
+    "patches/ndk-build2",
+    "patches/cargo-apk2",
+    # Its own workspace; consumed by path from privaxy-android.
+    "patches/backdrop-blur",
+    "patches/egui-json-tree",
+]
 # egui-android only builds for android targets (android-activity/eframe-android), so it is a
 # member (buildable via `cargo ndk -p egui-android`) but excluded from the default host build.
 default-members = [

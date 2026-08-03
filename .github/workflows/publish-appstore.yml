@@ -1,0 +1,147 @@
+name: Publish to app store
+
+# Publishes an example's APK to https://appstore.shadowbroker.app.
+#
+# Auto-runs when a push to main changes an app whose crate version was bumped —
+# the publish step is skipped when the version is already published, so pushing
+# without a version bump is a no-op rather than a failure.
+#
+# Not covered here:
+#   comfyui-android — its QNN runtime libs are gitignored (proprietary QAIRT SDK),
+#                     so a CI build would silently ship an APK without NPU support.
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "examples/appstore-android/**"
+      - "examples/plugins-android/**"
+      - "examples/privaxy-android/**"
+      - "crates/**"
+      - ".github/workflows/publish-appstore.yml"
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Which app to build and publish"
+        required: true
+        type: choice
+        options: [appstore-android, plugins-android, privaxy-android]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - app: appstore-android
+            crate: appstore_android
+            slug: appstore-android
+            features: tls
+          - app: plugins-android
+            crate: plugins_android
+            slug: plugins-android
+            features: ""
+          - app: privaxy-android
+            crate: privaxy_android
+            slug: privaxy
+            features: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip apps not selected by a manual run
+        id: gate
+        run: |
+          want='${{ github.event.inputs.app }}'
+          if [ -n "$want" ] && [ "$want" != '${{ matrix.app }}' ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          key: ${{ matrix.app }}
+
+      - uses: actions/setup-java@v4
+        if: steps.gate.outputs.skip == 'false'
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install NDK
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          sdkmanager --install "ndk;28.0.12674087" "platforms;android-35" "build-tools;35.0.0"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.0.12674087" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      # The wrapper resolves SDK/NDK/JDK and drives cargo-apk2; both come from this repo.
+      - name: Install build tooling
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          cargo install cargo-apk2 --locked || cargo install cargo-apk2
+          cargo install --path crates/cargo-egui-mobile --locked
+
+      # cargo-apk2 requires a release keystore; CI gets it from a secret.
+      - name: Restore signing keystore
+        if: steps.gate.outputs.skip == 'false'
+        run: |
+          mkdir -p "$HOME/.android"
+          echo '${{ secrets.ANDROID_KEYSTORE_B64 }}' | base64 -d > "$HOME/.android/debug.keystore"
+          test -s "$HOME/.android/debug.keystore"
+
+      - name: Read version
+        if: steps.gate.outputs.skip == 'false'
+        id: ver
+        run: |
+          v=$(sed -n 's/^version *= *"\([0-9.]*\)".*/\1/p' examples/${{ matrix.app }}/Cargo.toml | head -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          IFS=. read -r a b c <<< "$v"
+          echo "code=$(( (1 << 24) | (a << 16) | (b << 8) | c ))" >> "$GITHUB_OUTPUT"
+
+      # A push without a version bump must not fail the run — there is simply
+      # nothing new to publish, since the phone only takes a greater versionCode.
+      - name: Is this version already published?
+        if: steps.gate.outputs.skip == 'false'
+        id: check
+        run: |
+          published=$(curl -sS -H "x-api-key: ${{ secrets.AS_KEY }}" -H 'Accept: application/json' \
+            "${{ secrets.AS_URL }}/${{ matrix.slug }}/update.json" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("version_code") or 0)' || echo 0)
+          echo "published=$published (building ${{ steps.ver.outputs.code }})"
+          if [ "$published" -ge "${{ steps.ver.outputs.code }}" ]; then
+            echo "fresh=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "fresh=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build APK
+        if: steps.gate.outputs.skip == 'false' && steps.check.outputs.fresh == 'true'
+        working-directory: examples/${{ matrix.app }}
+        run: |
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo egui-mobile build -a --release --features ${{ matrix.features }}
+          else
+            cargo egui-mobile build -a --release
+          fi
+
+      - name: Publish
+        if: steps.gate.outputs.skip == 'false' && steps.check.outputs.fresh == 'true'
+        env:
+          AS_URL: ${{ secrets.AS_URL }}
+          AS_KEY: ${{ secrets.AS_KEY }}
+        run: |
+          notes=$(git log -1 --pretty=%s)
+          scripts/publish-appstore.sh --no-changelog \
+            "${{ matrix.slug }}" "examples/${{ matrix.app }}" "$notes"
+
+      - name: Nothing to publish
+        if: steps.gate.outputs.skip == 'false' && steps.check.outputs.fresh != 'true'
+        run: echo "v${{ steps.ver.outputs.version }} is already published — bump the crate version to ship a new build."

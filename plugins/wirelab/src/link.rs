@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use egui_ios_plugin_sdk::abi::{self, net};
+use wirelab_core::sim::PinBank;
 use wirelab_proto::frame::{Decoder, encode};
-use wirelab_proto::{ChipKind, DeviceMsg, HostMsg, MAX_FRAME, PROTO_VERSION};
+use wirelab_proto::{ChipKind, DeviceMsg, HostMsg, MAX_FRAME, PROTO_VERSION, PinMode};
 
 /// The subset of the host-op surface the link needs.
 pub trait Ops {
@@ -147,6 +148,11 @@ pub struct BoardLink {
     /// Completed UART1 rx lines plus the still-unterminated tail.
     pub uart_rx: VecDeque<String>,
     uart_partial: String,
+    /// Shadow of every command sent, for solve()/engine state.
+    pub mirror: PinBank,
+    /// Decoded device messages, captured for the live runner when enabled.
+    pub capture_events: bool,
+    events: Vec<DeviceMsg>,
 }
 
 impl Default for BoardLink {
@@ -166,6 +172,9 @@ impl Default for BoardLink {
             log: VecDeque::new(),
             uart_rx: VecDeque::new(),
             uart_partial: String::new(),
+            mirror: PinBank::default(),
+            capture_events: false,
+            events: Vec::new(),
         }
     }
 }
@@ -219,7 +228,27 @@ impl BoardLink {
             self.push_log(format!("send failed: {e}"));
             self.state = LinkState::Failed(e);
             self.id = None;
+        } else {
+            self.mirror.apply(msg);
         }
+    }
+
+    /// Commanded pin state with output levels backfilled from telemetry.
+    pub fn effective_bank(&self) -> PinBank {
+        let mut bank = self.mirror.clone();
+        for gpio in 0..64u8 {
+            if bank.get(gpio).mode == PinMode::Output
+                && let Some(p) = bank.get_mut(gpio)
+            {
+                p.out_high = self.levels & (1 << gpio) != 0;
+            }
+        }
+        bank
+    }
+
+    /// Device messages captured since the last take (only while `capture_events`).
+    pub fn take_events(&mut self) -> Vec<DeviceMsg> {
+        std::mem::take(&mut self.events)
     }
 
     /// One pump: drain rx, decode frames, drive the handshake.
@@ -270,6 +299,9 @@ impl BoardLink {
     }
 
     fn on_msg(&mut self, ops: &dyn Ops, msg: DeviceMsg) {
+        if self.capture_events && self.events.len() < 512 {
+            self.events.push(msg.clone());
+        }
         match msg {
             DeviceMsg::HelloAck { proto, fw_version, chip, gpio_mask, input_only_mask } => {
                 if proto != PROTO_VERSION {
@@ -331,7 +363,7 @@ impl BoardLink {
         }
     }
 
-    fn push_log(&mut self, line: String) {
+    pub(crate) fn push_log(&mut self, line: String) {
         self.log.push_back(line);
         while self.log.len() > LOG_CAP {
             self.log.pop_front();

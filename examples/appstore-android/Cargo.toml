@@ -1,0 +1,83 @@
+[package]
+name = "appstore_android"
+# Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
+# BUMP IT before every release build — the phone only offers an update whose code is strictly
+# greater than the installed one, so shipping twice at the same version is a silent no-op.
+version = "0.1.4"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# Native HTTPS to the appstore behind TLS. rustls with a bundled webpki-roots CA set and the ring
+# provider — deliberately NOT reqwest's `rustls` feature, which forces rustls-platform-verifier
+# (it needs Android Java helper classes we don't bundle, and panics uninitialized).
+tls = ["reqwest/rustls-no-provider", "dep:rustls", "dep:webpki-roots"]
+
+[dependencies]
+egui-mobile = { path = "../../crates/egui-mobile" }
+egui = "0.35"
+# crates.io 0.12 still targets egui 0.34; this fork tracks 0.35 (same one wirelab uses).
+# Launcher icons the store extracted from each APK; PNG only, pure Rust so it
+# cross-compiles to the NDK with no system libs.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# http-only by default: no TLS backend, so this cross-compiles cleanly. `tls` adds rustls below.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["rt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Verify a downloaded APK against the checksum the store recorded when it was published.
+sha2 = { version = "0.10", default-features = false }
+log = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# cargo-apk2 reads this to generate the APK manifest.
+[package.metadata.android]
+package = "com.kingsofalchemy.appstore"
+java_sources = "../../crates/egui-android/java"
+# Launcher icon mipmaps, rendered from icon/ic_launcher.svg by scripts/render-icons.sh.
+resources = "res"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+# Release installs are personal sideloads; sign with the auto-generated debug keystore.
+[package.metadata.android.signing.release]
+path = "/home/shadowbroker/.android/debug.keystore"
+keystore_password = "android"
+
+[package.metadata.android.application]
+label = "App Store"
+icon = "@mipmap/ic_launcher"
+has_code = true
+
+[[package.metadata.android.application.activity]]
+name = "com.github.egui_mobile.EguiNativeActivity"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
+window_soft_input_mode = "adjustResize"
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "appstore_android"
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+# Install fetched APKs via PackageInstaller; the user additionally grants "install unknown apps".
+[[package.metadata.android.uses_permission]]
+name = "android.permission.REQUEST_INSTALL_PACKAGES"
+# API 30+ package visibility: read installed versionCodes of the store's own catalog.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.QUERY_ALL_PACKAGES"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.VIBRATE"
+
+[dev-dependencies]
+# Reads the real font cmaps so the icon-coverage test can catch a tofu glyph.
+skrifa = "0.42"

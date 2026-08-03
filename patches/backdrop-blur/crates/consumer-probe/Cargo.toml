@@ -1,0 +1,16 @@
+[package]
+name = "consumer-probe"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+backdrop-blur-egui = { path = "../backdrop-blur-egui", default-features = false, features = ["grab-pass"] }
+egui = { workspace = true }
+egui_glow = { workspace = true }
+glow = { workspace = true }
+
+[dev-dependencies]
+# gl-snapshots exposes the doc-hidden EGL-surfaceless harness the end-to-end test drives.
+backdrop-blur-glow = { workspace = true, features = ["gl-snapshots"] }

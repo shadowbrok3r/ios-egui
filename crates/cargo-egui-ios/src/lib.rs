@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 
 pub mod plugin_cmd;
+pub mod store;
 
 // Embedded so a `cargo install`ed binary is fully self-contained.
 const TPL_CARGO: &str = include_str!("../../../template/Cargo.toml");

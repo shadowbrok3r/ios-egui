@@ -24,6 +24,11 @@ pub use egui_ios::app;
 #[cfg(target_os = "android")]
 pub use egui_android::app;
 
+/// Renderer selection, Android only. `Backend::Glow` is required for an OpenGL paint callback
+/// (backdrop blur); everything else should stay on the default wgpu.
+#[cfg(target_os = "android")]
+pub use egui_android::{Backend, glow_context, run_with};
+
 /// Android-only host capabilities (self-update, install/overlay permissions, …). Gate calls
 /// behind `#[cfg(target_os = "android")]` in shared app code.
 #[cfg(target_os = "android")]
@@ -40,6 +45,10 @@ pub use egui_android::device_orientation_deg;
 /// Android-only frame-accurate video decoding (MediaMetadataRetriever) for in-app playback.
 #[cfg(target_os = "android")]
 pub use egui_android::video;
+
+/// Android-only `VpnService` capture: consent, the foreground service, and the tun descriptor.
+#[cfg(target_os = "android")]
+pub use egui_android::vpn;
 
 /// Tell the Android IME bridge a text buffer changed outside the IME (programmatic edit while
 /// possibly focused), so it drops carried IME state and reseeds the hidden EditText.
