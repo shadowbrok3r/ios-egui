@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.5 — 2026-08-04
+
+TLS is on by default. A plain release build was http-only, so a sideloaded one
+could not reach the https store at all — and could not self-update out of it.
+
 ## v0.1.3 — 2026-08-03
 
 Launcher icon; network errors now report the underlying cause instead of a bare 'error sending request'.

@@ -3,7 +3,7 @@ name = "appstore_android"
 # Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
 # BUMP IT before every release build — the phone only offers an update whose code is strictly
 # greater than the installed one, so shipping twice at the same version is a silent no-op.
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 publish = false
 
@@ -11,10 +11,14 @@ publish = false
 crate-type = ["cdylib"]
 
 [features]
-default = []
+# On by default: the store is https, and a build without it fails every request
+# with "invalid URL, scheme is not http" — an app that cannot reach its own
+# store also cannot self-update out of that state.
+default = ["tls"]
 # Native HTTPS to the appstore behind TLS. rustls with a bundled webpki-roots CA set and the ring
-# provider — deliberately NOT reqwest's `rustls` feature, which forces rustls-platform-verifier
-# (it needs Android Java helper classes we don't bundle, and panics uninitialized).
+# provider, applied via use_preconfigured_tls — reqwest's own `rustls` feature would additionally
+# pull aws-lc-rs. rustls-platform-verifier rides along on both (reqwest 0.13 wires it into
+# `rustls-no-provider` too) but stays unused, since the preconfigured config carries the roots.
 tls = ["reqwest/rustls-no-provider", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
@@ -24,7 +28,7 @@ egui = "0.35"
 # Launcher icons the store extracted from each APK; PNG only, pure Rust so it
 # cross-compiles to the NDK with no system libs.
 image = { version = "0.25", default-features = false, features = ["png"] }
-# http-only by default: no TLS backend, so this cross-compiles cleanly. `tls` adds rustls below.
+# TLS comes from the `tls` feature (default-on) rather than reqwest's defaults.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 tokio = { version = "1", features = ["rt"] }
 serde = { version = "1", features = ["derive"] }
