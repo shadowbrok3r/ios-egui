@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5 — 2026-08-04
+
+Finishes the galactic recolor: the frost tint behind the nav bar is violet
+smoke (it was still green), and the launcher icon now wears the same palette —
+pink sweep, aqua emitter, violet blob.
+
 ## 0.1.4 — 2026-08-04
 
 Galactic neon recolor: hot pink sweep and live signals, aqua radar returns

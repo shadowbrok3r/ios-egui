@@ -86,9 +86,9 @@ mod android {
             Surface {
                 rect: bar,
                 blur_radius: BlurRadius::new(26.0),
-                // Dark green smoke: matches the phosphor identity; light tints
-                // wash the blur out and kill label contrast.
-                tint: Tint::from_srgb_unmultiplied([8, 16, 12, 96]),
+                // Dark violet smoke: matches the galactic identity; light
+                // tints wash the blur out and kill label contrast.
+                tint: Tint::from_srgb_unmultiplied([13, 9, 20, 96]),
                 corner_radius: CornerRadius::new(0.0),
                 presence: Presence::new(1.0),
                 repaint,

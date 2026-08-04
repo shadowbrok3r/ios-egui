@@ -1,12 +1,12 @@
 <svg viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <radialGradient id="bg" cx="50%" cy="38%" r="80%">
-      <stop offset="0%" stop-color="#1a1a22"/>
-      <stop offset="100%" stop-color="#0c0c10"/>
+      <stop offset="0%" stop-color="#150d20"/>
+      <stop offset="100%" stop-color="#08060d"/>
     </radialGradient>
     <radialGradient id="halo" cx="50%" cy="50%" r="50%">
-      <stop offset="0%" stop-color="#50c886" stop-opacity="0.55"/>
-      <stop offset="100%" stop-color="#50c886" stop-opacity="0"/>
+      <stop offset="0%" stop-color="#b28cff" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#b28cff" stop-opacity="0"/>
     </radialGradient>
   </defs>
 
@@ -14,21 +14,21 @@
 
   <!-- room floor plan -->
   <rect x="36" y="36" width="120" height="120" rx="10" fill="none"
-        stroke="#63636e" stroke-width="7"/>
+        stroke="#543880" stroke-width="7"/>
 
   <!-- radar at the bottom-left corner: sweep arcs + emitter dot -->
   <path d="M 46 116 A 40 40 0 0 1 76 146" fill="none"
-        stroke="#f0b446" stroke-width="7" stroke-linecap="round" opacity="0.45"/>
+        stroke="#ff40aa" stroke-width="7" stroke-linecap="round" opacity="0.55"/>
   <path d="M 46 96 A 60 60 0 0 1 96 146" fill="none"
-        stroke="#f0b446" stroke-width="7" stroke-linecap="round" opacity="0.22"/>
-  <circle cx="46" cy="146" r="13" fill="#f0b446"/>
+        stroke="#ff40aa" stroke-width="7" stroke-linecap="round" opacity="0.28"/>
+  <circle cx="46" cy="146" r="13" fill="#40e6dc"/>
 
   <!-- walk trail from radar toward the blob -->
-  <circle cx="82" cy="112" r="5" fill="#8a8a94"/>
-  <circle cx="100" cy="94" r="5" fill="#8a8a94"/>
-  <circle cx="116" cy="78" r="5" fill="#8a8a94"/>
+  <circle cx="82" cy="112" r="5" fill="#8a6fc0"/>
+  <circle cx="100" cy="94" r="5" fill="#8a6fc0"/>
+  <circle cx="116" cy="78" r="5" fill="#8a6fc0"/>
 
   <!-- CSI localization blob, upper right -->
   <circle cx="128" cy="66" r="34" fill="url(#halo)"/>
-  <circle cx="128" cy="66" r="13" fill="#50c886"/>
+  <circle cx="128" cy="66" r="13" fill="#b28cff"/>
 </svg>
