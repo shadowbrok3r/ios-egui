@@ -11,10 +11,12 @@
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
 pub mod config;
+pub mod frost;
 pub mod mount;
 pub mod net;
 pub mod proto;
 pub mod roommap;
+pub mod theme;
 
 #[cfg(target_os = "android")]
 mod app;

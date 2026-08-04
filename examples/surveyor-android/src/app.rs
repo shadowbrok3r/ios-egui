@@ -13,6 +13,7 @@ use crate::config::{AppConfig, NodePos};
 use crate::net::{self, HttpCall, HttpOutcome, WsEvent};
 use crate::proto::{MmwaveSnapshot, SensingSnapshot, WsMsg};
 use crate::roommap::{self, MapInputs, Trails};
+use crate::{frost, theme};
 
 /// Data older than this is stale — shown as such, never as live.
 const STALE_AFTER: Duration = Duration::from_secs(3);
@@ -229,56 +230,65 @@ impl SurveyorApp {
     }
 
     fn live_tab(&mut self, ui: &mut egui::Ui) {
+        let live = self.connected && self.sensing_fresh().is_some();
+        // Instrument status strip: monospace, phosphor when live, amber when not.
         ui.horizontal_wrapped(|ui| {
-            let live = self.connected && self.sensing_fresh().is_some();
-            let state = if live {
-                "live"
+            let (state, color) = if live {
+                ("LIVE", theme::PHOSPHOR_BRIGHT)
             } else if self.connected {
-                "connected, no data"
+                ("NO DATA", theme::AMBER)
             } else {
-                "disconnected"
+                ("OFFLINE", theme::AMBER)
             };
-            ui.label(format!("{state} ({})", self.cfg.server));
+            ui.label(egui::RichText::new(state).monospace().size(13.0).color(color));
+            ui.label(
+                egui::RichText::new(self.cfg.server.clone())
+                    .monospace()
+                    .size(12.0)
+                    .color(theme::INK),
+            );
             if !self.link_note.is_empty() && !live {
-                ui.label(format!("- {}", self.link_note));
+                ui.label(
+                    egui::RichText::new(self.link_note.clone())
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::AMBER),
+                );
             }
         });
-        if let Some(s) = self.sensing_fresh() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("source {}", s.source));
-                ui.label(format!("nodes {}", s.node_count));
+        ui.horizontal_wrapped(|ui| {
+            let mono = |t: String, c: egui::Color32| egui::RichText::new(t).monospace().size(12.0).color(c);
+            if let Some(s) = self.sensing_fresh() {
+                ui.label(mono(format!("nodes {}", s.node_count), theme::CYAN));
                 if let Some(p) = s.presence {
-                    ui.label(format!("presence {p}"));
+                    ui.label(mono(format!("presence {p}"), theme::CYAN));
                 }
                 if let Some(n) = s.estimated_persons {
-                    ui.label(format!("persons {n}"));
+                    ui.label(mono(format!("persons {n}"), theme::CYAN));
                 }
                 match s.localization {
-                    Some(loc) => ui.label(format!(
-                        "CSI ({:.2}, {:.2}) conf {:.2}",
-                        loc.x, loc.y, loc.confidence
+                    Some(loc) => ui.label(mono(
+                        format!("CSI ({:.2},{:.2}) c{:.2}", loc.x, loc.y, loc.confidence),
+                        theme::CYAN,
                     )),
-                    None => ui.label("CSI: no estimate"),
+                    None => ui.label(mono("CSI: no estimate".into(), theme::INK)),
                 };
-            });
-        } else if self.latest_sensing.is_some() {
-            ui.label("sensing data is stale - link quiet");
-        } else {
-            ui.label("waiting for sensing_update...");
-        }
-        if let Some(m) = self.mmwave_fresh() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("radar n{}", m.node_id));
+            } else if self.latest_sensing.is_some() {
+                ui.label(mono("sensing stale - link quiet".into(), theme::AMBER));
+            } else {
+                ui.label(mono("waiting for sensing_update...".into(), theme::INK));
+            }
+            if let Some(m) = self.mmwave_fresh() {
                 for t in &m.targets {
                     let (x, y) = self.cfg.mount.to_room(t.x_m, t.y_m);
-                    ui.label(format!("({x:.2}, {y:.2}) {:+.2} m/s", t.speed_mps));
+                    ui.label(mono(
+                        format!("tgt ({x:.2},{y:.2}) {:+.2}m/s", t.speed_mps),
+                        theme::AMBER_BRIGHT,
+                    ));
                 }
-                if m.targets.is_empty() {
-                    ui.label("no targets");
-                }
-            });
-        }
-        ui.separator();
+            }
+        });
+        ui.add_space(4.0);
 
         let radar_room: Vec<(f64, f64, f64)> = self
             .mmwave_fresh()
@@ -296,61 +306,92 @@ impl SurveyorApp {
             loc: self.sensing_fresh().and_then(|s| s.localization),
             radar_room: &radar_room,
             trails: &self.trails,
+            radar_pos: (self.cfg.mount.x_m, self.cfg.mount.y_m),
+            radar_yaw_deg: self.cfg.mount.yaw_deg,
+            live,
         };
         roommap::paint(ui, &self.cfg, &inputs);
     }
 
     fn record_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         let ctx = ui.ctx().clone();
-        ui.label("Calibration session recording (on the sensing server)");
-        ui.horizontal(|ui| {
-            ui.label("session");
-            ui.text_edit_singleline(&mut self.session_name);
-        });
-        ui.horizontal(|ui| {
-            if ui.button("Start recording").clicked() {
-                host.haptic(Haptic::Light);
-                self.http(
-                    &ctx,
-                    "record start",
-                    HttpCall::RecordStart { session: self.session_name.clone() },
+        theme::card().show(ui, |ui| {
+            ui.label("Calibration session (recorded on the sensing server)");
+            ui.horizontal(|ui| {
+                ui.label("session");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.session_name)
+                        .desired_width(f32::INFINITY),
+                );
+            });
+            // Two rows of half-width buttons: nothing gets cut off, targets
+            // stay big enough for thumbs.
+            let half = |ui: &egui::Ui| (ui.available_width() - 8.0) / 2.0;
+            let btn = |text: &str| egui::Button::new(text).min_size(egui::vec2(0.0, 40.0));
+            ui.horizontal(|ui| {
+                let w = half(ui);
+                if ui.add_sized([w, 40.0], btn("Start recording")).clicked() {
+                    host.haptic(Haptic::Light);
+                    self.http(
+                        &ctx,
+                        "record start",
+                        HttpCall::RecordStart { session: self.session_name.clone() },
+                    );
+                }
+                // Always available: the local flag can drift from the server's
+                // real state, and an unstoppable session is the worse failure.
+                if ui.add_sized([w, 40.0], btn("Stop recording")).clicked() {
+                    host.haptic(Haptic::Light);
+                    self.http(&ctx, "record stop", HttpCall::RecordStop);
+                }
+            });
+            ui.horizontal(|ui| {
+                let w = half(ui);
+                if ui.add_sized([w, 40.0], btn("Server status")).clicked() {
+                    self.http(&ctx, "status", HttpCall::LocStatus);
+                }
+                if ui.add_sized([w, 40.0], btn("Empty-room baseline")).clicked() {
+                    self.http(&ctx, "baseline", HttpCall::Baseline);
+                }
+            });
+            if self.recording {
+                ui.label(
+                    egui::RichText::new("REC")
+                        .monospace()
+                        .size(14.0)
+                        .color(theme::AMBER_BRIGHT)
+                        .strong(),
                 );
             }
-            // Always available: the local flag can drift from the server's
-            // real state, and an unstoppable session is the worse failure.
-            if ui.button("Stop recording").clicked() {
-                host.haptic(Haptic::Light);
-                self.http(&ctx, "record stop", HttpCall::RecordStop);
-            }
-            if ui.button("Server status").clicked() {
-                self.http(&ctx, "status", HttpCall::LocStatus);
-            }
-            if ui.button("Empty-room baseline").clicked() {
-                self.http(&ctx, "baseline", HttpCall::Baseline);
-            }
         });
-        if self.recording {
-            ui.colored_label(egui::Color32::from_rgb(240, 120, 100), "RECORDING");
-        }
-        ui.separator();
-        match &self.last_http {
-            Some(o) => {
-                ui.label(format!("last: {}", o.label));
-                match &o.result {
-                    Ok(v) => {
-                        ui.monospace(
-                            serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()),
-                        );
-                    }
-                    Err(e) => {
-                        ui.colored_label(egui::Color32::from_rgb(240, 120, 100), e);
+        ui.add_space(8.0);
+        theme::card().show(ui, |ui| {
+            match &self.last_http {
+                Some(o) => {
+                    ui.label(
+                        egui::RichText::new(format!("last: {}", o.label))
+                            .monospace()
+                            .color(theme::CYAN),
+                    );
+                    match &o.result {
+                        Ok(v) => {
+                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                ui.monospace(
+                                    serde_json::to_string_pretty(v)
+                                        .unwrap_or_else(|_| v.to_string()),
+                                );
+                            });
+                        }
+                        Err(e) => {
+                            ui.colored_label(theme::AMBER, e);
+                        }
                     }
                 }
+                None => {
+                    ui.label("no requests yet");
+                }
             }
-            None => {
-                ui.label("no requests yet");
-            }
-        }
+        });
     }
 
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -443,11 +484,35 @@ impl SurveyorApp {
     }
 }
 
+impl SurveyorApp {
+    fn nav_bar(&mut self, ui: &mut egui::Ui, host: &Host) {
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 16.0) / 3.0;
+            for (tab, label) in
+                [(Tab::Live, "Radar"), (Tab::Record, "Record"), (Tab::Settings, "Setup")]
+            {
+                let selected = self.tab == tab;
+                let text = egui::RichText::new(label).size(15.0).color(if selected {
+                    theme::AMBER_BRIGHT
+                } else {
+                    theme::INK
+                });
+                if ui
+                    .add_sized([w, 42.0], egui::Button::selectable(selected, text))
+                    .clicked()
+                    && !selected
+                {
+                    self.tab = tab;
+                    host.haptic(Haptic::Light);
+                }
+            }
+        });
+    }
+}
+
 impl EguiApp for SurveyorApp {
     fn theme(&self, ctx: &egui::Context) {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_gray(10);
-        ctx.set_visuals(visuals);
+        theme::apply(ctx);
     }
 
     fn update(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -458,12 +523,24 @@ impl EguiApp for SurveyorApp {
         }
         self.drain_channels();
 
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Live, "Live");
-            ui.selectable_value(&mut self.tab, Tab::Record, "Record");
-            ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-        });
-        ui.separator();
+        // Order is load-bearing: ambience lights the page, then the frost
+        // grabs what is already in the framebuffer, then chrome paints on top.
+        theme::ambience(ui.ctx());
+        frost::frost_chrome(ui);
+
+        // Bottom nav collapses while typing (focus leads the keyboard slide-in
+        // and the inset trails slide-out; the union avoids flicker).
+        let kb_editing = host.keyboard_height() > 1.0 || ui.ctx().text_edit_focused();
+        let mut nav_open = !kb_editing;
+        let bar = egui::Panel::bottom("nav")
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 6)))
+            .show_collapsible(ui, &mut nav_open, |ui| {
+                self.nav_bar(ui, host);
+            });
+        if let Some(bar) = &bar {
+            frost::remember(ui.ctx(), bar.response.rect);
+        }
+
         match self.tab {
             Tab::Live => self.live_tab(ui),
             Tab::Record => self.record_tab(ui, host),
@@ -472,4 +549,4 @@ impl EguiApp for SurveyorApp {
     }
 }
 
-app!(SurveyorApp::new);
+app!(SurveyorApp::new, egui_mobile::Backend::Glow);

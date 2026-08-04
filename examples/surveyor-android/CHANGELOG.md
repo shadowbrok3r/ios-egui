@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3 — 2026-08-04
+
+Visual overhaul: a radar-phosphor glass theme (vibrant green/amber/cyan on a
+lit near-black page, real backdrop blur behind the chrome), navigation moved to
+a bottom bar that collapses while typing, the Record tab rebuilt so no button
+is clipped, and the Live tab is now a proper sector-scan radar instrument —
+range rings, a sweeping FOV wedge, glowing targets with velocity ticks, and
+afterglow trails.
+
 ## 0.1.2 — 2026-08-04
 
 Fixes an install that produced no app: the manifest declared no launcher
