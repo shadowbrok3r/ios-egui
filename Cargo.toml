@@ -10,6 +10,7 @@ members = [
     "examples/comfyui-android",
     "examples/privaxy-android",
     "examples/appstore-android",
+    "examples/surveyor-android",
     "crates/cargo-egui-ios",
     "crates/cargo-egui-android",
     "crates/cargo-egui-mobile",

@@ -1,0 +1,36 @@
+[package]
+name = "surveyor_android"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+egui-mobile = { path = "../../crates/egui-mobile" }
+egui = "0.35"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Plain-HTTP LAN client to the RuView sensing server; no TLS on purpose.
+minreq = "2"
+# Sync WebSocket client, no TLS features.
+tungstenite = "0.24"
+
+# cargo-apk2 reads this to generate the APK manifest.
+[package.metadata.android]
+package = "com.kingsofalchemy.surveyor"
+java_sources = "../../crates/egui-android/java"
+
+[package.metadata.android.sdk]
+min_sdk_version = 26
+target_sdk_version = 35
+
+[package.metadata.android.application]
+label = "Surveyor"
+has_code = true
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.VIBRATE"

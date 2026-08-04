@@ -4319,6 +4319,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "minreq"
+version = "2.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05015102dad0f7d61691ca347e9d9d9006685a64aefb3d79eecf62665de2153d"
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6825,6 +6831,18 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "surveyor_android"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui-mobile",
+ "minreq",
+ "serde",
+ "serde_json",
+ "tungstenite",
+]
 
 [[package]]
 name = "syn"
