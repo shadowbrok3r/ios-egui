@@ -1,22 +1,23 @@
-//! Radar-phosphor theme: vibrant instrument color on near-black glass.
+//! Galactic-neon theme: vibrant instrument color on near-black glass.
 //!
 //! The structural grammar is borrowed from comfyui-android — every floating
 //! surface is translucent tinted glass, pane edges are dim WHITE hairlines
 //! (real glass has no color at its edge), and the black page is lit from
 //! beneath by wide, very-low-alpha light pools so the glass has something to
-//! catch. The palette is this app's own: phosphor green (signal/live), radar
-//! amber (selected/active — the color of a radar return), CSI cyan (info).
+//! catch. The palette is this app's own: hot pink (live/sweep/pressed), aqua
+//! (radar returns + hover), electric violet (CSI/info) on deep-space black.
 
 use egui::{Color32, Stroke};
 
 // ── Palette ──────────────────────────────────────────────────────────────
-pub const PHOSPHOR: Color32 = Color32::from_rgb(52, 214, 130);
-pub const PHOSPHOR_BRIGHT: Color32 = Color32::from_rgb(130, 240, 180);
-pub const AMBER: Color32 = Color32::from_rgb(255, 178, 74);
-pub const AMBER_BRIGHT: Color32 = Color32::from_rgb(255, 208, 138);
-pub const CYAN: Color32 = Color32::from_rgb(84, 220, 235);
-/// Body text: near-white with a hint of green cast.
-pub const INK: Color32 = Color32::from_rgb(228, 238, 231);
+pub const PINK: Color32 = Color32::from_rgb(255, 64, 170);
+pub const PINK_BRIGHT: Color32 = Color32::from_rgb(255, 138, 208);
+pub const AQUA: Color32 = Color32::from_rgb(64, 230, 220);
+pub const AQUA_BRIGHT: Color32 = Color32::from_rgb(148, 246, 240);
+pub const VIOLET: Color32 = Color32::from_rgb(178, 140, 255);
+pub const VIOLET_BRIGHT: Color32 = Color32::from_rgb(208, 184, 255);
+/// Body text: near-white with a hint of violet cast.
+pub const INK: Color32 = Color32::from_rgb(238, 231, 242);
 /// Pane edges: dim white hairlines, never colored.
 pub const RIM: Color32 = Color32::from_rgba_premultiplied(46, 46, 52, 46);
 pub const RIM_BRIGHT: Color32 = Color32::from_rgba_premultiplied(72, 72, 80, 72);
@@ -25,19 +26,19 @@ fn glass(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
-/// Widget rest fill: green-cast translucent glass. Translucency is
+/// Widget rest fill: violet-cast translucent glass. Translucency is
 /// load-bearing — an opaque fill punches a matte hole through the frost.
 fn fill_rest() -> Color32 {
-    glass(16, 30, 22, 165)
+    glass(26, 18, 40, 165)
 }
 fn fill_weak() -> Color32 {
-    glass(13, 24, 18, 150)
+    glass(20, 15, 32, 150)
 }
 fn fill_hover() -> Color32 {
-    glass(52, 214, 130, 40)
+    glass(64, 230, 220, 40)
 }
 fn fill_active() -> Color32 {
-    glass(255, 178, 74, 54)
+    glass(255, 64, 170, 54)
 }
 
 pub fn apply(ctx: &egui::Context) {
@@ -45,18 +46,18 @@ pub fn apply(ctx: &egui::Context) {
 
     // Near-black but not opaque: ambience() paints beneath every panel.
     v.panel_fill = glass(0, 0, 0, 232);
-    v.window_fill = glass(8, 19, 13, 120);
-    v.extreme_bg_color = Color32::from_rgb(6, 10, 8);
-    v.faint_bg_color = Color32::from_rgb(9, 14, 11);
-    v.code_bg_color = Color32::from_rgb(5, 8, 6);
+    v.window_fill = glass(16, 12, 26, 120);
+    v.extreme_bg_color = Color32::from_rgb(9, 7, 14);
+    v.faint_bg_color = Color32::from_rgb(12, 10, 18);
+    v.code_bg_color = Color32::from_rgb(7, 5, 11);
     v.window_stroke = Stroke::new(1.0, RIM_BRIGHT);
     v.window_corner_radius = 10.0.into();
     v.menu_corner_radius = 10.0.into();
 
     v.override_text_color = Some(INK);
-    v.hyperlink_color = CYAN;
-    v.selection.bg_fill = glass(255, 178, 74, 110);
-    v.selection.stroke = Stroke::new(1.2, AMBER_BRIGHT);
+    v.hyperlink_color = AQUA;
+    v.selection.bg_fill = glass(255, 64, 170, 110);
+    v.selection.stroke = Stroke::new(1.2, PINK_BRIGHT);
 
     v.widgets.noninteractive.bg_fill = Color32::TRANSPARENT;
     v.widgets.noninteractive.weak_bg_fill = Color32::TRANSPARENT;
@@ -70,18 +71,18 @@ pub fn apply(ctx: &egui::Context) {
 
     v.widgets.hovered.bg_fill = fill_hover();
     v.widgets.hovered.weak_bg_fill = fill_hover();
-    v.widgets.hovered.bg_stroke = Stroke::new(1.5, glass(52, 214, 130, 235));
-    v.widgets.hovered.fg_stroke = Stroke::new(1.2, PHOSPHOR_BRIGHT);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5, glass(64, 230, 220, 235));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.2, AQUA_BRIGHT);
 
     v.widgets.active.bg_fill = fill_active();
     v.widgets.active.weak_bg_fill = fill_active();
-    v.widgets.active.bg_stroke = Stroke::new(1.7, glass(255, 178, 74, 245));
+    v.widgets.active.bg_stroke = Stroke::new(1.7, glass(255, 64, 170, 245));
     v.widgets.active.fg_stroke = Stroke::new(1.3, Color32::WHITE);
 
     v.widgets.open.bg_fill = fill_rest();
     v.widgets.open.weak_bg_fill = fill_rest();
-    v.widgets.open.bg_stroke = Stroke::new(1.3, glass(84, 220, 235, 205));
-    v.widgets.open.fg_stroke = Stroke::new(1.2, CYAN);
+    v.widgets.open.bg_stroke = Stroke::new(1.3, glass(178, 140, 255, 205));
+    v.widgets.open.fg_stroke = Stroke::new(1.2, VIOLET);
 
     ctx.set_visuals(v);
 
@@ -105,9 +106,9 @@ pub fn ambience(ctx: &egui::Context) {
         .show(ctx, |ui| {
             let painter = ui.painter();
             let at = |fx: f32, fy: f32| rect.min + egui::vec2(rect.width() * fx, rect.height() * fy);
-            light_pool(painter, at(0.10, 0.10), min_dim * 0.46, PHOSPHOR);
-            light_pool(painter, at(0.94, 0.32), min_dim * 0.36, CYAN);
-            light_pool(painter, at(0.52, 0.96), min_dim * 0.42, AMBER);
+            light_pool(painter, at(0.10, 0.10), min_dim * 0.46, PINK);
+            light_pool(painter, at(0.94, 0.32), min_dim * 0.36, AQUA);
+            light_pool(painter, at(0.52, 0.96), min_dim * 0.42, VIOLET);
             ui.allocate_space(egui::Vec2::ZERO);
         });
 }
@@ -119,10 +120,10 @@ fn light_pool(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: C
     }
 }
 
-/// Card frame for content sections: green glass, white rim.
+/// Card frame for content sections: violet glass, white rim.
 pub fn card() -> egui::Frame {
     egui::Frame::new()
-        .fill(glass(12, 24, 17, 140))
+        .fill(glass(20, 15, 34, 140))
         .stroke(Stroke::new(1.0, RIM))
         .corner_radius(10.0)
         .inner_margin(12.0)
@@ -141,11 +142,11 @@ mod tests {
         }
     }
 
-    /// Surfaces carry the green cast: g strictly dominant.
+    /// Surfaces carry the violet cast: b strictly dominant, r over g.
     #[test]
-    fn surfaces_are_green_cast() {
+    fn surfaces_are_violet_cast() {
         for c in [fill_rest(), fill_weak()] {
-            assert!(c.g() > c.r() && c.g() > c.b(), "{c:?}");
+            assert!(c.b() > c.r() && c.r() > c.g(), "{c:?}");
         }
     }
 }

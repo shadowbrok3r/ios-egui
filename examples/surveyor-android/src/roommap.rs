@@ -1,6 +1,6 @@
 //! The Live radar view: a sector-scan instrument drawn from real data only.
 //! Range rings and the sweep originate at the radar's surveyed mount; targets
-//! are the LD2450's actual tracks, the cyan blob is the CSI estimate. The
+//! are the LD2450's actual tracks, the violet blob is the CSI estimate. The
 //! sweep and afterglow are presentation — nothing they show is invented.
 
 use std::collections::VecDeque;
@@ -13,11 +13,12 @@ use crate::proto::LocEstimate;
 pub const TRAIL_LEN: usize = 90;
 
 // Canvas bed + instrument colors; accents come from the app theme.
-pub const BG: Color32 = Color32::from_rgb(4, 8, 6);
-pub use crate::theme::{AMBER, CYAN, PHOSPHOR};
-const GRID: Color32 = Color32::from_rgb(16, 44, 30);
-const RING: Color32 = Color32::from_rgb(24, 78, 50);
-const ROOM_LINE: Color32 = Color32::from_rgb(38, 96, 66);
+// SWEEP = hot pink, TARGET = aqua, CSI = electric violet.
+pub const BG: Color32 = Color32::from_rgb(7, 5, 10);
+pub use crate::theme::{AQUA as TARGET, PINK as SWEEP, VIOLET as CSI};
+const GRID: Color32 = Color32::from_rgb(30, 20, 46);
+const RING: Color32 = Color32::from_rgb(58, 36, 88);
+const ROOM_LINE: Color32 = Color32::from_rgb(84, 56, 128);
 
 /// LD2450 azimuth field of view, half-angle in degrees.
 const FOV_HALF_DEG: f32 = 60.0;
@@ -176,7 +177,7 @@ pub fn paint(ui: &mut egui::Ui, cfg: &AppConfig, inputs: &MapInputs<'_>) -> egui
     for edge in [-FOV_HALF_DEG, FOV_HALF_DEG] {
         ring_painter.line_segment(
             [radar_px, ray(boresight + edge, max_range_m as f32)],
-            Stroke::new(1.0, with_alpha(PHOSPHOR, 70)),
+            Stroke::new(1.0, with_alpha(SWEEP, 70)),
         );
     }
 
@@ -195,18 +196,18 @@ pub fn paint(ui: &mut egui::Ui, cfg: &AppConfig, inputs: &MapInputs<'_>) -> egui
             let alpha = (36.0 * (1.0 - i as f32 / 24.0)) as u8;
             ring_painter.add(egui::Shape::convex_polygon(
                 vec![radar_px, ray(a0, max_range_m as f32), ray(a1, max_range_m as f32)],
-                with_alpha(PHOSPHOR, alpha),
+                with_alpha(SWEEP, alpha),
                 Stroke::NONE,
             ));
         }
         ring_painter.line_segment(
             [radar_px, ray(lead, max_range_m as f32)],
-            Stroke::new(2.0, with_alpha(PHOSPHOR, 200)),
+            Stroke::new(2.0, with_alpha(SWEEP, 200)),
         );
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    // CSI nodes: small cyan diamonds with labels
+    // CSI nodes: small violet diamonds with labels
     for n in &cfg.nodes {
         let p = t.to_screen(n.x, n.y);
         let d = 5.0;
@@ -217,7 +218,7 @@ pub fn paint(ui: &mut egui::Ui, cfg: &AppConfig, inputs: &MapInputs<'_>) -> egui
                 p + Vec2::new(0.0, d),
                 p + Vec2::new(-d, 0.0),
             ],
-            with_alpha(CYAN, 200),
+            with_alpha(CSI, 200),
             Stroke::NONE,
         ));
         painter.text(
@@ -225,12 +226,12 @@ pub fn paint(ui: &mut egui::Ui, cfg: &AppConfig, inputs: &MapInputs<'_>) -> egui
             egui::Align2::LEFT_BOTTOM,
             format!("n{}", n.id),
             egui::FontId::monospace(11.0),
-            with_alpha(CYAN, 150),
+            with_alpha(CSI, 150),
         );
     }
 
     // Radar emitter
-    glow_dot(&painter, radar_px, 5.0, AMBER);
+    glow_dot(&painter, radar_px, 5.0, TARGET);
 
     // Afterglow trails, alpha decaying with age
     let decay = |i: usize, len: usize, max_a: f32| -> u8 {
@@ -238,22 +239,22 @@ pub fn paint(ui: &mut egui::Ui, cfg: &AppConfig, inputs: &MapInputs<'_>) -> egui
     };
     let n = inputs.trails.radar.len();
     for (i, &(x, y)) in inputs.trails.radar.iter().enumerate() {
-        ring_painter.circle_filled(t.to_screen(x, y), 2.0, with_alpha(AMBER, decay(i, n, 110.0)));
+        ring_painter.circle_filled(t.to_screen(x, y), 2.0, with_alpha(TARGET, decay(i, n, 110.0)));
     }
     let n = inputs.trails.loc.len();
     for (i, &(x, y)) in inputs.trails.loc.iter().enumerate() {
-        ring_painter.circle_filled(t.to_screen(x, y), 2.0, with_alpha(CYAN, decay(i, n, 90.0)));
+        ring_painter.circle_filled(t.to_screen(x, y), 2.0, with_alpha(CSI, decay(i, n, 90.0)));
     }
 
     // Radar targets: amber glow + radial velocity tick (along the radar ray,
     // outward when receding)
     for &(x, y, v) in inputs.radar_room {
         let p = t.to_screen(x, y);
-        glow_dot(&painter, p, 5.5, AMBER);
+        glow_dot(&painter, p, 5.5, TARGET);
         if v.abs() > 0.02 {
             let to_target = (p - radar_px).normalized();
             let tick = to_target * (v as f32 * 0.6 * t.px_per_m());
-            painter.line_segment([p, p + tick], Stroke::new(2.0, with_alpha(AMBER, 180)));
+            painter.line_segment([p, p + tick], Stroke::new(2.0, with_alpha(TARGET, 180)));
         }
     }
 
@@ -261,8 +262,8 @@ pub fn paint(ui: &mut egui::Ui, cfg: &AppConfig, inputs: &MapInputs<'_>) -> egui
     if let Some(loc) = inputs.loc {
         let p = t.to_screen(loc.x, loc.y);
         let halo = 10.0 + 22.0 * (1.0 - loc.confidence.clamp(0.0, 1.0)) as f32;
-        painter.circle_filled(p, halo, with_alpha(CYAN, 46));
-        glow_dot(&painter, p, 5.0, CYAN);
+        painter.circle_filled(p, halo, with_alpha(CSI, 46));
+        glow_dot(&painter, p, 5.0, CSI);
     }
 
     // Corner legend, instrument-style
@@ -271,7 +272,7 @@ pub fn paint(ui: &mut egui::Ui, cfg: &AppConfig, inputs: &MapInputs<'_>) -> egui
         egui::Align2::LEFT_BOTTOM,
         format!("{}x{} m  rings 1 m", cfg.room_w, cfg.room_h),
         egui::FontId::monospace(10.0),
-        with_alpha(PHOSPHOR, 120),
+        with_alpha(SWEEP, 120),
     );
 
     response

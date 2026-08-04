@@ -234,11 +234,11 @@ impl SurveyorApp {
         // Instrument status strip: monospace, phosphor when live, amber when not.
         ui.horizontal_wrapped(|ui| {
             let (state, color) = if live {
-                ("LIVE", theme::PHOSPHOR_BRIGHT)
+                ("LIVE", theme::PINK_BRIGHT)
             } else if self.connected {
-                ("NO DATA", theme::AMBER)
+                ("NO DATA", theme::VIOLET_BRIGHT)
             } else {
-                ("OFFLINE", theme::AMBER)
+                ("OFFLINE", theme::VIOLET_BRIGHT)
             };
             ui.label(egui::RichText::new(state).monospace().size(13.0).color(color));
             ui.label(
@@ -252,29 +252,29 @@ impl SurveyorApp {
                     egui::RichText::new(self.link_note.clone())
                         .monospace()
                         .size(11.0)
-                        .color(theme::AMBER),
+                        .color(theme::VIOLET_BRIGHT),
                 );
             }
         });
         ui.horizontal_wrapped(|ui| {
             let mono = |t: String, c: egui::Color32| egui::RichText::new(t).monospace().size(12.0).color(c);
             if let Some(s) = self.sensing_fresh() {
-                ui.label(mono(format!("nodes {}", s.node_count), theme::CYAN));
+                ui.label(mono(format!("nodes {}", s.node_count), theme::VIOLET));
                 if let Some(p) = s.presence {
-                    ui.label(mono(format!("presence {p}"), theme::CYAN));
+                    ui.label(mono(format!("presence {p}"), theme::VIOLET));
                 }
                 if let Some(n) = s.estimated_persons {
-                    ui.label(mono(format!("persons {n}"), theme::CYAN));
+                    ui.label(mono(format!("persons {n}"), theme::VIOLET));
                 }
                 match s.localization {
                     Some(loc) => ui.label(mono(
                         format!("CSI ({:.2},{:.2}) c{:.2}", loc.x, loc.y, loc.confidence),
-                        theme::CYAN,
+                        theme::VIOLET,
                     )),
                     None => ui.label(mono("CSI: no estimate".into(), theme::INK)),
                 };
             } else if self.latest_sensing.is_some() {
-                ui.label(mono("sensing stale - link quiet".into(), theme::AMBER));
+                ui.label(mono("sensing stale - link quiet".into(), theme::VIOLET_BRIGHT));
             } else {
                 ui.label(mono("waiting for sensing_update...".into(), theme::INK));
             }
@@ -283,7 +283,7 @@ impl SurveyorApp {
                     let (x, y) = self.cfg.mount.to_room(t.x_m, t.y_m);
                     ui.label(mono(
                         format!("tgt ({x:.2},{y:.2}) {:+.2}m/s", t.speed_mps),
-                        theme::AMBER_BRIGHT,
+                        theme::AQUA_BRIGHT,
                     ));
                 }
             }
@@ -359,7 +359,7 @@ impl SurveyorApp {
                     egui::RichText::new("REC")
                         .monospace()
                         .size(14.0)
-                        .color(theme::AMBER_BRIGHT)
+                        .color(theme::AQUA_BRIGHT)
                         .strong(),
                 );
             }
@@ -371,7 +371,7 @@ impl SurveyorApp {
                     ui.label(
                         egui::RichText::new(format!("last: {}", o.label))
                             .monospace()
-                            .color(theme::CYAN),
+                            .color(theme::VIOLET),
                     );
                     match &o.result {
                         Ok(v) => {
@@ -383,7 +383,7 @@ impl SurveyorApp {
                             });
                         }
                         Err(e) => {
-                            ui.colored_label(theme::AMBER, e);
+                            ui.colored_label(theme::VIOLET_BRIGHT, e);
                         }
                     }
                 }
@@ -493,7 +493,7 @@ impl SurveyorApp {
             {
                 let selected = self.tab == tab;
                 let text = egui::RichText::new(label).size(15.0).color(if selected {
-                    theme::AMBER_BRIGHT
+                    theme::AQUA_BRIGHT
                 } else {
                     theme::INK
                 });

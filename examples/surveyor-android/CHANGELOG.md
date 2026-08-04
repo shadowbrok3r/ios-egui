@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4 — 2026-08-04
+
+Galactic neon recolor: hot pink sweep and live signals, aqua radar returns
+and hover, electric violet CSI and info text, violet-cast glass on deep-space
+black.
+
 ## 0.1.3 — 2026-08-04
 
 Visual overhaul: a radar-phosphor glass theme (vibrant green/amber/cyan on a
