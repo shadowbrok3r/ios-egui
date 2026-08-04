@@ -1,6 +1,6 @@
 [package]
 name = "surveyor_android"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 publish = false
 
@@ -38,6 +38,19 @@ keystore_password = "android"
 label = "Surveyor"
 icon = "@mipmap/ic_launcher"
 has_code = true
+
+# Without this stanza cargo-apk2 emits no launcher activity: the APK installs
+# and reports as present, but has no home-screen entry at all.
+[[package.metadata.android.application.activity]]
+name = "com.github.egui_mobile.EguiNativeActivity"
+config_changes = "orientation|keyboardHidden|screenSize|screenLayout|density"
+window_soft_input_mode = "adjustResize"
+[[package.metadata.android.application.activity.meta_data]]
+name = "android.app.lib_name"
+value = "surveyor_android"
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
 
 [[package.metadata.android.uses_permission]]
 name = "android.permission.INTERNET"

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2 — 2026-08-04
+
+Fixes an install that produced no app: the manifest declared no launcher
+activity, so the APK installed and reported as present while having no
+home-screen entry.
+
 ## 0.1.1 — 2026-08-04
 
 Network hardening from a code review. The WebSocket reader now uses a dial

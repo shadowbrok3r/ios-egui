@@ -73,9 +73,15 @@ AAPT2=$(command -v aapt2 2>/dev/null || ls -1 "$HOME"/Android/Sdk/build-tools/*/
 if [ -n "$AAPT2" ]; then
     # `|| true`: aapt2 exits nonzero on anything it cannot parse, and under
     # `set -e -o pipefail` that would abort the publish with no message.
-    CODE_APK=$("$AAPT2" dump badging "$APK" 2>/dev/null | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1 || true)
+    BADGING=$("$AAPT2" dump badging "$APK" 2>/dev/null || true)
+    CODE_APK=$(printf '%s' "$BADGING" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p" | head -1 || true)
     if [ -n "$CODE_APK" ] && [ "$CODE_APK" != "$CODE" ]; then
         die "APK versionCode $CODE_APK != $CODE from $VERSION — rebuild the APK after bumping the version"
+    fi
+    # An APK without a launcher activity installs, reports as present, and has no
+    # home-screen entry — indistinguishable from a failed install on the phone.
+    if [ -n "$BADGING" ] && ! printf '%s' "$BADGING" | grep -q '^launchable-activity:'; then
+        die "$APK declares no launcher activity — add [[package.metadata.android.application.activity]] with a MAIN/LAUNCHER intent_filter"
     fi
 elif [ -n "$MANIFEST" ] && [ "$MANIFEST" -nt "$APK" ]; then
     die "$APK is older than $MANIFEST — rebuild it (install aapt2 for an exact check)"
