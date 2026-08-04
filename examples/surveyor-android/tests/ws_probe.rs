@@ -1,25 +1,32 @@
-//! Host-side probe of the app's WebSocket path against a live sensing server:
+//! Live probe of the app's WebSocket path against a running sensing server:
 //! connects exactly like the Android app and runs every message through the
-//! same lenient parser the phone uses.
+//! same lenient parser the phone uses. Ignored by default (needs a server).
 //!
-//! `cargo run -p surveyor_android --example ws_probe -- 127.0.0.1:8080 20`
+//! ```text
+//! SURVEYOR_SERVER=127.0.0.1:8080 SURVEYOR_SECS=20 \
+//!   cargo test -p surveyor_android --test ws_probe -- --ignored --nocapture
+//! ```
 
 use std::time::{Duration, Instant};
 
 use surveyor_android::proto::{self, WsMsg};
 
-fn main() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
-    let server = args.next().unwrap_or_else(|| "127.0.0.1:8080".into());
-    let secs: u64 = args
-        .next()
-        .map(|s| s.parse().map_err(|_| "bad seconds".to_string()))
-        .transpose()?
+#[test]
+#[ignore = "requires a running sensing server"]
+fn probe_live_server() {
+    let server = std::env::var("SURVEYOR_SERVER").unwrap_or_else(|_| "127.0.0.1:8080".into());
+    let secs: u64 = std::env::var("SURVEYOR_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
     let url = format!("ws://{server}/ws/sensing");
     println!("connecting {url}");
-    let (mut socket, _) = tungstenite::connect(&url).map_err(|e| e.to_string())?;
+    let (mut socket, _) = tungstenite::connect(&url).expect("connect");
+    // Without a read timeout a silent server hangs the probe past its deadline.
+    if let tungstenite::stream::MaybeTlsStream::Plain(s) = socket.get_ref() {
+        let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    }
 
     let (mut sensing, mut mmwave, mut other, mut unparsed) = (0u32, 0u32, 0u32, 0u32);
     let mut last_radar = String::new();
@@ -49,7 +56,12 @@ fn main() -> Result<(), String> {
                 None => unparsed += 1,
             },
             Ok(_) => {}
-            Err(e) => return Err(format!("ws read: {e}")),
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("ws read: {e}"),
         }
     }
 
@@ -57,8 +69,6 @@ fn main() -> Result<(), String> {
     if !last_radar.is_empty() {
         println!("last radar frame: {last_radar}");
     }
-    if mmwave == 0 {
-        return Err("no mmwave_targets arrived — shim or server arm not working".into());
-    }
-    Ok(())
+    assert_eq!(unparsed, 0, "every server message must parse");
+    assert!(sensing > 0, "no sensing_update arrived");
 }

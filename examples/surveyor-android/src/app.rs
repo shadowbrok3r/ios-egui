@@ -2,16 +2,20 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use egui_mobile::egui;
 use egui_mobile::{app, CreateContext, EguiApp, Haptic, Host};
 
 use crate::config::{AppConfig, NodePos};
-use crate::net::{self, HttpCall, HttpOutcome};
+use crate::net::{self, HttpCall, HttpOutcome, WsEvent};
 use crate::proto::{MmwaveSnapshot, SensingSnapshot, WsMsg};
 use crate::roommap::{self, MapInputs, Trails};
+
+/// Data older than this is stale — shown as such, never as live.
+const STALE_AFTER: Duration = Duration::from_secs(3);
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
@@ -25,13 +29,14 @@ struct SurveyorApp {
     cfg_path: Option<PathBuf>,
     tab: Tab,
 
-    ws_rx: Option<Receiver<WsMsg>>,
-    ws_tx: Option<Sender<WsMsg>>,
+    ws_rx: Option<Receiver<WsEvent>>,
+    ws_tx: Option<SyncSender<WsEvent>>,
     ws_stop: Option<Arc<AtomicBool>>,
     connected: bool,
+    link_note: String,
 
-    latest_sensing: Option<SensingSnapshot>,
-    latest_mmwave: Option<MmwaveSnapshot>,
+    latest_sensing: Option<(SensingSnapshot, Instant)>,
+    latest_mmwave: Option<(MmwaveSnapshot, Instant)>,
     trails: Trails,
 
     http_rx: Receiver<HttpOutcome>,
@@ -71,6 +76,7 @@ impl SurveyorApp {
             ws_tx: None,
             ws_stop: None,
             connected: false,
+            link_note: String::new(),
             latest_sensing: None,
             latest_mmwave: None,
             trails: Trails::default(),
@@ -115,11 +121,16 @@ impl SurveyorApp {
 
     fn connect(&mut self, ctx: &egui::Context) {
         self.disconnect();
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Old trails/snapshots belong to the previous link or room geometry.
+        self.trails.clear();
+        self.latest_sensing = None;
+        self.latest_mmwave = None;
+        let (tx, rx) = std::sync::mpsc::sync_channel(256);
         let stop = net::spawn_ws(self.cfg.server.clone(), tx.clone(), ctx.clone());
         self.ws_rx = Some(rx);
         self.ws_tx = Some(tx);
         self.ws_stop = Some(stop);
+        self.link_note = "connecting".to_owned();
     }
 
     fn disconnect(&mut self) {
@@ -133,45 +144,78 @@ impl SurveyorApp {
 
     fn drain_channels(&mut self) {
         if let Some(rx) = &self.ws_rx {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    WsMsg::Sensing(s) => {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    WsEvent::Connected => {
+                        self.connected = true;
+                        self.link_note = "connected".to_owned();
+                    }
+                    WsEvent::Disconnected(why) => {
+                        self.connected = false;
+                        self.link_note = why;
+                    }
+                    WsEvent::Msg(WsMsg::Sensing(s)) => {
                         if let Some(loc) = s.localization {
                             self.trails.push_loc(loc.x, loc.y);
                         }
-                        self.latest_sensing = Some(s);
+                        self.latest_sensing = Some((s, Instant::now()));
                         self.connected = true;
                     }
-                    WsMsg::Mmwave(m) => {
+                    WsEvent::Msg(WsMsg::Mmwave(m)) => {
                         for t in &m.targets {
                             let (x, y) = self.cfg.mount.to_room(t.x_m, t.y_m);
                             self.trails.push_radar(x, y);
                         }
-                        self.latest_mmwave = Some(m);
+                        self.latest_mmwave = Some((m, Instant::now()));
                         self.connected = true;
                     }
-                    WsMsg::Other(tag) => {
-                        if tag == "connected" {
-                            self.connected = true;
-                        } else if tag == "connect failed" {
-                            self.connected = false;
-                        }
-                    }
+                    WsEvent::Msg(WsMsg::Other(_)) => {}
                 }
             }
         }
         while let Ok(outcome) = self.http_rx.try_recv() {
-            if outcome.label == "record start" {
-                self.recording = outcome
-                    .result
-                    .as_ref()
-                    .map(|v| v.get("success").is_some())
-                    .unwrap_or(false);
-            } else if outcome.label == "record stop" {
-                self.recording = false;
+            match (outcome.label.as_str(), &outcome.result) {
+                // Only a real {"success": true} means the server started; an
+                // "already recording" rejection also means it IS recording.
+                ("record start", Ok(v)) => {
+                    let started = v.get("success").and_then(serde_json::Value::as_bool) == Some(true);
+                    let already = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .is_some_and(|e| e.contains("already recording"));
+                    self.recording = started || already;
+                }
+                ("record start", Err(_)) => {}
+                // A failed stop leaves the server recording — don't lie about it.
+                ("record stop", Ok(v)) => {
+                    if v.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
+                        self.recording = false;
+                    }
+                }
+                ("record stop", Err(_)) => {}
+                ("status", Ok(v)) => {
+                    if let Some(b) = v.get("recording").and_then(serde_json::Value::as_bool) {
+                        self.recording = b;
+                    }
+                }
+                _ => {}
             }
             self.last_http = Some(outcome);
         }
+    }
+
+    fn sensing_fresh(&self) -> Option<&SensingSnapshot> {
+        self.latest_sensing
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < STALE_AFTER)
+            .map(|(s, _)| s)
+    }
+
+    fn mmwave_fresh(&self) -> Option<&MmwaveSnapshot> {
+        self.latest_mmwave
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < STALE_AFTER)
+            .map(|(m, _)| m)
     }
 
     fn http(&self, ctx: &egui::Context, label: &str, call: HttpCall) {
@@ -185,11 +229,21 @@ impl SurveyorApp {
     }
 
     fn live_tab(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let dot = if self.connected { "connected" } else { "disconnected" };
-            ui.label(format!("{} ({})", dot, self.cfg.server));
+        ui.horizontal_wrapped(|ui| {
+            let live = self.connected && self.sensing_fresh().is_some();
+            let state = if live {
+                "live"
+            } else if self.connected {
+                "connected, no data"
+            } else {
+                "disconnected"
+            };
+            ui.label(format!("{state} ({})", self.cfg.server));
+            if !self.link_note.is_empty() && !live {
+                ui.label(format!("- {}", self.link_note));
+            }
         });
-        if let Some(s) = &self.latest_sensing {
+        if let Some(s) = self.sensing_fresh() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("source {}", s.source));
                 ui.label(format!("nodes {}", s.node_count));
@@ -207,10 +261,12 @@ impl SurveyorApp {
                     None => ui.label("CSI: no estimate"),
                 };
             });
+        } else if self.latest_sensing.is_some() {
+            ui.label("sensing data is stale - link quiet");
         } else {
             ui.label("waiting for sensing_update...");
         }
-        if let Some(m) = &self.latest_mmwave {
+        if let Some(m) = self.mmwave_fresh() {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("radar n{}", m.node_id));
                 for t in &m.targets {
@@ -225,8 +281,7 @@ impl SurveyorApp {
         ui.separator();
 
         let radar_room: Vec<(f64, f64, f64)> = self
-            .latest_mmwave
-            .as_ref()
+            .mmwave_fresh()
             .map(|m| {
                 m.targets
                     .iter()
@@ -238,7 +293,7 @@ impl SurveyorApp {
             })
             .unwrap_or_default();
         let inputs = MapInputs {
-            loc: self.latest_sensing.as_ref().and_then(|s| s.localization),
+            loc: self.sensing_fresh().and_then(|s| s.localization),
             radar_room: &radar_room,
             trails: &self.trails,
         };
@@ -253,18 +308,19 @@ impl SurveyorApp {
             ui.text_edit_singleline(&mut self.session_name);
         });
         ui.horizontal(|ui| {
-            if self.recording {
-                if ui.button("Stop recording").clicked() {
-                    host.haptic(Haptic::Light);
-                    self.http(&ctx, "record stop", HttpCall::RecordStop);
-                }
-            } else if ui.button("Start recording").clicked() {
+            if ui.button("Start recording").clicked() {
                 host.haptic(Haptic::Light);
                 self.http(
                     &ctx,
                     "record start",
                     HttpCall::RecordStart { session: self.session_name.clone() },
                 );
+            }
+            // Always available: the local flag can drift from the server's
+            // real state, and an unstoppable session is the worse failure.
+            if ui.button("Stop recording").clicked() {
+                host.haptic(Haptic::Light);
+                self.http(&ctx, "record stop", HttpCall::RecordStop);
             }
             if ui.button("Server status").clicked() {
                 self.http(&ctx, "status", HttpCall::LocStatus);
@@ -328,6 +384,9 @@ impl SurveyorApp {
         ui.horizontal(|ui| {
             if ui.button("Save + reconnect").clicked() {
                 self.apply_edits();
+                // Re-render the fields from what was actually accepted, so
+                // silently dropped entries are visible instead of assumed.
+                self.refresh_edits();
                 if let Some(path) = &self.cfg_path {
                     self.cfg.save(path);
                 }
@@ -346,11 +405,16 @@ impl SurveyorApp {
 
     fn apply_edits(&mut self) {
         self.cfg.server = self.edit_server.trim().to_owned();
-        if let Ok(w) = self.edit_room_w.trim().parse() {
-            self.cfg.room_w = w;
+        // Non-finite or non-positive dimensions would break the map transform.
+        if let Ok(w) = self.edit_room_w.trim().parse::<f64>() {
+            if w.is_finite() && w > 0.0 {
+                self.cfg.room_w = w;
+            }
         }
-        if let Ok(h) = self.edit_room_h.trim().parse() {
-            self.cfg.room_h = h;
+        if let Ok(h) = self.edit_room_h.trim().parse::<f64>() {
+            if h.is_finite() && h > 0.0 {
+                self.cfg.room_h = h;
+            }
         }
         self.cfg.nodes = self
             .edit_nodes

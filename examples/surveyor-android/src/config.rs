@@ -13,6 +13,7 @@ pub struct NodePos {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
     /// Sensing-server host:port (plain HTTP on the LAN).
     pub server: String,

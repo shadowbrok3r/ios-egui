@@ -17,6 +17,11 @@ pub struct Trails {
 }
 
 impl Trails {
+    pub fn clear(&mut self) {
+        self.loc.clear();
+        self.radar.clear();
+    }
+
     pub fn push_loc(&mut self, x: f64, y: f64) {
         if self.loc.len() >= TRAIL_LEN {
             self.loc.pop_front();
