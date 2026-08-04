@@ -26,6 +26,12 @@ java_sources = "../../crates/egui-android/java"
 min_sdk_version = 26
 target_sdk_version = 35
 
+# Same shared debug keystore as every app in this repo — a different key
+# would make future updates fail INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+[package.metadata.android.signing.release]
+path = "/home/shadowbroker/.android/debug.keystore"
+keystore_password = "android"
+
 [package.metadata.android.application]
 label = "Surveyor"
 has_code = true
