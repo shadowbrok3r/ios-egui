@@ -4712,10 +4712,11 @@ dependencies = [
 
 [[package]]
 name = "wirelab_panel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui-ios-plugin-host",
  "egui-ios-plugin-sdk",
+ "rhai",
  "serde",
  "serde_json",
  "wirelab-core",

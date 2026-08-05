@@ -19,6 +19,7 @@ use wirelab_core::validate::{Lint, Severity};
 use wirelab_flow_ui::{FlowView, FlowViewer, ViewerOptions, build_snarl};
 
 use crate::link::Ops;
+use crate::theme;
 
 /// Everything derivable from one board's snapshot: the reconstructed library,
 /// its netlist/bindings, and the static lints. Rebuilt when a snapshot lands
@@ -128,6 +129,23 @@ enum Push {
     Moves,
     /// A structural edit (add/remove component or wire); refetch on success.
     Edit,
+    /// A whole local project offered to the desktop; parked there for confirmation.
+    Import,
+}
+
+/// The `from` label the desktop names this device by when it announces an import.
+const IMPORT_FROM: &str = "the WireLab mobile app";
+
+/// The `POST /project/import` body: the `{name, active, boards}` the desktop's
+/// `parse_import_push` requires, plus the `from` label it announces the offer under.
+pub fn import_body(name: &str, active: usize, boards: &[BoardTab]) -> String {
+    serde_json::json!({
+        "name": name,
+        "active": active,
+        "boards": boards,
+        "from": IMPORT_FROM,
+    })
+    .to_string()
 }
 
 /// What's selected on the canvas (for highlight + delete).
@@ -135,6 +153,22 @@ enum Push {
 enum CanvasSel {
     Comp(u32),
     Wire(u32),
+}
+
+/// Where the shown project lives: the desktop over HTTP, or this device.
+#[derive(Clone, PartialEq)]
+pub enum Source {
+    Desktop,
+    Local(String),
+}
+
+/// Open modal over the project picker.
+#[derive(Clone, Copy, PartialEq)]
+enum Dialog {
+    None,
+    New,
+    Rename,
+    Delete,
 }
 
 /// An in-progress touch drag, decided at drag-start by what's under the finger.
@@ -217,6 +251,23 @@ pub struct ProjectView {
     /// Circuit-canvas view: pan offset in mm and zoom over the fitted scale.
     pan: [f32; 2],
     zoom: f32,
+    /// A two-finger gesture owns the canvas: holds the frozen fit and pauses refreshes.
+    pinching: bool,
+    /// Whether the shown project is the desktop's or one of this device's.
+    pub source: Source,
+    /// Board profiles + component defs, loaded once on first use.
+    lib: Library,
+    lib_loaded: bool,
+    /// Projects created on this device.
+    store: crate::store::Store,
+    store_loaded: bool,
+    /// A local edit awaiting the debounced write-back to the store.
+    local_dirty: bool,
+    local_dirty_at: Option<f64>,
+    /// Project picker modal state and its text/board fields.
+    dialog: Dialog,
+    dialog_name: String,
+    dialog_board: String,
 }
 
 /// A WireLab desktop found via its self-broadcast beacon.
@@ -358,16 +409,16 @@ pub(crate) fn highlight_rhai(
 ) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     let comment = egui::Color32::from_gray(110);
-    let string = egui::Color32::from_rgb(166, 227, 161);
-    let number = egui::Color32::from_rgb(137, 180, 250);
-    let keyword = egui::Color32::from_rgb(203, 166, 247);
+    let string = theme::AQUA;
+    let number = egui::Color32::from_rgb(110, 170, 255);
+    let keyword = theme::VIOLET;
     let font = egui::FontId::monospace(13.0);
     let mut job = LayoutJob::default();
     let underlined = |s: usize, e: usize| diag.iter().any(|(ds, de)| s < *de && *ds < e);
     let mut push = |slice: &str, s: usize, color: egui::Color32| {
         let mut fmt = TextFormat::simple(font.clone(), color);
         if underlined(s, s + slice.len()) {
-            fmt.underline = egui::Stroke::new(1.5, egui::Color32::from_rgb(243, 139, 168));
+            fmt.underline = egui::Stroke::new(1.5, theme::PINK);
         }
         job.append(slice, 0.0, fmt);
     };
@@ -474,11 +525,193 @@ impl Default for ProjectView {
             problems_open: false,
             pan: [0.0, 0.0],
             zoom: 1.0,
+            pinching: false,
+            source: Source::Desktop,
+            lib: Library::default(),
+            lib_loaded: false,
+            store: Default::default(),
+            store_loaded: false,
+            local_dirty: false,
+            local_dirty_at: None,
+            dialog: Dialog::None,
+            dialog_name: String::new(),
+            dialog_board: String::new(),
         }
     }
 }
 
 impl ProjectView {
+    /// True when the shown project lives on this device.
+    pub fn is_local(&self) -> bool {
+        matches!(self.source, Source::Local(_))
+    }
+
+    fn ensure_lib(&mut self, ops: &dyn Ops) {
+        if !self.lib_loaded {
+            self.lib_loaded = true;
+            self.lib = crate::library::load(ops);
+        }
+    }
+
+    /// Load the project store once and reopen whatever was last open.
+    fn ensure_store(&mut self, ops: &dyn Ops, now: f64) {
+        if self.store_loaded {
+            return;
+        }
+        self.store_loaded = true;
+        self.store = crate::store::Store::load(ops);
+        if let Some(id) = self.store.active.clone()
+            && self.store.get(&id).is_some()
+        {
+            self.open_local(ops, now, &id);
+        }
+    }
+
+    /// Show a stored project, rehydrating its board/component library.
+    pub fn open_local(&mut self, ops: &dyn Ops, now: f64, id: &str) {
+        self.ensure_lib(ops);
+        if self.local_dirty {
+            self.flush_local(ops, now);
+        }
+        let Some(p) = self.store.get(id).cloned() else { return };
+        let snap = Snapshot {
+            name: p.name,
+            active: p.active,
+            boards: p.boards,
+            profiles: self.lib.boards.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            defs: self.lib.components.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            flow_bases: HashMap::new(),
+        };
+        self.source = Source::Local(id.to_string());
+        self.selected_board = snap.active.min(snap.boards.len().saturating_sub(1));
+        self.snapshot = Some(snap);
+        self.reset_editors();
+        self.store.active = Some(id.to_string());
+        self.store.save(ops);
+    }
+
+    /// Drop the local project and go back to the desktop source.
+    fn close_local(&mut self, ops: &dyn Ops, now: f64) {
+        if self.local_dirty {
+            self.flush_local(ops, now);
+        }
+        self.source = Source::Desktop;
+        self.snapshot = None;
+        self.reset_editors();
+        self.store.active = None;
+        self.store.save(ops);
+        self.start_fetch(ops, now);
+    }
+
+    /// Clear every editor's in-flight and per-project state.
+    fn reset_editors(&mut self) {
+        self.fetch = Fetch::Idle;
+        self.push = None;
+        self.script_push = None;
+        self.conflict = None;
+        self.drag = None;
+        self.moved.clear();
+        self.armed_def = None;
+        self.sel = None;
+        self.needs_refetch = false;
+        self.flow_built_for = usize::MAX;
+        self.flow_dirty_at = None;
+        self.script_comp = None;
+        self.script_board = None;
+        self.script_buf.clear();
+        self.script_synced.clear();
+        self.script_dirty_at = None;
+        self.diagnostics.clear();
+        self.compile_error = None;
+        self.autowire_plan = None;
+        self.pending_wires.clear();
+        self.local_dirty = false;
+        self.local_dirty_at = None;
+        self.snap_rev += 1;
+    }
+
+    /// Mark the open local project changed; the store write is debounced.
+    fn touch_local(&mut self) {
+        self.local_dirty = true;
+    }
+
+    /// Write the open local project back to the store.
+    fn flush_local(&mut self, ops: &dyn Ops, now: f64) {
+        self.local_dirty = false;
+        self.local_dirty_at = None;
+        let Source::Local(id) = self.source.clone() else { return };
+        let Some(snap) = &self.snapshot else { return };
+        self.store.put(&id, &snap.name, self.selected_board, &snap.boards, (now * 1000.0) as u64);
+        self.store.save(ops);
+    }
+
+    /// Apply a structural edit in-process, with the desktop's wire verdict.
+    fn edit_local(&mut self, board_id: u64, op: serde_json::Value) {
+        let op: wirelab_core::edit::EditOp = match serde_json::from_value(op) {
+            Ok(op) => op,
+            Err(e) => {
+                self.conflict = Some(format!("bad edit: {e}"));
+                return;
+            }
+        };
+        let outs: Vec<u8> = self
+            .model
+            .as_ref()
+            .map(|m| m.bindings.outputs.values().map(|b| b.gpio).collect())
+            .unwrap_or_default();
+        let result = {
+            let ProjectView { snapshot, lib, .. } = self;
+            let Some(tab) =
+                snapshot.as_mut().and_then(|s| s.boards.iter_mut().find(|b| b.id == board_id))
+            else {
+                return;
+            };
+            wirelab_core::edit::apply_edit(&mut tab.circuit, lib, &outs, op)
+        };
+        match result {
+            Ok(_) => {
+                self.drag = None;
+                self.sel = None;
+                self.snap_rev += 1;
+                self.touch_local();
+            }
+            Err(e) => self.conflict = Some(e),
+        }
+    }
+
+    /// Replace a board's rules (local projects own their program).
+    pub fn set_program(&mut self, board_id: u64, program: wirelab_core::program::Program) {
+        if let Some(snap) = &mut self.snapshot
+            && let Some(tab) = snap.boards.iter_mut().find(|b| b.id == board_id)
+        {
+            tab.program = program;
+        }
+        self.snap_rev += 1;
+        self.touch_local();
+    }
+
+    /// Append a board to the open local project and select it.
+    fn add_local_board(&mut self) {
+        let Some(snap) = &mut self.snapshot else { return };
+        let board_id = match snap.boards.get(self.selected_board) {
+            Some(b) => b.circuit.board_id.clone(),
+            None => return,
+        };
+        let id = snap.boards.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+        let name = format!("Board {}", snap.boards.len() + 1);
+        snap.boards.push(BoardTab {
+            id,
+            name,
+            circuit: wirelab_core::circuit::Circuit::new(&board_id),
+            program: Default::default(),
+            flow: Default::default(),
+        });
+        self.selected_board = snap.boards.len() - 1;
+        self.flow_built_for = usize::MAX;
+        self.snap_rev += 1;
+        self.touch_local();
+    }
+
     pub fn start_fetch(&mut self, ops: &dyn Ops, now: f64) {
         if matches!(self.fetch, Fetch::Pending(_)) || self.desktop_addr.trim().is_empty() {
             return;
@@ -505,7 +738,37 @@ impl ProjectView {
     }
 
     pub fn poll(&mut self, ops: &dyn Ops, now: f64) {
-        self.poll_push(ops);
+        self.ensure_store(ops, now);
+        if self.is_local() {
+            // A local project's only outbound push is the project offered to the desktop.
+            self.poll_push(ops, now);
+            self.desktop_scan.poll(ops, now);
+            if self.conflict.is_some() {
+                self.pending_wires.clear();
+            } else if !self.pending_wires.is_empty() {
+                let board_id = self.pending_board;
+                let (a, b) = self.pending_wires.remove(0);
+                self.edit(
+                    ops,
+                    board_id,
+                    serde_json::json!({
+                        "op": "add_wire",
+                        "a": serde_json::to_value(&a).unwrap_or_default(),
+                        "b": serde_json::to_value(&b).unwrap_or_default(),
+                    }),
+                );
+            }
+            if self.local_dirty && self.local_dirty_at.is_none() {
+                self.local_dirty_at = Some(now);
+            }
+            if let Some(t0) = self.local_dirty_at
+                && now - t0 > 1.0
+            {
+                self.flush_local(ops, now);
+            }
+            return;
+        }
+        self.poll_push(ops, now);
         self.poll_script(ops);
         self.desktop_scan.poll(ops, now);
         // Auto-fill the address from a discovered desktop and pull immediately.
@@ -552,6 +815,14 @@ impl ProjectView {
                         if rsp.status == 200 {
                             match serde_json::from_slice::<Snapshot>(&rsp.body) {
                                 Ok(snap) => {
+                                    self.ensure_lib(ops);
+                                    if crate::library::merge(
+                                        &mut self.lib,
+                                        &snap.profiles,
+                                        &snap.defs,
+                                    ) {
+                                        crate::library::cache(ops, &self.lib);
+                                    }
                                     self.selected_board =
                                         self.selected_board.min(snap.boards.len().saturating_sub(1));
                                     self.snapshot = Some(snap);
@@ -580,11 +851,17 @@ impl ProjectView {
         }
     }
 
+    /// Drops the pinch latch when the canvas isn't the visible tab.
+    pub fn clear_pinch(&mut self) {
+        self.pinching = false;
+    }
+
     /// Local edits in flight — pause refreshes so they aren't clobbered.
     fn editing(&self) -> bool {
         self.flow_dirty_at.is_some()
             || self.push.is_some()
             || self.drag.is_some()
+            || self.pinching
             || self.conflict.is_some()
             || !self.moved.is_empty()
             || self.armed_def.is_some()
@@ -639,11 +916,11 @@ impl ProjectView {
         let Some((mut err, warn, info)) = self.model().map(|m| m.problem_counts()) else { return };
         err += self.live_warnings.len();
         let (label, color) = if err > 0 {
-            (format!("✖ {err}"), egui::Color32::from_rgb(243, 139, 168))
+            (format!("✖ {err}"), theme::PINK)
         } else if warn > 0 {
-            (format!("⚠ {warn}"), egui::Color32::from_rgb(249, 226, 175))
+            (format!("⚠ {warn}"), theme::AQUA_BRIGHT)
         } else {
-            ("✔ checks".to_string(), egui::Color32::from_rgb(166, 227, 161))
+            ("✔ checks".to_string(), theme::AQUA)
         };
         if ui.button(egui::RichText::new(label).color(color).small()).clicked() {
             self.checks_open = !self.checks_open;
@@ -655,6 +932,7 @@ impl ProjectView {
         let screen = ui.ctx().content_rect();
         let mut still_open = true;
         let mut select: Option<u32> = None;
+        let local = self.is_local();
         egui::Window::new("Checks")
             .open(&mut still_open)
             .collapsible(false)
@@ -664,10 +942,10 @@ impl ProjectView {
             .vscroll(false)
             .show(ui.ctx(), |ui| {
                 let Some(model) = self.model.as_ref() else { return };
-                let err = egui::Color32::from_rgb(243, 139, 168);
-                let warn = egui::Color32::from_rgb(249, 226, 175);
-                let dim = egui::Color32::from_rgb(127, 132, 156);
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                let err = theme::PINK;
+                let warn = theme::AQUA_BRIGHT;
+                let dim = theme::INK_DIM;
+                theme::scroll_vertical().show(ui, |ui| {
                     for w in &self.live_warnings {
                         ui.label(egui::RichText::new(format!("✖ {w}")).color(err));
                     }
@@ -697,9 +975,13 @@ impl ProjectView {
                         }) = &lint.fix
                         {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "    fix on the desktop: splice a ~{ohms:.0} ohm resistor"
-                                ))
+                                egui::RichText::new(if local {
+                                    format!("    fix: splice a ~{ohms:.0} ohm resistor in series")
+                                } else {
+                                    format!(
+                                        "    fix on the desktop: splice a ~{ohms:.0} ohm resistor"
+                                    )
+                                })
                                 .color(dim)
                                 .small(),
                             );
@@ -719,8 +1001,12 @@ impl ProjectView {
         }
     }
 
-    /// Post a structural edit `{board_id, op, ...}` to the desktop.
+    /// Apply a structural edit `{board_id, op, ...}` — locally, or to the desktop.
     fn edit(&mut self, ops: &dyn Ops, board_id: u64, mut op: serde_json::Value) {
+        if self.is_local() {
+            self.edit_local(board_id, op);
+            return;
+        }
         if self.push.is_some() {
             return; // one structural edit at a time
         }
@@ -734,9 +1020,13 @@ impl ProjectView {
     fn conflict_banner(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) {
         let Some(err) = self.conflict.clone() else { return };
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(243, 139, 168)));
+            ui.label(egui::RichText::new(err).color(theme::PINK));
             if ui.button("Dismiss").clicked() {
                 self.conflict = None;
+            }
+            // A local project has no second writer to reload from.
+            if self.is_local() {
+                return;
             }
             if ui.button("Reload").clicked() {
                 self.conflict = None;
@@ -791,7 +1081,31 @@ impl ProjectView {
         }
     }
 
-    fn poll_push(&mut self, ops: &dyn Ops) {
+    /// The desktop to talk to: the typed address, else the first one discovered.
+    fn desktop_target(&self) -> Option<String> {
+        let typed = self.desktop_addr.trim();
+        if !typed.is_empty() {
+            return Some(typed.to_string());
+        }
+        self.desktop_scan.desktops().next().map(|d| d.addr.clone())
+    }
+
+    /// Offer the open local project to the desktop's `/project/import`.
+    fn send_to_desktop(&mut self, ops: &dyn Ops, now: f64, addr: String) {
+        let body = {
+            let Some(snap) = &self.snapshot else { return };
+            if snap.boards.is_empty() {
+                self.conflict = Some("nothing to send: this project has no boards".into());
+                return;
+            }
+            import_body(&snap.name, self.selected_board, &snap.boards)
+        };
+        self.desktop_addr = addr;
+        self.post(ops, "/project/import", body, Push::Import);
+        self.notice = Some(("sending to the desktop…".into(), now));
+    }
+
+    fn poll_push(&mut self, ops: &dyn Ops, now: f64) {
         let Some((id, _)) = &self.push else { return };
         let id = *id;
         let rsp = match ops.call(net::op::HTTP_POLL, &net::id_to_bytes(id)) {
@@ -850,31 +1164,125 @@ impl ProjectView {
                 self.drag = None;
                 self.needs_refetch = true;
             }
+            Push::Import => {
+                // The desktop parks the project behind a confirm modal; nothing is applied yet.
+                let name = v
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the project")
+                    .to_string();
+                self.notice =
+                    Some((format!("sent '{name}' — accept it on the desktop"), now));
+            }
         }
     }
 
-    /// Address bar + board chips; returns whether a snapshot is showing.
+    /// Project picker + board chips; returns whether a project is showing.
     pub fn header(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) -> bool {
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("desktop").small());
-            ui.add(
-                egui::TextEdit::singleline(&mut self.desktop_addr)
-                    .hint_text("192.168.1.x (WireLab app)")
-                    .desired_width(150.0),
-            );
-            if ui.button("Fetch").clicked() {
-                self.start_fetch(ops, now);
+        self.ensure_lib(ops);
+        let local = self.is_local();
+        let title = match &self.snapshot {
+            Some(s) if local => format!("📁 {}", s.name),
+            Some(s) => format!("🖥 {}", s.name),
+            None => "📁 no project".to_string(),
+        };
+        let mut open: Option<String> = None;
+        let mut to_desktop = false;
+        let mut add_board = false;
+        let mut send: Option<String> = None;
+        let target = self.desktop_target();
+        let sending = self.push.is_some();
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button(title, |ui| {
+                theme::menu_row_style(ui);
+                if ui.button("New project…").clicked() {
+                    self.dialog = Dialog::New;
+                    self.dialog_name = format!("Project {}", self.store.projects.len() + 1);
+                    self.dialog_board =
+                        self.lib.boards.keys().next().cloned().unwrap_or_default();
+                    ui.close();
+                }
+                if local {
+                    if ui.button("Rename…").clicked() {
+                        self.dialog = Dialog::Rename;
+                        self.dialog_name =
+                            self.snapshot.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+                        ui.close();
+                    }
+                    if ui.button("🗑 Delete…").clicked() {
+                        self.dialog = Dialog::Delete;
+                        ui.close();
+                    }
+                    if ui.button("Add board").clicked() {
+                        add_board = true;
+                        ui.close();
+                    }
+                    // Only with a desktop to send to; it lands there for confirmation.
+                    if let Some(addr) = &target {
+                        let row = egui::Button::new("🖥 Send to desktop…");
+                        if ui.add_enabled(!sending, row).clicked() {
+                            send = Some(addr.clone());
+                            ui.close();
+                        }
+                    }
+                }
+                let listing = self.store.listing();
+                if !listing.is_empty() {
+                    ui.separator();
+                    for (id, name) in listing {
+                        let sel = self.source == Source::Local(id.clone());
+                        if ui.selectable_label(sel, format!("📁 {name}")).clicked() {
+                            open = Some(id);
+                            ui.close();
+                        }
+                    }
+                }
+                ui.separator();
+                if ui.selectable_label(!local, "🖥 Desktop project").clicked() {
+                    to_desktop = true;
+                    ui.close();
+                }
+            });
+            if !local {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.desktop_addr)
+                        .hint_text("192.168.1.x (WireLab app)")
+                        .desired_width(140.0),
+                );
+                if ui.button("Fetch").clicked() {
+                    self.start_fetch(ops, now);
+                }
+                if matches!(self.fetch, Fetch::Pending(_)) {
+                    ui.spinner();
+                }
+                ui.checkbox(&mut self.auto_refresh, egui::RichText::new("live").small());
             }
-            if matches!(self.fetch, Fetch::Pending(_)) {
-                ui.spinner();
-            }
-            ui.checkbox(&mut self.auto_refresh, egui::RichText::new("live").small());
         });
+        // The one status line for every project tab: sends, auto-wire, wiring refusals.
+        match &self.notice {
+            Some((msg, at)) if now - at < 3.5 => {
+                ui.label(egui::RichText::new(msg).small().color(theme::AQUA_BRIGHT));
+            }
+            _ => self.notice = None,
+        }
+        if let Some(addr) = send {
+            self.send_to_desktop(ops, now, addr);
+        }
+        self.project_dialogs(ui, ops, now);
+        if add_board {
+            self.add_local_board();
+        }
+        if let Some(id) = open {
+            self.open_local(ops, now, &id);
+        } else if to_desktop && local {
+            self.close_local(ops, now);
+        }
+        if self.is_local() {
+            return self.board_chips(ui);
+        }
         if let Fetch::Failed(e) = &self.fetch {
             ui.label(
-                egui::RichText::new(e)
-                    .small()
-                    .color(egui::Color32::from_rgb(243, 139, 168)),
+                egui::RichText::new(e).small().color(theme::PINK),
             );
         }
         // Auto-discovered desktops — tap to connect.
@@ -891,29 +1299,158 @@ impl ProjectView {
                 }
             });
         }
-        let Some(snap) = &self.snapshot else {
+        if self.snapshot.is_none() {
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(if found.is_empty() {
-                    "enter the desktop's IP, or open WireLab on your Mac/PC \
-                     and it will appear here automatically"
+                    "start a project here with New project, or open WireLab on your \
+                     Mac/PC and it will appear above automatically"
                 } else {
-                    "tap a discovered desktop above to connect"
+                    "tap a discovered desktop above, or start a project here with \
+                     New project"
                 })
                 .weak(),
             );
             return false;
-        };
-        ui.horizontal(|ui| {
+        }
+        self.board_chips(ui)
+    }
+
+    /// Project name + one chip per board; always true (a project is showing).
+    fn board_chips(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(snap) = &self.snapshot else { return false };
+        let mut select = self.selected_board;
+        ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(&snap.name).strong());
             ui.separator();
             for (i, b) in snap.boards.iter().enumerate() {
                 if ui.selectable_label(self.selected_board == i, &b.name).clicked() {
-                    self.selected_board = i;
+                    select = i;
                 }
             }
         });
+        if select != self.selected_board {
+            self.selected_board = select;
+            if self.is_local() {
+                self.touch_local();
+            }
+        }
         true
+    }
+
+    /// New / Rename / Delete modals over the project picker.
+    fn project_dialogs(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) {
+        if self.dialog == Dialog::None {
+            return;
+        }
+        let screen = ui.ctx().content_rect();
+        let mut close = false;
+        let mut created: Option<String> = None;
+        let mut deleted = false;
+        let title = match self.dialog {
+            Dialog::New => "New project",
+            Dialog::Rename => "Rename project",
+            _ => "Delete project",
+        };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
+            .default_width((screen.width() - 48.0).min(360.0))
+            .show(ui.ctx(), |ui| match self.dialog {
+                Dialog::Delete => {
+                    let name =
+                        self.snapshot.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+                    ui.label(format!("Delete '{name}' from this device? This cannot be undone."));
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            deleted = true;
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                Dialog::Rename => {
+                    theme::card().show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.dialog_name)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        let ok = !self.dialog_name.trim().is_empty();
+                        if ui.add_enabled(ok, egui::Button::new("Rename")).clicked() {
+                            let name = self.dialog_name.trim().to_string();
+                            if let Source::Local(id) = self.source.clone() {
+                                self.store.rename(&id, &name, (now * 1000.0) as u64);
+                                self.store.save(ops);
+                            }
+                            if let Some(s) = &mut self.snapshot {
+                                s.name = name;
+                            }
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+                _ => {
+                    let current = self
+                        .lib
+                        .board(&self.dialog_board)
+                        .map(|b| b.name.clone())
+                        .unwrap_or_else(|| "pick a board".to_string());
+                    let boards: Vec<(String, String)> =
+                        self.lib.boards.values().map(|b| (b.id.clone(), b.name.clone())).collect();
+                    theme::card().show(ui, |ui| {
+                        ui.label(egui::RichText::new("name").small().weak());
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.dialog_name)
+                                .desired_width(f32::INFINITY),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("board").small().weak());
+                        egui::ComboBox::from_id_salt("new-project-board")
+                            .selected_text(current)
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for (id, name) in boards {
+                                    theme::selectable_value(ui, &mut self.dialog_board, id, name);
+                                }
+                            });
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let ok = !self.dialog_name.trim().is_empty()
+                            && self.lib.board(&self.dialog_board).is_some();
+                        if ui.add_enabled(ok, egui::Button::new("Create")).clicked() {
+                            created = Some(self.store.create(
+                                self.dialog_name.trim(),
+                                &self.dialog_board.clone(),
+                                (now * 1000.0) as u64,
+                            ));
+                            close = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    });
+                }
+            });
+        if deleted && let Source::Local(id) = self.source.clone() {
+            self.store.delete(&id);
+            self.close_local(ops, now);
+        }
+        if let Some(id) = created {
+            self.open_local(ops, now, &id);
+        }
+        if close {
+            self.dialog = Dialog::None;
+        }
     }
 
     // ── circuit canvas ─────────────────────────────────────────────────
@@ -969,9 +1506,8 @@ impl ProjectView {
         }
     }
 
-    /// Modeless toolbar (like the desktop): a palette to arm a part for
-    /// placing, a Delete button for the current selection, and a hint. Drag a
-    /// body to move it; drag from a pin/terminal to wire; tap to select.
+    /// Modeless toolbar (like the desktop): a palette to arm a part for placing, a Delete button
+    /// for the current selection, and a mid-gesture hint.
     fn canvas_toolbar(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, board_id: u64, now: f64) {
         ui.horizontal_wrapped(|ui| {
             let cats = self.categories();
@@ -986,7 +1522,7 @@ impl ProjectView {
             };
             let mut chosen = None;
             ui.menu_button(btn_text, |ui| {
-                egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                theme::scroll_vertical().max_height(320.0).show(ui, |ui| {
                     for (cat, parts) in &cats {
                         ui.menu_button(cat, |ui| {
                             for (id, name) in parts {
@@ -1050,25 +1586,18 @@ impl ProjectView {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 self.checks_ui(ui);
-                if let Some((msg, at)) = &self.notice {
-                    if now - at < 3.5 {
-                        ui.label(
-                            egui::RichText::new(msg.clone())
-                                .small()
-                                .color(egui::Color32::from_rgb(249, 226, 175)),
-                        );
-                        return;
-                    }
-                    self.notice = None;
-                }
+                // Only the mid-gesture states: the idle sentence overflowed the row and ran
+                // under the buttons (right_to_left never wraps and inherits the parent clip).
                 let hint = if self.armed_def.is_some() {
-                    "tap the board to place"
+                    Some("tap the board to place")
                 } else if matches!(self.drag, Some(CanvasDrag::Wire { .. })) {
-                    "release on a pin/terminal"
+                    Some("release on a pin/terminal")
                 } else {
-                    "drag a part to move · drag from a pin to wire · tap to select"
+                    None
                 };
-                ui.label(egui::RichText::new(hint).small().weak());
+                if let Some(hint) = hint {
+                    ui.label(egui::RichText::new(hint).small().weak());
+                }
             });
         });
     }
@@ -1102,7 +1631,7 @@ impl ProjectView {
                 .default_size([screen.width() - 40.0, (screen.height() * 0.5).min(360.0)])
                 .vscroll(false)
                 .show(ui.ctx(), |ui| {
-                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                    theme::scroll_vertical().max_height(240.0).show(ui, |ui| {
                         for note in &plan.notes {
                             ui.label(egui::RichText::new(note).monospace().small());
                         }
@@ -1134,7 +1663,14 @@ impl ProjectView {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         let p = ui.painter_at(rect);
-        p.rect_filled(rect, 6.0, egui::Color32::from_rgb(13, 13, 18));
+        p.rect_filled(rect, 8.0, theme::CANVAS);
+        // Same lit page the flow canvas stands on, so the two read as one surface.
+        theme::ambience(&p, rect, 3);
+
+        // Read before the early returns below: a latched `pinching` would freeze the fit and
+        // pause snapshot refreshes for the rest of the session.
+        let multi = ui.input(|i| i.multi_touch());
+        let was_pinching = std::mem::replace(&mut self.pinching, multi.is_some());
 
         let (min, fit, scale, origin, board_id, band_route) = {
             let Some(snap) = &self.snapshot else { return };
@@ -1164,15 +1700,14 @@ impl ProjectView {
             let fit = ((rect.width() - 24.0) / span.0)
                 .min((rect.height() - 24.0) / span.1)
                 .clamp(0.5, 12.0);
-            // A drag must not reshape the auto-fit under the finger.
-            let (min, fit) = match &self.drag {
-                Some(_) => *self.drag_view.get_or_insert((min, fit)),
-                None => {
-                    self.drag_view = None;
-                    (min, fit)
-                }
+            // A drag or pinch must not reshape the auto-fit under the finger.
+            let (min, fit) = if self.drag.is_some() || self.pinching {
+                *self.drag_view.get_or_insert((min, fit))
+            } else {
+                self.drag_view = None;
+                (min, fit)
             };
-            let scale = (fit * self.zoom).clamp(0.2, 40.0);
+            let scale = (fit * self.zoom).clamp(0.05, 40.0);
             let origin = rect.min + egui::vec2(12.0, 12.0);
             let pan = self.pan;
             let to_px = |w: [f32; 2]| {
@@ -1183,7 +1718,7 @@ impl ProjectView {
             // Dot grid (5 mm), anchored in world space so it pans with the view.
             let step = 5.0 * scale;
             if step > 7.0 {
-                let dot = egui::Color32::from_gray(30);
+                let dot = crate::flowstyle::DOT_COLOR;
                 let phase = to_px([0.0, 0.0]) - rect.min;
                 let mut x = rect.min.x + phase.x.rem_euclid(step);
                 while x < rect.max.x {
@@ -1204,11 +1739,11 @@ impl ProjectView {
                     tab.circuit.board_pos[1] + profile.height_mm,
                 ]),
             );
-            p.rect_filled(board_rect, 4.0, egui::Color32::from_rgb(24, 30, 24));
+            p.rect_filled(board_rect, 4.0, theme::SURFACE);
             p.rect_stroke(
                 board_rect,
                 4.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                egui::Stroke::new(1.0, theme::RIM_BRIGHT),
                 egui::StrokeKind::Middle,
             );
             p.text(
@@ -1216,7 +1751,7 @@ impl ProjectView {
                 egui::Align2::CENTER_TOP,
                 &profile.name,
                 egui::FontId::proportional(10.0),
-                egui::Color32::from_gray(140),
+                theme::VIOLET,
             );
             // The on-board WS2812, glowing its last commanded color.
             if let Some([r, g, b]) = live.and_then(|o| o.rgb) {
@@ -1573,7 +2108,7 @@ impl ProjectView {
                     p.rect_stroke(
                         r,
                         4.0,
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(249, 226, 175)),
+                        egui::Stroke::new(2.0, theme::PINK),
                         egui::StrokeKind::Middle,
                     );
                 }
@@ -1583,7 +2118,7 @@ impl ProjectView {
                     if wid.0 == id {
                         p.line_segment(
                             [*s0, *s1],
-                            egui::Stroke::new(3.5, egui::Color32::from_rgb(249, 226, 175)),
+                            egui::Stroke::new(3.5, theme::PINK),
                         );
                     }
                 }
@@ -1600,19 +2135,43 @@ impl ProjectView {
             ]
         };
 
-        // Pinch zoom anchored under the gesture, so the spot you pinch stays
-        // put. Zoom is clamped so the effective scale never hits its outer
-        // clamp — a clamped product would break the anchor math and drift.
-        let zd = ui.input(|i| i.zoom_delta());
-        if (zd - 1.0).abs() > 1e-3
-            && self.drag.is_none()
-            && let Some(ptr) = response.hover_pos()
+        // A second finger takes the canvas from any pan/move/wire drag, so the pinch owns the
+        // gesture instead of being discarded by it. A Move flushes its position first, or the
+        // next snapshot reverts it.
+        if multi.is_some()
+            && let Some(drag) = self.drag.take()
+            && let CanvasDrag::Move { id, grab } = drag
+            && let Some(ptr) = response.interact_pointer_pos()
         {
-            let w = to_world(ptr);
-            self.zoom = (self.zoom * zd).clamp((0.2 / fit).max(0.25), (40.0 / fit).min(10.0));
-            let s = (fit * self.zoom).clamp(0.2, 40.0);
-            self.pan[0] = w[0] - (ptr.x - origin.x) / s - min[0];
-            self.pan[1] = w[1] - (ptr.y - origin.y) / s - min[1];
+            let wp = to_world(ptr);
+            self.moved.push((id.0, [wp[0] - grab[0], wp[1] - grab[1]]));
+        }
+        // Lifting one finger of a pinch leaves egui's dragged id unchanged, so drag_started()
+        // never fires again — re-arm a pan or the canvas is inert until every finger is up.
+        if was_pinching && multi.is_none() && response.dragged() {
+            self.drag = Some(CanvasDrag::Pan);
+        }
+
+        // Pinch zoom anchored on the gesture centroid, so the spot you pinch stays put. Zoom is
+        // clamped so the effective scale never hits its outer clamp — a clamped product would
+        // break the anchor math and drift.
+        let (zd, anchor) = match &multi {
+            Some(m) => (m.zoom_delta, Some(m.center_pos)),
+            None => (ui.input(|i| i.zoom_delta()), response.hover_pos()),
+        };
+        if let Some(ptr) = anchor {
+            if (zd - 1.0).abs() > 1e-4 {
+                let w = to_world(ptr);
+                self.zoom = (self.zoom * zd).clamp((0.05 / fit).max(0.05), (40.0 / fit).min(10.0));
+                let s = (fit * self.zoom).clamp(0.05, 40.0);
+                self.pan[0] = w[0] - (ptr.x - origin.x) / s - min[0];
+                self.pan[1] = w[1] - (ptr.y - origin.y) / s - min[1];
+            }
+            // Two-finger translation pans whether or not the pinch also scaled.
+            if let Some(m) = &multi {
+                self.pan[0] -= m.translation_delta.x / scale;
+                self.pan[1] -= m.translation_delta.y / scale;
+            }
         }
         if let Some(CanvasDrag::Wire { from }) = &self.drag {
             // Every candidate endpoint carries its verdict: ring = ok,
@@ -1621,15 +2180,11 @@ impl ProjectView {
             for (ep, px) in &endpoints {
                 match self.wire_ok(from, ep) {
                     WireVerdict::Ok => {
-                        p.circle_stroke(
-                            *px,
-                            3.5,
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(203, 166, 247)),
-                        );
+                        p.circle_stroke(*px, 3.5, egui::Stroke::new(1.0, theme::AQUA));
                     }
                     WireVerdict::Blocked(_) => {
-                        p.circle_filled(*px, 4.0, egui::Color32::from_gray(15));
-                        let s = egui::Stroke::new(1.3, egui::Color32::from_rgb(243, 139, 168));
+                        p.circle_filled(*px, 4.0, egui::Color32::from_black_alpha(200));
+                        let s = egui::Stroke::new(1.3, theme::PINK);
                         p.line_segment([*px + egui::vec2(-3.0, -3.0), *px + egui::vec2(3.0, 3.0)], s);
                         p.line_segment([*px + egui::vec2(-3.0, 3.0), *px + egui::vec2(3.0, -3.0)], s);
                     }
@@ -1654,7 +2209,7 @@ impl ProjectView {
                 for seg in pts.windows(2) {
                     p.line_segment(
                         [egui::pos2(seg[0][0], seg[0][1]), egui::pos2(seg[1][0], seg[1][1])],
-                        egui::Stroke::new(2.0, egui::Color32::from_rgb(249, 226, 175)),
+                        egui::Stroke::new(2.0, theme::PINK),
                     );
                 }
             }
@@ -1755,11 +2310,16 @@ impl ProjectView {
             _ => {}
         }
 
-        // Flush finished moves.
+        // Flush finished moves. The drag already wrote the snapshot, so a
+        // local project only has to record that it changed.
         if !self.moved.is_empty() && self.push.is_none() {
             let moves = std::mem::take(&mut self.moved);
-            let body = serde_json::json!({ "board_id": board_id, "moves": moves }).to_string();
-            self.post(ops, "/project/positions", body, Push::Moves);
+            if self.is_local() {
+                self.touch_local();
+            } else {
+                let body = serde_json::json!({ "board_id": board_id, "moves": moves }).to_string();
+                self.post(ops, "/project/positions", body, Push::Moves);
+            }
         }
 
         // A plain tap: place the armed part, else select what's under it.
@@ -1840,7 +2400,6 @@ impl ProjectView {
             if ui.button("Start").on_hover_text("Pan to the first node").clicked() {
                 self.flow_canvas.go_to_start(&self.flow_view.snarl, vertical);
             }
-            ui.weak("drag a pin to wire");
         });
 
         // Drawn directly rather than through `wirelab_flow_ui::show`, which hard-codes a bare
@@ -1849,6 +2408,13 @@ impl ProjectView {
         let mut styled =
             crate::flowstyle::Styled::new(&mut viewer, &mut self.flow_canvas, &self.flow_view.snarl);
         self.flow_view.snarl.show(&mut styled, &crate::flowstyle::style(), "ipad-flow", ui);
+        drop(styled);
+        crate::flowstyle::graph_menu(
+            ui,
+            &mut self.flow_canvas,
+            &mut viewer,
+            &mut self.flow_view.snarl,
+        );
 
         // Overview only once the graph is big enough to lose your place in.
         if self.flow_view.snarl.nodes_pos_ids().count() > 3 {
@@ -1868,7 +2434,13 @@ impl ProjectView {
             if self.flow_dirty_at.is_none() {
                 self.flow_dirty_at = Some(now);
             }
-            if let (Some(t0), None, None, Some(base)) =
+            let settled = self.flow_dirty_at.is_some_and(|t0| now - t0 > 0.7);
+            if self.is_local() {
+                // No second writer, so no optimistic-concurrency base.
+                if settled {
+                    self.apply_flow_local(board_id, graph);
+                }
+            } else if let (Some(t0), None, None, Some(base)) =
                 (self.flow_dirty_at, self.push.as_ref(), self.conflict.as_ref(), base)
                 && now - t0 > 0.7
             {
@@ -1885,9 +2457,10 @@ impl ProjectView {
             self.flow_dirty_at = None;
         }
         ui.label(
-            egui::RichText::new(match (&self.flow_dirty_at, &self.push) {
-                (_, Some(_)) => "syncing…",
-                (Some(_), _) => "• editing (auto-syncs)",
+            egui::RichText::new(match (&self.flow_dirty_at, &self.push, self.is_local()) {
+                (_, Some(_), _) => "syncing…",
+                (Some(_), _, _) => "• editing (auto-saves)",
+                (_, _, true) => "✔ saved on this device",
                 _ => "✔ in sync with the desktop",
             })
             .small()
@@ -1946,7 +2519,42 @@ impl ProjectView {
         self.compile_error = None;
     }
 
+    /// Commit the edited flow graph into the open local project.
+    fn apply_flow_local(&mut self, board_id: u64, graph: wirelab_core::flow::FlowGraph) {
+        if let Some(snap) = &mut self.snapshot
+            && let Some(tab) = snap.boards.iter_mut().find(|b| b.id == board_id)
+        {
+            tab.flow = graph.clone();
+        }
+        self.flow_synced = graph;
+        self.flow_dirty_at = None;
+        self.snap_rev += 1;
+        self.touch_local();
+    }
+
+    /// Store a script on the open local project; syntax is checked in-process,
+    /// the desktop's semantic diagnostics are not available.
+    fn apply_script_local(&mut self, board_id: u64, comp: u32) {
+        let src = self.script_buf.clone();
+        self.compile_error = rhai::Engine::new().compile(&src).err().map(|e| e.to_string());
+        self.diagnostics.clear();
+        if let Some(snap) = &mut self.snapshot
+            && let Some(tab) = snap.boards.iter_mut().find(|b| b.id == board_id)
+            && let Some(c) = tab.circuit.components.get_mut(&CompId(comp))
+        {
+            c.script = Some(src.clone());
+        }
+        self.script_synced = src;
+        self.script_dirty_at = None;
+        self.snap_rev += 1;
+        self.touch_local();
+    }
+
     fn post_script(&mut self, ops: &dyn Ops, board_id: u64, comp: u32) {
+        if self.is_local() {
+            self.apply_script_local(board_id, comp);
+            return;
+        }
         let mut addr = self.desktop_addr.trim().to_string();
         if !addr.contains(':') {
             addr = format!("{addr}:4520");
@@ -2125,8 +2733,8 @@ impl ProjectView {
         let mut insert: Option<&'static str> = None;
         ui.horizontal_wrapped(|ui| {
             let n = self.diagnostics.len() + usize::from(self.compile_error.is_some());
-            let ok = egui::Color32::from_rgb(166, 227, 161);
-            let err = egui::Color32::from_rgb(243, 139, 168);
+            let ok = theme::AQUA;
+            let err = theme::PINK;
             let status = match (&self.script_dirty_at, &self.script_push) {
                 (_, Some(_)) => egui::RichText::new("linting…").small().weak(),
                 (Some(_), _) => egui::RichText::new("editing…").small().weak(),
@@ -2148,12 +2756,18 @@ impl ProjectView {
                     ui.label(egui::RichText::new(format!("· {e}")).small().color(err));
                 }
             }
+            if self.is_local() {
+                ui.label(
+                    egui::RichText::new("• syntax only — connect a desktop for full checks")
+                        .small()
+                        .weak(),
+                );
+            }
             if let Some(snips) = &snips {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.menu_button("+ insert", |ui| {
-                        // Finger-sized rows (egui 0.35 menus default to ~18px).
-                        ui.style_mut().spacing.button_padding = egui::vec2(10.0, 8.0);
-                        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        theme::menu_row_style(ui);
+                        theme::scroll_vertical().max_height(320.0).show(ui, |ui| {
                             for s in snips {
                                 if ui.button(s.title).clicked() {
                                     insert = Some(s.code);
@@ -2171,9 +2785,9 @@ impl ProjectView {
 
         // Every diagnostic as a tap-to-jump row (desktop Problems tab).
         if self.problems_open {
-            let err = egui::Color32::from_rgb(243, 139, 168);
+            let err = theme::PINK;
             let rows: Vec<(u32, u32, String)> = self.diagnostics.clone();
-            egui::ScrollArea::vertical().id_salt("problems").max_height(110.0).show(ui, |ui| {
+            theme::scroll_vertical().id_salt("problems").max_height(110.0).show(ui, |ui| {
                 for (l, c, msg) in &rows {
                     let row = ui.add(
                         egui::Label::new(
@@ -2306,7 +2920,8 @@ impl ProjectView {
             self.completion.clear();
         }
 
-        // Debounced push to the desktop, which applies + lints the script.
+        // Debounced apply: in-process for a local project, otherwise a push
+        // the desktop applies + lints.
         if self.script_buf != self.script_synced {
             if self.script_dirty_at.is_none() {
                 self.script_dirty_at = Some(now);

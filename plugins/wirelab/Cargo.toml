@@ -1,7 +1,7 @@
 [package]
 name = "wirelab_panel"
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 publish = false
 
 [dependencies]
@@ -11,6 +11,7 @@ wirelab-core = { path = "../../../../EmbeddedApps/wirelab/crates/wirelab-core" }
 wirelab-flow-ui = { path = "../../../../EmbeddedApps/wirelab/crates/wirelab-flow-ui" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rhai = "1.25.1"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

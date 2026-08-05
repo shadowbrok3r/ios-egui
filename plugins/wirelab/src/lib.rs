@@ -4,10 +4,13 @@
 
 pub mod docs;
 pub mod flowstyle;
+pub mod library;
 pub mod link;
 pub mod rules;
 pub mod runner;
 pub mod snippets;
+pub mod store;
+pub mod theme;
 pub mod view;
 
 use std::time::Duration;
@@ -19,11 +22,11 @@ use wirelab_proto::{BEHAVIOR_SLOTS, Behavior, HostMsg, PinMode, UART_CHUNK, Wifi
 
 use link::{BoardLink, LinkState, Ops, Scanner};
 
-const OK: egui::Color32 = egui::Color32::from_rgb(166, 227, 161);
-const ERR: egui::Color32 = egui::Color32::from_rgb(243, 139, 168);
-const DIM: egui::Color32 = egui::Color32::from_rgb(127, 132, 156);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(203, 166, 247);
-const HIGH: egui::Color32 = egui::Color32::from_rgb(249, 226, 175);
+const OK: egui::Color32 = theme::AQUA;
+const ERR: egui::Color32 = theme::PINK;
+const DIM: egui::Color32 = theme::INK_DIM;
+const ACCENT: egui::Color32 = theme::VIOLET;
+const HIGH: egui::Color32 = theme::AQUA_BRIGHT;
 
 /// `HostHandle` as the link's op surface.
 struct HostOps<'a>(&'a HostHandle);
@@ -192,9 +195,12 @@ impl App {
         }
     }
 
-    /// The rules to run for a board: the local override, else the desktop's.
+    /// The rules to run for a board. A local project owns its own program;
+    /// only a desktop project is shadowed by the local override.
     fn program_for(&self, board_id: u64) -> Option<wirelab_core::program::Program> {
-        if let Some(p) = self.local_programs.get(&board_id) {
+        if !self.project.is_local()
+            && let Some(p) = self.local_programs.get(&board_id)
+        {
             return Some(p.clone());
         }
         self.project.board_tab().map(|t| t.program.clone())
@@ -212,7 +218,14 @@ impl App {
 }
 
 impl PluginApp for App {
+    fn theme(&self, ctx: &egui::Context) {
+        theme::apply(ctx);
+    }
+
     fn update(&mut self, ui: &mut egui::Ui, host: &HostHandle) {
+        // First thing on the layer, so every translucent surface below composites against a lit
+        // black page rather than against whatever the host left on screen.
+        theme::paint_page(ui.painter(), ui.max_rect());
         let ops = HostOps(host);
         let now = ui.input(|i| i.time);
 
@@ -285,36 +298,42 @@ impl PluginApp for App {
         // Sockets are host-side; keep frames coming while anything is live.
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
-        ui.horizontal(|ui| {
-            for (tab, label) in [
-                (Tab::Board, "⚡ Board"),
-                (Tab::Canvas, "🗺 Canvas"),
-                (Tab::Flow, "⛓ Flow"),
-                (Tab::Script, "📜 Script"),
-                (Tab::Rules, "🛠 Rules"),
-            ] {
-                if ui.selectable_label(self.tab == tab, label).clicked() {
-                    self.tab = tab;
-                    self.saved.tab = tab;
+        theme::bar().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (tab, label) in [
+                    (Tab::Board, "⚡ Board"),
+                    (Tab::Canvas, "🗺 Canvas"),
+                    (Tab::Flow, "⛓ Flow"),
+                    (Tab::Script, "📜 Script"),
+                    (Tab::Rules, "🛠 Rules"),
+                ] {
+                    if theme::selectable_label(ui, self.tab == tab, label).clicked() {
+                        self.tab = tab;
+                        self.saved.tab = tab;
+                    }
                 }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("?", |ui| {
-                    // Finger-sized rows (egui 0.35 menus default to ~18px).
-                    ui.style_mut().spacing.button_padding = egui::vec2(10.0, 8.0);
-                    if ui.button("Script reference").clicked() {
-                        self.docs.open = Some(docs::DocKind::Script);
-                        ui.close();
-                    }
-                    if ui.button("Wiring guide").clicked() {
-                        self.docs.open = Some(docs::DocKind::Wiring);
-                        ui.close();
-                    }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.menu_button("?", |ui| {
+                        theme::menu_row_style(ui);
+                        if ui.button("Script reference").clicked() {
+                            self.docs.open = Some(docs::DocKind::Script);
+                            ui.close();
+                        }
+                        if ui.button("Wiring guide").clicked() {
+                            self.docs.open = Some(docs::DocKind::Wiring);
+                            ui.close();
+                        }
+                    });
                 });
             });
         });
         self.docs.show(ui.ctx());
-        ui.separator();
+        ui.add_space(4.0);
+
+        // Only show_canvas maintains it, so leaving the tab mid-pinch would strand it set.
+        if self.tab != Tab::Canvas {
+            self.project.clear_pinch();
+        }
 
         match self.tab {
             Tab::Board => {
@@ -505,7 +524,7 @@ impl App {
         let Some(info) = self.link.info else { return };
 
         ui.add_space(8.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        theme::scroll_vertical().show(ui, |ui| {
             // ── RGB LED ────────────────────────────────────────────────
             ui.label(egui::RichText::new("RGB LED").color(ACCENT).small());
             ui.horizontal(|ui| {
@@ -714,7 +733,7 @@ impl App {
                 .selected_text(BEHAVIOR_KINDS[d.kind])
                 .show_ui(ui, |ui| {
                     for (i, k) in BEHAVIOR_KINDS.iter().enumerate() {
-                        ui.selectable_value(&mut d.kind, i, *k);
+                        theme::selectable_value(ui, &mut d.kind, i, *k);
                     }
                 });
             match d.kind {
@@ -766,8 +785,8 @@ impl App {
         else {
             ui.label(
                 egui::RichText::new(
-                    "fetch the desktop project in the Canvas tab first — its scripts, \
-                     flow and rules can then run right here, desktop off",
+                    "open a project in the Canvas tab first — make one here, or fetch the \
+                     desktop's. Its scripts, flow and rules then run right here.",
                 )
                 .color(DIM)
                 .small(),
@@ -822,7 +841,11 @@ impl App {
             ui.label(
                 egui::RichText::new(format!(
                     "rules: {rules}{}",
-                    if self.local_programs.contains_key(&board_id) { " (local copy)" } else { "" }
+                    if !self.project.is_local() && self.local_programs.contains_key(&board_id) {
+                        " (local copy)"
+                    } else {
+                        ""
+                    }
                 ))
                 .color(DIM)
                 .small(),
@@ -887,7 +910,7 @@ impl App {
         if !self.uart_open {
             return;
         }
-        egui::ScrollArea::vertical()
+        theme::scroll_vertical()
             .id_salt("uart")
             .max_height(120.0)
             .stick_to_bottom(true)
@@ -933,16 +956,23 @@ impl App {
                 return;
             }
         };
-        let local = self.local_programs.contains_key(&board_id);
-        let base = self
-            .local_programs
-            .get(&board_id)
-            .cloned()
-            .unwrap_or_else(|| desktop_program.clone());
+        let own = self.project.is_local();
+        let local = !own && self.local_programs.contains_key(&board_id);
+        let base = if own {
+            desktop_program.clone()
+        } else {
+            self.local_programs.get(&board_id).cloned().unwrap_or_else(|| desktop_program.clone())
+        };
 
         let mut reset = false;
         ui.horizontal_wrapped(|ui| {
-            if local {
+            if own {
+                ui.label(
+                    egui::RichText::new("part of this project — saved on this device")
+                        .small()
+                        .color(DIM),
+                );
+            } else if local {
                 ui.label(
                     egui::RichText::new("local copy — runs from this device; the desktop keeps its own")
                         .small()
@@ -1001,29 +1031,37 @@ impl App {
             Vec::new()
         };
         let mut prog = base.clone();
-        egui::ScrollArea::vertical().id_salt("rules").show(ui, |ui| {
-            rules::show(ui, &mut prog, &cat, &recent);
+        theme::card().show(ui, |ui| {
+            theme::scroll_vertical().id_salt("rules").show(ui, |ui| {
+                rules::show(ui, &mut prog, &cat, &recent);
+            });
         });
         if reset {
             self.local_programs.remove(&board_id);
             self.programs_dirty = true;
         } else if prog != base {
-            self.local_programs.insert(board_id, prog);
-            self.programs_dirty = true;
+            if own {
+                self.project.set_program(board_id, prog);
+            } else {
+                self.local_programs.insert(board_id, prog);
+                self.programs_dirty = true;
+            }
         }
     }
 
     fn console(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Console").color(ACCENT).small());
-        egui::ScrollArea::vertical()
-            .id_salt("console")
-            .max_height(120.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for line in &self.link.log {
-                    ui.label(egui::RichText::new(line).monospace().small().color(DIM));
-                }
-            });
+        theme::card().show(ui, |ui| {
+            theme::scroll_vertical()
+                .id_salt("console")
+                .max_height(120.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &self.link.log {
+                        ui.label(egui::RichText::new(line).monospace().small().color(DIM));
+                    }
+                });
+        });
     }
 }
 

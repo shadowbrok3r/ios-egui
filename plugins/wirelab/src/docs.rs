@@ -5,6 +5,8 @@
 
 use egui_ios_plugin_sdk::egui;
 
+use crate::theme;
+
 /// (title, body) sections; code fences render monospaced via the Rhai highlighter.
 const SCRIPT_SECTIONS: &[(&str, &str)] = &[
     (
@@ -258,7 +260,7 @@ impl DocsState {
                 ui.separator();
                 let needle = self.filter.to_lowercase();
                 let base = ui.visuals().text_color();
-                egui::ScrollArea::vertical().show(ui, |ui| {
+                theme::scroll_vertical().show(ui, |ui| {
                     for (i, (title, body)) in sections.iter().enumerate() {
                         if !needle.is_empty()
                             && !title.to_lowercase().contains(&needle)

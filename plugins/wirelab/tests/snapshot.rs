@@ -104,3 +104,24 @@ fn desktop_project_json_round_trips_into_the_plugin() {
         }
     }
 }
+
+/// The other direction: what the phone POSTs to /project/import must satisfy every check the
+/// desktop's `parse_import_push` runs — a string `name`, a non-empty `boards`, a `from` label, and
+/// a body `Project::from_json` accepts whole.
+#[test]
+fn the_import_push_body_matches_what_the_desktop_accepts() {
+    let boards = Project::new("phone lab", "esp32-c5-devkitc-1").boards;
+    let body = wirelab_panel::view::import_body("phone lab", 0, &boards);
+
+    let v: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+    assert!(v.get("name").is_some_and(serde_json::Value::is_string));
+    assert!(
+        v.get("boards").and_then(serde_json::Value::as_array).is_some_and(|b| !b.is_empty())
+    );
+    assert!(v.get("from").and_then(serde_json::Value::as_str).is_some());
+
+    let project = Project::from_json(&body).expect("desktop parses the project");
+    assert_eq!(project.name, "phone lab");
+    assert_eq!(project.boards.len(), 1);
+    assert_eq!(project.circuit.board_id, "esp32-c5-devkitc-1");
+}

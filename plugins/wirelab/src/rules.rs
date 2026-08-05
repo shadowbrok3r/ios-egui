@@ -7,6 +7,8 @@ use wirelab_core::circuit::{CompId, Circuit};
 use wirelab_core::library::Library;
 use wirelab_core::program::{Action, Program, Rule, Trigger};
 
+use crate::theme;
+
 /// Components that can fire events / receive actions, with their verb lists.
 pub struct CompCatalog {
     pub events: Vec<(CompId, String, Vec<String>)>,
@@ -166,7 +168,7 @@ fn trigger_editor(
                 .unwrap_or_else(|| format!("#{}", comp.0));
             ComboBox::from_id_salt(("trig-comp", idx)).selected_text(name).show_ui(ui, |ui| {
                 for (id, n, _) in event_comps {
-                    ui.selectable_value(comp, *id, n);
+                    theme::selectable_value(ui, comp, *id, n.clone());
                 }
             });
             let events = event_comps
@@ -178,7 +180,7 @@ fn trigger_editor(
                 ui,
                 |ui| {
                     for e in &events {
-                        ui.selectable_value(event, e.clone(), e);
+                        theme::selectable_value(ui, event, e.clone(), e.clone());
                     }
                 },
             );
@@ -270,7 +272,7 @@ fn action_editor(
                 .unwrap_or_else(|| format!("#{}", comp.0));
             ComboBox::from_id_salt(("act-comp", salt)).selected_text(name).show_ui(ui, |ui| {
                 for (id, n, _) in action_comps {
-                    ui.selectable_value(comp, *id, n);
+                    theme::selectable_value(ui, comp, *id, n.clone());
                 }
             });
             let verbs = action_comps
@@ -282,7 +284,7 @@ fn action_editor(
                 .selected_text(verb.clone())
                 .show_ui(ui, |ui| {
                     for v in &verbs {
-                        ui.selectable_value(verb, v.clone(), v);
+                        theme::selectable_value(ui, verb, v.clone(), v.clone());
                     }
                 });
             // Common tunables per verb.
@@ -371,7 +373,7 @@ fn action_editor(
                         PinMode::Pwm,
                         PinMode::Analog,
                     ] {
-                        ui.selectable_value(mode, m, format!("{m:?}"));
+                        theme::selectable_value(ui, mode, m, format!("{m:?}"));
                     }
                 });
         }

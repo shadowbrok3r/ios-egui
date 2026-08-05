@@ -12,10 +12,12 @@ use egui::emath::TSTransform;
 use wirelab_flow_ui::egui_snarl::{
     InPin, InPinId, NodeId, OutPin, OutPinId, Snarl,
     ui::{
-        AnyPins, BackgroundPattern, NodeLayout, PinPlacement, SnarlPin, SnarlStyle, SnarlViewer,
-        WireStyle,
+        AnyPins, BackgroundPattern, NodeLayout, PinPlacement, PinWireInfo, SelectionStyle, SnarlPin,
+        SnarlStyle, SnarlViewer, WireStyle,
     },
 };
+
+use crate::theme;
 
 /// Zoom clamps, so a fit of a wide graph can't shrink nodes past legibility or blow one node up
 /// to fill the canvas.
@@ -29,9 +31,9 @@ const NOMINAL_NODE: egui::Vec2 = egui::vec2(180.0, 100.0);
 /// AMOLED canvas, bold axis-aligned traces, pins outside the node body.
 pub fn style() -> SnarlStyle {
     let mut s = SnarlStyle::new();
-    s.bg_frame = Some(egui::Frame::new().fill(egui::Color32::from_rgb(3, 3, 5)));
-    // A tighter grid than snarl's default, so the canvas reads as graph paper the nodes sit on.
-    s.bg_pattern = Some(BackgroundPattern::grid(egui::vec2(28.0, 28.0), 0.0));
+    s.bg_frame = Some(egui::Frame::new().fill(theme::CANVAS));
+    // The dot grid is painted by `draw_background`; snarl's own pattern is never consulted.
+    s.bg_pattern = Some(BackgroundPattern::NoPattern);
     s.min_scale = Some(MIN_SCALE);
     s.max_scale = Some(MAX_SCALE);
     s.centering = Some(true);
@@ -41,20 +43,127 @@ pub fn style() -> SnarlStyle {
     s.wire_width = Some(2.6);
     // Pins sit just outside the node body: their dots stop overlapping the pin labels, and they
     // become finger targets clear of the draggable node frame.
-    s.pin_placement = Some(PinPlacement::Outside { margin: 3.0 });
-    s.pin_size = Some(15.0);
+    s.pin_placement = Some(PinPlacement::Outside { margin: PIN_MARGIN });
+    s.pin_size = Some(PIN_DOT);
+    s.pin_fill = Some(egui::Color32::from_rgba_unmultiplied(43, 226, 214, 220));
+    // `pin_info` sets a per-type fill but never a stroke, so this rim reaches every dot.
+    s.pin_stroke = Some(egui::Stroke::new(1.6, theme::RIM_BRIGHT));
+    // Snarl's default is `Frame::window`, which pulls in the opaque window fill.
+    s.node_frame = Some(node_frame());
+    // Left None it would be `node_frame` again, and the two translucent fills would stack.
+    s.header_frame = Some(header_frame());
+    s.select_style = Some(SelectionStyle {
+        margin: egui::Margin::same(4),
+        rounding: egui::CornerRadius::same(10),
+        fill: egui::Color32::from_rgba_unmultiplied(255, 61, 139, 26),
+        stroke: egui::Stroke::new(2.0, theme::PINK),
+    });
     // Inputs above outputs rather than side by side. Snarl's default Coil layout measures both
     // columns against the full node width and sums them, so every node carries its output labels'
     // width as dead weight — which `arrange` then spaces its columns by.
-    s.node_layout = Some(NodeLayout::sandwich());
+    // The row floor keeps enlarged hit rects on adjacent pins from stacking on top of each other.
+    s.node_layout = Some(NodeLayout::sandwich().with_min_pin_row_height(PIN_ROW));
     s
+}
+
+/// A node body: glass over the lit canvas, a neutral hairline, and a shadow to lift it off.
+fn node_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(theme::SURFACE)
+        .corner_radius(NODE_CORNER)
+        .inner_margin(6)
+        .stroke(egui::Stroke::new(1.0, theme::RIM_BRIGHT))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 2],
+            blur: 12,
+            spread: 2,
+            color: egui::Color32::from_black_alpha(200),
+        })
+}
+
+/// A node title bar: a faint aqua wash banding the top of the body.
+fn header_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(HEADER_FILL)
+        .corner_radius(egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 })
+        .inner_margin(egui::Margin { left: 8, right: 8, top: 5, bottom: 5 })
 }
 
 /// Base spacing (graph units) of the canvas dot grid — anchored in graph space so it scales with
 /// the nodes; coarsened by powers of two when zoomed far out.
 const DOT_SPACING: f32 = 28.0;
 const DOT_RADIUS: f32 = 1.7;
-const DOT_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 70, 74);
+pub const DOT_COLOR: egui::Color32 = egui::Color32::from_rgb(30, 70, 74);
+
+const NODE_CORNER: f32 = 8.0;
+const HEADER_FILL: egui::Color32 = egui::Color32::from_rgba_premultiplied(3, 14, 13, 16);
+/// Glow under a pin dot.
+const PIN_HALO: egui::Color32 = egui::Color32::from_rgba_premultiplied(5, 27, 25, 30);
+
+/// Drawn diameter of a pin dot, in graph units.
+const PIN_DOT: f32 = 20.0;
+/// Gap between a pin dot and the node body, in graph units.
+const PIN_MARGIN: f32 = 10.0;
+/// Pitch snarl spaces pin rows at, in graph units.
+const PIN_ROW: f32 = 32.0;
+/// Drag target the enlarged hit rect aims at, in screen points.
+const PIN_TOUCH: f32 = 44.0;
+/// Ceiling on the hit rect in graph units. Unbounded, `PIN_TOUCH / MIN_SCALE` is 880 units — one
+/// pin would cover the whole node.
+const PIN_TOUCH_MAX: f32 = PIN_DOT * 3.0;
+/// Widest a centred hit rect can be without reaching past the node edge: snarl centres the dot
+/// `PIN_MARGIN + PIN_DOT/2` out from the body, and the rect grows both ways.
+const PIN_HIT_W_MAX: f32 = 2.0 * (PIN_MARGIN + PIN_DOT * 0.5);
+
+/// Side of a pin's hit square in graph units: a roughly constant on-screen target, capped so one
+/// pin can't cover the node it belongs to.
+fn pin_hit(scaling: f32) -> f32 {
+    (PIN_TOUCH / scaling.max(MIN_SCALE)).clamp(PIN_DOT, PIN_TOUCH_MAX)
+}
+
+/// Widens a pin's drag target without widening its dot.
+///
+/// Snarl uses one rect for both: `pin_rect` is handed to `interact` and then straight on to
+/// `draw`, and it is in graph units, so at a fit-all zoom of ~0.3 a 20-unit pin is a 6pt target.
+/// Overriding `pin_rect` and shrinking the rect back before delegating `draw` separates the two.
+struct FatPin<P> {
+    inner: P,
+    hit: f32,
+    dot: f32,
+}
+
+/// A pin's hit square, centred on the dot — snarl takes the wire endpoint from `rect.center()` —
+/// and bounded so it reaches neither into the node body nor over the next pin row.
+fn pin_hit_rect(x: f32, y0: f32, y1: f32, hit: f32, dot: f32) -> egui::Rect {
+    // Taller than the row and adjacent rects overlap, where egui hands the tap to the later pin
+    // and the wire starts from the wrong port.
+    let h = hit.min((y1 - y0).max(dot));
+    egui::Rect::from_center_size(egui::pos2(x, (y0 + y1) * 0.5), egui::vec2(hit.min(PIN_HIT_W_MAX), h))
+}
+
+impl<P: SnarlPin> SnarlPin for FatPin<P> {
+    fn pin_rect(&self, x: f32, y0: f32, y1: f32, _size: f32) -> egui::Rect {
+        pin_hit_rect(x, y0, y1, self.hit, self.dot)
+    }
+
+    fn draw(
+        self,
+        snarl_style: &SnarlStyle,
+        style: &egui::Style,
+        rect: egui::Rect,
+        painter: &egui::Painter,
+    ) -> PinWireInfo {
+        // Snarl pops the rect 1.2x on hover; carry that factor onto the dot.
+        let k = (rect.width() / self.hit.min(PIN_HIT_W_MAX)).max(1.0);
+        let visual =
+            egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(self.dot * k));
+        painter.circle_filled(visual.center(), visual.width() * 0.85, PIN_HALO);
+        let mut info = self.inner.draw(snarl_style, style, visual, painter);
+        // The shared viewer's type colours are desktop-tuned; lift them for the black page.
+        info.color = info.color.gamma_multiply(1.15);
+        info
+    }
+}
 
 /// A one-shot view move, applied by the next [`Styled`] pass.
 #[derive(Clone, Copy, PartialEq)]
@@ -76,6 +185,18 @@ pub struct Canvas {
     ui_rect: egui::Rect,
     to_global: TSTransform,
     bounds: Option<egui::Rect>,
+    /// Node extents measured by the previous pass, for hit-testing a press against a node.
+    sizes: HashMap<NodeId, egui::Vec2>,
+    /// Filled by `final_node_rect` during a pass, promoted to `sizes` at the next one.
+    sizes_next: HashMap<NodeId, egui::Vec2>,
+    /// Press being timed for a long-press: (start time, screen position).
+    press: Option<(f64, egui::Pos2)>,
+    long_fired: bool,
+    /// Graph-space position the open graph menu was summoned at.
+    menu: Option<egui::Pos2>,
+    menu_open: bool,
+    /// Set while the finger that summoned the menu is still down; suppresses the close write-back.
+    menu_hold: bool,
 }
 
 impl Default for Canvas {
@@ -87,6 +208,13 @@ impl Default for Canvas {
             ui_rect: egui::Rect::NOTHING,
             to_global: TSTransform::IDENTITY,
             bounds: None,
+            sizes: HashMap::new(),
+            sizes_next: HashMap::new(),
+            press: None,
+            long_fired: false,
+            menu: None,
+            menu_open: false,
+            menu_hold: false,
         }
     }
 }
@@ -118,24 +246,21 @@ impl Canvas {
         }
         let (resp, painter) = ui.allocate_painter(size, egui::Sense::click_and_drag());
         let rect = resp.rect;
-        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(180));
-        painter.rect_stroke(
-            rect,
-            4.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
-            egui::StrokeKind::Inside,
-        );
+        theme::glass_shadow(&painter, rect, 8);
+        theme::glass(&painter, rect, 8.0, egui::Color32::from_black_alpha(180), theme::RIM_BRIGHT);
         // One uniform scale for both axes, so the overview isn't a distorted squash of the graph.
         let pad = graph.expand(40.0);
         let scale = (rect.width() / pad.width()).min(rect.height() / pad.height());
         let to_map = |p: egui::Pos2| rect.center() + (p - pad.center()) * scale;
         for (_, pos, _) in snarl.nodes_pos_ids() {
             let r = egui::Rect::from_min_size(pos, NOMINAL_NODE);
-            painter.rect_filled(
-                egui::Rect::from_min_max(to_map(r.min), to_map(r.max)),
-                1.0,
-                egui::Color32::from_rgb(120, 140, 160),
+            let mapped = egui::Rect::from_min_max(to_map(r.min), to_map(r.max));
+            // A 2px floor, or a zoomed-out graph maps every node to nothing.
+            let mapped = egui::Rect::from_center_size(
+                mapped.center(),
+                mapped.size().max(egui::Vec2::splat(2.0)),
             );
+            painter.rect_filled(mapped, 1.0, egui::Color32::from_gray(150));
         }
         // The visible canvas, back-projected into graph space.
         let inv = self.to_global.inverse();
@@ -146,12 +271,122 @@ impl Canvas {
         painter.rect_stroke(
             egui::Rect::from_min_max(to_map(view.min), to_map(view.max)),
             0.0,
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(43, 226, 214)),
+            egui::Stroke::new(1.5, theme::AQUA),
             egui::StrokeKind::Inside,
         );
         if let Some(p) = resp.interact_pointer_pos() {
             self.cmd = Some(ViewCmd::Center(pad.center() + (p - rect.center()) / scale));
         }
+    }
+
+    /// The node under a screen position, using the extents the previous pass measured.
+    fn node_at<T>(&self, snarl: &Snarl<T>, screen: egui::Pos2) -> Option<NodeId> {
+        let g = self.to_global.inverse() * screen;
+        snarl
+            .nodes_pos_ids()
+            .find(|(id, pos, _)| {
+                let size = self.sizes.get(id).copied().unwrap_or(NOMINAL_NODE);
+                egui::Rect::from_min_size(*pos, size).contains(g)
+            })
+            .map(|(id, _, _)| id)
+    }
+
+    /// Graph-space position of a long-press on empty canvas, once per press.
+    fn long_press<T>(&mut self, ctx: &egui::Context, snarl: &Snarl<T>) -> Option<egui::Pos2> {
+        if !self.ready() {
+            self.press = None;
+            self.long_fired = false;
+            return None;
+        }
+        let (down, pos, time, dragging) = ctx.input(|i| {
+            (
+                i.pointer.any_down(),
+                i.pointer.interact_pos(),
+                i.time,
+                i.pointer.is_decidedly_dragging(),
+            )
+        });
+        if !down {
+            self.press = None;
+            self.long_fired = false;
+            return None;
+        }
+        let Some(pos) = pos else { return None };
+        // Off-canvas, or over an overlay — the minimap sits on Order::Foreground.
+        if !self.ui_rect.contains(pos)
+            || ctx.layer_id_at(pos).is_some_and(|l| l.order != egui::Order::Background)
+        {
+            self.press = None;
+            return None;
+        }
+        // Nodes are drawn on the same layer order as the canvas, so they need an explicit
+        // hit-test; a press on one belongs to snarl's node menu.
+        if self.node_at(snarl, pos).is_some() {
+            self.press = None;
+            return None;
+        }
+        match self.press {
+            None => {
+                self.press = Some((time, pos));
+                None
+            }
+            Some((start, origin)) => {
+                if dragging || (origin - pos).length() > 12.0 {
+                    self.press = None;
+                    return None;
+                }
+                ctx.request_repaint();
+                if !self.long_fired && time - start > 0.5 {
+                    self.long_fired = true;
+                    return Some(self.to_global.inverse() * pos);
+                }
+                None
+            }
+        }
+    }
+}
+
+/// The graph's add-node menu, opened by long-press and kept open until dismissed.
+///
+/// Snarl only calls `.context_menu()` while a pointer position exists (its `ui.rs:1291` guard), so
+/// on touch the popup is garbage-collected the frame the finger lifts. Driving an egui `Popup` from
+/// a bool this side of the ABI re-shows it every pass, which is what keeps it alive.
+///
+/// A long-press while the menu is already open moves it to the new spot. That press lands outside
+/// the popup, so `CloseOnClickOutside` would shut it on the finger-lift and the menu would blink to
+/// the new position and vanish — `menu_hold` drops the close write-back until that press ends.
+pub fn graph_menu<T, V: SnarlViewer<T>>(
+    ui: &mut egui::Ui,
+    canvas: &mut Canvas,
+    viewer: &mut V,
+    snarl: &mut Snarl<T>,
+) {
+    if let Some(pos) = canvas.long_press(ui.ctx(), snarl)
+        && viewer.has_graph_menu(pos, snarl)
+    {
+        canvas.menu = Some(pos);
+        canvas.menu_open = true;
+        canvas.menu_hold = true;
+    }
+    let Some(graph_pos) = canvas.menu else { return };
+    let mut open = canvas.menu_open;
+    egui::Popup::new(
+        egui::Id::new("wirelab-flow-graph-menu"),
+        ui.ctx().clone(),
+        egui::PopupAnchor::Position(canvas.to_global * graph_pos),
+        ui.layer_id(),
+    )
+    .open_bool(&mut open)
+    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+    .show(|ui| viewer.show_graph_menu(graph_pos, ui, snarl));
+    if canvas.menu_hold {
+        // The lift is the frame the click registers, so clear the hold only after skipping it.
+        canvas.menu_hold = ui.ctx().input(|i| i.pointer.any_down());
+        return;
+    }
+    canvas.menu_open = open;
+    if !open {
+        canvas.menu = None;
     }
 }
 
@@ -193,6 +428,10 @@ impl<'a, T, V: SnarlViewer<T>> Styled<'a, T, V> {
         let bounds = bounds(snarl);
         Self { inner, canvas, bounds, marker: PhantomData }
     }
+
+    fn pin_hit(&self) -> f32 {
+        pin_hit(self.canvas.to_global.scaling)
+    }
 }
 
 impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
@@ -205,6 +444,9 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         painter: &egui::Painter,
         _snarl: &Snarl<T>,
     ) {
+        // Light pools under the nodes: without them the translucent node fills read as flat
+        // plastic. Anchored to the viewport, so the light stays put as the graph pans under it.
+        theme::ambience(painter, *viewport, 3);
         // Drawn in graph space (the layer transform sizes it to screen), so spacing and radius
         // scale 1:1 with the nodes. Zoomed far out the spacing coarsens by powers of two, keeping
         // the on-screen density and the dot count bounded.
@@ -258,6 +500,8 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         }
         self.canvas.to_global = *to_global;
         self.canvas.bounds = self.bounds;
+        // Runs once per pass, before the nodes: last pass's measurements become the current ones.
+        self.canvas.sizes = std::mem::take(&mut self.canvas.sizes_next);
     }
 
     // ── Everything below forwards to the wrapped viewer unchanged ──
@@ -277,7 +521,8 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<T>,
     ) -> impl SnarlPin + 'static {
-        self.inner.show_input(pin, ui, snarl)
+        let hit = self.pin_hit();
+        FatPin { inner: self.inner.show_input(pin, ui, snarl), hit, dot: PIN_DOT }
     }
     fn show_output(
         &mut self,
@@ -285,8 +530,11 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<T>,
     ) -> impl SnarlPin + 'static {
-        self.inner.show_output(pin, ui, snarl)
+        let hit = self.pin_hit();
+        FatPin { inner: self.inner.show_output(pin, ui, snarl), hit, dot: PIN_DOT }
     }
+    /// Glass over whatever the wrapped viewer returned. A 2px stroke is a status rim the inner
+    /// viewer painted deliberately (executing, error) and keeps its colour.
     fn node_frame(
         &mut self,
         default: egui::Frame,
@@ -295,7 +543,16 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         outputs: &[OutPin],
         snarl: &Snarl<T>,
     ) -> egui::Frame {
-        self.inner.node_frame(default, node, inputs, outputs, snarl)
+        let frame = self
+            .inner
+            .node_frame(default, node, inputs, outputs, snarl)
+            .fill(theme::SURFACE)
+            .corner_radius(NODE_CORNER);
+        if frame.stroke.width < 2.0 {
+            frame.stroke(egui::Stroke::new(1.0, theme::RIM_BRIGHT))
+        } else {
+            frame
+        }
     }
     fn header_frame(
         &mut self,
@@ -305,16 +562,21 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         outputs: &[OutPin],
         snarl: &Snarl<T>,
     ) -> egui::Frame {
-        self.inner.header_frame(default, node, inputs, outputs, snarl)
+        self.inner
+            .header_frame(default, node, inputs, outputs, snarl)
+            .fill(HEADER_FILL)
+            .shadow(egui::epaint::Shadow::NONE)
     }
+    /// Always true: snarl builds each node's `Ui` from this style, so without it the widgets
+    /// inside a node keep whatever palette surrounds the canvas.
     fn has_node_style(
         &mut self,
-        node: NodeId,
-        inputs: &[InPin],
-        outputs: &[OutPin],
-        snarl: &Snarl<T>,
+        _node: NodeId,
+        _inputs: &[InPin],
+        _outputs: &[OutPin],
+        _snarl: &Snarl<T>,
     ) -> bool {
-        self.inner.has_node_style(node, inputs, outputs, snarl)
+        true
     }
     fn apply_node_style(
         &mut self,
@@ -325,6 +587,7 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         snarl: &Snarl<T>,
     ) {
         self.inner.apply_node_style(style, node, inputs, outputs, snarl);
+        theme::widget_palette(&mut style.visuals.widgets);
     }
     fn node_layout(
         &mut self,
@@ -379,6 +642,7 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
         ui: &mut egui::Ui,
         snarl: &mut Snarl<T>,
     ) {
+        self.canvas.sizes_next.insert(node, rect.size());
         self.inner.final_node_rect(node, rect, ui, snarl);
     }
     fn has_on_hover_popup(&mut self, node: &T) -> bool {
@@ -406,8 +670,10 @@ impl<T, V: SnarlViewer<T>> SnarlViewer<T> for Styled<'_, T, V> {
     ) {
         self.inner.show_wire_widget(from, to, ui, snarl);
     }
-    fn has_graph_menu(&mut self, pos: egui::Pos2, snarl: &mut Snarl<T>) -> bool {
-        self.inner.has_graph_menu(pos, snarl)
+    /// Suppressed: snarl's own graph menu cannot survive a finger lift on touch. `graph_menu`
+    /// drives the same `show_graph_menu` content from a long-press instead.
+    fn has_graph_menu(&mut self, _pos: egui::Pos2, _snarl: &mut Snarl<T>) -> bool {
+        false
     }
     fn show_graph_menu(&mut self, pos: egui::Pos2, ui: &mut egui::Ui, snarl: &mut Snarl<T>) {
         self.inner.show_graph_menu(pos, ui, snarl);
@@ -779,6 +1045,35 @@ mod tests {
             wirelab_flow_ui::egui_snarl::InPinId { node: ids[0], input: 0 },
         );
         assert_eq!(arrange(&mut s, &HashMap::new(), false).len(), 3);
+    }
+
+    /// The hit square holds a usable on-screen target across the zoom range without ever growing
+    /// large enough to cover the node it hangs off.
+    #[test]
+    fn the_pin_hit_target_stays_grabbable_and_bounded() {
+        // Two rows a pitch apart, as snarl lays them out.
+        let (y0, y1) = (0.0, PIN_ROW);
+        for scale in [MIN_SCALE, 0.1, 0.3, 1.0, MAX_SCALE] {
+            let hit = pin_hit(scale);
+            assert!(hit >= PIN_DOT, "scale {scale}: hit {hit} is smaller than the dot");
+            // x is where snarl centres an input dot: PIN_MARGIN + PIN_DOT/2 left of the body.
+            let node_left = 0.0;
+            let r = pin_hit_rect(node_left - PIN_MARGIN - PIN_DOT * 0.5, y0, y1, hit, PIN_DOT);
+            assert!(
+                r.right() <= node_left + 0.001,
+                "scale {scale}: hit rect reaches {} into the node body",
+                r.right() - node_left
+            );
+            assert!(
+                r.height() <= PIN_ROW + 0.001,
+                "scale {scale}: hit rect is {} tall against a {PIN_ROW} row — adjacent pins overlap",
+                r.height()
+            );
+            assert!(r.width() >= PIN_DOT, "scale {scale}: target narrower than the dot");
+        }
+        // Below the cap the target is constant on screen, which a fixed pin_size cannot be.
+        assert!((pin_hit(1.5) * 1.5 - PIN_TOUCH).abs() < 0.01);
+        assert!(pin_hit(0.3) > PIN_DOT, "zoomed out, the target must beat the bare dot");
     }
 
     #[test]
