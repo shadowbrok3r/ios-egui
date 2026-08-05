@@ -1,0 +1,37 @@
+//! Tiny geometry helpers for the sample project.
+
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Point {
+    pub fn new(x: f64, y: f64) -> Self {
+        Point { x, y }
+    }
+
+    pub fn dist(&self, other: &Point) -> f64 {
+        ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt()
+    }
+}
+
+pub fn largest<T: PartialOrd + Copy>(items: &[T]) -> Option<T> {
+    let mut best = *items.first()?;
+    for &it in &items[1..] {
+        if it > best {
+            best = it;
+        }
+    }
+    Some(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dist_works() {
+        let d = Point::new(0.0, 0.0).dist(&Point::new(3.0, 4.0));
+        assert!((d - 5.0).abs() < 1e-9);
+    }
+}

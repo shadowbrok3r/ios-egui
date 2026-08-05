@@ -1,0 +1,8 @@
+# notes
+
+rvim keeps these files in the plugin state store.
+
+- `:e <name>` opens or creates a file
+- `Space f f` (or Ctrl+p) fuzzy-finds across the project
+- `:help` shows the full cheatsheet
+- markdown gets no rust highlighting, as it should
