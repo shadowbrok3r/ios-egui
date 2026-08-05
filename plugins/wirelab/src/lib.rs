@@ -299,33 +299,7 @@ impl PluginApp for App {
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
         theme::bar().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (tab, label) in [
-                    (Tab::Board, "⚡ Board"),
-                    (Tab::Canvas, "🗺 Canvas"),
-                    (Tab::Flow, "⛓ Flow"),
-                    (Tab::Script, "📜 Script"),
-                    (Tab::Rules, "🛠 Rules"),
-                ] {
-                    if theme::selectable_label(ui, self.tab == tab, label).clicked() {
-                        self.tab = tab;
-                        self.saved.tab = tab;
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("?", |ui| {
-                        theme::menu_row_style(ui);
-                        if ui.button("Script reference").clicked() {
-                            self.docs.open = Some(docs::DocKind::Script);
-                            ui.close();
-                        }
-                        if ui.button("Wiring guide").clicked() {
-                            self.docs.open = Some(docs::DocKind::Wiring);
-                            ui.close();
-                        }
-                    });
-                });
-            });
+            self.top_row(ui, &ops, now);
         });
         self.docs.show(ui.ctx());
         ui.add_space(4.0);
@@ -409,6 +383,58 @@ impl PluginApp for App {
 }
 
 impl App {
+    /// The whole top row: every tab and both doc pages in one menu, the project menu, and the
+    /// checks chip pinned right in width reserved before the menus lay out.
+    fn top_row(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) {
+        const TABS: [(Tab, &str); 5] = [
+            (Tab::Board, "⚡ Board"),
+            (Tab::Canvas, "🗺 Canvas"),
+            (Tab::Flow, "⛓ Flow"),
+            (Tab::Script, "📜 Script"),
+            (Tab::Rules, "🛠 Rules"),
+        ];
+        let current = TABS.iter().find(|(t, _)| *t == self.tab).map_or("Menu", |(_, l)| *l);
+        // The project menu and its checks only mean anything on the project tabs.
+        let on_project = self.tab != Tab::Board;
+        ui.horizontal(|ui| {
+            // Resolved once: the menu below can change project or board, and a chip measured
+            // before that but drawn after would paint into the wrong reservation.
+            let chip = if on_project { self.project.checks_label() } else { None };
+            let edge = theme::reserve_trailing(ui, view::ProjectView::checks_width(ui, chip.as_ref()));
+            ui.scope(|ui| {
+                // A long project name shortens instead of pushing the row wider.
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                theme::menu_button(ui, current, |ui| {
+                    for (tab, label) in TABS {
+                        if theme::selectable_label(ui, self.tab == tab, label).clicked() {
+                            self.tab = tab;
+                            self.saved.tab = tab;
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("📜 Script reference").clicked() {
+                        self.docs.open = Some(docs::DocKind::Script);
+                        ui.close();
+                    }
+                    if ui.button("🗺 Wiring guide").clicked() {
+                        self.docs.open = Some(docs::DocKind::Wiring);
+                        ui.close();
+                    }
+                });
+                if on_project {
+                    self.project.project_menu(ui, ops, now);
+                }
+            });
+            theme::end_trailing(ui, edge);
+            if on_project {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.project.checks_chip(ui, chip);
+                });
+            }
+        });
+    }
+
     fn connect_panel(&mut self, ui: &mut egui::Ui, ops: &dyn Ops) {
         ui.heading("WireLab boards");
         ui.add_space(4.0);

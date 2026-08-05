@@ -21,6 +21,9 @@ use wirelab_flow_ui::{FlowView, FlowViewer, ViewerOptions, build_snarl};
 use crate::link::Ops;
 use crate::theme;
 
+/// Closest the circuit canvas's dot grid is allowed to get on screen, in points.
+const GRID_MIN_PX: f32 = 20.0;
+
 /// Everything derivable from one board's snapshot: the reconstructed library,
 /// its netlist/bindings, and the static lints. Rebuilt when a snapshot lands
 /// or the board selection moves.
@@ -909,23 +912,35 @@ impl ProjectView {
         self.snapshot.as_ref()?.boards.get(self.selected_board)
     }
 
-    /// Checks chip for the canvas toolbar plus the overlay it opens: the
-    /// desktop Checks panel (binding warnings + static lints), tap a row to
-    /// select the first involved component.
-    fn checks_ui(&mut self, ui: &mut egui::Ui) {
-        let Some((mut err, warn, info)) = self.model().map(|m| m.problem_counts()) else { return };
+    /// Text and colour of the checks chip, or `None` when there is nothing to check.
+    pub fn checks_label(&mut self) -> Option<(String, egui::Color32)> {
+        let (mut err, warn, _info) = self.model().map(|m| m.problem_counts())?;
         err += self.live_warnings.len();
-        let (label, color) = if err > 0 {
+        Some(if err > 0 {
             (format!("✖ {err}"), theme::PINK)
         } else if warn > 0 {
             (format!("⚠ {warn}"), theme::AQUA_BRIGHT)
         } else {
             ("✔ checks".to_string(), theme::AQUA)
-        };
+        })
+    }
+
+    /// Width the checks chip will take, for a row that reserves its space up front.
+    /// Width the chip needs, measured from the same label the row will draw.
+    pub fn checks_width(ui: &egui::Ui, chip: Option<&(String, egui::Color32)>) -> f32 {
+        let Some((label, _)) = chip else { return 0.0 };
+        let font = egui::TextStyle::Small.resolve(ui.style());
+        let text = ui.painter().layout_no_wrap(label.clone(), font, egui::Color32::PLACEHOLDER);
+        text.size().x + ui.spacing().button_padding.x * 2.0 + 2.0
+    }
+
+    /// Checks chip plus the overlay it opens: the desktop Checks panel (binding
+    /// warnings + static lints), tap a row to select the first involved component.
+    pub fn checks_chip(&mut self, ui: &mut egui::Ui, chip: Option<(String, egui::Color32)>) {
+        let Some((label, color)) = chip else { return };
         if ui.button(egui::RichText::new(label).color(color).small()).clicked() {
             self.checks_open = !self.checks_open;
         }
-        let _ = info;
         if !self.checks_open {
             return;
         }
@@ -1177,163 +1192,163 @@ impl ProjectView {
         }
     }
 
-    /// Project picker + board chips; returns whether a project is showing.
-    pub fn header(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) -> bool {
+    /// Project menu: pick or edit a project, pick a board, and reach the desktop connection
+    /// controls (address, Fetch, live, discovered desktops). One button in the caller's row.
+    pub fn project_menu(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) {
         self.ensure_lib(ops);
         let local = self.is_local();
-        let title = match &self.snapshot {
+        let target = self.desktop_target();
+        let sending = self.push.is_some();
+        let boards: Vec<String> = self
+            .snapshot
+            .as_ref()
+            .map(|s| s.boards.iter().map(|b| b.name.clone()).collect())
+            .unwrap_or_default();
+        let found: Vec<(String, String)> =
+            self.desktop_scan.desktops().map(|d| (d.addr.clone(), d.name.clone())).collect();
+        let mut title = match &self.snapshot {
             Some(s) if local => format!("📁 {}", s.name),
             Some(s) => format!("🖥 {}", s.name),
             None => "📁 no project".to_string(),
         };
+        if boards.len() > 1
+            && let Some(b) = boards.get(self.selected_board)
+        {
+            title = format!("{title} • {b}");
+        }
         let mut open: Option<String> = None;
         let mut to_desktop = false;
         let mut add_board = false;
         let mut send: Option<String> = None;
-        let target = self.desktop_target();
-        let sending = self.push.is_some();
-        ui.horizontal_wrapped(|ui| {
-            ui.menu_button(title, |ui| {
-                theme::menu_row_style(ui);
-                if ui.button("New project…").clicked() {
-                    self.dialog = Dialog::New;
-                    self.dialog_name = format!("Project {}", self.store.projects.len() + 1);
-                    self.dialog_board =
-                        self.lib.boards.keys().next().cloned().unwrap_or_default();
+        let mut fetch = false;
+        let mut select = self.selected_board;
+        theme::menu_button(ui, title, |ui| {
+            if ui.button("New project…").clicked() {
+                self.dialog = Dialog::New;
+                self.dialog_name = format!("Project {}", self.store.projects.len() + 1);
+                self.dialog_board = self.lib.boards.keys().next().cloned().unwrap_or_default();
+                ui.close();
+            }
+            if local {
+                if ui.button("Rename…").clicked() {
+                    self.dialog = Dialog::Rename;
+                    self.dialog_name =
+                        self.snapshot.as_ref().map(|s| s.name.clone()).unwrap_or_default();
                     ui.close();
                 }
-                if local {
-                    if ui.button("Rename…").clicked() {
-                        self.dialog = Dialog::Rename;
-                        self.dialog_name =
-                            self.snapshot.as_ref().map(|s| s.name.clone()).unwrap_or_default();
+                if ui.button("🗑 Delete…").clicked() {
+                    self.dialog = Dialog::Delete;
+                    ui.close();
+                }
+                if ui.button("Add board").clicked() {
+                    add_board = true;
+                    ui.close();
+                }
+                // Only with a desktop to send to; it lands there for confirmation.
+                if let Some(addr) = &target {
+                    let row = egui::Button::new("🖥 Send to desktop…");
+                    if ui.add_enabled(!sending, row).clicked() {
+                        send = Some(addr.clone());
                         ui.close();
-                    }
-                    if ui.button("🗑 Delete…").clicked() {
-                        self.dialog = Dialog::Delete;
-                        ui.close();
-                    }
-                    if ui.button("Add board").clicked() {
-                        add_board = true;
-                        ui.close();
-                    }
-                    // Only with a desktop to send to; it lands there for confirmation.
-                    if let Some(addr) = &target {
-                        let row = egui::Button::new("🖥 Send to desktop…");
-                        if ui.add_enabled(!sending, row).clicked() {
-                            send = Some(addr.clone());
-                            ui.close();
-                        }
                     }
                 }
-                let listing = self.store.listing();
-                if !listing.is_empty() {
-                    ui.separator();
-                    for (id, name) in listing {
-                        let sel = self.source == Source::Local(id.clone());
-                        if ui.selectable_label(sel, format!("📁 {name}")).clicked() {
-                            open = Some(id);
-                            ui.close();
-                        }
-                    }
-                }
+            }
+            if boards.len() > 1 {
                 ui.separator();
-                if ui.selectable_label(!local, "🖥 Desktop project").clicked() {
-                    to_desktop = true;
-                    ui.close();
+                for (i, b) in boards.iter().enumerate() {
+                    if ui.selectable_label(i == select, b).clicked() {
+                        select = i;
+                        ui.close();
+                    }
                 }
-            });
+            }
+            let listing = self.store.listing();
+            if !listing.is_empty() {
+                ui.separator();
+                for (id, name) in listing {
+                    let sel = self.source == Source::Local(id.clone());
+                    if ui.selectable_label(sel, format!("📁 {name}")).clicked() {
+                        open = Some(id);
+                        ui.close();
+                    }
+                }
+            }
+            ui.separator();
+            if ui.selectable_label(!local, "🖥 Desktop project").clicked() {
+                to_desktop = true;
+                ui.close();
+            }
             if !local {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.desktop_addr)
                         .hint_text("192.168.1.x (WireLab app)")
-                        .desired_width(140.0),
+                        .desired_width(200.0),
                 );
-                if ui.button("Fetch").clicked() {
-                    self.start_fetch(ops, now);
+                // No ui.close(): the spinner and the discovered list stay up during a fetch.
+                ui.horizontal(|ui| {
+                    fetch |= ui.button("Fetch").clicked();
+                    if matches!(self.fetch, Fetch::Pending(_)) {
+                        ui.spinner();
+                    }
+                    ui.checkbox(&mut self.auto_refresh, egui::RichText::new("live").small());
+                });
+                for (addr, name) in &found {
+                    if ui.button(format!("🖥 {name}")).clicked() {
+                        self.desktop_addr = addr.clone();
+                        fetch = true;
+                    }
                 }
-                if matches!(self.fetch, Fetch::Pending(_)) {
-                    ui.spinner();
-                }
-                ui.checkbox(&mut self.auto_refresh, egui::RichText::new("live").small());
             }
         });
-        // The one status line for every project tab: sends, auto-wire, wiring refusals.
-        match &self.notice {
-            Some((msg, at)) if now - at < 3.5 => {
-                ui.label(egui::RichText::new(msg).small().color(theme::AQUA_BRIGHT));
-            }
-            _ => self.notice = None,
-        }
         if let Some(addr) = send {
             self.send_to_desktop(ops, now, addr);
         }
-        self.project_dialogs(ui, ops, now);
         if add_board {
             self.add_local_board();
+        }
+        if fetch {
+            self.start_fetch(ops, now);
+        }
+        if select != self.selected_board {
+            self.selected_board = select;
+            if local {
+                self.touch_local();
+            }
         }
         if let Some(id) = open {
             self.open_local(ops, now, &id);
         } else if to_desktop && local {
             self.close_local(ops, now);
         }
-        if self.is_local() {
-            return self.board_chips(ui);
+    }
+
+    /// Status lines under the top row plus the project modals; returns whether a project is
+    /// showing.
+    pub fn header(&mut self, ui: &mut egui::Ui, ops: &dyn Ops, now: f64) -> bool {
+        // Exactly one status line for every project tab, so the chrome stays within two rows:
+        // sends, auto-wire and wiring refusals outrank a sticky fetch error.
+        if matches!(&self.notice, Some((_, at)) if now - at >= 3.5) {
+            self.notice = None;
         }
-        if let Fetch::Failed(e) = &self.fetch {
-            ui.label(
-                egui::RichText::new(e).small().color(theme::PINK),
-            );
+        let status = match (&self.notice, &self.fetch) {
+            (Some((msg, _)), _) => Some((msg.clone(), theme::AQUA_BRIGHT)),
+            (None, Fetch::Failed(e)) if !self.is_local() => Some((e.clone(), theme::PINK)),
+            _ => None,
+        };
+        if let Some((msg, color)) = status {
+            ui.label(egui::RichText::new(msg).small().color(color));
         }
-        // Auto-discovered desktops — tap to connect.
-        let found: Vec<(String, String)> =
-            self.desktop_scan.desktops().map(|d| (d.addr.clone(), d.name.clone())).collect();
-        if !found.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("found:").small().weak());
-                for (addr, name) in &found {
-                    if ui.button(egui::RichText::new(format!("🖥 {name}")).small()).clicked() {
-                        self.desktop_addr = addr.clone();
-                        self.start_fetch(ops, now);
-                    }
-                }
-            });
-        }
-        if self.snapshot.is_none() {
+        self.project_dialogs(ui, ops, now);
+        if self.snapshot.is_none() && !matches!(self.fetch, Fetch::Failed(_)) {
             ui.add_space(6.0);
             ui.label(
-                egui::RichText::new(if found.is_empty() {
-                    "start a project here with New project, or open WireLab on your \
-                     Mac/PC and it will appear above automatically"
-                } else {
-                    "tap a discovered desktop above, or start a project here with \
-                     New project"
-                })
+                egui::RichText::new(
+                    "open the project menu above to start a project here, or to reach a \
+                     WireLab desktop on your network",
+                )
                 .weak(),
             );
             return false;
-        }
-        self.board_chips(ui)
-    }
-
-    /// Project name + one chip per board; always true (a project is showing).
-    fn board_chips(&mut self, ui: &mut egui::Ui) -> bool {
-        let Some(snap) = &self.snapshot else { return false };
-        let mut select = self.selected_board;
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(&snap.name).strong());
-            ui.separator();
-            for (i, b) in snap.boards.iter().enumerate() {
-                if ui.selectable_label(self.selected_board == i, &b.name).clicked() {
-                    select = i;
-                }
-            }
-        });
-        if select != self.selected_board {
-            self.selected_board = select;
-            if self.is_local() {
-                self.touch_local();
-            }
         }
         true
     }
@@ -1521,19 +1536,18 @@ impl ProjectView {
                 None => "add part".to_string(),
             };
             let mut chosen = None;
-            ui.menu_button(btn_text, |ui| {
-                theme::scroll_vertical().max_height(320.0).show(ui, |ui| {
-                    for (cat, parts) in &cats {
-                        ui.menu_button(cat, |ui| {
-                            for (id, name) in parts {
-                                if ui.button(name).clicked() {
-                                    chosen = Some(id.clone());
-                                    ui.close();
-                                }
+            theme::menu_button(ui, btn_text, |ui| {
+                // Submenus inherit the root's close behavior from the ui stack.
+                for (cat, parts) in &cats {
+                    ui.menu_button(cat, |ui| {
+                        for (id, name) in parts {
+                            if ui.button(name).clicked() {
+                                chosen = Some(id.clone());
+                                ui.close();
                             }
-                        });
-                    }
-                });
+                        }
+                    });
+                }
             });
             if let Some(c) = chosen {
                 self.armed_def = Some(c);
@@ -1585,7 +1599,6 @@ impl ProjectView {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                self.checks_ui(ui);
                 // Only the mid-gesture states: the idle sentence overflowed the row and ran
                 // under the buttons (right_to_left never wraps and inherits the parent clip).
                 let hint = if self.armed_def.is_some() {
@@ -1715,9 +1728,18 @@ impl ProjectView {
                     + egui::vec2((w[0] - min[0] - pan[0]) * scale, (w[1] - min[1] - pan[1]) * scale)
             };
 
-            // Dot grid (5 mm), anchored in world space so it pans with the view.
-            let step = 5.0 * scale;
-            if step > 7.0 {
+            // Dot grid (5 mm), anchored in world space so it pans with the view. Coarsened by
+            // powers of two so on-screen density — and the dot count — stays bounded at every
+            // zoom instead of spiking just before the grid cuts out.
+            let mut mm = 5.0;
+            while mm * scale < GRID_MIN_PX && mm < 5_000.0 {
+                mm *= 2.0;
+            }
+            let step = mm * scale;
+            let cols = (rect.width() / step).ceil();
+            let rows = (rect.height() / step).ceil();
+            // Backstop against a degenerate scale.
+            if step > 0.5 && cols * rows <= 8_000.0 {
                 let dot = crate::flowstyle::DOT_COLOR;
                 let phase = to_px([0.0, 0.0]) - rect.min;
                 let mut x = rect.min.x + phase.x.rem_euclid(step);
@@ -2765,19 +2787,16 @@ impl ProjectView {
             }
             if let Some(snips) = &snips {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.menu_button("+ insert", |ui| {
-                        theme::menu_row_style(ui);
-                        theme::scroll_vertical().max_height(320.0).show(ui, |ui| {
-                            for s in snips {
-                                if ui.button(s.title).clicked() {
-                                    insert = Some(s.code);
-                                    ui.close();
-                                }
-                                // Touch has no hover: the blurb rides below.
-                                ui.label(egui::RichText::new(s.blurb).small().weak());
-                                ui.add_space(2.0);
+                    theme::menu_button(ui, "+ insert", |ui| {
+                        for s in snips {
+                            if ui.button(s.title).clicked() {
+                                insert = Some(s.code);
+                                ui.close();
                             }
-                        });
+                            // Touch has no hover: the blurb rides below.
+                            ui.label(egui::RichText::new(s.blurb).small().weak());
+                            ui.add_space(2.0);
+                        }
                     });
                 });
             }

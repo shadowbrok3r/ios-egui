@@ -192,15 +192,16 @@ pub fn selectable<'a>(selected: bool, atoms: impl egui::IntoAtoms<'a>) -> egui::
     egui::Button::selectable(selected, atoms).frame_when_inactive(true)
 }
 
-/// [`egui::Ui::selectable_label`] with a persistent frame plus a neon pink rim when selected —
-/// egui's `interact_selectable` leaves `bg_stroke` off for the selected state, so the pink edge a
-/// pressed button would show is painted here on top of the selection fill.
+/// [`egui::Ui::selectable_label`] at a fixed size, with a persistent frame plus a neon pink rim
+/// when selected — egui's `interact_selectable` leaves `bg_stroke` off for the selected state, so
+/// the pink edge a pressed button would show is painted here on top of the selection fill.
 pub fn selectable_label<'a>(
     ui: &mut egui::Ui,
     selected: bool,
+    size: impl Into<egui::Vec2>,
     text: impl egui::IntoAtoms<'a>,
 ) -> egui::Response {
-    let resp = ui.add(selectable(selected, text));
+    let resp = ui.add_sized(size, selectable(selected, text));
     if selected {
         ui.painter().rect_stroke(
             resp.rect,
@@ -224,4 +225,9 @@ pub fn status_dot(ui: &mut egui::Ui, color: Color32) {
 /// Vertical scroll area; scrollbar only when content overflows.
 pub fn scroll_vertical() -> egui::ScrollArea {
     egui::ScrollArea::vertical().scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
+}
+
+/// Horizontal scroll for the nav strip; no bar, since one under the tabs would eat tap height.
+pub fn scroll_horizontal() -> egui::ScrollArea {
+    egui::ScrollArea::horizontal().scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
 }

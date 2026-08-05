@@ -281,6 +281,8 @@ pub fn selectable_value<'a, Value: PartialEq>(
 
 /// Tap height for a menu row.
 pub const MENU_ROW_H: f32 = 40.0;
+/// Tallest a menu body grows before it scrolls instead of running off the screen.
+pub const MENU_MAX_H: f32 = 320.0;
 
 /// Give a menu's rows a framed, touch-sized look: egui's `menu_style` strips the rest-state fill
 /// and every accent rim and squashes `button_padding` to 2x0, so an entry otherwise reads as bare
@@ -291,6 +293,43 @@ pub fn menu_row_style(ui: &mut egui::Ui) {
     s.spacing.interact_size.y = MENU_ROW_H;
     s.spacing.item_spacing.y = 4.0;
     widget_palette(&mut s.visuals.widgets);
+}
+
+/// Takes `width` plus one gap off the trailing edge of a row; returns the row's right edge for
+/// [`end_trailing`]. A `right_to_left` child never wraps and inherits the parent clip rect, so an
+/// unbudgeted trailing widget runs leftward under the leading content.
+pub fn reserve_trailing(ui: &mut egui::Ui, width: f32) -> f32 {
+    let row = ui.max_rect();
+    let reserved = if width > 0.0 { width + ui.spacing().item_spacing.x } else { 0.0 };
+    ui.set_max_width((row.width() - reserved).max(0.0));
+    row.max.x
+}
+
+/// Restores the row's right edge after [`reserve_trailing`]; `set_max_width` measures from the
+/// cursor, not from the row start.
+pub fn end_trailing(ui: &mut egui::Ui, right_edge: f32) {
+    let cursor = ui.available_rect_before_wrap().min.x;
+    ui.set_max_width((right_edge - cursor).max(0.0));
+}
+
+/// Menu button whose popup closes only on a click outside it or an explicit `ui.close()`, and
+/// whose rows get [`menu_row_style`]. egui's `CloseOnClick` default closes a menu on any click
+/// inside it — padding, scrollbar, a submenu row, or a drag-scroll short enough to read as a tap.
+pub fn menu_button<'a, R>(
+    ui: &mut egui::Ui,
+    atoms: impl egui::IntoAtoms<'a>,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> Option<R> {
+    use egui::containers::menu::{MenuButton, MenuConfig};
+    let (_, inner) = MenuButton::new(atoms)
+        .config(MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+        .ui(ui, |ui| {
+            menu_row_style(ui);
+            // A popup is an Area: `constrain` moves it but cannot shrink it, so an uncapped body
+            // is clipped off the bottom of the screen rather than scrolled.
+            scroll_vertical().max_height(MENU_MAX_H).show(ui, content).inner
+        });
+    inner.map(|r| r.inner)
 }
 
 /// Vertical scroll area; scrollbar only when content overflows.
@@ -352,6 +391,53 @@ mod tests {
         // The two interaction accents keep their own hues — violet must not have eaten them.
         assert_eq!(v.error_fg_color, PINK);
         assert_eq!(v.hyperlink_color, AQUA);
+    }
+
+    /// A trailing widget in a phone-width row: reserving its width first is the only thing that
+    /// keeps it out from under the leading buttons, which is how the checks chip used to get cut
+    /// off on the right.
+    #[test]
+    fn a_reserved_trailing_widget_stays_clear_of_the_leading_row() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let chip_w = 80.0;
+        let lead = std::cell::Cell::new(egui::Rect::NOTHING);
+        let chip = std::cell::Cell::new(egui::Rect::NOTHING);
+        let row = std::cell::Cell::new(egui::Rect::NOTHING);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            ui.horizontal(|ui| {
+                row.set(ui.max_rect());
+                let edge = reserve_trailing(ui, chip_w);
+                ui.scope(|ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    lead.set(ui.button("🗺 Canvas").rect);
+                    lead.set(lead.get() | ui.button("📁 a project with a very long name").rect);
+                });
+                end_trailing(ui, edge);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    chip.set(ui.add_sized([chip_w, 30.0], egui::Button::new("✔ checks")).rect);
+                });
+            });
+        });
+        assert!(
+            chip.get().max.x <= row.get().max.x + 0.5,
+            "chip {:?} overflows the row {:?}",
+            chip.get(),
+            row.get()
+        );
+        assert!(
+            chip.get().min.x >= lead.get().max.x,
+            "chip {:?} runs under the leading buttons {:?}",
+            chip.get(),
+            lead.get()
+        );
     }
 
     /// Mastertech's 18px rows and 4x1 button padding are desktop density; every one of them has to
