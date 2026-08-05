@@ -366,8 +366,8 @@ impl EguiApp for PrivaxyApp {
     }
 
     fn update(&mut self, ui: &mut egui::Ui, host: &Host) {
-        // Android never calls `EguiApp::theme` — egui-android has no `.theme(..)` call — so the
-        // palette is installed here instead, and the backdrop painted under every panel.
+        // Redundant since egui-android's `run_with` started calling `EguiApp::theme` before the
+        // first frame; kept because it is idempotent and the backdrop below has to run per frame.
         ui::apply_theme(ui.ctx());
         ui::paint_backdrop(ui.ctx());
         // Before anything paints into the chrome rects — the grab-pass blurs whatever is already

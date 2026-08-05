@@ -23240,7 +23240,8 @@ impl EguiApp for ComfyApp {
         }
         if !self.loaded {
             self.loaded = true;
-            // The framework never calls EguiApp::theme, so apply the color scheme here.
+            // Redundant since egui-android's `run_with` started calling EguiApp::theme before the
+            // first frame; harmless, and it keeps the scheme if that call is ever reordered.
             crate::theme::apply(ui.ctx());
             // Touch double-taps are slower and less precise than a mouse; widen egui's window.
             // `max_click_dist` is doing double duty in egui: how far the finger may travel DURING a

@@ -325,8 +325,10 @@ pub mod rt {
                 textures_free,
                 platform: WirePlatform {
                     repaint_delay_secs,
-                    wants_keyboard: ctx.egui_wants_keyboard_input()
-                        || WANT_KEYBOARD.with(|c| c.get()),
+                    // Text-edit focus only. `egui_wants_keyboard_input` is any focused widget, so a
+                    // widget holding focus to receive keys raised the keyboard on plain taps;
+                    // custom text UIs opt in through `HostHandle::request_keyboard`.
+                    wants_keyboard: ctx.text_edit_focused() || WANT_KEYBOARD.with(|c| c.get()),
                     wants_pointer: ctx.egui_wants_pointer_input(),
                     cursor_icon: Some(full.platform_output.cursor_icon),
                     open_url,

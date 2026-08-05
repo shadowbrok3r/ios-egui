@@ -116,12 +116,14 @@ impl PluginManagerUi {
         let mut reload: Option<usize> = None;
         for (i, plugin) in manager.plugins.iter_mut().enumerate() {
             ui.horizontal(|ui| {
-                let (dot, color) = match (&plugin.status, plugin.enabled) {
-                    (PluginStatus::Errored(_), _) => ("*", egui::Color32::RED),
-                    (_, false) => ("*", egui::Color32::GRAY),
-                    (PluginStatus::Ready, true) => ("*", egui::Color32::GREEN),
+                // Colours come from the visuals so the dot follows whatever theme the host applied.
+                // `•` (U+2022) rather than an icon glyph: egui's default fonts cover it everywhere.
+                let color = match (&plugin.status, plugin.enabled) {
+                    (PluginStatus::Errored(_), _) => ui.visuals().error_fg_color,
+                    (_, false) => ui.visuals().weak_text_color(),
+                    (PluginStatus::Ready, true) => ui.visuals().hyperlink_color,
                 };
-                ui.colored_label(color, dot);
+                ui.colored_label(color, "•");
                 let label = format!("{} v{}", plugin.manifest.name, plugin.manifest.version);
                 if ui
                     .selectable_label(self.selected == Some(i), label)
@@ -130,7 +132,8 @@ impl PluginManagerUi {
                     self.selected = if self.selected == Some(i) { None } else { Some(i) };
                 }
                 ui.checkbox(&mut plugin.enabled, "");
-                if ui.small_button("⟳").on_hover_text("Hot reload from disk").clicked() {
+                // ASCII: no host loads a font covering U+27F3, so the glyph rendered as tofu.
+                if ui.small_button("Reload").on_hover_text("Hot reload from disk").clicked() {
                     reload = Some(i);
                 }
             });

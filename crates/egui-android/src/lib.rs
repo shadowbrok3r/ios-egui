@@ -174,6 +174,10 @@ impl eframe::App for Adapter {
             self.app.update(ui, &self.host);
         });
         let focused = ui.ctx().memory(|m| m.focused());
+        // Text-edit focus only: plugin viewports focus on any press to route keys to the guest, and
+        // any-widget focus would raise the soft keyboard for plain taps. Plugins that draw their own
+        // text (the terminal) ask via `Host::request_keyboard` -> `guest_kb`.
+        let text_focus = is_text_edit(ui.ctx(), focused);
         let prev_focus = self.last_focus;
         if let Some(id) = focused {
             self.last_focus = Some(id);
@@ -229,9 +233,9 @@ impl eframe::App for Adapter {
                 should_interrupt_composition: false,
             });
         } else if hold
-            || focused.is_some()
+            || text_focus
             || guest_kb
-            || (self.ime_bridge_hot && self.last_focus.is_some() && !allow_blur)
+            || (self.ime_bridge_hot && is_text_edit(ui.ctx(), self.last_focus) && !allow_blur)
         {
             if let Some(ime) = self.last_ime {
                 ui.ctx().output_mut(|o| {
@@ -241,7 +245,7 @@ impl eframe::App for Adapter {
         }
         let ime_wanted = ui.ctx().output(|o| o.ime.is_some());
         // Do not key want_ime off ime_bridge_hot alone — that can never go false and traps the keyboard.
-        let want_ime = hold || ime_wanted || focused.is_some() || guest_kb;
+        let want_ime = hold || ime_wanted || text_focus || guest_kb;
         if want_ime {
             self.ime_hide_arm = 0;
             let kb = self.host.keyboard_height();
@@ -318,7 +322,7 @@ impl eframe::App for Adapter {
                 self.ime_synced_focus = self.last_focus;
                 self.ime_force_sync = false;
                 self.ime_seed_restart = false;
-            } else if self.ime_bridge_hot && self.last_focus.is_some() {
+            } else if self.ime_bridge_hot && is_text_edit(ui.ctx(), self.last_focus) {
                 self.ime_force_sync = true;
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             } else {
@@ -359,7 +363,7 @@ impl eframe::App for Adapter {
         if let Some(text) = copied {
             self.host.copy_text(text);
         }
-        self.text_actions_bar(ui, full_rect, focused.is_some());
+        self.text_actions_bar(ui, full_rect, text_focus);
         // Clear bar_touch only after the bar has handled this frame's release/click.
         if self.bar_touch && ui.ctx().input(|i| !i.pointer.any_down()) {
             self.bar_touch = false;
@@ -393,6 +397,11 @@ impl eframe::App for Adapter {
             self.ime_inset_pt = inset;
         }
     }
+}
+
+/// Whether `id` is a `TextEdit`, as opposed to a widget holding focus for key routing only.
+fn is_text_edit(ctx: &egui::Context, id: Option<egui::Id>) -> bool {
+    id.is_some_and(|id| egui::text_edit::TextEditState::load(ctx, id).is_some())
 }
 
 impl Adapter {
@@ -611,6 +620,11 @@ pub fn run_with(
                 pixels_per_point: cc.egui_ctx.pixels_per_point(),
             };
             let app = factory(&cx);
+            // Before the first frame, like the iOS runtime does in `__ffi`. Without this the trait
+            // method silently did nothing on Android and every app's palette fell back to egui's
+            // default — comfyui and privaxy each carry a workaround calling their own `apply` from
+            // `update`, which costs a frame of unstyled UI and only fixed those two.
+            app.theme(&cc.egui_ctx);
             Ok(Box::new(Adapter {
                 app,
                 host: Host::new(),

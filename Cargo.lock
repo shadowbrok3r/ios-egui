@@ -5282,7 +5282,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "plugins_android"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "egui",
  "egui-android",
@@ -6834,10 +6834,12 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "surveyor_android"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
+ "backdrop-blur-egui",
  "egui",
  "egui-mobile",
+ "log",
  "minreq",
  "serde",
  "serde_json",
