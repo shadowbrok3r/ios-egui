@@ -1,6 +1,6 @@
 [package]
 name = "surveyor_android"
-version = "0.1.5"
+version = "0.1.7"
 edition = "2024"
 publish = false
 
@@ -9,7 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
-egui = "0.35"
+egui = "0.36"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Plain-HTTP LAN client to the RuView sensing server; no TLS on purpose.

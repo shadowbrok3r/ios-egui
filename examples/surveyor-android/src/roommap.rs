@@ -10,7 +10,9 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 use crate::config::AppConfig;
 use crate::proto::LocEstimate;
 
-pub const TRAIL_LEN: usize = 90;
+// ~2.7 s of afterglow at the radar's 11 Hz. At 90 the streak ran 8 s behind a
+// walker and read as render lag, though the head dot was always current.
+pub const TRAIL_LEN: usize = 30;
 
 // Canvas bed + instrument colors; accents come from the app theme.
 // SWEEP = hot pink, TARGET = aqua, CSI = electric violet.

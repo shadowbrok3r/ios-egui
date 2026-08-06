@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.7 — 2026-08-06
+
+Shortens the radar afterglow from 8 seconds to under 3. The live dot was
+always current, but an 8-second streak trailing behind a walker read as the
+map lagging. Measured for comparison: the server-to-app path adds 0.6 ms.
+
+## v0.1.6 — 2026-08-05
+
+egui 0.36: collapsed bottom bars no longer leave an invisible drag strip at the screen edge, and password fields now tell the keyboard not to learn them
+
 ## 0.1.5 — 2026-08-04
 
 Finishes the galactic recolor: the frost tint behind the nav bar is violet
