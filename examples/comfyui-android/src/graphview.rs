@@ -943,8 +943,12 @@ impl GraphView {
                     egui::StrokeKind::Inside,
                 );
 
+                // egui 0.36 reports a drag as soon as the finger leaves the minimap, and the
+                // pointer is then outside `rect` — centring on it would jump to a wild graph
+                // coordinate. Only points still over the minimap select a view centre.
                 if (resp.clicked() || resp.dragged())
                     && let Some(pointer) = resp.interact_pointer_pos()
+                    && rect.contains(pointer)
                 {
                     self.cmd = Some(ViewCmd::Center(tf.inverse() * pointer));
                 }
@@ -2954,7 +2958,8 @@ mod tests {
                     ..Default::default()
                 };
                 let mut tapped = None;
-                let _ = ctx.run_ui(input, |ctx| {
+                // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+                ctx.run_ui(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         tapped = view.show(
                             ui,
@@ -2966,7 +2971,7 @@ mod tests {
                             &mut HashMap::new(),
                         );
                     });
-                });
+                }).textures_delta.clear();
                 for (id, pos, data) in graph.snarl.nodes_pos_ids() {
                     assert!(
                         pos.x.is_finite() && pos.y.is_finite(),
@@ -3727,7 +3732,8 @@ mod tests {
         let run = |view: &mut GraphView, graph: &mut ComfyUiNodeGraph, frames: usize| {
             for _ in 0..frames {
                 let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
-                let _ = ctx.run_ui(input, |ctx| {
+                // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+                ctx.run_ui(input, |ctx| {
                     egui::CentralPanel::default().show(ctx, |ui| {
                         let _ = view.show(
                             ui,
@@ -3739,7 +3745,7 @@ mod tests {
                             &mut HashMap::new(),
                         );
                     });
-                });
+                }).textures_delta.clear();
             }
         };
         let positions = |graph: &ComfyUiNodeGraph| -> Vec<(NodeId, egui::Pos2)> {
@@ -3949,12 +3955,13 @@ mod tests {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, screen);
         let frame = |view: &mut GraphView, graph: &mut ComfyUiNodeGraph| {
             let input = egui::RawInput { screen_rect: Some(rect), ..Default::default() };
-            let _ = ctx.run_ui(input, |ctx| {
+            // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+            ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     let _ =
                         view.show(ui, graph, None, None, &HashSet::new(), &[], &mut HashMap::new());
                 });
-            });
+            }).textures_delta.clear();
         };
 
         view.mark_needs_auto_arrange();

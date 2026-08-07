@@ -36,6 +36,10 @@ exclude = [
     # Its own workspace; consumed by path from privaxy-android.
     "patches/backdrop-blur",
     "patches/egui-json-tree",
+    # Repinned to egui 0.36; reach the graph through [patch.crates-io], not as members.
+    "patches/egui-snarl",
+    "patches/egui-scale",
+    "patches/rucomfyui-node-graph",
 ]
 # egui-android only builds for android targets (android-activity/eframe-android), so it is a
 # member (buildable via `cargo ndk -p egui-android`) but excluded from the default host build.
@@ -65,12 +69,19 @@ repository = "https://github.com/shadowbrok3r/egui-ios"
 # hides so the bridge owns keyboard dismiss.
 [patch.crates-io]
 android-activity = { path = "patches/android-activity" }
+# The comfyui graph editor's stack: all three still pin egui 0.35 upstream, and a second egui in
+# the graph makes their types incompatible with the app's.
+egui-snarl = { path = "patches/egui-snarl" }
+egui-scale = { path = "patches/egui-scale" }
+
+[patch."https://github.com/philpax/rucomfyui"]
+rucomfyui_node_graph = { path = "patches/rucomfyui-node-graph" }
 
 [workspace.dependencies]
-egui = "0.35"
-egui-wgpu = "0.35"
-eframe = "0.35"
-wgpu = "29"
+egui = "0.36"
+egui-wgpu = "0.36"
+eframe = "0.36"
+wgpu = "30"
 pollster = "1.0.1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"

@@ -1,0 +1,27 @@
+# Vendored rucomfyui_node_graph (philpax/rucomfyui @ 1c76e3e), repinned to egui 0.36.
+# Upstream still targets 0.35; `rucomfyui` itself has no egui dependency and stays on the git dep.
+
+[package]
+name = "rucomfyui_node_graph"
+description = "A recreation of the ComfyUI node graph in Rust using `egui` and `rucomfyui`."
+version = "1.1.1"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/philpax/rucomfyui"
+readme = "README.md"
+keywords = ["comfyui", "egui", "node-graph", "stable-diffusion"]
+categories = ["gui", "visualization"]
+
+[dependencies]
+egui = "0.36"
+egui-snarl = "0.11"
+
+# We don't need the typed nodes, so we are opting out of them
+rucomfyui = { git = "https://github.com/philpax/rucomfyui", version = "1.1.1", default-features = false }
+
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "egui-snarl/serde"]

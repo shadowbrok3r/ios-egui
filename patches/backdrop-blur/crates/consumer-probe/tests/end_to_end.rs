@@ -98,7 +98,7 @@ fn grab_pass_composites_a_real_egui_035_frame() {
 
     // egui 0.35: `Context::run` -> `Context::run_ui`, whose closure gets a `&mut Ui` (was `&Context`),
     // and `CentralPanel::show` takes that `&mut Ui` (was `&Context`).
-    let output = ctx.run_ui(raw, |ui| {
+    let mut output = ctx.run_ui(raw, |ui| {
         egui::CentralPanel::no_frame().show(ui, |ui| {
             consumer_probe::frame(&renderer, ui, surface_rect);
         });
@@ -108,7 +108,8 @@ fn grab_pass_composites_a_real_egui_035_frame() {
 
     // The painter must paint into OUR framebuffer, not the (nonexistent) default one.
     unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo)) };
-    painter.paint_and_update_textures([W, H], output.pixels_per_point, &prims, &output.textures_delta);
+    // egui_glow 0.36 drains the delta rather than reading it, so it takes &mut.
+    painter.paint_and_update_textures([W, H], output.pixels_per_point, &prims, &mut output.textures_delta);
 
     let outcome = poll(&renderer);
     assert_eq!(

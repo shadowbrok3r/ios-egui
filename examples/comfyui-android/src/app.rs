@@ -7350,7 +7350,12 @@ impl ComfyApp {
                     btn = btn.fill(fill);
                 }
                 let resp = ui.add(btn);
-                resp.dnd_set_drag_payload(ChipDrag { field: disc, idx: i });
+                // egui 0.36 also calls it a drag once the finger leaves the chip, which on a
+                // wrapped row is a few points — well inside the tuned tap wobble. Arm the payload
+                // only past max_click_dist, or a sloppy tap reorders the prompt.
+                if ui.input(|i| i.pointer.is_decidedly_dragging()) {
+                    resp.dnd_set_drag_payload(ChipDrag { field: disc, idx: i });
+                }
                 if let (Some(pointer), Some(held)) =
                     (ui.input(|i| i.pointer.interact_pos()), resp.dnd_hover_payload::<ChipDrag>())
                 {
@@ -15504,7 +15509,7 @@ impl ComfyApp {
 
         // Above the app nav bar (Create / Graph / Gallery / Settings).
         let mut panes_open = !self.kb_editing;
-        let bar = egui::Panel::bottom("create-panes").show_collapsible(ui, &mut panes_open, |ui| {
+        let bar = egui::Panel::bottom("create-panes").drag_to_open(false).show_collapsible(ui, &mut panes_open, |ui| {
             ui.add_space(2.0);
             self.create_pane_bar(ui);
             ui.add_space(2.0);
@@ -15735,12 +15740,10 @@ impl ComfyApp {
                     .add_enabled_ui(can_queue, |ui| crate::theme::fab(ui, &label, fill))
                     .inner
                     .on_hover_text(tip);
-                if resp.dragged() {
-                    let delta = resp.drag_delta();
-                    if delta != egui::Vec2::ZERO {
-                        pos += delta;
-                        self.queue_fab_pos = Some(pos);
-                    }
+                let delta = crate::theme::fab_drag_delta(ui, &resp);
+                if delta != egui::Vec2::ZERO {
+                    pos += delta;
+                    self.queue_fab_pos = Some(pos);
                 }
                 if resp.clicked() {
                     queue_clicked = true;
@@ -15939,12 +15942,10 @@ impl ComfyApp {
                 };
                 let label = if open { icons::CHECK } else { icons::MENU };
                 let resp = crate::theme::fab(ui, label, fill).on_hover_text("Actions — drag to move");
-                if resp.dragged() {
-                    let delta = resp.drag_delta();
-                    if delta != egui::Vec2::ZERO {
-                        pos += delta;
-                        self.create_fab_pos = Some(pos);
-                    }
+                let delta = crate::theme::fab_drag_delta(ui, &resp);
+                if delta != egui::Vec2::ZERO {
+                    pos += delta;
+                    self.create_fab_pos = Some(pos);
                 }
                 if resp.clicked() {
                     act = Some(FabAct::Toggle);
@@ -16084,7 +16085,7 @@ impl ComfyApp {
         // fullscreen while the bar is collapsed for an edit.
         let fs = self.graph_fullscreen;
         let mut controls_open = !self.kb_editing;
-        let bar = egui::Panel::bottom("graph-controls").show_collapsible(ui, &mut controls_open, |ui| {
+        let bar = egui::Panel::bottom("graph-controls").drag_to_open(false).show_collapsible(ui, &mut controls_open, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 self.graph_controls(ui, host);
@@ -19403,7 +19404,7 @@ impl ComfyApp {
         let editing_search =
             !self.select_mode && ui.ctx().memory(|m| m.focused()) == Some(Self::gallery_search_id());
         let mut controls_open = editing_search || self.select_mode || !ui.ctx().text_edit_focused();
-        let bar = egui::Panel::bottom("gallery-controls").show_collapsible(ui, &mut controls_open, |ui| {
+        let bar = egui::Panel::bottom("gallery-controls").drag_to_open(false).show_collapsible(ui, &mut controls_open, |ui| {
             ui.add_space(2.0);
             if self.select_mode {
                 self.selection_bar(ui, host);
@@ -21140,7 +21141,7 @@ impl ComfyApp {
 
         let can_undo = pos > 0;
         let mut actions_open = !self.kb_editing;
-        let bar = egui::Panel::bottom("triage-actions").show_collapsible(ui, &mut actions_open, |ui| {
+        let bar = egui::Panel::bottom("triage-actions").drag_to_open(false).show_collapsible(ui, &mut actions_open, |ui| {
             const BTN_H: f32 = 40.0;
             const GAP: f32 = 4.0;
             ui.add_space(2.0);
@@ -21524,7 +21525,7 @@ impl ComfyApp {
                 !v.item.is_video && v.bytes.is_some() && self.wd14_pack.is_some() && !self.wd14_running;
             let mut remix_held = false;
             let mut actions_open = !self.kb_editing;
-            let bar = egui::Panel::bottom("viewer-actions").show_collapsible(ui, &mut actions_open, |ui| {
+            let bar = egui::Panel::bottom("viewer-actions").drag_to_open(false).show_collapsible(ui, &mut actions_open, |ui| {
                 const BTN_H: f32 = 36.0;
                 const GAP: f32 = 4.0;
                 ui.add_space(2.0);
@@ -22273,6 +22274,7 @@ impl ComfyApp {
         }
         let bar = egui::Panel::bottom("filmstrip")
             .exact_size(FRAME + 12.0)
+            .drag_to_open(false)
             .show_collapsible(ui, &mut strip_open, |ui| {
                 strip.show(
                     ui,
@@ -22346,7 +22348,7 @@ impl ComfyApp {
 
     fn logs_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
         let mut actions_open = !self.kb_editing;
-        let bar = egui::Panel::bottom("logs-actions").show_collapsible(ui, &mut actions_open, |ui| {
+        let bar = egui::Panel::bottom("logs-actions").drag_to_open(false).show_collapsible(ui, &mut actions_open, |ui| {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Copy all").clicked() {
@@ -23583,7 +23585,7 @@ impl EguiApp for ComfyApp {
         // whole page up; the response is deliberately dropped — `note_bottom_bar` only tracks
         // bottom bars, and feeding it a top panel would park the undo pill off-screen.
         let mut progress_open = self.running || self.queue_remaining > 0;
-        egui::Panel::top("run-progress").show_collapsible(ui, &mut progress_open, |ui| {
+        egui::Panel::top("run-progress").drag_to_open(false).show_collapsible(ui, &mut progress_open, |ui| {
             let (v, m) = self.progress;
             let (frac, label) = if m > 0 {
                 (v as f32 / m as f32, format!("{} {v}/{m}", elide(&self.status, 40)))
@@ -23630,7 +23632,9 @@ impl EguiApp for ComfyApp {
         // central content so the tab bar always keeps its height on a short screen. Slides away
         // while text is being edited, which also makes a mid-edit tab switch impossible.
         let mut nav_open = !self.kb_editing;
-        let bar = egui::Panel::bottom("nav").show_collapsible(ui, &mut nav_open, |ui| {
+        // drag_to_open: egui 0.36 leaves an invisible resize strip along a collapsed panel's
+        // edge, which on a phone eats taps at the screen edge and paints a grab line over them.
+        let bar = egui::Panel::bottom("nav").drag_to_open(false).show_collapsible(ui, &mut nav_open, |ui| {
             ui.add_space(2.0);
             self.nav_bar(ui);
             ui.add_space(2.0);

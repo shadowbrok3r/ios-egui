@@ -3,7 +3,7 @@ name = "appstore_android"
 # Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
 # BUMP IT before every release build — the phone only offers an update whose code is strictly
 # greater than the installed one, so shipping twice at the same version is a silent no-op.
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 publish = false
 
@@ -23,8 +23,7 @@ tls = ["reqwest/rustls-no-provider", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
-egui = "0.35"
-# crates.io 0.12 still targets egui 0.34; this fork tracks 0.35 (same one wirelab uses).
+egui = "0.36"
 # Launcher icons the store extracted from each APK; PNG only, pure Rust so it
 # cross-compiles to the NDK with no system libs.
 image = { version = "0.25", default-features = false, features = ["png"] }

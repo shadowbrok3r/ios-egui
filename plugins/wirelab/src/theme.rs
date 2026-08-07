@@ -411,7 +411,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        let _ = ctx.run_ui(input, |ui| {
+        // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+        ctx.run_ui(input, |ui| {
             ui.horizontal(|ui| {
                 row.set(ui.max_rect());
                 let edge = reserve_trailing(ui, chip_w);
@@ -425,7 +426,7 @@ mod tests {
                     chip.set(ui.add_sized([chip_w, 30.0], egui::Button::new("✔ checks")).rect);
                 });
             });
-        });
+        }).textures_delta.clear();
         assert!(
             chip.get().max.x <= row.get().max.x + 0.5,
             "chip {:?} overflows the row {:?}",

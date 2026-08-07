@@ -45,6 +45,8 @@ public class EguiNativeActivity extends NativeActivity {
     /** The keyboard went away without the app asking (back button/gesture). */
     private volatile boolean imeDismissed;
     private boolean imeInsetVisible;
+    /** Focused field is a password (egui IMEOutput.purpose); read by onCreateInputConnection. */
+    private volatile boolean imePassword;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -236,8 +238,17 @@ public class EguiNativeActivity extends NativeActivity {
                     return null;
                 }
                 outAttrs.imeOptions = outAttrs.imeOptions | EditorInfo.IME_FLAG_NO_FULLSCREEN;
+                // A password variation stops the keyboard suggesting, autocorrecting and
+                // learning the secret; it also suppresses the personalized-learning store.
                 outAttrs.inputType =
-                        InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+                        self.imePassword
+                                ? InputType.TYPE_CLASS_TEXT
+                                        | InputType.TYPE_TEXT_VARIATION_PASSWORD
+                                : InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE;
+                if (self.imePassword) {
+                    outAttrs.imeOptions =
+                            outAttrs.imeOptions | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
+                }
                 if (TRACE) Log.i("EguiIme", "onCreateInputConnection");
                 return new EguiImeBridge(base, self);
             }
@@ -577,6 +588,29 @@ public class EguiNativeActivity extends NativeActivity {
                     if (!edit.hasFocus()) {
                         edit.requestFocus();
                     }
+                });
+    }
+
+    /**
+     * Set whether the focused egui field is a password. The input type lives in EditorInfo, so a
+     * change only reaches the keyboard through restartInput — which re-runs
+     * onCreateInputConnection rather than mutating the EditText's selectable/cursor state.
+     */
+    public void setImePassword(boolean password) {
+        runOnUiThread(
+                () -> {
+                    if (imePassword == password) {
+                        return;
+                    }
+                    imePassword = password;
+                    EditText edit = imeEdit;
+                    if (edit == null) {
+                        return;
+                    }
+                    InputMethodManager imm =
+                            (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
+                    imm.restartInput(edit);
+                    if (TRACE) Log.i("EguiIme", "setImePassword(" + password + ")");
                 });
     }
 

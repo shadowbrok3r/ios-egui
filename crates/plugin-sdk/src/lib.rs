@@ -296,11 +296,13 @@ pub mod rt {
             let GuestRuntime { ctx, app, out_buf } = rt;
 
             let host = HostHandle;
-            let full = ctx.run_ui(input.raw_input, |ui| app.update(ui, &host));
+            let mut full = ctx.run_ui(input.raw_input, |ui| app.update(ui, &host));
 
             let clipped = ctx.tessellate(full.shapes, full.pixels_per_point);
             let (primitives, skipped_callbacks) = abi::primitives_to_wire(&clipped);
             let (textures_set, textures_free) = abi::textures_delta_to_wire(&full.textures_delta);
+            // Copied onto the wire above; epaint panics on a delta dropped with entries left.
+            full.textures_delta.clear();
 
             let mut open_url = None;
             let mut copy_text = None;

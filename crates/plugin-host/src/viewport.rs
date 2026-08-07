@@ -185,6 +185,17 @@ impl PluginViewport {
         let translate = |p: Pos2| p - off;
 
         let mut events = Vec::new();
+
+        // egui 0.36 dropped `RawInput::modifiers`, so held modifiers reach the guest only as
+        // events. Diffing against the last value sent to this instance restores the old
+        // per-frame-state semantics: a guest focused mid-chord still learns what is held.
+        let mods_id = egui::Id::new(("egui_ios_plugin_modifiers", plugin.instance_key));
+        let host_mods = ui.input(|i| i.modifiers);
+        let last_mods: Option<egui::Modifiers> = ui.ctx().data(|d| d.get_temp(mods_id));
+        if last_mods != Some(host_mods) {
+            ui.ctx().data_mut(|d| d.insert_temp(mods_id, host_mods));
+            events.push(Event::ModifiersChanged(host_mods));
+        }
         for ev in &host_raw.events {
             match ev {
                 Event::PointerMoved(pos) => {
@@ -260,7 +271,6 @@ impl PluginViewport {
             max_texture_side: host_raw.max_texture_side,
             time: Some(time),
             predicted_dt: host_raw.predicted_dt,
-            modifiers: host_raw.modifiers,
             events,
             focused: host_raw.focused,
             ..Default::default()

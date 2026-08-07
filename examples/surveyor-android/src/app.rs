@@ -534,6 +534,8 @@ impl EguiApp for SurveyorApp {
         let mut nav_open = !kb_editing;
         let bar = egui::Panel::bottom("nav")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 6)))
+            // egui 0.36's collapsed-panel resize strip would eat taps at the bottom screen edge.
+            .drag_to_open(false)
             .show_collapsible(ui, &mut nav_open, |ui| {
                 self.nav_bar(ui, host);
             });

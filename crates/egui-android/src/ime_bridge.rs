@@ -138,6 +138,28 @@ pub fn set_soft_keyboard(show: bool) -> bool {
     ok
 }
 
+/// Mirror egui's `IMEOutput::purpose` into the EditText's input type. A password field then gets
+/// no suggestions, no autocorrect and no personalized learning from the keyboard.
+pub fn set_ime_password(password: bool) -> bool {
+    let ok = crate::host::with_native_activity(|env, activity| {
+        if !is_egui_activity(env, activity)? {
+            return Ok(false);
+        }
+        env.call_method(
+            activity,
+            "setImePassword",
+            "(Z)V",
+            &[JValue::Bool(password as u8)],
+        )?;
+        Ok(true)
+    })
+    .unwrap_or(false);
+    if ok && TRACE {
+        log::info!("egui-android ime: set_ime_password({password})");
+    }
+    ok
+}
+
 /// Keep the hidden EditText focused/visible without requesting another IME show animation.
 pub fn bind_ime() -> bool {
     crate::host::with_native_activity(|env, activity| {
@@ -683,61 +705,29 @@ pub fn apply_pending(
                     reseed_after_selection_delete();
                     continue;
                 }
-                // Anchored + no preedit: delete at Java's exact union bounds instead of
-                // around egui's own caret, which may have drifted from the mirror's.
-                if let Some((a0, a1)) = anchor
-                    && preedit.is_empty()
-                {
-                    if had_mutate {
-                        deferred.push(ImeEvent::Delete { before, after, anchor });
-                        continue;
-                    }
-                    had_mutate = true;
-                    if before > 0 {
-                        set_state_selection(ctx, focus, a0, a0);
-                        for _ in 0..before {
-                            pending_events.push(key(egui::Key::Backspace));
-                        }
-                        if after > 0 {
-                            // The after side lands next frame, shifted by the deletion.
-                            deferred.push(ImeEvent::Delete {
-                                before: 0,
-                                after,
-                                anchor: Some((
-                                    a0.saturating_sub(before),
-                                    a1.saturating_sub(before),
-                                )),
-                            });
-                        }
-                    } else if after > 0 {
-                        set_state_selection(ctx, focus, a1, a1);
-                        for _ in 0..after {
-                            pending_events.push(key(egui::Key::Delete));
-                        }
-                    }
+                // Java deleted nothing (document edge); egui must not delete either.
+                if before == 0 && after == 0 {
+                    continue;
+                }
+                // The anchor is an absolute span, so it only means anything once the
+                // mutations staged earlier in this batch have landed in egui.
+                if anchor.is_some() && had_mutate {
+                    deferred.push(ImeEvent::Delete { before, after, anchor });
                     continue;
                 }
                 had_mutate = true;
-                // With an active preedit, egui keeps it selected and a bare Backspace would
-                // delete the whole word: lift the preedit, delete around it, re-apply.
-                if !preedit.is_empty() {
-                    pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
-                        text: String::new(),
-                        active_range_chars: None,
-                    }));
+                // Anchor egui on the span Java measured against (selection ∪ composition), then
+                // remove both sides in one event. `ImeEvent::DeleteSurrounding` deletes around
+                // that range and keeps it, so an active composition survives and the caret lands
+                // where Java put it — no lifting and re-applying the preedit around a backspace
+                // run, and no deferring the `after` side to a frame where offsets have shifted.
+                if let Some((a0, a1)) = anchor {
+                    set_state_selection(ctx, focus, a0, a1);
                 }
-                for _ in 0..before {
-                    pending_events.push(key(egui::Key::Backspace));
-                }
-                for _ in 0..after {
-                    pending_events.push(key(egui::Key::Delete));
-                }
-                if !preedit.is_empty() {
-                    pending_events.push(egui::Event::Ime(egui::ImeEvent::Preedit {
-                        text: preedit,
-                        active_range_chars: None,
-                    }));
-                }
+                pending_events.push(egui::Event::Ime(egui::ImeEvent::DeleteSurrounding {
+                    before_chars: before,
+                    after_chars: after,
+                }));
             }
             ImeEvent::Region { start, end, text } => {
                 // Repositions the egui cursor; only sound while nothing earlier in this batch

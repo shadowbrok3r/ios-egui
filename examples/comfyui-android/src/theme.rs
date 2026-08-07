@@ -106,6 +106,16 @@ pub fn fab(ui: &mut egui::Ui, icon: &str, fill: Color32) -> egui::Response {
     fab_with_sense(ui, icon, fill, Sense::click_and_drag())
 }
 
+/// A FAB's drag delta, zero until the gesture passes `max_click_dist`. egui 0.36 calls a press a
+/// drag the moment the finger leaves the 40pt disc, which walks the FAB across ordinary taps.
+pub fn fab_drag_delta(ui: &egui::Ui, resp: &egui::Response) -> egui::Vec2 {
+    if resp.dragged() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
+        resp.drag_delta()
+    } else {
+        egui::Vec2::ZERO
+    }
+}
+
 /// Selectable button that always keeps a frame (egui hides it when unselected + inactive).
 pub fn selectable<'a>(selected: bool, atoms: impl egui::IntoAtoms<'a>) -> egui::Button<'a> {
     egui::Button::selectable(selected, atoms).frame_when_inactive(true)
@@ -669,12 +679,13 @@ mod tests {
                 Vec::new()
             };
             let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ctx| {
+            // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+            ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(screen.y - 40.0);
                     up_menu(ui, "View", |ui| build(ui));
                 });
-            });
+            }).textures_delta.clear();
         }
     }
 
@@ -750,7 +761,8 @@ mod tests {
         for height in [400.0, 160.0, 159.0, 140.0, 40.0, 1.0] {
             let rect =
                 egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(873.0, height));
-            let _ = ctx.run_ui(
+            // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+            ctx.run_ui(
                 egui::RawInput { screen_rect: Some(rect), ..Default::default() },
                 |ctx| {
                     let anchor = egui::Rect::from_min_size(
@@ -761,7 +773,7 @@ mod tests {
                     assert!(cap > 0.0 && cap.is_finite(), "cap {cap} at height {height}");
                     assert!(cap <= height.max(160.0), "cap {cap} exceeds a {height}pt screen");
                 },
-            );
+            ).textures_delta.clear();
         }
     }
 
@@ -797,7 +809,8 @@ mod tests {
                 Vec::new()
             };
             let input = egui::RawInput { screen_rect: Some(viewport), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ctx| {
+            // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+            ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(screen.y - 40.0);
                     span.set(None);
@@ -825,7 +838,7 @@ mod tests {
                         });
                     });
                 });
-            });
+            }).textures_delta.clear();
         }
 
         span.get().expect("the menu never opened")
@@ -867,7 +880,8 @@ mod tests {
                 Vec::new()
             };
             let input = egui::RawInput { screen_rect: Some(rect), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ctx| {
+            // Measurement pass only — nothing uploads the textures, and epaint panics on an unapplied delta.
+            ctx.run_ui(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if bottom_bar {
                         ui.add_space(screen.y - 40.0);
@@ -887,7 +901,7 @@ mod tests {
                         }
                     });
                 });
-            });
+            }).textures_delta.clear();
         }
         seen.get()
     }

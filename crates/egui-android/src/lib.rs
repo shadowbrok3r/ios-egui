@@ -50,6 +50,8 @@ struct Adapter {
     ime_force_sync: bool,
     /// The next successful seed restarts the IME session (field switch / out-of-band edit).
     ime_seed_restart: bool,
+    /// Input type last pushed to the EditText, from egui's `IMEOutput::purpose`.
+    ime_password: bool,
     /// Points subtracted from `screen_rect.max.y` this frame for the soft keyboard.
     ime_inset_pt: f32,
 }
@@ -228,6 +230,7 @@ impl eframe::App for Adapter {
         let guest_kb = crate::host::keyboard_requested();
         if let Some(ime) = ui.ctx().output(|o| o.ime) {
             self.last_ime = Some(egui::output::IMEOutput {
+                purpose: ime.purpose,
                 rect: ime.rect,
                 cursor_rect: ime.cursor_rect,
                 should_interrupt_composition: false,
@@ -244,6 +247,20 @@ impl eframe::App for Adapter {
             }
         }
         let ime_wanted = ui.ctx().output(|o| o.ime.is_some());
+        // egui 0.36 reports the focused field's IME purpose; a password field must not reach the
+        // keyboard's suggestion, autocorrect or personalized-learning stores.
+        let password = ui
+            .ctx()
+            .output(|o| o.ime.map(|ime| ime.purpose == egui::IMEPurpose::Password))
+            .unwrap_or(self.ime_password);
+        if password != self.ime_password {
+            self.ime_password = password;
+            crate::ime_bridge::set_ime_password(password);
+            // The restart drops the EditText's IME session; the mirror must be pushed again.
+            crate::ime_bridge::invalidate_last_sync();
+            self.ime_seed_restart = true;
+            self.ime_force_sync = true;
+        }
         // Do not key want_ime off ime_bridge_hot alone — that can never go false and traps the keyboard.
         let want_ime = hold || ime_wanted || text_focus || guest_kb;
         if want_ime {
@@ -646,6 +663,7 @@ pub fn run_with(
                 ime_synced_focus: None,
                 ime_force_sync: false,
                 ime_seed_restart: false,
+                ime_password: false,
                 ime_inset_pt: 0.0,
             }))
         }),

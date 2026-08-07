@@ -3,7 +3,7 @@ name = "comfyui_android"
 # Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
 # BUMP IT before every release build — the phone only offers an update whose code is strictly
 # greater than the installed one, so shipping twice at the same version is a silent no-op.
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 publish = false
 
@@ -29,7 +29,7 @@ local-npu = ["dep:local-sd", "dep:local-anima", "dep:local-wd14", "dep:local-cli
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
-egui = "0.35"
+egui = "0.36"
 # Thread CPU clock for the frame profiler (already in the workspace tree via qnn-rs).
 libc = "0.2"
 # default-features off drops the websocket transport: rucomfyui can't attach the auth header to its
@@ -40,7 +40,7 @@ rucomfyui_node_graph = { git = "https://github.com/philpax/rucomfyui" }
 # Direct snarl access for the graph presentation layer (view transform, selection, custom viewer).
 egui-snarl = "0.11"
 # bytes:// image loader for output images / previews rendered inside graph nodes.
-egui_extras = { version = "0.35", default-features = false, features = ["image"] }
+egui_extras = { version = "0.36", default-features = false, features = ["image"] }
 # http-only by default: no TLS backend, so this cross-compiles cleanly. `tls` adds rustls below.
 # gzip/brotli/deflate: a real proxy compresses the large object_info response; without these reqwest
 # would hand the compressed bytes to the JSON parser.
@@ -85,7 +85,7 @@ local-rewrite = { path = "../../crates/local-rewrite", optional = true }
 
 # Real backdrop blur: a grab-pass that samples the live framebuffer inside an egui paint callback,
 # blurs it and composites the frosted pane back. Vendored fork of
-# github.com/abdu-benayad/backdrop-blur bumped to egui 0.35 — see patches/backdrop-blur. Only the
+# github.com/abdu-benayad/backdrop-blur bumped to egui 0.36 — see patches/backdrop-blur. Only the
 # glow path exists, which is why this app runs on Backend::Glow.
 [target.'cfg(target_os = "android")'.dependencies]
 backdrop-blur-egui = { path = "../../patches/backdrop-blur/crates/backdrop-blur-egui", default-features = false, features = [

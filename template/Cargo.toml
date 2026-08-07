@@ -11,7 +11,7 @@ publish = false
 egui-ios = { git = "https://github.com/shadowbrok3r/egui-ios" }
 # Local checkout (uncomment for development against a local clone):
 #   egui-ios = { path = "../ios-egui/crates/egui-ios" }
-egui = "0.35"
+egui = "0.36"
 
 [lib]
 crate-type = ["staticlib"]

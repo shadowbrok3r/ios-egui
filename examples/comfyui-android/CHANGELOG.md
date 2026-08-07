@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.7.0 — 2026-08-05
+
+Built on egui 0.36. Two of its changes needed answering before they became bugs you would have hit.
+
+egui now decides a press is a drag the moment your finger leaves the widget, rather than after the 16 points of travel this app tunes for finger wobble. Left alone, a sloppy tap on a prompt tag would reorder the prompt, the Queue and Create buttons would creep across the screen a few points at a time, tapping a pin in the graph editor would flick out a wire and sometimes drop a connection on release, and a tap near the minimap's edge could throw the view to a far corner of the graph. All four now wait for real travel again. Panels also grew an invisible drag strip along their edge while collapsed — on a phone that sits exactly where your thumb rests, swallowing taps and painting a bright line over the bottom of the screen — so it is turned off.
+
+Password fields now tell the keyboard they are passwords. Until now every field looked the same to the hidden text bridge, so API keys and tokens went into the keyboard's suggestion and personalized-learning stores like ordinary words. Deleting around the cursor is also handled by egui directly instead of being replayed as a run of backspaces around a lifted composition, which is what made a mid-word backspace occasionally eat the wrong character or leave the caret behind.
+
 ## v0.6.0 — 2026-08-03
 
 Fixes the 401 that took the app offline. comfy-gate expires a signed-in session after 14 days and nothing renewed it, so the app went on presenting a dead token forever with no way to tell why — the websocket said "polling still works", which was a hardcoded phrase rather than a fact. A refused session is now cleared and named ("Session expired — sign in again, or set an API key"), a rejected credential ends the websocket's reconnect loop instead of retrying it every 30 seconds, and a credential carrying a character an HTTP header cannot hold is reported rather than silently dropped.

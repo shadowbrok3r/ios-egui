@@ -271,6 +271,8 @@ impl EguiApp for App {
         egui::Panel::bottom("plugins-nav")
             .show_separator_line(false)
             .frame(theme::bar())
+            // egui 0.36's collapsed-panel resize strip would eat taps at the bottom screen edge.
+            .drag_to_open(false)
             .show_collapsible(ui, &mut nav_open, |ui| {
                 closed = nav_bar(ui, &mut self.tabs, manager, host);
             });

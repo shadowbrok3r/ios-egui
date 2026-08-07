@@ -1,6 +1,6 @@
 [package]
 name = "plugins_android"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 publish = false
 
@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 egui-android = { path = "../../crates/egui-android", features = ["plugins"] }
-egui = "0.35"
+egui = "0.36"
 # Store client: HTTPS to the appstore. Already in the graph via egui-android's `plugins`
 # feature (plugin-host/net), so this adds no new crates.
 ureq = "2"

@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.6 — 2026-08-05
+
+egui 0.36: collapsed bottom bars no longer leave an invisible drag strip at the screen edge, and password fields now tell the keyboard not to learn them
+
 ## v0.1.5 — 2026-08-04
 
 TLS is on by default. A plain release build was http-only, so a sideloaded one

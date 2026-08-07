@@ -1,0 +1,37 @@
+# Vendored egui-snarl 0.11.0, repinned to egui 0.36. Upstream (zakarumych/egui-snarl) still
+# targets 0.35 and comfyui-android's graph editor needs one egui in the graph.
+# The optional egui-probe dep and the demo example are dropped: egui-probe 0.12 pins egui 0.35,
+# and resolving it would put a second egui in the lock for a feature nothing here enables.
+
+[package]
+edition = "2024"
+rust-version = "1.95"
+name = "egui-snarl"
+version = "0.11.0"
+description = "Node-graphs for egui"
+documentation = "https://docs.rs/egui-snarl"
+readme = "README.md"
+keywords = ["egui", "node", "graph", "ui", "node-graph"]
+categories = ["gui", "visualization"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zakarumych/egui-snarl"
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+
+[features]
+serde = ["dep:serde", "egui/serde", "slab/serde"]
+
+[lib]
+name = "egui_snarl"
+path = "src/lib.rs"
+
+[dependencies]
+ahash = { version = "0.8.12", default-features = false }
+egui = "0.36"
+egui-scale = "0.5.0"
+serde = { version = "1", features = ["derive"], optional = true }
+slab = "0.4"
+smallvec = { version = "1.15", features = ["const_new"] }

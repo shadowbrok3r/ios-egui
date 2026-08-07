@@ -122,7 +122,7 @@ host.request_keyboard(response.wants_keyboard);      // bridge the soft keyboard
 ops.drain_into(host);                                // apply queued haptics/notifications/…
 ```
 
-Desktop (eframe 0.35 + wgpu): see `examples/desktop-host`. The one-time hookup on any host is
+Desktop (eframe 0.36 + wgpu): see `examples/desktop-host`. The one-time hookup on any host is
 `egui_ios_plugin_host::install(&mut renderer, surface_format, msaa_samples)`; the iOS runtime
 does this automatically when the `plugins` feature is on.
 

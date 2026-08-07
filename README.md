@@ -155,7 +155,7 @@ dev-sync, and native `net.http.*`/`net.tcp.*`/`net.udp.*`/`ssh.*` ops on both). 
 
 ## Versions
 
-egui 0.35 · egui-wgpu 0.35 · wgpu 29 · wasmtime 46 · Rust 2024 edition.
+egui 0.36 · egui-wgpu 0.36 · wgpu 30 · wasmtime 47 · Rust 2024 edition.
 
 ## License
 

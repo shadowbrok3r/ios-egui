@@ -26,3 +26,10 @@ opt-level = "s"
 lto = true
 
 [workspace]
+
+# wirelab-flow-ui pulls egui-snarl (and its egui-scale) from the wirelab workspace, whose own
+# [patch] section does not reach this build. Without repeating it here the plugin resolves both
+# egui 0.35 and 0.36 and every SnarlViewer signature mismatches.
+[patch.crates-io]
+egui-snarl = { path = "../../patches/egui-snarl" }
+egui-scale = { path = "../../patches/egui-scale" }

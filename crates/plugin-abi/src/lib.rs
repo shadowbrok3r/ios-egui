@@ -15,7 +15,7 @@ pub const ABI_VERSION: u32 = 1;
 
 /// egui minor version whose serde encoding rides the wire (`RawInput`, `TextureOptions`, …).
 /// Host and guest must agree; bump alongside workspace egui upgrades.
-pub const WIRE_FORMAT: u32 = 35;
+pub const WIRE_FORMAT: u32 = 36;
 
 /// Import module name the guest links host functions from.
 pub const HOST_MODULE: &str = "egui_plugin_host";
@@ -243,16 +243,20 @@ pub fn wire_to_primitive(wp: &WirePrimitive) -> Option<ClippedPrimitive> {
 /// Convert a texture delta to wire form (pixels expanded to RGBA8).
 pub fn textures_delta_to_wire(delta: &epaint::textures::TexturesDelta) -> (Vec<WireTextureSet>, Vec<WireTextureId>) {
     let mut set = Vec::with_capacity(delta.set.len());
-    for (id, image_delta) in &delta.set {
-        let (size, source_size, pixels) = image_data_to_rgba(&image_delta.image);
-        set.push(WireTextureSet {
-            id: texture_id_to_wire(*id),
-            pos: image_delta.pos.map(|p| [p[0] as u32, p[1] as u32]),
-            size,
-            source_size,
-            pixels,
-            options: image_delta.options,
-        });
+    // egui 0.36 groups several deltas under one id; they are order-dependent, and the flat wire
+    // list keeps that order because the host applies entries as they arrive.
+    for (id, image_deltas) in &delta.set {
+        for image_delta in image_deltas {
+            let (size, source_size, pixels) = image_data_to_rgba(&image_delta.image);
+            set.push(WireTextureSet {
+                id: texture_id_to_wire(*id),
+                pos: image_delta.pos.map(|p| [p[0] as u32, p[1] as u32]),
+                size,
+                source_size,
+                pixels,
+                options: image_delta.options,
+            });
+        }
     }
     let free = delta.free.iter().map(|id| texture_id_to_wire(*id)).collect();
     (set, free)

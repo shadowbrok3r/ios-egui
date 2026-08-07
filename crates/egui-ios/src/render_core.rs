@@ -67,6 +67,8 @@ impl RenderCore {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
+            // Bucketing only matters when untrusted content can see the adapter.
+            apply_limit_buckets: false,
         }))
         .expect("request_adapter");
 
@@ -97,6 +99,8 @@ impl RenderCore {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            // Auto resolves to sRGB for the srgb format picked above.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: width_px.max(1),
             height: height_px.max(1),
             present_mode: wgpu::PresentMode::Fifo,
@@ -238,7 +242,12 @@ impl RenderCore {
     }
 
     pub fn key_event(&mut self, hid_key_code: i32, modifier_flags: i32, pressed: bool) {
-        self.modifiers = ios_modifiers_to_egui(modifier_flags);
+        let modifiers = ios_modifiers_to_egui(modifier_flags);
+        // egui 0.36 dropped `RawInput::modifiers`; held modifiers ride the event stream instead.
+        if modifiers != self.modifiers {
+            self.modifiers = modifiers;
+            self.events.push(Event::ModifiersChanged(modifiers));
+        }
         if let Some(key) = hid_to_egui_key(hid_key_code) {
             self.events.push(Event::Key {
                 key,
@@ -295,6 +304,15 @@ impl RenderCore {
         }
     }
 
+    /// Release the frame's freed textures and empty the delta. epaint asserts on a delta dropped
+    /// with entries left, so every exit from `render` runs this.
+    fn free_textures(&mut self, delta: &mut egui::TexturesDelta) {
+        for id in &delta.free {
+            self.renderer.free_texture(id);
+        }
+        delta.clear();
+    }
+
     /// Run one frame: assemble input, run the UI closure, paint, and present.
     pub fn render(&mut self, time: f64, mut build_ui: impl FnMut(&mut egui::Ui)) {
         self.apply_long_press(time);
@@ -309,13 +327,12 @@ impl RenderCore {
         let raw_input = egui::RawInput {
             screen_rect: Some(screen_rect),
             time: Some(time),
-            modifiers: self.modifiers,
             focused: self.active,
             events: std::mem::take(&mut self.events),
             ..Default::default()
         };
 
-        let full_output = self.egui_ctx.run_ui(raw_input, |ui| build_ui(ui));
+        let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| build_ui(ui));
         // Text-edit focus only: plugin viewports focus on any press, and any-widget focus
         // would raise the soft keyboard for plain taps. Plugins use Host::request_keyboard.
         self.wants_keyboard = self.egui_ctx.text_edit_focused();
@@ -331,9 +348,11 @@ impl RenderCore {
         let paint_jobs = self
             .egui_ctx
             .tessellate(full_output.shapes, full_output.pixels_per_point);
-        for (id, delta) in &full_output.textures_delta.set {
-            self.renderer
-                .update_texture(&self.device, &self.queue, *id, delta);
+        for (id, deltas) in &full_output.textures_delta.set {
+            for delta in deltas {
+                self.renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
         }
 
         let screen = egui_wgpu::ScreenDescriptor {
@@ -350,6 +369,8 @@ impl RenderCore {
             self.renderer
                 .update_buffers(&self.device, &self.queue, &mut encoder, &paint_jobs, &screen);
 
+        // Freeing on a bail-out too: `set` is already uploaded above, and abandoning `free`
+        // leaks the sub-renderer's textures (and trips epaint's unapplied-delta assert).
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -357,10 +378,10 @@ impl RenderCore {
                 match self.surface.get_current_texture() {
                     wgpu::CurrentSurfaceTexture::Success(f)
                     | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-                    _ => return,
+                    _ => return self.free_textures(&mut full_output.textures_delta),
                 }
             }
-            _ => return,
+            _ => return self.free_textures(&mut full_output.textures_delta),
         };
         let view = frame
             .texture
@@ -389,10 +410,8 @@ impl RenderCore {
 
         self.queue
             .submit(user_buffers.into_iter().chain(std::iter::once(encoder.finish())));
-        frame.present();
+        self.queue.present(frame);
 
-        for id in &full_output.textures_delta.free {
-            self.renderer.free_texture(id);
-        }
+        self.free_textures(&mut full_output.textures_delta);
     }
 }

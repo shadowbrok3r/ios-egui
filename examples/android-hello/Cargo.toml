@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
-egui = "0.35"
+egui = "0.36"
 
 # cargo-apk2 reads this to generate the APK manifest.
 [package.metadata.android]
