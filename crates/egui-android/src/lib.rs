@@ -586,6 +586,25 @@ pub fn glow_context() -> Option<std::sync::Arc<glow::Context>> {
 pub fn run_with(
     app: AndroidApp,
     backend: Backend,
+    factory: impl FnMut(&CreateContext) -> Box<dyn EguiApp> + 'static,
+) {
+    run_with_depth(app, backend, 0, factory);
+}
+
+/// Like [`run_with`], but asks the window for a depth attachment of `depth_bits`.
+///
+/// eframe defaults `NativeOptions::depth_buffer` to 0 and passes it straight to glutin's
+/// `with_depth_size`, so a 3D app gets a window with **no depth attachment at all**:
+/// `glEnable(GL_DEPTH_TEST)` and `glClear(GL_DEPTH_BUFFER_BIT)` then silently do nothing and the far
+/// side of a model paints over the near one. Worse, `eglChooseConfig` breaks ties by *smaller* depth
+/// size and eframe takes the first config, so the depth-less outcome is deterministic rather than a
+/// lottery some devices lose.
+///
+/// Pass 24 for anything that depth-tests. 0 keeps the old behaviour.
+pub fn run_with_depth(
+    app: AndroidApp,
+    backend: Backend,
+    depth_bits: u8,
     mut factory: impl FnMut(&CreateContext) -> Box<dyn EguiApp> + 'static,
 ) {
     android_logger::init_once(
@@ -615,7 +634,8 @@ pub fn run_with(
         Backend::Wgpu => eframe::Renderer::Wgpu,
         Backend::Glow => eframe::Renderer::Glow,
     };
-    log::info!("egui-android: renderer {backend:?}");
+    options.depth_buffer = depth_bits;
+    log::info!("egui-android: renderer {backend:?}, depth {depth_bits} bits");
 
     let result = eframe::run_native(
         "egui-android",
@@ -698,6 +718,14 @@ macro_rules! app {
         #[unsafe(no_mangle)]
         fn android_main(app: $crate::AndroidApp) {
             $crate::run_with(app, $backend, |cc| ::std::boxed::Box::new($factory(cc)));
+        }
+    };
+    // Third form also asks for a depth attachment, e.g. `app!(MyApp::new, Backend::Glow, 24)`.
+    // Without it eframe requests 0 bits and depth testing silently does nothing.
+    ($factory:path, $backend:expr, $depth:expr) => {
+        #[unsafe(no_mangle)]
+        fn android_main(app: $crate::AndroidApp) {
+            $crate::run_with_depth(app, $backend, $depth, |cc| ::std::boxed::Box::new($factory(cc)));
         }
     };
 }

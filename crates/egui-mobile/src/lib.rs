@@ -26,8 +26,12 @@ pub use egui_android::app;
 
 /// Renderer selection, Android only. `Backend::Glow` is required for an OpenGL paint callback
 /// (backdrop blur); everything else should stay on the default wgpu.
+///
+/// `run_with_depth` additionally asks for a depth attachment — eframe requests 0 bits by default, so
+/// anything that depth-tests renders see-through without it. Reach it through `app!` with a third
+/// argument: `app!(MyApp::new, Backend::Glow, 24)`.
 #[cfg(target_os = "android")]
-pub use egui_android::{Backend, glow_context, run_with};
+pub use egui_android::{Backend, glow_context, run_with, run_with_depth};
 
 /// Android-only host capabilities (self-update, install/overlay permissions, …). Gate calls
 /// behind `#[cfg(target_os = "android")]` in shared app code.

@@ -1,0 +1,37 @@
+# Changelog
+
+## 0.2.0
+
+The alpha library, and somewhere to put your work.
+
+- **Alphas** — all 16 procedural patterns as a thumbnail grid. Tap one to put it on the band; the
+  layer snaps to the side faces where the profile has any, because that is where relief casts
+  clean. Repeats and depth adjust live, and the whole set regenerates at 128, 256 or 512.
+- **Files** — name, save and reopen designs; export an STL at 1024x320 straight to the share sheet
+  with a real `model/stl` type; copy or paste a whole design as JSON, which needs no network and
+  works when nothing else does.
+- `Alpha::from_bytes` in the core, so an image that arrives as bytes rather than a path can become
+  an alpha — the shape every Android file handoff takes.
+
+## 0.1.0
+
+First release. RingDesigner on the phone, for designs that have to come out of a two-part sand
+mould.
+
+- **Ring** — the band in 3D, ported to OpenGL ES. One finger orbits, two pinch and pan. Metal,
+  draft and normal shading, a barycentric wireframe, and the castability verdict with its undercut
+  percentage.
+- **Band** — the unrolled `(u, v)` surface with the composited height field drawn underneath, so
+  you can see where the metal actually lands. Castability zones are tinted by what they can hold,
+  with the ring-angle ruler and the seam marked.
+- **Pen** — pressure is millimetres of metal, not opacity, and the ceiling comes from the local
+  draft angle: about 1.6 mm on a squared side face, about 0.05 mm on the crest of a half-round.
+  Press past what the surface allows and the stroke says so. Hover reads out the limit before you
+  commit. The barrel button and the flipped tip carve; palm and finger contacts are rejected while
+  Pen only is on.
+- **Tile** — draw one motif that wraps in both axes and marches round the ring an integer number of
+  times, so it meets itself at the joint by construction.
+- **Bench** — per-stage timings of the geometry core on this device.
+
+Drawings are stored as strokes inside the design, not as baked images, so a `.ring.json` stays
+self-contained, re-rasterizes at any resolution, and opens on the desktop unchanged.

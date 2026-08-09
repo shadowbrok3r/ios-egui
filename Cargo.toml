@@ -11,6 +11,7 @@ members = [
     "examples/privaxy-android",
     "examples/appstore-android",
     "examples/surveyor-android",
+    "examples/ringdesigner-android",
     "crates/cargo-egui-ios",
     "crates/cargo-egui-android",
     "crates/cargo-egui-mobile",
