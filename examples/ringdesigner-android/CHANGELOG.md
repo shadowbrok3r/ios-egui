@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0
+
+- **Sync with the desktop.** Files gained a host and token; Pull takes whatever the desktop app is
+  showing, Push replaces it. Over Tailscale that works from anywhere, not just your own network —
+  the desktop binds its `100.x` tailnet address specifically, never `0.0.0.0`, and refuses to serve
+  off-loopback without a token. An open port here would let anyone who can reach it rewrite the
+  design you are looking at.
+
+## 0.3.0
+
+- **Photograph a surface and cast it.** Pick a photo from the gallery and it becomes an alpha on
+  the band. Shoot flat, even light — a photo records the lighting as much as the surface, and
+  raking light turns into bumps that are not there, which the picker now says on screen. Imports
+  are kept on disk, so they survive a restart instead of coming back as a blank layer.
+- **1:1.** The ring renders at true physical size, from the panel's real `DisplayMetrics.xdpi`
+  rather than the density bucket Android rounds to — hold the phone against a finger or a mandrel
+  and compare. The toggle only appears when the panel reports a DPI worth trusting.
+
 ## 0.2.0
 
 The alpha library, and somewhere to put your work.

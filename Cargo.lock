@@ -4330,6 +4330,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05015102dad0f7d61691ca347e9d9d9006685a64aefb3d79eecf62665de2153d"
 
 [[package]]
+name = "minreq"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "659579df697b372ef9e36f02fcbb41f6d6f157dcec7db9c9618fa0f23cf0fc20"
+
+[[package]]
 name = "mio"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6059,12 +6065,13 @@ dependencies = [
 
 [[package]]
 name = "ringdesigner_android"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "egui",
  "egui-mobile",
  "egui_glow",
  "log",
+ "minreq 3.0.0",
  "ringdesign-core",
  "serde_json",
 ]
@@ -6961,7 +6968,7 @@ dependencies = [
  "egui",
  "egui-mobile",
  "log",
- "minreq",
+ "minreq 2.14.1",
  "serde",
  "serde_json",
  "tungstenite",

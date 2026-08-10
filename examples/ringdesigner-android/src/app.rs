@@ -7,6 +7,7 @@
 //! and nothing replaces the desktop's eframe-storage path, so without a write on the dirty debounce
 //! the design is gone the moment the OS reaps the process.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,7 @@ use crate::bench;
 use crate::canvas::{self, CanvasInput, Domain, View};
 use crate::library as liblib;
 use crate::paint;
+use crate::util::{slug, sync_base};
 use crate::ring::{self, RingPane, Worker};
 use crate::viewport::{GpuMeshRenderer, ShadeMode};
 
@@ -109,12 +111,21 @@ pub struct RingApp {
     px_per_mm: Option<f32>,
 
     thumbs: liblib::Thumbs,
+    /// Device photos offered as ornament sources, `(id, display name)`.
+    photos: Vec<(i64, String)>,
+    photo_thumbs: HashMap<i64, egui::TextureHandle>,
+    picker_open: bool,
     alpha_filter: String,
     /// Alpha currently on the pattern layer.
     picked_alpha: Option<String>,
     pattern_repeats: u32,
     pattern_height_mm: f64,
     builtin_size: usize,
+
+    /// Desktop sync: `host:port` and the shared token, both remembered between launches.
+    sync_host: String,
+    sync_token: String,
+    sync_job: Option<std::sync::mpsc::Receiver<SyncResult>>,
 
     brush: Brush,
     band_view: View,
@@ -152,11 +163,17 @@ impl RingApp {
             data_root: None,
             px_per_mm: None,
             thumbs: liblib::Thumbs::default(),
+            photos: Vec::new(),
+            photo_thumbs: HashMap::new(),
+            picker_open: false,
             alpha_filter: String::new(),
             picked_alpha: None,
             pattern_repeats: 24,
             pattern_height_mm: 0.35,
             builtin_size: 256,
+            sync_host: String::new(),
+            sync_token: String::new(),
+            sync_job: None,
             brush: Brush::default(),
             band_view: View::default(),
             tile_view: View::default(),
@@ -506,6 +523,12 @@ impl RingApp {
                         host.haptic(Haptic::Light);
                     }
                 }
+                if ui.button("From photo").clicked() {
+                    self.picker_open = !self.picker_open;
+                    if self.picker_open && self.photos.is_empty() {
+                        self.photos = host.list_device_media(false, 60);
+                    }
+                }
                 if self.picked_alpha.is_some() && ui.button("Remove").clicked() {
                     self.design.layers.layers.retain(|e| e.name != PATTERN_LAYER);
                     self.picked_alpha = None;
@@ -515,6 +538,10 @@ impl RingApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.picker_open {
+                self.photo_picker(ui, host);
+                return;
+            }
             let picked = liblib::grid(
                 ui,
                 &self.lib,
@@ -539,6 +566,130 @@ impl RingApp {
                 liblib::Pick::None => {}
             }
         });
+    }
+
+    /// The device photo picker, for turning a real surface into ornament.
+    ///
+    /// A photograph is *luminance*, not elevation — a hammered surface under raking light puts a
+    /// highlight and a shadow on the same facet, and the alpha will then stand the highlight proud
+    /// and sink the shadow. Flat, even light is the difference between a texture and a rubbing of
+    /// the lighting, so the UI says so rather than letting it be discovered in metal.
+    fn photo_picker(&mut self, ui: &mut egui::Ui, host: &Host) {
+        if !host.has_media_permission(false) {
+            ui.label("RingDesigner needs access to your photos to use one as a texture.");
+            if ui.button("Grant access").clicked() {
+                host.request_media_images_permission();
+            }
+            if ui.button("Open app settings").clicked() {
+                host.open_app_settings();
+            }
+            return;
+        }
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Refresh").clicked() || self.photos.is_empty() {
+                self.photos = host.list_device_media(false, 60);
+                self.photo_thumbs.clear();
+            }
+            if ui.button("Close").clicked() {
+                self.picker_open = false;
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Shoot flat, even light. A photo records the lighting as much as the surface, and \
+                 raking light becomes bumps that are not there.",
+            )
+            .small()
+            .weak(),
+        );
+
+        if self.photos.is_empty() {
+            ui.label(egui::RichText::new("no photos found").weak());
+            return;
+        }
+
+        let cell = 84.0f32;
+        let spacing = ui.spacing().item_spacing.x;
+        let cols = (((ui.available_width() + spacing) / (cell + spacing)).floor() as usize).max(1);
+        let mut chosen: Option<(i64, String)> = None;
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("photo_grid").num_columns(cols).show(ui, |ui| {
+                for (i, (id, name)) in self.photos.clone().into_iter().enumerate() {
+                    let tex = self.photo_thumbs.get(&id).cloned().or_else(|| {
+                        let (w, h, rgba) = host.load_device_thumbnail(false, id, 192)?;
+                        if w == 0 || h == 0 {
+                            return None;
+                        }
+                        let img = egui::ColorImage::from_rgba_unmultiplied(
+                            [w as usize, h as usize],
+                            &rgba,
+                        );
+                        let t = ui.ctx().load_texture(
+                            format!("photo:{id}"),
+                            img,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.photo_thumbs.insert(id, t.clone());
+                        Some(t)
+                    });
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(cell, cell), egui::Sense::click());
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect.shrink(2.0), 3.0, egui::Color32::from_rgb(26, 27, 31));
+                    if let Some(t) = tex {
+                        p.image(
+                            t.id(),
+                            rect.shrink(2.0),
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                    if resp.clicked() {
+                        chosen = Some((id, name.clone()));
+                    }
+                    if (i + 1) % cols == 0 {
+                        ui.end_row();
+                    }
+                }
+            });
+        });
+
+        if let Some((id, name)) = chosen {
+            self.import_photo(host, id, &name);
+        }
+    }
+
+    /// Decode a device photo into an alpha, keep a copy on disk, and put it on the band.
+    fn import_photo(&mut self, host: &Host, id: i64, display: &str) {
+        let Some(bytes) = host.load_device_media(false, id) else {
+            self.status = "could not read that photo".into();
+            host.haptic(Haptic::Error);
+            return;
+        };
+        let stem = display.rsplit_once('.').map(|(a, _)| a).unwrap_or(display).to_string();
+        match ringdesign_core::alpha::Alpha::from_bytes(stem.clone(), &bytes) {
+            Ok(alpha) => {
+                // Persist the source so the library still has it next launch; the design references
+                // alphas by name and an unsaved import would come back as a blank layer.
+                if let Some(root) = self.data_root.as_ref() {
+                    let dir = root.join("alphas");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let _ = std::fs::write(dir.join(format!("{stem}.png")), &bytes);
+                }
+                self.status = format!("{stem}: {}x{}", alpha.width, alpha.height);
+                Arc::make_mut(&mut self.lib).insert(alpha);
+                self.thumbs.forget(&stem);
+                self.picker_open = false;
+                self.apply_alpha(&stem);
+                host.haptic(Haptic::Success);
+            }
+            Err(e) => {
+                self.status = format!("import failed: {e}");
+                host.haptic(Haptic::Error);
+            }
+        }
     }
 
     fn files_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
@@ -605,6 +756,49 @@ impl RingApp {
         });
 
         ui.separator();
+        ui.label(egui::RichText::new("desktop").weak());
+        ui.horizontal_wrapped(|ui| {
+            ui.label("host");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_host)
+                    .hint_text("100.x.y.z or name.ts.net")
+                    .desired_width(170.0),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("token");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.sync_token)
+                    .password(true)
+                    .desired_width(170.0),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            let busy = self.sync_job.is_some();
+            let ready = !self.sync_host.trim().is_empty();
+            ui.add_enabled_ui(!busy && ready, |ui| {
+                if ui.button("Pull").clicked() {
+                    self.sync(false);
+                }
+                if ui.button("Push").clicked() {
+                    self.sync(true);
+                }
+            });
+            if busy {
+                ui.spinner();
+                ui.ctx().request_repaint_after(Duration::from_millis(200));
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Start the sync server on the desktop first. Over Tailscale this works from \
+                 anywhere, not just your own network.",
+            )
+            .small()
+            .weak(),
+        );
+
+        ui.separator();
         ui.label(egui::RichText::new("saved designs").weak());
         egui::ScrollArea::vertical().show(ui, |ui| {
             let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&designs)
@@ -657,6 +851,85 @@ impl RingApp {
             .small()
             .weak(),
         );
+    }
+
+    /// Pull the desktop's live design, or push this one to it.
+    ///
+    /// On a worker: a network round trip on the UI thread is an ANR waiting for a slow tailnet.
+    fn sync(&mut self, push: bool) {
+        let base = sync_base(&self.sync_host);
+        let token = self.sync_token.trim().to_string();
+        let body = push.then(|| serde_json::to_vec(&self.design).unwrap_or_default());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.status = if push { "pushing…".into() } else { "pulling…".into() };
+        std::thread::Builder::new()
+            .name("ring-sync".into())
+            .spawn(move || {
+                let out = match body {
+                    Some(bytes) => match minreq::post(format!("{base}/design"))
+                        .with_header("x-ring-token", &token)
+                        .with_header("content-type", "application/json")
+                        .with_timeout(15)
+                        .with_body(bytes)
+                        .send()
+                    {
+                        Ok(r) if r.status_code == 200 => {
+                            SyncResult::Pushed("pushed to desktop".into())
+                        }
+                        Ok(r) => SyncResult::Failed(format!(
+                            "push failed ({}): {}",
+                            r.status_code,
+                            r.as_str().unwrap_or("").chars().take(90).collect::<String>()
+                        )),
+                        Err(e) => SyncResult::Failed(format!("push failed: {e}")),
+                    },
+                    None => match minreq::get(format!("{base}/design"))
+                        .with_header("x-ring-token", &token)
+                        .with_timeout(15)
+                        .send()
+                    {
+                        Ok(r) if r.status_code == 200 => match r
+                            .as_str()
+                            .ok()
+                            .and_then(|t| serde_json::from_str::<RingDesign>(t).ok())
+                        {
+                            Some(d) => SyncResult::Pulled(Box::new(d)),
+                            None => SyncResult::Failed("desktop sent something else".into()),
+                        },
+                        Ok(r) => SyncResult::Failed(format!("pull failed ({})", r.status_code)),
+                        Err(e) => SyncResult::Failed(format!("pull failed: {e}")),
+                    },
+                };
+                let _ = tx.send(out);
+            })
+            .expect("spawn sync thread");
+        self.sync_job = Some(rx);
+    }
+
+    fn poll_sync(&mut self, host: &Host) {
+        let Some(rx) = self.sync_job.as_ref() else { return };
+        let Ok(result) = rx.try_recv() else { return };
+        self.sync_job = None;
+        match result {
+            SyncResult::Pulled(d) => {
+                self.design = *d;
+                let lib = Arc::make_mut(&mut self.lib);
+                self.design.bake_drawn(lib);
+                self.thumbs.clear();
+                self.picked_alpha = None;
+                self.status = "pulled from desktop".into();
+                self.mark_dirty();
+                host.haptic(Haptic::Success);
+            }
+            SyncResult::Pushed(msg) => {
+                self.status = msg;
+                host.haptic(Haptic::Success);
+            }
+            SyncResult::Failed(msg) => {
+                self.status = msg;
+                host.haptic(Haptic::Error);
+            }
+        }
     }
 
     /// Build at export resolution and hand the file to the system share sheet.
@@ -755,6 +1028,14 @@ impl EguiApp for RingApp {
             for sub in ["designs", "alphas", "exports"] {
                 let _ = std::fs::create_dir_all(root.join(sub));
             }
+            // Imported textures were written here; without this they come back as blank layers,
+            // because a design references alphas by name and never embeds them.
+            library::set_data_root(root.clone());
+            match Arc::make_mut(&mut self.lib).load_dir(root.join("alphas")) {
+                Ok(n) if n > 0 => log::info!("loaded {n} user alphas"),
+                Ok(_) => {}
+                Err(e) => log::warn!("user alphas: {e}"),
+            }
             if let Ok(loaded) = library::load_design(root.join(AUTOSAVE)) {
                 self.design = loaded;
                 log::info!("restored {}", AUTOSAVE);
@@ -762,7 +1043,7 @@ impl EguiApp for RingApp {
             self.data_root = Some(root);
         }
 
-        self.px_per_mm = device_px_per_mm();
+        self.px_per_mm = device_px_per_mm(host);
         self.has_stylus = host.has_stylus();
         // Resting a hand on the glass should not draw, so pen-only is the default where there is
         // a pen. It stays a toggle: a finger is still the fastest way to rough something in.
@@ -780,6 +1061,7 @@ impl EguiApp for RingApp {
 
     fn update(&mut self, ui: &mut egui::Ui, host: &Host) {
         self.probe = host.stylus_probe();
+        self.poll_sync(host);
         self.tick(ui.ctx());
 
         egui::Panel::bottom(egui::Id::new("tabs")).show(ui, |ui| {
@@ -812,14 +1094,11 @@ impl EguiApp for RingApp {
     }
 }
 
-/// Filesystem-safe stem from a design name.
-fn slug(name: &str) -> String {
-    let s: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-        .collect();
-    let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "ring".into() } else { s }
+/// Outcome of a sync call, handed back from the worker thread.
+enum SyncResult {
+    Pulled(Box<RingDesign>),
+    Pushed(String),
+    Failed(String),
 }
 
 /// Verdict colour and text for the toolbar chip. The undercut fraction is the number that decides
@@ -841,11 +1120,15 @@ fn verdict_chip(cast: &CastReport) -> (egui::Color32, String) {
 
 /// Physical pixels per millimetre, for true-scale rendering.
 ///
-/// `None` for now: the framework exposes no display DPI, and the obvious substitute —
-/// `pixels_per_point`, which is Android's *bucketed* density — is off by around 10% from a panel's
-/// real xdpi. A 1:1 mode that is 10% wrong is worse than no 1:1 mode, because the whole reason the
-/// feature beats a monitor is that a monitor's reported DPI is a lie. Needs a
-/// `DisplayMetrics.xdpi` accessor on `HostExt`, following `jni_has_stylus`.
-fn device_px_per_mm() -> Option<f32> {
-    None
+/// From `DisplayMetrics.xdpi`, the panel's real DPI — deliberately not from `pixels_per_point`,
+/// which is Android's rounded density bucket and is typically ~10% out. A 1:1 mode that is 10%
+/// wrong is worse than none, because the reason to trust a phone over a monitor is that the
+/// monitor's DPI is a lie. `None` when the panel will not say, and then the toggle is not offered.
+fn device_px_per_mm(host: &Host) -> Option<f32> {
+    let (x, y) = host.display_dpi()?;
+    // Square pixels on every phone panel worth the name; averaging costs nothing and guards a
+    // driver that fills only one field sensibly.
+    let dpi = (x + y) * 0.5;
+    (dpi.is_finite() && dpi > 40.0).then(|| dpi / 25.4)
 }
+

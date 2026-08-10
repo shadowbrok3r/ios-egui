@@ -15,6 +15,7 @@ pub mod library;
 pub mod paint;
 pub mod camera;
 pub mod ring;
+pub mod util;
 pub mod viewport;
 
 #[cfg(target_os = "android")]

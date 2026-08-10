@@ -1773,6 +1773,25 @@ fn jni_has_stylus() -> Option<bool> {
     })
 }
 
+/// `DisplayMetrics.xdpi` / `ydpi`: the panel's *physical* pixels per inch.
+///
+/// Not the same thing as `densityDpi`, which is the bucket Android rounds to (400, 480, 560, ...)
+/// and which `pixels_per_point` derives from. The bucket is routinely 10% off the real panel, so
+/// anything that has to match a physical object — a ruler, a ring against a finger — needs these.
+fn jni_display_dpi() -> Option<(f32, f32)> {
+    with_activity(|env, activity| {
+        let res = env
+            .call_method(activity, "getResources", "()Landroid/content/res/Resources;", &[])?
+            .l()?;
+        let dm = env
+            .call_method(&res, "getDisplayMetrics", "()Landroid/util/DisplayMetrics;", &[])?
+            .l()?;
+        let x = env.get_field(&dm, "xdpi", "F")?.f()?;
+        let y = env.get_field(&dm, "ydpi", "F")?.f()?;
+        Ok((x, y))
+    })
+}
+
 /// `ApplicationInfo.nativeLibraryDir`: the APK's extracted lib dir, the only path a non-rooted
 /// device can `dlopen` bundled `.so` from.
 fn jni_native_lib_dir() -> Option<String> {
@@ -1958,6 +1977,15 @@ pub trait HostExt {
     fn has_stylus(&self) -> bool {
         false
     }
+    /// The display's true physical DPI as `(xdpi, ydpi)`, for rendering at 1:1 with a real object.
+    ///
+    /// `None` off-device, and treat a nonsense value as absent: some panels report zero or a
+    /// placeholder. Deliberately *not* derived from `pixels_per_point`, which is the rounded
+    /// density bucket and is typically off by around 10% — a 1:1 mode that is 10% wrong is worse
+    /// than none, because the reason to trust a phone over a monitor is that the monitor lies.
+    fn display_dpi(&self) -> Option<(f32, f32)> {
+        None
+    }
     /// This app's `ApplicationInfo.nativeLibraryDir` — the APK-bundled lib dir. `None` off-device.
     /// The only directory bundled `.so` (e.g. QNN HTP libs) can be `dlopen`'d from on non-rooted
     /// Android.
@@ -2073,6 +2101,9 @@ impl HostExt for Host {
     }
     fn has_stylus(&self) -> bool {
         jni_has_stylus().unwrap_or(false)
+    }
+    fn display_dpi(&self) -> Option<(f32, f32)> {
+        jni_display_dpi().filter(|(x, y)| x.is_finite() && y.is_finite() && *x > 40.0 && *y > 40.0)
     }
     fn native_lib_dir(&self) -> Option<String> {
         jni_native_lib_dir()

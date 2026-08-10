@@ -1,6 +1,6 @@
 [package]
 name = "ringdesigner_android"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2024"
 publish = false
 
@@ -17,6 +17,8 @@ egui = "0.36"
 egui_glow = "0.36"
 log = "0.4"
 serde_json = "1"
+# Plain HTTP to the desktop over Tailscale; no TLS on purpose, the tailnet is the boundary.
+minreq = "3"
 # The geometry, unchanged. Lives in another workspace; cargo resolves its own
 # `.workspace = true` inheritance from its own root, so a plain path dep is enough.
 ringdesign-core = { path = "../../../../JewelryProjects/RingDesigner/crates/ringdesign-core" }
@@ -55,3 +57,21 @@ value = "ringdesigner_android"
 [[package.metadata.android.application.activity.intent_filter]]
 actions = ["android.intent.action.MAIN"]
 categories = ["android.intent.category.LAUNCHER"]
+
+# Read the gallery so a photograph of a real surface can become an alpha. Images only — there is
+# no video source here.
+# Reaching the desktop's sync endpoint over the tailnet.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_IMAGES"
+# Android 14+ hands out a partial "Select photos" grant instead of a full one; an app targeting 34+
+# that asks for READ_MEDIA_IMAGES must declare this too or the partial choice reads as a denial.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+# Pre-Android-13 devices, where the scoped permissions do not exist.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32
+[[package.metadata.android.uses_permission]]
+name = "android.permission.VIBRATE"

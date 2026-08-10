@@ -26,6 +26,29 @@ So the order is always: **bump `version` → build → publish.**
 | Privaxy | `examples/privaxy-android/Cargo.toml` | `privaxy` |
 | Plugins Android | `examples/plugins-android/Cargo.toml` | `plugins-android` |
 | App Store | `examples/appstore-android/Cargo.toml` | `appstore-android` |
+| RingDesigner | `examples/ringdesigner-android/Cargo.toml` | `ringdesigner-android` |
+
+## A brand-new app has to be created first
+
+`publish-appstore.sh` only uploads to an app the store already knows about. The first publish of a
+new slug fails with:
+
+```
+curl: (22) The requested URL returned error: 404
+error: upload failed: {"ok":false,"error":"unknown app — create it first (POST /api/apps)"}
+```
+
+**That message names the wrong route.** `POST /api/apps` is 405; the one that works is
+**`POST /api/apps/create`**:
+
+```bash
+curl -sS -X POST -H "x-api-key: $AS_KEY" -H "Content-Type: application/json" \
+  --data '{"slug":"my-app","name":"My App","package":"com.example.myapp","notes":"one line"}' \
+  "$AS_URL/api/apps/create"
+```
+
+`GET $AS_URL/api/apps` lists what exists, which is the quickest way to confirm the slug took before
+you spend a release build on it. Then publish normally.
 
 ## Build
 
