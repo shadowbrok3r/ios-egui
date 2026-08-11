@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.8.0 — 2026-08-11
+
+Graph editor: nodes copy between workflow tabs. Long-press a node → **Copy** (or **Copy with inputs**, which brings the whole upstream chain), then long-press the canvas in any tab → **Paste nodes**. The pack rides the system clipboard, so it survives closing tabs and can travel between phones; classes the target server lacks are reported by name instead of silently dropped.
+
+Apps now insert as a single collapsed node — ComfyUI's subgraph, phone edition — placed exactly where your finger opened the menu, wearing a violet coat so it can be spotted across a big graph. Its sockets are the app's real inputs (image, model, …), its widgets are the knobs, and it unfolds into the true nodes only at queue time. Long-press → **Unpack app** unfolds it in place for hand-editing. They also appear in Add node under "apps". **Save tab as app** now states the app's seams instead of implying them: an Inputs row lists what it will consume from the surrounding graph, and when more than one IMAGE end dangles, an Output picker asks which one is the result rather than guessing the last.
+
+Enhance steps can now run on the **source image**: every image step has a "Runs on" choice between the finished render and the img2img input, the latter splicing it between load and encode — so an oversized source can be shrunk *before* it costs (or freezes) a full-resolution sampler pass, instead of being upscaled again after one. A step aimed at a source that doesn't exist says so in the run note rather than silently doing nothing. New builtin **Resize to megapixels** scales to a total pixel budget whatever size came in — point it at the source to tame any huge input.
+
+The graph editor's image picker closes itself once you tap a picture (the choice shows on the node; keeping the window up just cost an extra tap) and grows a full-width Close button — the title-bar ✕ was a fingertip-hostile target.
+
 ## v0.7.0 — 2026-08-05
 
 Built on egui 0.36. Two of its changes needed answering before they became bugs you would have hit.

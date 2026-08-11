@@ -3,7 +3,7 @@ name = "comfyui_android"
 # Android versionCode is derived from this: (1<<24)|(major<<16)|(minor<<8)|patch.
 # BUMP IT before every release build — the phone only offers an update whose code is strictly
 # greater than the installed one, so shipping twice at the same version is a silent no-op.
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 publish = false
 

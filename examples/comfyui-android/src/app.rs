@@ -37,6 +37,7 @@ use crate::types::{
     FALLBACK_SAMPLERS, FALLBACK_SCHEDULERS, Facets, FontSizes, GalleryGroup,
     GalleryItem, GalleryMedia, GallerySort, GalleryView, GenMode, Img2ImgSource, LoraCatalog,
     LoraDetail, LoraEntry, LoraFacets, LoraItem, LoraOverride, LoraPack, Mode, TrashItem,
+    AppStage, ClipNode, NodePack,
     ModelKind, ModelOverride, Params,
     PromptHist, RatingFilter, RewriteEngine,
     CheckpointRecommended, SamplerPack, Settings, Tombstone, VARIATION_COUNT_RANGE, VariationStrength,
@@ -414,6 +415,11 @@ struct PublishDraft {
     error: String,
     /// A socket no Create-graph handle can supply; saving is refused until it is wired.
     blocked: bool,
+    /// Boundary handles the app will consume ("image", "model", …), for the dialog's Inputs row.
+    inputs: Vec<String>,
+    /// Every node with an unconsumed IMAGE output: (local id, class, slot). The dialog offers
+    /// these as the app's output instead of silently taking the last one.
+    out_candidates: Vec<(String, String, u32)>,
 }
 
 struct PublishWidget {
@@ -1231,10 +1237,10 @@ struct ComfyApp {
     variation_count: u32,
     variation_strength: VariationStrength,
     /// Elements the variations request must hold fixed, comma-separated and user-editable.
-    /// Session-only; re-seeded from the applied character's injected tags when that changes, so a
-    /// variation can't quietly restyle the character.
+    /// Session-only; re-seeded from the applied character card's identity tags when those change,
+    /// so a variation can't quietly restyle the character.
     variation_keep: String,
-    /// The character injection `variation_keep` was last seeded from (empty = none).
+    /// The character identity `variation_keep` was last seeded from (empty = none).
     variation_keep_seed: String,
     /// The pending-jobs queue sheet is open.
     queue_sheet_open: bool,
@@ -1430,6 +1436,9 @@ struct ComfyApp {
     sampler_clip: Option<SamplerPack>,
     /// LoRA stack copied from a gallery image (also on the system clipboard).
     lora_clip: Option<LoraPack>,
+    /// Graph nodes copied from a workflow tab (also on the system clipboard), for pasting into
+    /// another tab.
+    node_clip: Option<String>,
     /// Create/graph prompts still being tracked locally (supports Queue while running).
     jobs_left: usize,
     /// Thumbnail for Create img2img "From URL".
@@ -2043,6 +2052,7 @@ impl ComfyApp {
             workflow_clip: None,
             sampler_clip: None,
             lora_clip: None,
+            node_clip: None,
             jobs_left: 0,
             img2img_url_tex: None,
             img2img_url_key: String::new(),
@@ -2886,6 +2896,10 @@ impl ComfyApp {
                 self.engine.as_ref().unwrap().fetch_checkpoint_catalog();
                 self.engine.as_ref().unwrap().fetch_tag_dict();
                 self.installed_loras = schemas.loras();
+                // Fold the installed apps in as `app:` classes so collapsed app nodes exist in
+                // the catalog like any server node (Add-node list, export, convert, reload).
+                let mut schemas = schemas;
+                crate::apps::register_app_schemas(Arc::make_mut(&mut schemas), &self.apps);
                 // Swap the node catalog in place so a reconnect keeps open tabs.
                 let object_info = schema::to_object_info(&schemas);
                 let had_nodes = self.graph_tabs.iter().any(|d| !d.is_empty());
@@ -4094,6 +4108,12 @@ impl ComfyApp {
                 }
             }
         }
+        // Collapsed app nodes become their real fragments before anything validates the graph —
+        // the server never sees an `app:` class.
+        for w in crate::apps::expand_app_nodes(&mut wf, &self.apps, &schemas) {
+            self.log.warn(format!("app node: {w}"));
+            self.graph_status = w;
+        }
         // Repairs: snap stale file paths / clip types to what this server actually has installed.
         for n in crate::preflight::snap_installed_enums(&mut wf, &schemas) {
             self.log.info(format!("repair: {n}"));
@@ -5267,6 +5287,7 @@ impl ComfyApp {
         }
         self.log.info(format!("{} enhance app(s) loaded", apps.by_id.len()));
         self.apps = Arc::new(apps);
+        self.sync_app_schemas();
         #[cfg(feature = "local-npu")]
         self.ensure_local_packs(host, false);
         self.refresh_backup_list(host);
@@ -6574,17 +6595,21 @@ impl ComfyApp {
     }
 
     /// Elements a variation must not touch: whatever the user typed into the modal's Keep field,
-    /// re-seeded from the applied character's injected tags whenever that changes. The server
+    /// re-seeded from the applied character card's identity tags whenever those change. The server
     /// already anchors anything the prompt weights (`(pink hair:1.2)`); this covers the identity
     /// tags a character put in the prompt unweighted, which a drifting variation would restyle.
+    /// Read off the card (by name) rather than `AppliedCharacter::pos_injected`: the modern apply
+    /// is a snapshot/restore that leaves the legacy token fields empty, and delete/rename keep an
+    /// active card present, so the lookup only misses when nothing is applied.
     ///
-    /// Re-seeding is keyed on the injection itself, so a hand-edited Keep survives every run for
-    /// that character and is replaced only when a different one (or none) is applied.
+    /// Re-seeding is keyed on the identity itself, so a hand-edited Keep survives every run for
+    /// that character and is replaced only when a different card (or none) is applied.
     fn sync_variation_keep(&mut self) {
         let seed = self
             .active_character
             .as_ref()
-            .map(|c| c.pos_injected.trim().to_string())
+            .and_then(|a| self.characters.iter().find(|c| c.name == a.name))
+            .map(|c| c.identity.trim().to_string())
             .unwrap_or_default();
         if seed != self.variation_keep_seed {
             self.variation_keep = seed.clone();
@@ -12531,7 +12556,7 @@ impl ComfyApp {
         }
 
         ui.add_space(4.0);
-        ui.weak("Steps run top to bottom on the finished image.");
+        ui.weak("Steps run top to bottom on the finished image; a step set to “Source image” runs before sampling instead.");
         ui.add_space(130.0);
     }
 
@@ -12592,6 +12617,30 @@ impl ComfyApp {
         }
         if !status.runnable() {
             return;
+        }
+
+        // Image-transform steps can aim at the img2img source instead of the finished render —
+        // the way to shrink an oversized input before it costs (or freezes) a full-res sampler
+        // pass. Latent re-renderers (hi-res fix) have nothing to run on before the sampler.
+        if crate::apps::source_capable(def) {
+            let stage = self.params.apps[i].stage;
+            ui.horizontal(|ui| {
+                ui.label("Runs on");
+                let mut next = stage;
+                crate::theme::selectable_value(ui, &mut next, AppStage::Output, "Final image");
+                crate::theme::selectable_value(ui, &mut next, AppStage::Source, "Source image");
+                if next != stage {
+                    self.params.apps[i].stage = next;
+                }
+            });
+            if stage == AppStage::Source {
+                let hint = if self.params.mode == Mode::Img2Img {
+                    "Runs on the source photo before sampling — e.g. downscale a huge input."
+                } else {
+                    "Only runs in img2img — this step is idle until a source image is set."
+                };
+                ui.weak(hint);
+            }
         }
 
         // A knob whose target input vanished cannot be sent, so it is not offered.
@@ -13107,6 +13156,10 @@ impl ComfyApp {
 
     /// Materialize an app's fragment as loose nodes on the active graph tab, wired to each other.
     /// Boundary inputs (`$image`, `$model`) are left open for the user to connect.
+    /// Drop an app into the graph as ONE collapsed node (ComfyUI's subgraph, phone edition),
+    /// placed exactly at `at` — the long-press that opened the menu. Its sockets are the app's
+    /// boundary refs, its widgets are the knobs; `expand_app_nodes` unfolds it at queue time,
+    /// and the long-press menu's "Unpack app" unfolds it in place for editing.
     fn insert_app_into_graph(&mut self, id: &str, doc_id: u64, at: egui::Pos2, host: &Host) {
         let Some(def) = self.apps.get(id).cloned() else { return };
         // The picker outlives a tab switch, and `at` is a position in the tab it was opened on.
@@ -13121,13 +13174,85 @@ impl ComfyApp {
             host.haptic(Haptic::Warning);
             return;
         }
-        let plan = def.plan(None);
+        let class = crate::apps::app_class(id);
         let Some(doc) = self.active_doc_mut() else { return };
+        let Some(object) = doc.graph.object_info.get(&class).cloned() else {
+            // The class is registered on connect, so this is "not connected yet".
+            self.graph_status = "Connect to a server first — apps insert as live nodes".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let node = doc.graph.snarl.insert_node(at, FlowNodeData::new(object));
+        doc.props_node = Some(node);
+        let pins: Vec<&str> = doc
+            .graph
+            .snarl
+            .get_node(node)
+            .map(|d| {
+                d.inputs
+                    .iter()
+                    .filter(|i| matches!(i.value, FlowValueType::Other(_)))
+                    .map(|i| i.name.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.graph_status = if pins.is_empty() {
+            format!("Inserted {}", def.name)
+        } else {
+            format!("Inserted {} — wire: {}", def.name, pins.join(", "))
+        };
+        host.haptic(Haptic::Success);
+    }
 
+    /// Replace a collapsed `app:` node with the def's real nodes — ComfyUI's "open subgraph",
+    /// except the fragment lands in the parent graph for hand-editing. Wires through the app
+    /// node's sockets carry over; its widget values become the fragment's literals.
+    fn unpack_app_node(&mut self, nid: NodeId, host: &Host) {
+        if self.active_doc().is_some_and(|d| d.view.locked) {
+            self.graph_status = "Graph is locked — unlock to unpack".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let Some(app_id) = self
+            .active_doc()
+            .and_then(|d| d.graph.snarl.get_node(nid))
+            .and_then(|d| crate::apps::app_id_of(&d.object.name).map(str::to_string))
+        else {
+            return;
+        };
+        let Some(def) = self.apps.get(&app_id).cloned() else {
+            self.graph_status = format!("App '{app_id}' is not installed — can't unpack");
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        let Some(doc) = self.active_doc_mut() else { return };
+        let Some(info) = doc.graph.snarl.get_node_info(nid) else { return };
+        let at = info.pos;
+
+        // The node's widget values become the step the fragment is materialized with.
+        let mut step = AppStep::new(&def);
+        let input_names: Vec<String> = info.value.inputs.iter().map(|i| i.name.clone()).collect();
+        for input in &info.value.inputs {
+            if def.knob(&input.name).is_some()
+                && let Some(v) = flow_value_json(&input.value)
+            {
+                step.values.insert(input.name.clone(), v);
+            }
+        }
+        // Boundary wires in, consumers out — reattached to the fragment below.
+        let mut incoming: Vec<(String, OutPinId)> = Vec::new();
+        for (idx, name) in input_names.iter().enumerate() {
+            for remote in doc.graph.snarl.in_pin(InPinId { node: nid, input: idx }).remotes {
+                incoming.push((name.clone(), remote));
+            }
+        }
+        let consumers: Vec<InPinId> =
+            doc.graph.snarl.out_pin(OutPinId { node: nid, output: 0 }).remotes;
+
+        let plan = def.plan(Some(&step));
         let mut made: HashMap<String, NodeId> = HashMap::new();
         let mut inserted: Vec<NodeId> = Vec::new();
         let mut missing: Vec<String> = Vec::new();
-        let mut open: Vec<String> = Vec::new();
         // Inputs the app specified that this build would not take.
         let mut unset: Vec<String> = Vec::new();
 
@@ -13159,26 +13284,21 @@ impl ComfyApp {
                     }
                 }
             }
-            for (_, r) in &p.open {
-                let label = r.label();
-                if !open.contains(&label) {
-                    open.push(label);
-                }
-            }
         }
 
         // Wire by input NAME: FlowNodeData::new re-sorts inputs, so declaration order is not
         // slot order. Disconnect first — an input holds a single wire.
+        let by_name = |doc: &GraphDoc, node: NodeId, name: &str| {
+            doc.graph
+                .snarl
+                .get_node(node)
+                .and_then(|d| d.inputs.iter().position(|i| i.name == name))
+        };
         for p in &plan {
             let Some(&to_node) = made.get(&p.local) else { continue };
             for (name, from_local, slot) in &p.links {
                 let Some(&from_node) = made.get(from_local) else { continue };
-                let Some(idx) = doc
-                    .graph
-                    .snarl
-                    .get_node(to_node)
-                    .and_then(|d| d.inputs.iter().position(|i| i.name == *name))
-                else {
+                let Some(idx) = by_name(doc, to_node, name) else {
                     // This build has no input by that name — the wire cannot be made.
                     unset.push(format!("{}.{name}", p.class));
                     continue;
@@ -13197,32 +13317,55 @@ impl ComfyApp {
                 }
                 doc.graph.snarl.connect(from, to);
             }
+            // The app node's boundary wires reattach wherever the fragment expects that ref.
+            for (name, r) in &p.open {
+                let Some((_, from)) = incoming.iter().find(|(pin, _)| *pin == r.label()) else {
+                    continue;
+                };
+                let Some(idx) = by_name(doc, to_node, name) else { continue };
+                doc.graph.snarl.connect(*from, InPinId { node: to_node, input: idx });
+            }
+        }
+        // Consumers of the app node's output move onto the fragment's output.
+        if let Some(&out_node) = made.get(&def.output.node) {
+            let outs = doc.graph.snarl.get_node(out_node).map_or(0, |d| d.outputs.len());
+            if (def.output.slot as usize) < outs {
+                let from = OutPinId { node: out_node, output: def.output.slot as usize };
+                for to in consumers {
+                    for remote in doc.graph.snarl.in_pin(to).remotes.clone() {
+                        doc.graph.snarl.disconnect(remote, to);
+                    }
+                    doc.graph.snarl.connect(from, to);
+                }
+            }
         }
 
-        doc.view.request_arrange();
-        let n_inserted = inserted.len();
-        // Reverting the insert is the general undo's job now — it snapshots this edit like any
-        // other, which is both correct across later hand-edits and one less thing to keep in sync.
+        doc.graph.snarl.remove_node(nid);
+        doc.bypassed.remove(&nid);
+        doc.seed_randomize.retain(|(n, _), _| *n != nid);
+        doc.extra_widgets.retain(|(n, _), _| *n != nid);
+        doc.props_node = inserted.first().copied();
 
-        // Missing node classes mean the inserted fragment is broken — that list must be readable
+        let n_inserted = inserted.len();
+        // Missing node classes mean the unpacked fragment is broken — that list must be readable
         // in full, so it goes to the dialog; the happy paths stay a toast.
         if !missing.is_empty() {
             self.report_error(
-                "App inserted with missing nodes",
+                "Unpacked with missing nodes",
                 format!(
-                    "Inserted {n_inserted} node(s), but this server lacks: {}",
+                    "Unpacked {n_inserted} node(s), but this server lacks: {}",
                     missing.join(", ")
                 ),
             );
         } else if !unset.is_empty() {
             unset.dedup();
-            self.graph_status =
-                format!("Inserted {n_inserted} node(s) — this build ignored: {}", unset.join(", "));
-        } else if !open.is_empty() {
-            self.graph_status =
-                format!("Inserted {n_inserted} node(s) — connect: {}", open.join(", "));
+            self.graph_status = format!(
+                "Unpacked {} into {n_inserted} node(s) — this build ignored: {}",
+                def.name,
+                unset.join(", ")
+            );
         } else {
-            self.graph_status = format!("Inserted {n_inserted} node(s)");
+            self.graph_status = format!("Unpacked {} into {n_inserted} node(s)", def.name);
         }
         host.haptic(Haptic::Success);
     }
@@ -13255,6 +13398,7 @@ impl ComfyApp {
         let mut unbound: Vec<String> = Vec::new();
         let mut widgets = Vec::new();
         let mut requires: Vec<crate::apps::Require> = Vec::new();
+        let mut bound_inputs: Vec<String> = Vec::new();
 
         for id in &order {
             let Some(data) = snarl.get_node(*id) else { continue };
@@ -13304,6 +13448,10 @@ impl ComfyApp {
                     match bound {
                         Some(b) => {
                             inputs.insert(input.name.clone(), serde_json::Value::from(b));
+                            let label = b.trim_start_matches('$').to_string();
+                            if !bound_inputs.contains(&label) {
+                                bound_inputs.push(label);
+                            }
                         }
                         // Nothing in the Create graph can feed this socket. Only a REQUIRED one
                         // blocks the save — an optional socket left unwired is exactly how the
@@ -13345,16 +13493,23 @@ impl ComfyApp {
             });
         }
 
-        // The output is the last node with an unconsumed IMAGE output.
-        let output = order.iter().rev().find_map(|id| {
-            let data = snarl.get_node(*id)?;
-            let slot = data.outputs.iter().position(|o| {
-                graphview::type_str(&o.typ) == "IMAGE"
-            })?;
-            (!consumed.contains(&(*id, slot))).then(|| crate::apps::LocalRef {
-                node: local[id].clone(),
-                slot: slot as u32,
+        // Every node with an unconsumed IMAGE output is a candidate; the dialog lets the user
+        // choose, defaulting to the last one (the end of the chain in a linear graph).
+        let out_candidates: Vec<(String, String, u32)> = order
+            .iter()
+            .filter_map(|id| {
+                let data = snarl.get_node(*id)?;
+                let slot = data.outputs.iter().position(|o| {
+                    graphview::type_str(&o.typ) == "IMAGE"
+                })?;
+                (!consumed.contains(&(*id, slot))).then(|| {
+                    (local[id].clone(), data.object.name.clone(), slot as u32)
+                })
             })
+            .collect();
+        let output = out_candidates.last().map(|(node, _, slot)| crate::apps::LocalRef {
+            node: node.clone(),
+            slot: *slot,
         })?;
 
         let name = doc.name.trim_end_matches(".json").to_string();
@@ -13388,6 +13543,8 @@ impl ComfyApp {
                 )
             },
             blocked: !unbound.is_empty(),
+            inputs: bound_inputs,
+            out_candidates,
         })
     }
 
@@ -13421,12 +13578,50 @@ impl ComfyApp {
             );
 
             ui.separator();
-            ui.label(format!(
-                "{} node(s) · output {}:{}",
-                draft.def.nodes.len(),
-                draft.def.output.node,
-                draft.def.output.slot
-            ));
+            // The seams of the app, stated instead of implied: what it consumes from the
+            // surrounding graph, and which node's image leaves it.
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Inputs:");
+                if draft.inputs.is_empty() {
+                    ui.weak("none — the app is self-contained");
+                } else {
+                    ui.label(draft.inputs.join(", "));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.strong("Output:");
+                if draft.out_candidates.len() <= 1 {
+                    ui.label(format!(
+                        "{} · slot {}",
+                        draft.def.output.node, draft.def.output.slot
+                    ));
+                } else {
+                    // More than one loose IMAGE end: let the user say which one IS the result.
+                    let current = draft
+                        .out_candidates
+                        .iter()
+                        .position(|(n, _, s)| {
+                            *n == draft.def.output.node && *s == draft.def.output.slot
+                        })
+                        .unwrap_or(draft.out_candidates.len() - 1);
+                    let mut sel = current;
+                    egui::ComboBox::from_id_salt("publish-output")
+                        .selected_text(format!(
+                            "{} ({})",
+                            draft.out_candidates[current].1, draft.out_candidates[current].0
+                        ))
+                        .show_ui(ui, |ui| {
+                            for (i, (node, class, _)) in draft.out_candidates.iter().enumerate() {
+                                ui.selectable_value(&mut sel, i, format!("{class} ({node})"));
+                            }
+                        });
+                    if sel != current {
+                        let (node, _, slot) = draft.out_candidates[sel].clone();
+                        draft.def.output = crate::apps::LocalRef { node, slot };
+                    }
+                }
+            });
+            ui.label(format!("{} node(s)", draft.def.nodes.len()));
             ui.weak("Tick the settings to expose as controls in the Create tab.");
             crate::theme::scroll_vertical().max_height(220.0).show(ui, |ui| {
                 for w in &mut draft.widgets {
@@ -13549,8 +13744,20 @@ impl ComfyApp {
         let apps = AppSet::load(Some(dir.as_str()));
         self.log.info(format!("saved app '{id}' ({} total)", apps.by_id.len()));
         self.apps = Arc::new(apps);
+        self.sync_app_schemas();
         self.publish = None;
         Ok(path)
+    }
+
+    /// Re-sync the `app:` classes in the schema catalog (and every tab's node list) after the
+    /// installed apps change. A no-op until a server connect has provided schemas.
+    fn sync_app_schemas(&mut self) {
+        let Some(schemas) = self.schemas.as_mut() else { return };
+        crate::apps::register_app_schemas(Arc::make_mut(schemas), &self.apps);
+        let object_info = schema::to_object_info(schemas);
+        for doc in &mut self.graph_tabs {
+            doc.graph.object_info = object_info.clone();
+        }
     }
 
     /// Insert a step at its group's place in the pipeline so the common order needs no taps.
@@ -14945,7 +15152,10 @@ impl ComfyApp {
         };
         if let Some(old) = editing.as_ref().filter(|o| *o != &card.name) {
             self.characters.retain(|c| &c.name != old);
-            // Carry the denied / suggestion history across the rename.
+            // Carry the approved / denied / suggestion history across the rename.
+            if let Some(v) = self.character_approved.remove(old) {
+                self.character_approved.insert(card.name.clone(), v);
+            }
             if let Some(v) = self.character_denied.remove(old) {
                 self.character_denied.insert(card.name.clone(), v);
             }
@@ -16396,9 +16606,11 @@ impl ComfyApp {
         // Prefer the in-app clip; only touch the system clipboard when pasting.
         let has_clip = self.workflow_clip.is_some()
             || host.clipboard_has_text();
+        let has_node_clip = self.node_clip.is_some() || host.clipboard_has_text();
         let mut close = false;
         let mut add = false;
         let mut paste = false;
+        let mut paste_nodes = false;
         let mut insert_app = false;
         let resp = egui::Area::new(egui::Id::new("graph-canvas-menu"))
             .order(egui::Order::Foreground)
@@ -16415,6 +16627,16 @@ impl ComfyApp {
                         .clicked()
                     {
                         insert_app = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            has_node_clip,
+                            egui::Button::new(format!("{} Paste nodes", icons::PROPS)),
+                        )
+                        .on_hover_text("Insert nodes copied from a node's long-press menu")
+                        .clicked()
+                    {
+                        paste_nodes = true;
                     }
                     if ui
                         .add_enabled(has_clip, egui::Button::new(format!("{} Paste workflow", icons::PROPS)))
@@ -16445,6 +16667,11 @@ impl ComfyApp {
                 at: graph_pos - egui::vec2(90.0, 50.0),
             });
             self.app_filter.clear();
+            close = true;
+        }
+        if paste_nodes {
+            // Same half-node offset as Add node, so a single pasted node centers on the finger.
+            self.paste_nodes(graph_pos - egui::vec2(90.0, 50.0), host);
             close = true;
         }
         if paste {
@@ -16493,7 +16720,18 @@ impl ComfyApp {
         let mut duplicate = false;
         let mut delete = false;
         let mut choose_file = false;
+        let mut copy = false;
+        let mut copy_tree = false;
+        let mut unpack = false;
+        let is_app_node = crate::apps::app_id_of(&class).is_some();
         let media = self.node_media_input(nid);
+        // Only offer "with inputs" when there is an upstream tree to bring along.
+        let has_incoming = self.active_doc().is_some_and(|d| {
+            d.graph.snarl.get_node(nid).is_some_and(|data| {
+                (0..data.inputs.len())
+                    .any(|i| !d.graph.snarl.in_pin(InPinId { node: nid, input: i }).remotes.is_empty())
+            })
+        });
         let resp = egui::Area::new(egui::Id::new("graph-node-menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(screen)
@@ -16517,6 +16755,29 @@ impl ComfyApp {
                         .clicked()
                     {
                         duplicate = true;
+                    }
+                    if ui
+                        .button(format!("{} Copy", icons::PROPS))
+                        .on_hover_text("Copy this node for pasting into another workflow tab")
+                        .clicked()
+                    {
+                        copy = true;
+                    }
+                    if has_incoming
+                        && ui
+                            .button(format!("{} Copy with inputs", icons::PROPS))
+                            .on_hover_text("Copy this node and everything feeding it")
+                            .clicked()
+                    {
+                        copy_tree = true;
+                    }
+                    if is_app_node
+                        && ui
+                            .button(format!("{} Unpack app", icons::GRAPH))
+                            .on_hover_text("Replace this app node with its real nodes, wired up")
+                            .clicked()
+                    {
+                        unpack = true;
                     }
                     let bypass_label = if bypassed {
                         format!("{} Unbypass", icons::CHECK)
@@ -16561,6 +16822,14 @@ impl ComfyApp {
         }
         if duplicate {
             self.duplicate_node(nid, host);
+            close = true;
+        }
+        if copy || copy_tree {
+            self.copy_nodes(nid, copy_tree, host);
+            close = true;
+        }
+        if unpack {
+            self.unpack_app_node(nid, host);
             close = true;
         }
         if toggle_bypass {
@@ -16634,6 +16903,211 @@ impl ComfyApp {
         }
         doc.props_node = Some(new_id);
         self.graph_status = format!("Duplicated {class}");
+        host.haptic(Haptic::Success);
+    }
+
+    /// Copy `root` (and, with `with_inputs`, everything feeding it) to the node clipboard, for
+    /// pasting into any workflow tab — including one opened later against another server.
+    fn copy_nodes(&mut self, root: NodeId, with_inputs: bool, host: &Host) {
+        let Some(doc) = self.active_doc() else { return };
+        // Gather the set breadth-first over incoming wires. Order doesn't matter to the pack;
+        // dedupe does — diamond-shaped graphs (one loader feeding two encodes) revisit nodes.
+        let mut set: Vec<NodeId> = Vec::new();
+        let mut queue: Vec<NodeId> = vec![root];
+        while let Some(nid) = queue.pop() {
+            if set.contains(&nid) || doc.graph.snarl.get_node(nid).is_none() {
+                continue;
+            }
+            set.push(nid);
+            if !with_inputs {
+                continue;
+            }
+            let n_inputs = doc.graph.snarl.get_node(nid).map_or(0, |d| d.inputs.len());
+            for input in 0..n_inputs {
+                let pin = doc.graph.snarl.in_pin(InPinId { node: nid, input });
+                for remote in pin.remotes {
+                    queue.push(remote.node);
+                }
+            }
+        }
+        // Positions travel relative to the set's top-left, so a paste lands the same shape
+        // wherever the finger is.
+        let mut origin = egui::pos2(f32::MAX, f32::MAX);
+        for nid in &set {
+            if let Some(info) = doc.graph.snarl.get_node_info(*nid) {
+                origin = origin.min(info.pos);
+            }
+        }
+        let mut nodes: Vec<ClipNode> = Vec::new();
+        for nid in &set {
+            let Some(info) = doc.graph.snarl.get_node_info(*nid) else { continue };
+            let data = &info.value;
+            let mut values = std::collections::BTreeMap::new();
+            for input in &data.inputs {
+                if let Some(v) = flow_value_json(&input.value) {
+                    values.insert(input.name.clone(), v);
+                }
+            }
+            let seed_randomize = doc
+                .seed_randomize
+                .iter()
+                .filter(|((n, _), _)| n == nid)
+                .map(|((_, name), &v)| (name.clone(), v))
+                .collect();
+            let extra_widgets = doc
+                .extra_widgets
+                .iter()
+                .filter(|((n, _), _)| n == nid)
+                .map(|((_, name), (class, v))| (name.clone(), (class.clone(), v.clone())))
+                .collect();
+            nodes.push(ClipNode {
+                class: data.object.name.clone(),
+                pos: [info.pos.x - origin.x, info.pos.y - origin.y],
+                open: info.open,
+                values,
+                bypassed: doc.bypassed.contains(nid),
+                seed_randomize,
+                extra_widgets,
+            });
+        }
+        let mut links: Vec<(usize, u32, usize, String)> = Vec::new();
+        for (out, inp) in doc.graph.snarl.wires() {
+            let (Some(from), Some(to)) = (
+                set.iter().position(|n| *n == out.node),
+                set.iter().position(|n| *n == inp.node),
+            ) else {
+                continue;
+            };
+            let Some(name) = doc
+                .graph
+                .snarl
+                .get_node(inp.node)
+                .and_then(|d| d.inputs.get(inp.input))
+                .map(|i| i.name.clone())
+            else {
+                continue;
+            };
+            links.push((from, out.output as u32, to, name));
+        }
+        if nodes.is_empty() {
+            self.graph_status = "Node gone".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let pack = NodePack { nodes, links };
+        let n = pack.nodes.len();
+        let json = pack.to_clipboard_json();
+        host.copy_text(json.clone());
+        self.node_clip = Some(json);
+        self.graph_status = if n == 1 {
+            "Copied 1 node — paste from another tab's long-press menu".into()
+        } else {
+            format!("Copied {n} nodes — paste from another tab's long-press menu")
+        };
+        host.haptic(Haptic::Success);
+    }
+
+    /// Materialize the node clipboard into the active tab at `at`, wiring the pack's internal
+    /// links. The counterpart of [`Self::copy_nodes`]; classes this server lacks are reported,
+    /// not silently dropped.
+    fn paste_nodes(&mut self, at: egui::Pos2, host: &Host) {
+        let body = self.node_clip.clone().or_else(|| host.clipboard_text());
+        let Some(pack) = body.as_deref().and_then(NodePack::from_clipboard_json) else {
+            self.graph_status = "No copied nodes on the clipboard".into();
+            host.haptic(Haptic::Warning);
+            return;
+        };
+        if self.active_doc().is_some_and(|d| d.view.locked) {
+            self.graph_status = "Graph is locked — unlock to paste".into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let Some(doc) = self.active_doc_mut() else { return };
+        // Index-aligned with pack.nodes so links can find their remapped ends; None = class
+        // missing on this server.
+        let mut made: Vec<Option<NodeId>> = Vec::with_capacity(pack.nodes.len());
+        let mut missing: Vec<String> = Vec::new();
+        let mut first: Option<NodeId> = None;
+        let mut kept_default = 0usize;
+        for cn in &pack.nodes {
+            let Some(object) = doc.graph.object_info.get(&cn.class).cloned() else {
+                if !missing.contains(&cn.class) {
+                    missing.push(cn.class.clone());
+                }
+                made.push(None);
+                continue;
+            };
+            let pos = at + egui::vec2(cn.pos[0], cn.pos[1]);
+            let node = doc.graph.snarl.insert_node(pos, FlowNodeData::new(object));
+            if let Some(info) = doc.graph.snarl.get_node_info_mut(node) {
+                info.open = cn.open;
+            }
+            if let Some(data) = doc.graph.snarl.get_node_mut(node) {
+                for (name, v) in &cn.values {
+                    // A value this build's widget won't take (renamed input, foreign option)
+                    // keeps the default; count it so the paste doesn't read as exact.
+                    let took = data
+                        .inputs
+                        .iter_mut()
+                        .find(|i| i.name == *name)
+                        .is_some_and(|input| set_flow_value(&mut input.value, v));
+                    if !took {
+                        kept_default += 1;
+                    }
+                }
+            }
+            if cn.bypassed {
+                doc.bypassed.insert(node);
+            }
+            for (name, v) in &cn.seed_randomize {
+                doc.seed_randomize.insert((node, name.clone()), *v);
+            }
+            for (name, (class, v)) in &cn.extra_widgets {
+                doc.extra_widgets.insert((node, name.clone()), (class.clone(), v.clone()));
+            }
+            first.get_or_insert(node);
+            made.push(Some(node));
+        }
+        // Same rules as Insert app: wire by input name, bounds-check the source slot, and clear
+        // whatever the fresh node was born wired to (nothing — but stay defensive).
+        for (from_idx, slot, to_idx, name) in &pack.links {
+            let (Some(&Some(from_node)), Some(&Some(to_node))) =
+                (made.get(*from_idx), made.get(*to_idx))
+            else {
+                continue;
+            };
+            let Some(idx) = doc
+                .graph
+                .snarl
+                .get_node(to_node)
+                .and_then(|d| d.inputs.iter().position(|i| i.name == *name))
+            else {
+                continue;
+            };
+            let outs = doc.graph.snarl.get_node(from_node).map_or(0, |d| d.outputs.len());
+            if *slot as usize >= outs {
+                continue;
+            }
+            let to = InPinId { node: to_node, input: idx };
+            let from = OutPinId { node: from_node, output: *slot as usize };
+            for remote in doc.graph.snarl.in_pin(to).remotes.clone() {
+                doc.graph.snarl.disconnect(remote, to);
+            }
+            doc.graph.snarl.connect(from, to);
+        }
+        doc.props_node = first;
+        let n = made.iter().flatten().count();
+        if !missing.is_empty() {
+            self.report_error(
+                "Pasted with missing nodes",
+                format!("Pasted {n} node(s), but this server lacks: {}", missing.join(", ")),
+            );
+        } else if kept_default > 0 {
+            self.graph_status =
+                format!("Pasted {n} node(s) — {kept_default} value(s) not accepted here");
+        } else {
+            self.graph_status = format!("Pasted {n} node(s)");
+        }
         host.haptic(Haptic::Success);
     }
 
@@ -16911,11 +17385,23 @@ impl ComfyApp {
                 .on_hover_text("Publish this graph as a reusable Create-tab enhance step")
                 .clicked()
             {
-                match self.derive_app_draft() {
-                    Some(draft) => self.publish = Some(draft),
-                    None => {
-                        self.graph_status =
-                            "Needs a graph whose final IMAGE output is unconnected".into();
+                // An app can't nest another app — the fragment format has no placeholder concept.
+                let nested = self.active_doc().is_some_and(|d| {
+                    d.graph
+                        .snarl
+                        .nodes_pos_ids()
+                        .any(|(_, _, n)| crate::apps::app_id_of(&n.object.name).is_some())
+                });
+                if nested {
+                    self.graph_status =
+                        "Unpack the app node(s) first — an app can't contain another app".into();
+                } else {
+                    match self.derive_app_draft() {
+                        Some(draft) => self.publish = Some(draft),
+                        None => {
+                            self.graph_status =
+                                "Needs a graph whose final IMAGE output is unconnected".into();
+                        }
                     }
                 }
             }
@@ -17331,9 +17817,10 @@ impl ComfyApp {
     /// posters for videos — a pick is downloaded and re-uploaded into the server's input dir), the
     /// files already uploaded to the server, and the phone's own photos.
     ///
-    /// Shared by the Properties pane and the canvas popup, so both stay in step.
-    fn file_picker_ui(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId, header: bool) {
-        let Some(mi) = self.node_media_input(node) else { return };
+    /// Shared by the Properties pane and the canvas popup, so both stay in step. Returns true when
+    /// a pick landed this frame, so the popup can dismiss itself (the props pane ignores it).
+    fn file_picker_ui(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId, header: bool) -> bool {
+        let Some(mi) = self.node_media_input(node) else { return false };
         if header {
             ui.separator();
             let icon = if mi.video { icons::RUN } else { icons::IMAGE };
@@ -17422,11 +17909,12 @@ impl ComfyApp {
         host: &Host,
         node: NodeId,
         mi: &graphview::MediaInput,
-    ) {
+    ) -> bool {
         if !matches!(self.conn, Conn::Connected) {
             ui.weak("Connect to a server to browse its gallery.");
-            return;
+            return false;
         }
+        let mut picked = false;
         let want_video = mi.video;
         let items = self.picker_items(want_video);
         // Same fetched-once latch as the Gallery tab: emptiness alone would refire forever.
@@ -17458,6 +17946,7 @@ impl ComfyApp {
             }
         } else if let Some(idx) = self.gallery_pick_grid(ui, &items) {
             self.pick_gallery_for_node(idx, node, host);
+            picked = true;
         }
         if more && !self.gallery_loading {
             ui.add_space(4.0);
@@ -17476,6 +17965,7 @@ impl ComfyApp {
                 );
             }
         }
+        picked
     }
 
     /// Download a gallery item, then upload it as a server input for `node`'s file selector.
@@ -17537,20 +18027,41 @@ impl ComfyApp {
             format!("{} Choose {what} · {class}", icons::IMAGE)
         };
         let mut open = true;
+        let mut picked = false;
+        let mut close = false;
         centered(ctx, egui::Window::new(title))
             .collapsible(false)
             .open(&mut open)
             .default_size([360.0, 470.0])
             .show(ctx, |ui| {
+                // Cap the scroll area short of the bottom, or its [false,false] auto-shrink eats
+                // the whole window and squeezes the footer out.
+                let footer = 44.0;
+                let max_h = (ui.available_height() - footer).max(120.0);
                 crate::theme::scroll_vertical()
                     .id_salt("file-picker-window")
+                    .max_height(max_h)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.file_picker_ui(ui, host, node, false);
+                        picked = self.file_picker_ui(ui, host, node, false);
                         ui.add_space(8.0);
                     });
+                ui.add_space(4.0);
+                ui.separator();
+                // The title-bar ✕ is a tiny target on a phone; give closing a full-width row too.
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 30.0],
+                        egui::Button::new(format!("{} Close", icons::CLOSE)),
+                    )
+                    .clicked()
+                {
+                    close = true;
+                }
             });
-        if !open {
+        // A pick dismisses the popup: the selection (or its upload spinner) is visible on the node
+        // itself, so keeping the window up just costs an extra tap.
+        if picked || close || !open {
             self.file_picker = None;
         }
     }
@@ -17580,10 +18091,10 @@ impl ComfyApp {
         input_idx: usize,
         options: &[String],
         selected: &str,
-    ) {
+    ) -> bool {
         if options.is_empty() {
             ui.weak("Nothing uploaded to the server yet — pick from Gallery or Device.");
-            return;
+            return false;
         }
         ui.add(
             egui::TextEdit::singleline(&mut self.img_pick_filter)
@@ -17685,6 +18196,7 @@ impl ComfyApp {
             ui.weak(format!("… {} more — type to filter", options.len() - matches.len()));
         }
 
+        let applied = picked.is_some();
         if let Some(chosen) = picked
             && let Some(doc) = self.active_doc_mut()
             && let Some(data) = doc.graph.snarl.get_node_mut(node)
@@ -17693,6 +18205,7 @@ impl ComfyApp {
         {
             *selected = chosen;
         }
+        applied
     }
 
     /// Grid over the phone's photo gallery (MediaStore). Tapping an image uploads it to the server
@@ -17849,8 +18362,14 @@ impl ComfyApp {
     /// Graph device picker: a pick eagerly uploads the phone's file to the server's `input` dir for
     /// `node` — a loader node can only reference an input, so the bytes have to get there first.
     /// `video` picks which half of the phone's gallery to browse.
-    fn loadimage_device_grid(&mut self, ui: &mut egui::Ui, host: &Host, node: NodeId, video: bool) {
-        let Some((id, name)) = self.device_photo_grid(ui, host, video) else { return };
+    fn loadimage_device_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        host: &Host,
+        node: NodeId,
+        video: bool,
+    ) -> bool {
+        let Some((id, name)) = self.device_photo_grid(ui, host, video) else { return false };
         match host.load_device_media(video, id) {
             Some(bytes) if !bytes.is_empty() => {
                 let ext = if video { "mp4" } else { "jpg" };
@@ -17864,11 +18383,13 @@ impl ComfyApp {
                 self.graph_status = format!("Uploading {}…", graphview::elide_tail(&fname, 32));
                 self.engine.as_ref().unwrap().upload_input_image(token, fname, bytes);
                 host.haptic(Haptic::Light);
+                true
             }
             _ => {
                 let what = if video { "video" } else { "photo" };
                 self.graph_status = format!("Couldn't read that {what} from the device");
                 host.haptic(Haptic::Error);
+                false
             }
         }
     }

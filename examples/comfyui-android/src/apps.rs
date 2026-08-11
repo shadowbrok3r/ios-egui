@@ -11,12 +11,12 @@ use rucomfyui::nodes::types::{
     ClipOut, ConditioningOut, ImageOut, LatentOut, ModelOut, Out, VaeOut,
 };
 use rucomfyui::workflow::{WorkflowInput, WorkflowNode, WorkflowNodeId};
-use rucomfyui::{WorkflowGraph, workflow::WorkflowMeta};
+use rucomfyui::{Workflow, WorkflowGraph, workflow::WorkflowMeta};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::schema::{InputKind, InputSchema, SchemaSet};
-use crate::types::{AppStep, Params};
+use crate::types::{AppStage, AppStep, Params};
 
 fn one() -> u32 {
     1
@@ -432,10 +432,11 @@ impl Ref {
 
 // ── Build-time context ───────────────────────────────────────────────────────
 
-/// Handles published by the base graph. `image` is rebound as each step runs.
+/// Handles published by the base graph. `image` is rebound as each step runs. `latent` is `None`
+/// during the source-stage pass, which runs before the sampler exists (see [`apply_source`]).
 pub struct Ctx {
     pub image: ImageOut,
-    pub latent: LatentOut,
+    pub latent: Option<LatentOut>,
     pub model: ModelOut,
     pub clip: ClipOut,
     pub vae: VaeOut,
@@ -909,6 +910,17 @@ pub struct Report {
 }
 
 impl Report {
+    /// Fold another report into this one. The source-stage pass runs first and separately, so
+    /// `build` stitches its report together from two passes.
+    pub fn absorb(&mut self, other: Report) {
+        self.applied.extend(other.applied);
+        self.skipped.extend(other.skipped);
+        self.dropped.extend(other.dropped);
+        self.substituted.extend(other.substituted);
+        self.warnings.extend(other.warnings);
+        self.params.extend(other.params);
+    }
+
     /// One user-facing line, empty when everything applied cleanly.
     pub fn note(&self) -> String {
         let mut parts = Vec::new();
@@ -1040,6 +1052,11 @@ pub fn apply(
     let mut image_rebound = false;
     let mut rerendered = false;
     for step in steps.iter().filter(|s| s.enabled) {
+        // Source-stage steps ran (or were reported) before the encode — see `apply_source`.
+        // `build` notes the ones that had no source image to run on.
+        if step.stage == AppStage::Source {
+            continue;
+        }
         let Some(def) = set.by_id.get(&step.app) else {
             report.skipped.push((step.app.clone(), "app not installed".into()));
             continue;
@@ -1086,11 +1103,346 @@ pub fn apply(
     report
 }
 
+/// Run the enabled source-stage steps on the freshly loaded img2img input, threading `ctx.image`
+/// exactly like the output chain does after the decode. The caller feeds the resulting image into
+/// the VAE encode, so a Resize here tames an oversized source before it costs a sampler pass.
+pub fn apply_source(
+    g: &WorkflowGraph,
+    ctx: &mut Ctx,
+    steps: &[AppStep],
+    set: &AppSet,
+    schemas: &SchemaSet,
+    p: &Params,
+    report: &mut Report,
+) {
+    for step in steps.iter().filter(|s| s.enabled && s.stage == AppStage::Source) {
+        let Some(def) = set.by_id.get(&step.app) else {
+            report.skipped.push((step.app.clone(), "app not installed".into()));
+            continue;
+        };
+        let st = status(def, Some(step), Some(schemas));
+        if !st.runnable() {
+            report.skipped.push((def.name.clone(), st.chip()));
+            continue;
+        }
+        // No sampler exists yet, so there is no latent for a re-render step to read.
+        if reads_latent(def) {
+            report.skipped.push((
+                def.name.clone(),
+                "re-renders from the latent — it can only run on the finished image".into(),
+            ));
+            continue;
+        }
+        match apply_one(g, ctx, def, step, schemas, p) {
+            Ok(out) => {
+                report.applied.push(format!("{} (source)", def.name));
+                report.dropped.extend(out.dropped);
+                report.substituted.extend(out.substituted);
+            }
+            Err(e) => report.skipped.push((def.name.clone(), e)),
+        }
+    }
+}
+
 /// Whether the fragment consumes the base latent instead of the running image.
 fn reads_latent(def: &AppDef) -> bool {
     def.nodes.iter().any(|n| {
         n.inputs.values().any(|v| matches!(as_ref(v), Some(Ok(Ref::Latent))))
     })
+}
+
+/// Whether a step of this def could run on the img2img source: it must transform the running
+/// image and not need the sampler's latent. Gates the "Runs on" choice in the enhance pane.
+pub fn source_capable(def: &AppDef) -> bool {
+    !reads_latent(def)
+        && def
+            .nodes
+            .iter()
+            .any(|n| n.inputs.values().any(|v| matches!(as_ref(v), Some(Ok(Ref::Image)))))
+}
+
+// ── Apps as single graph-editor nodes ────────────────────────────────────────
+//
+// In the graph tab an app is one collapsed node (ComfyUI's subgraph, phone edition): its class is
+// `app:<id>`, its sockets are the def's boundary refs, its widgets are the knobs. The class lives
+// in the schema catalog like any server node — so Add-node, export, convert and reload all treat
+// it normally — and `expand_app_nodes` swaps it for the real fragment on the way to the server.
+
+/// Class-name prefix marking an app placeholder node.
+pub const APP_CLASS_PREFIX: &str = "app:";
+
+/// The graph-editor class name for an app.
+pub fn app_class(id: &str) -> String {
+    format!("{APP_CLASS_PREFIX}{id}")
+}
+
+/// The app id inside a placeholder class name, if it is one.
+pub fn app_id_of(class: &str) -> Option<&str> {
+    class.strip_prefix(APP_CLASS_PREFIX)
+}
+
+/// The def's boundary refs in a stable socket order, with their ComfyUI connection types.
+fn boundary_pins(def: &AppDef) -> Vec<(&'static str, &'static str)> {
+    let mut refs: Vec<Ref> = Vec::new();
+    for tpl in &def.nodes {
+        for v in tpl.inputs.values() {
+            if let Some(Ok(r)) = as_ref(v)
+                && matches!(
+                    r,
+                    Ref::Image
+                        | Ref::Latent
+                        | Ref::Model
+                        | Ref::Clip
+                        | Ref::Vae
+                        | Ref::Positive
+                        | Ref::Negative
+                )
+                && !refs.contains(&r)
+            {
+                refs.push(r);
+            }
+        }
+    }
+    const ORDER: &[(Ref, &str, &str)] = &[
+        (Ref::Image, "image", "IMAGE"),
+        (Ref::Latent, "latent", "LATENT"),
+        (Ref::Model, "model", "MODEL"),
+        (Ref::Clip, "clip", "CLIP"),
+        (Ref::Vae, "vae", "VAE"),
+        (Ref::Positive, "positive", "CONDITIONING"),
+        (Ref::Negative, "negative", "CONDITIONING"),
+    ];
+    ORDER
+        .iter()
+        .filter(|(r, _, _)| refs.contains(r))
+        .map(|(_, name, ty)| (*name, *ty))
+        .collect()
+}
+
+/// Sync one `app:<id>` schema entry per def into `schemas`, replacing whatever app entries were
+/// there. Everything downstream of the schema catalog — `to_object_info` (and with it every
+/// tab's node list), `export_ui`'s widget mapping, `uiwf::convert` — then handles app nodes
+/// without knowing they exist.
+pub fn register_app_schemas(schemas: &mut SchemaSet, set: &AppSet) {
+    use crate::schema::{InputSchema, NodeSchema, OutputSchema};
+    schemas.nodes.retain(|class, _| app_id_of(class).is_none());
+    for def in set.by_id.values() {
+        let mut inputs: Vec<InputSchema> = boundary_pins(def)
+            .into_iter()
+            .map(|(name, ty)| InputSchema {
+                name: name.into(),
+                required: true,
+                kind: InputKind::Connection { ty: ty.into() },
+                tooltip: None,
+            })
+            .collect();
+        for k in &def.knobs {
+            let kind = match &k.ty {
+                KnobTy::Enum { class, input, prefix } => {
+                    let mut options = schemas.enum_options(class, input);
+                    if let Some(pre) = prefix {
+                        options.retain(|o| o.starts_with(pre.as_str()));
+                    }
+                    let default = combo_text(&k.default);
+                    // Off-line (or the class is missing): a one-entry combo keeps the value
+                    // visible and editable instead of blanking it.
+                    if options.is_empty() {
+                        options.extend(default.clone());
+                    }
+                    // The editor seeds a combo with its first option, so the default leads.
+                    if let Some(d) = &default
+                        && let Some(i) = options.iter().position(|o| o == d)
+                    {
+                        options.swap(0, i);
+                    }
+                    InputKind::Enum { options, default, typed: None }
+                }
+                KnobTy::Choice { options } => {
+                    let mut options = options.clone();
+                    let default = combo_text(&k.default);
+                    if let Some(d) = &default
+                        && let Some(i) = options.iter().position(|o| o == d)
+                    {
+                        options.swap(0, i);
+                    }
+                    InputKind::Enum { options, default, typed: None }
+                }
+                KnobTy::Int { min, max, step } => InputKind::Int {
+                    default: k.default.as_i64().unwrap_or(0),
+                    min: Some(*min),
+                    max: Some(*max),
+                    step: Some(*step),
+                    control: false,
+                },
+                KnobTy::Float { min, max, step } => InputKind::Float {
+                    default: k.default.as_f64().unwrap_or(0.0),
+                    min: Some(*min),
+                    max: Some(*max),
+                    step: (*step != 0.0).then_some(*step),
+                },
+                KnobTy::Bool => {
+                    InputKind::Bool { default: k.default.as_bool().unwrap_or(false) }
+                }
+                KnobTy::Text { multiline } => InputKind::Text {
+                    default: k.default.as_str().unwrap_or_default().into(),
+                    multiline: *multiline,
+                },
+            };
+            inputs.push(InputSchema {
+                name: k.id.clone(),
+                required: true,
+                kind,
+                tooltip: (!k.tooltip.is_empty()).then(|| k.tooltip.clone()),
+            });
+        }
+        let schema = NodeSchema {
+            name: app_class(&def.id),
+            display_name: format!("App: {}", def.name),
+            category: "apps".into(),
+            description: def.description.clone(),
+            inputs,
+            outputs: vec![OutputSchema { ty: "IMAGE".into(), name: "IMAGE".into(), is_list: false }],
+            output_node: false,
+        };
+        schemas.nodes.insert(schema.name.clone(), schema);
+    }
+}
+
+/// Expand every `app:<id>` placeholder in an API workflow into its def's fragment, rewiring the
+/// placeholder's sockets into the fragment's boundary refs and its consumers onto the fragment's
+/// output. Runs after `uiwf::convert` on the graph tab's queue path — that pipeline never touches
+/// the typed builder `apply` uses, so the `$ref` resolution is repeated here in API space.
+/// Returns user-facing warnings; a placeholder that cannot expand is left in place (preflight
+/// then reports its class, which at least names the app).
+pub fn expand_app_nodes(wf: &mut Workflow, set: &AppSet, schemas: &SchemaSet) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let placeholders: Vec<(WorkflowNodeId, String)> = wf
+        .0
+        .iter()
+        .filter_map(|(id, n)| app_id_of(&n.class_type).map(|a| (*id, a.to_string())))
+        .collect();
+    if placeholders.is_empty() {
+        return warnings;
+    }
+    let mut next = wf.0.keys().map(|k| k.0).max().unwrap_or(0) + 1;
+    // Not the Create tab's seed — the graph tab has no params. Each expansion gets a fresh base
+    // so `$seed`-reading fragments don't repeat across runs.
+    let seed_base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    for (ph_id, app_id) in placeholders {
+        let Some(def) = set.by_id.get(&app_id) else {
+            warnings.push(format!("app '{app_id}' is not installed — its node was left as-is"));
+            continue;
+        };
+        let ph_inputs = wf.0[&ph_id].inputs.clone();
+        let mut local: BTreeMap<String, WorkflowNodeId> = BTreeMap::new();
+        let mut fresh: Vec<(WorkflowNodeId, WorkflowNode)> = Vec::new();
+        let mut fail: Option<String> = None;
+        for tpl in &def.nodes {
+            if let Some(req) = &tpl.needs
+                && !schemas.has_node(req)
+            {
+                continue;
+            }
+            if !schemas.has_node(&tpl.class) {
+                fail = Some(format!(
+                    "{}: {} is not installed on this server",
+                    def.name, tpl.class
+                ));
+                break;
+            }
+            let mut inputs: HashMap<String, WorkflowInput> = HashMap::new();
+            for (name, raw) in &tpl.inputs {
+                let kind = schemas.input(&tpl.class, name).map(|i| &i.kind);
+                let mut put = |v: &Value| {
+                    if let Some(kind) = kind
+                        && let Some(w) = coerce(v, kind)
+                    {
+                        inputs.insert(name.clone(), w);
+                    }
+                };
+                match as_ref(raw) {
+                    None => put(&unescape(raw).unwrap_or_else(|| raw.clone())),
+                    Some(Ok(r)) => match &r {
+                        Ref::Image
+                        | Ref::Latent
+                        | Ref::Model
+                        | Ref::Clip
+                        | Ref::Vae
+                        | Ref::Positive
+                        | Ref::Negative => match ph_inputs.get(&r.label()) {
+                            Some(w) => {
+                                inputs.insert(name.clone(), w.clone());
+                            }
+                            None => {
+                                let w = format!("{}: connect its {} socket", def.name, r.label());
+                                if !warnings.contains(&w) {
+                                    warnings.push(w);
+                                }
+                            }
+                        },
+                        Ref::Knob(k) => match ph_inputs.get(k.as_str()) {
+                            // Convert already coerced the widget through the app schema.
+                            Some(w) => {
+                                inputs.insert(name.clone(), w.clone());
+                            }
+                            None => {
+                                if let Some(d) = def.knob(k).map(|k| k.default.clone()) {
+                                    put(&d);
+                                }
+                            }
+                        },
+                        Ref::Seed(off) => put(&Value::from(seed_base.wrapping_add(*off))),
+                        // No Create params exist on the graph tab; the target input's own
+                        // schema default is the only sane stand-in.
+                        Ref::Param(_) => {
+                            if let Some(kind) = kind
+                                && let Some(d) = schema_default(kind)
+                            {
+                                put(&d);
+                            }
+                        }
+                        Ref::Node(lr) => {
+                            if let Some(id) = local.get(&lr.node) {
+                                inputs.insert(name.clone(), WorkflowInput::slot(*id, lr.slot));
+                            }
+                        }
+                    },
+                    Some(Err(_)) => {}
+                }
+            }
+            let id = WorkflowNodeId(next);
+            next += 1;
+            local.insert(tpl.id.clone(), id);
+            fresh.push((
+                id,
+                WorkflowNode { inputs, class_type: tpl.class.clone(), meta: None },
+            ));
+        }
+        if let Some(f) = fail {
+            warnings.push(f);
+            continue;
+        }
+        let Some(out) = local.get(&def.output.node).copied() else {
+            warnings.push(format!("{}: output node missing — its node was left as-is", def.name));
+            continue;
+        };
+        for (id, node) in fresh {
+            wf.0.insert(id, node);
+        }
+        // Everything that drank from the placeholder now drinks from the fragment's output.
+        for node in wf.0.values_mut() {
+            for w in node.inputs.values_mut() {
+                if w.as_slot().is_some_and(|(n, _)| n == ph_id) {
+                    *w = WorkflowInput::slot(out, def.output.slot);
+                }
+            }
+        }
+        wf.0.remove(&ph_id);
+    }
+    warnings
 }
 
 #[derive(Default)]
@@ -1203,7 +1555,9 @@ fn resolve(
 ) -> Option<Resolved> {
     Some(match r {
         Ref::Image => Resolved::Input(ctx.image.into_input()),
-        Ref::Latent => Resolved::Input(ctx.latent.into_input()),
+        // `None` only during the source-stage pass, which pre-filters latent readers — this arm
+        // then leaves the input unset and `backfill_required` fails the step with a clear reason.
+        Ref::Latent => Resolved::Input(ctx.latent?.into_input()),
         Ref::Model => Resolved::Input(ctx.model.into_input()),
         Ref::Clip => Resolved::Input(ctx.clip.into_input()),
         Ref::Vae => Resolved::Input(ctx.vae.into_input()),
@@ -1248,6 +1602,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("eye_detailer.json", include_str!("apps_builtin/eye_detailer.json")),
     ("upscale_model.json", include_str!("apps_builtin/upscale_model.json")),
     ("upscale_scale.json", include_str!("apps_builtin/upscale_scale.json")),
+    ("resize_mp.json", include_str!("apps_builtin/resize_mp.json")),
     ("sharpen.json", include_str!("apps_builtin/sharpen.json")),
 ];
 
@@ -1372,7 +1727,7 @@ mod tests {
         });
         Ctx {
             image: ImageOut::from_dynamic(n, 0),
-            latent: LatentOut::from_dynamic(n, 1),
+            latent: Some(LatentOut::from_dynamic(n, 1)),
             model: ModelOut::from_dynamic(n, 2),
             clip: ClipOut::from_dynamic(n, 3),
             vae: VaeOut::from_dynamic(n, 4),
@@ -2309,5 +2664,106 @@ mod tests {
         let report = apply(&g, &mut c, &[AppStep::new(def)], &set, &schemas, &params());
         assert!(report.applied.is_empty());
         assert_eq!(c.image.0.node_id, before.0.node_id);
+    }
+
+    /// Registration turns every installed app into an `app:` class with the boundary refs as
+    /// connection pins and the knobs as widgets, and re-registering replaces instead of piling up.
+    #[test]
+    fn app_schemas_register_as_placeholder_classes() {
+        let set = AppSet::builtin();
+        let mut s = schemas();
+        register_app_schemas(&mut s, &set);
+        let n = s.nodes.get("app:upscale.scale").expect("registered");
+        assert_eq!(n.display_name, "App: Resize");
+        let names: Vec<&str> = n.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["image", "scale_by", "upscale_method"]);
+        assert!(matches!(
+            n.inputs[0].kind,
+            crate::schema::InputKind::Connection { ref ty } if ty == "IMAGE"
+        ));
+        // Enum knob options resolve from the live catalog at registration time.
+        let m = n.inputs.iter().find(|i| i.name == "upscale_method").unwrap();
+        let crate::schema::InputKind::Enum { options, .. } = &m.kind else {
+            panic!("upscale_method should be an enum")
+        };
+        assert!(options.contains(&"lanczos".to_string()));
+        register_app_schemas(&mut s, &set);
+        assert_eq!(
+            s.nodes.keys().filter(|k| k.starts_with(APP_CLASS_PREFIX)).count(),
+            set.by_id.len()
+        );
+    }
+
+    /// The queue-path expansion: a placeholder node becomes its fragment, keeping its wires
+    /// (image in, consumers out) and its widget values.
+    #[test]
+    fn a_placeholder_node_expands_to_its_fragment_in_api_space() {
+        let set = AppSet::builtin();
+        let s = schemas();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            WorkflowNodeId(2),
+            WorkflowNode { inputs: HashMap::new(), class_type: "LoadImage".into(), meta: None },
+        );
+        nodes.insert(
+            WorkflowNodeId(1),
+            WorkflowNode {
+                inputs: HashMap::from([
+                    ("image".to_string(), WorkflowInput::slot(WorkflowNodeId(2), 0)),
+                    ("scale_by".to_string(), WorkflowInput::F64(0.5)),
+                    ("upscale_method".to_string(), WorkflowInput::String("lanczos".into())),
+                ]),
+                class_type: "app:upscale.scale".into(),
+                meta: None,
+            },
+        );
+        nodes.insert(
+            WorkflowNodeId(3),
+            WorkflowNode {
+                inputs: HashMap::from([(
+                    "images".to_string(),
+                    WorkflowInput::slot(WorkflowNodeId(1), 0),
+                )]),
+                class_type: "SaveImage".into(),
+                meta: None,
+            },
+        );
+        let mut wf = Workflow(nodes);
+        let warnings = expand_app_nodes(&mut wf, &set, &s);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!wf.0.values().any(|n| n.class_type.starts_with(APP_CLASS_PREFIX)));
+        let (scale_id, scale) =
+            wf.0.iter().find(|(_, n)| n.class_type == "ImageScaleBy").expect("fragment emitted");
+        assert_eq!(scale.inputs["image"].as_slot(), Some((WorkflowNodeId(2), 0)));
+        assert_eq!(scale.inputs["scale_by"], WorkflowInput::F64(0.5));
+        assert_eq!(scale.inputs["upscale_method"], WorkflowInput::String("lanczos".into()));
+        assert_eq!(wf.0[&WorkflowNodeId(3)].inputs["images"].as_slot(), Some((*scale_id, 0)));
+    }
+
+    /// An unwired socket warns by name, and an app whose def is gone leaves the node untouched.
+    #[test]
+    fn expansion_reports_unwired_sockets_and_unknown_apps() {
+        let set = AppSet::builtin();
+        let s = schemas();
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            WorkflowNodeId(1),
+            WorkflowNode {
+                inputs: HashMap::new(),
+                class_type: "app:upscale.scale".into(),
+                meta: None,
+            },
+        );
+        nodes.insert(
+            WorkflowNodeId(2),
+            WorkflowNode { inputs: HashMap::new(), class_type: "app:nope".into(), meta: None },
+        );
+        let mut wf = Workflow(nodes);
+        let warnings = expand_app_nodes(&mut wf, &set, &s);
+        assert!(warnings.iter().any(|w| w.contains("image")), "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("nope")), "{warnings:?}");
+        // The unknown app's node is left as-is for preflight to name; the known one expanded.
+        assert!(wf.0.values().any(|n| n.class_type == "app:nope"));
+        assert!(wf.0.values().any(|n| n.class_type == "ImageScaleBy"));
     }
 }

@@ -1562,11 +1562,25 @@ impl SnarlViewer<FlowNodeData> for Wrapper<'_> {
         // The inner viewer paints a green 2px stroke on the executing node; anything below 2px is
         // just its default hairline, so we only override our own rims when the width is < 2.
         let inner_width = frame.stroke.width;
+        let is_app = snarl
+            .get_node(node)
+            .is_some_and(|d| d.object.name.starts_with(crate::apps::APP_CLASS_PREFIX));
         if self.bypassed.contains(&node) {
             // Dimmed fill + orange stroke marks a bypassed (mode-4) node.
             frame = frame
                 .fill(egui::Color32::from_rgb(38, 32, 24))
                 .stroke(egui::Stroke::new(2.0, egui::Color32::from_rgb(214, 140, 70)));
+        } else if is_app {
+            // Collapsed app nodes get a violet coat so they can be spotted across a big graph.
+            // Focus (pink) still needs to read on top of it, so only the fill marks a focused one.
+            frame = frame.fill(egui::Color32::from_rgb(34, 26, 46)).stroke(egui::Stroke::new(
+                2.0,
+                if self.focus == Some(node) && inner_width < 2.0 {
+                    crate::theme::PINK
+                } else {
+                    crate::theme::VIOLET
+                },
+            ));
         } else if self.focus == Some(node) && inner_width < 2.0 {
             // Selected / focused: a vivid pink rim (the primary accent).
             frame = frame.stroke(egui::Stroke::new(2.0, crate::theme::PINK));

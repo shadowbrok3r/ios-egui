@@ -12,7 +12,7 @@ const MAX_OPTION_LEN: usize = 1024;
 /// Cap on options per enum input.
 const MAX_OPTIONS: usize = 20_000;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct SchemaSet {
     pub nodes: BTreeMap<String, NodeSchema>,
     /// Nodes that could not be parsed at all: (name, reason).

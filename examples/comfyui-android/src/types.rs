@@ -318,6 +318,16 @@ impl GenMode {
     }
 }
 
+/// Which image an enhance step runs on. `Output` is the classic chain after the VAE decode;
+/// `Source` splices the step between the img2img input's LoadImage and its VAE encode — the
+/// place to shrink an oversized source before it costs a sampler pass at full resolution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppStage {
+    #[default]
+    Output,
+    Source,
+}
+
 /// One configured app in the Create tab's enhance chain.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppStep {
@@ -331,6 +341,9 @@ pub struct AppStep {
     /// Knob overrides, keyed by knob id. Missing entries fall back to the def's default.
     #[serde(default)]
     pub values: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Defaulted so presets and clipboard packs from older builds keep loading.
+    #[serde(default)]
+    pub stage: AppStage,
 }
 
 fn yes() -> bool {
@@ -345,6 +358,7 @@ impl AppStep {
             enabled: true,
             version: def.version,
             values: def.knobs.iter().map(|k| (k.id.clone(), k.default.clone())).collect(),
+            stage: AppStage::default(),
         }
     }
 
@@ -377,6 +391,62 @@ impl AppPack {
         }
         let apps: Vec<AppStep> = serde_json::from_value(v.get("apps")?.clone()).ok()?;
         (!apps.is_empty()).then_some(Self { apps })
+    }
+}
+
+/// One graph-editor node on the clipboard. Everything is keyed by input *name*, not slot index —
+/// the paste target rebuilds the node from its own `/object_info`, whose slot order can differ.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClipNode {
+    pub class: String,
+    /// Canvas position relative to the copied selection's top-left corner.
+    pub pos: [f32; 2],
+    #[serde(default)]
+    pub open: bool,
+    /// Widget values by input name. `Array` widgets carry only the selected option — the option
+    /// list belongs to whichever server the paste lands on.
+    #[serde(default)]
+    pub values: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub bypassed: bool,
+    /// `control_after_generate` flags by seed-input name.
+    #[serde(default)]
+    pub seed_randomize: std::collections::BTreeMap<String, bool>,
+    /// Widgets `/object_info` doesn't declare (VHS encoder settings …): name → (class, value).
+    #[serde(default)]
+    pub extra_widgets: std::collections::BTreeMap<String, (String, serde_json::Value)>,
+}
+
+/// Nodes copied from the graph editor, for pasting into any workflow tab — ComfyUI's node
+/// clipboard, phone edition. Links only cover wires *inside* the copied set; wires to the rest of
+/// the source graph are dropped, like ComfyUI does.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct NodePack {
+    pub nodes: Vec<ClipNode>,
+    /// (from node index, output slot) → (to node index, input name).
+    #[serde(default)]
+    pub links: Vec<(usize, u32, usize, String)>,
+}
+
+impl NodePack {
+    pub const CLIP_TYPE: &'static str = "comfyui_android_nodes_v1";
+
+    pub fn to_clipboard_json(&self) -> String {
+        serde_json::json!({ "type": Self::CLIP_TYPE, "nodes": self.nodes, "links": self.links })
+            .to_string()
+    }
+
+    pub fn from_clipboard_json(raw: &str) -> Option<Self> {
+        let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) != Some(Self::CLIP_TYPE) {
+            return None;
+        }
+        let nodes: Vec<ClipNode> = serde_json::from_value(v.get("nodes")?.clone()).ok()?;
+        let links: Vec<(usize, u32, usize, String)> = v
+            .get("links")
+            .and_then(|l| serde_json::from_value(l.clone()).ok())
+            .unwrap_or_default();
+        (!nodes.is_empty()).then_some(Self { nodes, links })
     }
 }
 
@@ -4109,6 +4179,7 @@ mod tests {
                 enabled: true,
                 version: 0,
                 values: Default::default(),
+                stage: Default::default(),
             }],
             mode: Mode::Img2Img,
             randomize_seed: false,

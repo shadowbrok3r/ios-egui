@@ -19,7 +19,7 @@ use rucomfyui::{Workflow, WorkflowGraph, WorkflowNodeId};
 
 use crate::apps::{AppSet, Ctx, Report};
 use crate::schema::SchemaSet;
-use crate::types::{ActiveLora, Mode, ModelKind, Params, VideoParams};
+use crate::types::{ActiveLora, AppStage, Mode, ModelKind, Params, VideoParams};
 
 /// The Create output filename prefix, shared by images and video outputs.
 const OUTPUT_PREFIX: &str = "comfyui_android";
@@ -57,8 +57,22 @@ pub fn build(
     // scales it up). Resolve that layer ONCE here so the base graph and every `$param:` inside an
     // app read the same numbers the Create tab is showing.
     let (p, notes) = crate::apps::effective_params(p, &p.apps, apps, Some(schemas));
-    let (g, mut ctx) = build_base(&p, input_image);
-    let mut report = crate::apps::apply(&g, &mut ctx, &p.apps, apps, schemas, &p);
+    let has_source = input_image.is_some() && p.mode == Mode::Img2Img;
+    let mut report = Report::default();
+    let (g, mut ctx) = build_base(&p, input_image, Some((apps, schemas, &mut report)));
+    // A step aimed at the source has nothing to run on in a txt2img run — say so, or an enabled
+    // Resize would just silently do nothing.
+    if !has_source {
+        for step in p.apps.iter().filter(|s| s.enabled && s.stage == AppStage::Source) {
+            let name = apps
+                .by_id
+                .get(&step.app)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| step.app.clone());
+            report.skipped.push((name, "set to run on the source image — this run has none".into()));
+        }
+    }
+    report.absorb(crate::apps::apply(&g, &mut ctx, &p.apps, apps, schemas, &p));
     report.params = notes;
     let out = g.add(SaveImage::new(ctx.image, "comfyui_android"));
     (g.into_workflow(), out, report)
@@ -78,7 +92,13 @@ fn text_encoder(g: &WorkflowGraph, p: &Params) -> ClipOut {
 }
 
 /// The typed base graph, ending at the VAE decode. Publishes every handle an app can reference.
-fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
+/// `chain` lets the enhance chain's source-stage steps splice between the img2img LoadImage and
+/// its VAE encode; pass `None` to build the bare graph (tests, previews).
+fn build_base(
+    p: &Params,
+    input_image: Option<String>,
+    chain: Option<(&AppSet, &SchemaSet, &mut Report)>,
+) -> (WorkflowGraph, Ctx) {
     let g = WorkflowGraph::new();
 
     // Checkpoints carry MODEL+CLIP+VAE in one file; diffusion models (Anima, Flux, Qwen-Image)
@@ -125,10 +145,41 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
         (model, clip)
     };
 
+    // CLIP skip (checkpoints only): Pony/Illustrious conventionally encode at -2. Diffusion-model
+    // text encoders (Anima/Flux qwen/t5 towers) have no CLIP layers to stop at.
+    let clip = if p.clip_skip >= 1 && p.model_kind == ModelKind::Checkpoint {
+        g.add(CLIPSetLastLayer::new(clip, -(p.clip_skip.min(24) as i64)))
+    } else {
+        clip
+    };
+
+    // Encodes before the latent: the img2img arm below runs source-stage enhance steps, whose
+    // fragments may reference any published handle.
+    let positive = g.add(CLIPTextEncode::new(p.server_positive(), clip.clone()));
+    let negative = g.add(CLIPTextEncode::new(p.negative.clone(), clip.clone()));
+
     let latent = match input_image {
         Some(name) if p.mode == Mode::Img2Img => {
             let img = g.add(LoadImage::new(name));
-            let enc = g.add(VAEEncode::new(img.image, vae));
+            // Steps aimed at the source run between load and encode — shrinking an oversized
+            // input here spares the sampler (and the server) a full-resolution pass.
+            let src_image = match chain {
+                Some((set, schemas, report)) => {
+                    let mut src = Ctx {
+                        image: img.image,
+                        latent: None,
+                        model,
+                        clip: clip.clone(),
+                        vae,
+                        positive,
+                        negative,
+                    };
+                    crate::apps::apply_source(&g, &mut src, &p.apps, set, schemas, p, report);
+                    src.image
+                }
+                None => img.image,
+            };
+            let enc = g.add(VAEEncode::new(src_image, vae));
             if p.inpaint_mask {
                 g.add(SetLatentNoiseMask::new(enc, img.mask))
             } else {
@@ -145,16 +196,6 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
     // denoise 1.0 regenerates fully; < 1.0 keeps the input image's structure for img2img.
     let denoise = if p.mode == Mode::Img2Img { p.denoise } else { 1.0 };
 
-    // CLIP skip (checkpoints only): Pony/Illustrious conventionally encode at -2. Diffusion-model
-    // text encoders (Anima/Flux qwen/t5 towers) have no CLIP layers to stop at.
-    let clip = if p.clip_skip >= 1 && p.model_kind == ModelKind::Checkpoint {
-        g.add(CLIPSetLastLayer::new(clip, -(p.clip_skip.min(24) as i64)))
-    } else {
-        clip
-    };
-
-    let positive = g.add(CLIPTextEncode::new(p.server_positive(), clip.clone()));
-    let negative = g.add(CLIPTextEncode::new(p.negative.clone(), clip.clone()));
     let samples = g.add(KSampler {
         model,
         seed: p.seed,
@@ -169,7 +210,7 @@ fn build_base(p: &Params, input_image: Option<String>) -> (WorkflowGraph, Ctx) {
     });
 
     let image = g.add(VAEDecode { samples, vae });
-    let ctx = Ctx { image, latent: samples, model, clip, vae, positive, negative };
+    let ctx = Ctx { image, latent: Some(samples), model, clip, vae, positive, negative };
     (g, ctx)
 }
 
@@ -611,6 +652,74 @@ mod tests {
         assert_eq!(wf.0[&sharp].class_type, "ImageSharpen");
         let (dec, _) = wf.0[&sharp].inputs["image"].as_slot().unwrap();
         assert_eq!(wf.0[&dec].class_type, "VAEDecode");
+    }
+
+    /// A source-stage Resize splices between the img2img LoadImage and its VAE encode, and the
+    /// output chain is left alone (the save still eats the decode directly).
+    #[test]
+    fn a_source_stage_step_splices_between_load_and_encode() {
+        let apps = AppSet::builtin();
+        let schemas = schemas_with(
+            r#"{"ImageScaleBy": {"input": {"required": {"image": ["IMAGE"], "upscale_method": [["nearest-exact", "lanczos"]], "scale_by": ["FLOAT", {"default": 1.0}]}}, "output": ["IMAGE"]}}"#,
+        );
+        let mut p = params();
+        p.mode = Mode::Img2Img;
+        let mut step = crate::types::AppStep::new(apps.get("upscale.scale").unwrap());
+        step.stage = AppStage::Source;
+        p.apps = vec![step];
+        let (wf, out, report) = build(&p, Some("input.png".into()), &apps, &schemas);
+        assert_eq!(report.applied, vec!["Resize (source)"]);
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+        // Save ← decode: the finished image is untouched.
+        let dec = upstream(&wf, &out, "images");
+        assert_eq!(class_of(&wf, &dec), "VAEDecode");
+        // Encode ← scale ← load: the source was resized before it met the sampler.
+        let enc = upstream(&wf, &upstream(&wf, &dec, "samples"), "latent_image");
+        assert_eq!(class_of(&wf, &enc), "VAEEncode");
+        let scale = upstream(&wf, &enc, "pixels");
+        assert_eq!(class_of(&wf, &scale), "ImageScaleBy");
+        let load = upstream(&wf, &scale, "image");
+        assert_eq!(class_of(&wf, &load), "LoadImage");
+    }
+
+    /// The same step in a txt2img run has no source to act on: it must be reported, not silently
+    /// dropped, and must not touch the graph.
+    #[test]
+    fn a_source_stage_step_without_a_source_is_reported() {
+        let apps = AppSet::builtin();
+        let schemas = schemas_with(
+            r#"{"ImageScaleBy": {"input": {"required": {"image": ["IMAGE"], "upscale_method": [["nearest-exact", "lanczos"]], "scale_by": ["FLOAT", {"default": 1.0}]}}, "output": ["IMAGE"]}}"#,
+        );
+        let mut p = params();
+        let mut step = crate::types::AppStep::new(apps.get("upscale.scale").unwrap());
+        step.stage = AppStage::Source;
+        p.apps = vec![step];
+        let (wf, _, report) = build(&p, None, &apps, &schemas);
+        assert!(report.applied.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].0, "Resize");
+        assert!(!wf.0.values().any(|n| n.class_type == "ImageScaleBy"));
+    }
+
+    /// A latent re-renderer forced onto the source stage is refused with a reason — there is no
+    /// latent before the sampler for it to read.
+    #[test]
+    fn a_latent_step_cannot_run_on_the_source() {
+        let apps = AppSet::builtin();
+        let schemas = schemas_with(
+            r#"{"LatentUpscaleBy": {"input": {"required": {"samples": ["LATENT"], "upscale_method": [["bislerp"]], "scale_by": ["FLOAT", {"default": 1.5}]}}, "output": ["LATENT"]},
+                "KSampler": {"input": {"required": {"model": ["MODEL"], "positive": ["CONDITIONING"], "negative": ["CONDITIONING"], "latent_image": ["LATENT"], "seed": ["INT", {"default": 0}], "steps": ["INT", {"default": 20}], "cfg": ["FLOAT", {"default": 7.0}], "sampler_name": [["euler"]], "scheduler": [["normal"]], "denoise": ["FLOAT", {"default": 1.0}]}}, "output": ["LATENT"]},
+                "VAEDecode": {"input": {"required": {"samples": ["LATENT"], "vae": ["VAE"]}}, "output": ["IMAGE"]}}"#,
+        );
+        let mut p = params();
+        p.mode = Mode::Img2Img;
+        let mut step = crate::types::AppStep::new(apps.get("hires.fix").unwrap());
+        step.stage = AppStage::Source;
+        p.apps = vec![step];
+        let (_, _, report) = build(&p, Some("input.png".into()), &apps, &schemas);
+        assert!(report.applied.is_empty());
+        assert_eq!(report.skipped.len(), 1);
+        assert!(report.skipped[0].1.contains("finished image"), "got: {:?}", report.skipped);
     }
 
     /// The duplicate-run fingerprint is stable across independent rebuilds of the same params
