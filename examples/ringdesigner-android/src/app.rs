@@ -49,7 +49,6 @@ const TILE_EDGE: u32 = 512;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Ring,
-    Design,
     Band,
     Tile,
     Alphas,
@@ -58,20 +57,20 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: &'static [Tab] = &[
-        Tab::Ring,
-        Tab::Design,
-        Tab::Band,
-        Tab::Tile,
-        Tab::Alphas,
-        Tab::Files,
-        Tab::Bench,
+    /// `(tab, emoji, label)` — a labelled button when the label is non-empty,
+    /// a square icon button when it is.
+    const BAR: &'static [(Tab, &'static str, &'static str)] = &[
+        (Tab::Ring, "", "Ring"),
+        (Tab::Band, "", "Band"),
+        (Tab::Tile, "", "Tile"),
+        (Tab::Alphas, "\u{1F3A8}", ""),
+        (Tab::Files, "\u{1F4C1}", ""),
+        (Tab::Bench, "\u{26A1}", ""),
     ];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Ring => "Ring",
-            Tab::Design => "Design",
             Tab::Band => "Band",
             Tab::Tile => "Tile",
             Tab::Alphas => "Alphas",
@@ -122,6 +121,8 @@ pub struct RingApp {
     /// Last long-press readout, shown as a chip until dismissed.
     probe_info: Option<String>,
     show_gems: bool,
+    /// The design editor rides a collapsible bottom sheet over the live view.
+    design_open: bool,
     /// Soften the preview at the sand's detail radius — see the pour early.
     as_cast: bool,
     /// Cut exports oversize for this metal's shrink; None is nominal.
@@ -186,6 +187,7 @@ impl RingApp {
             preview_mesh: None,
             probe_info: None,
             show_gems: true,
+            design_open: false,
             as_cast: false,
             shrink_metal: None,
             status: "starting".into(),
@@ -300,7 +302,8 @@ impl RingApp {
         egui::Panel::top(egui::Id::new("ring_tools")).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for mode in ShadeMode::ALL {
-                    if ui.selectable_label(self.pane.shade == *mode, mode.label()).clicked() {
+                    let sel = self.pane.shade == *mode;
+                    if ui.add(crate::theme::selectable(sel, mode.label())).clicked() {
                         self.pane.shade = *mode;
                     }
                 }
@@ -386,16 +389,19 @@ impl RingApp {
                 });
             }
             ui.horizontal_wrapped(|ui| {
-                for view in crate::camera::StandardView::ALL {
-                    if ui.button(view.label()).clicked() {
-                        self.pane.camera.set_view(*view);
+                crate::theme::up_menu(ui, "\u{1F4D0} View", |ui| {
+                    for view in crate::camera::StandardView::ALL {
+                        if ui.button(view.label()).clicked() {
+                            self.pane.camera.set_view(*view);
+                            self.pane.actual_size = false;
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Reset camera").clicked() {
+                        self.pane.camera.reset();
                         self.pane.actual_size = false;
                     }
-                }
-                if ui.button("Reset").clicked() {
-                    self.pane.camera.reset();
-                    self.pane.actual_size = false;
-                }
+                });
             });
         });
 
@@ -488,6 +494,75 @@ impl RingApp {
         ));
     }
 
+    /// Labelled tabs and the Design-sheet toggle split the width; the rarer
+    /// tabs collapse to icon squares so nothing ever runs off the edge.
+    fn nav_bar(&mut self, ui: &mut egui::Ui, host: &Host) {
+        const ROW_H: f32 = 40.0;
+        const ICON_BTN: f32 = 44.0;
+        const ICON_GAP: f32 = 2.0;
+        let labeled_n =
+            Tab::BAR.iter().filter(|(_, _, l)| !l.is_empty()).count() as f32 + 1.0;
+        let icon_n = Tab::BAR.iter().filter(|(_, _, l)| l.is_empty()).count() as f32;
+        let icon_cluster_w = icon_n * ICON_BTN + (icon_n - 1.0).max(0.0) * ICON_GAP;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let labeled_w = ((ui.available_width() - icon_cluster_w - 6.0 * labeled_n)
+                / labeled_n)
+                .max(58.0);
+
+            for (tab, _, label) in Tab::BAR.iter().filter(|(_, _, l)| !l.is_empty()) {
+                let selected = self.tab == *tab;
+                let text = egui::RichText::new(*label).size(13.0);
+                if crate::theme::selectable_label(
+                    ui,
+                    selected,
+                    [labeled_w, ROW_H],
+                    text,
+                )
+                .clicked()
+                    && !selected
+                {
+                    self.tab = *tab;
+                    host.haptic(Haptic::Light);
+                }
+            }
+
+            // The Design sheet's toggle lives with the tabs but is not one:
+            // it slides the editor up over whatever tab is showing.
+            let text = egui::RichText::new("Design").size(13.0);
+            if crate::theme::selectable_label(ui, self.design_open, [labeled_w, ROW_H], text)
+                .on_hover_text("Slide the design controls over the live ring")
+                .clicked()
+            {
+                self.design_open = !self.design_open;
+                if self.design_open {
+                    self.tab = Tab::Ring;
+                }
+                host.haptic(Haptic::Light);
+            }
+
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = ICON_GAP;
+                ui.spacing_mut().button_padding = egui::vec2(0.0, 0.0);
+                for (tab, icon, _) in Tab::BAR.iter().filter(|(_, _, l)| l.is_empty()) {
+                    let selected = self.tab == *tab;
+                    let resp = crate::theme::selectable_label(
+                        ui,
+                        selected,
+                        [ICON_BTN, ROW_H],
+                        egui::RichText::new(*icon).size(18.0),
+                    )
+                    .on_hover_text(tab.label());
+                    if resp.clicked() && !selected {
+                        self.tab = *tab;
+                        host.haptic(Haptic::Light);
+                    }
+                }
+            });
+        });
+    }
+
     /// The whole design editor: size, profile, shank, head, and the stock
     /// generators. Every control writes straight into the design and marks
     /// dirty, so the Ring tab shows the result on the next settled build.
@@ -497,7 +572,7 @@ impl RingApp {
         use ringdesign_core::{ProfileStyle, RingSize, ShankKind};
 
         let mut dirty = false;
-        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.scope(|ui| {
             ui.label(egui::RichText::new("ring").weak());
             let mut size = self.design.size.0;
             if ui
@@ -1237,46 +1312,101 @@ impl RingApp {
         let designs = root.join("designs");
         let exports = root.join("exports");
 
+        // One row of menus instead of a dozen wrapping buttons: every popup
+        // opens upward so it never lands under the system gesture area.
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Save").clicked() {
-                let path = designs.join(format!("{}.ring.json", slug(&self.design.name)));
-                let _ = std::fs::create_dir_all(&designs);
-                self.status = match library::save_design(&path, &self.design) {
-                    Ok(()) => format!("saved {}", path.display()),
-                    Err(e) => format!("save failed: {e}"),
-                };
-                host.haptic(Haptic::Success);
-            }
-            if ui.button("Export STL").clicked() {
-                let _ = std::fs::create_dir_all(&exports);
-                let path = exports.join(format!("{}.stl", slug(&self.design.name)));
-                self.export_mesh(host, path, false);
-            }
-            if ui.button("Export 3MF").clicked() {
-                let _ = std::fs::create_dir_all(&exports);
-                let path = exports.join(format!("{}.3mf", slug(&self.design.name)));
-                self.export_mesh(host, path, true);
-            }
-            if ui.button("Casting sheet").clicked() {
-                let _ = std::fs::create_dir_all(&exports);
-                let path = exports.join(format!("{}_sheet.html", slug(&self.design.name)));
-                self.share_spec(host, path);
-            }
-            if ui.button("Share render").clicked() {
-                let _ = std::fs::create_dir_all(&exports);
-                let path = exports.join(format!("{}.png", slug(&self.design.name)));
-                self.share_render(host, path);
-            }
-            if ui.button("Share spin").on_hover_text("A looping 36-frame turntable GIF").clicked() {
-                let _ = std::fs::create_dir_all(&exports);
-                let path = exports.join(format!("{}.gif", slug(&self.design.name)));
-                self.share_turntable(host, path);
-            }
-            if ui.button("Share GLB").on_hover_text("glTF binary for AR and web viewers, metre-scaled").clicked() {
-                let _ = std::fs::create_dir_all(&exports);
-                let path = exports.join(format!("{}.glb", slug(&self.design.name)));
-                self.share_glb(host, path);
-            }
+            crate::theme::up_menu(ui, "\u{1F4C4} File", |ui| {
+                if ui.button("Save").clicked() {
+                    let path = designs.join(format!("{}.ring.json", slug(&self.design.name)));
+                    let _ = std::fs::create_dir_all(&designs);
+                    self.status = match library::save_design(&path, &self.design) {
+                        Ok(()) => format!("saved {}", path.display()),
+                        Err(e) => format!("save failed: {e}"),
+                    };
+                    host.haptic(Haptic::Success);
+                }
+                if ui.button("Copy design as JSON").clicked() {
+                    if let Ok(json) = serde_json::to_string_pretty(&self.design) {
+                        host.copy_text(json);
+                        self.status = "design copied as JSON".into();
+                        host.haptic(Haptic::Success);
+                    }
+                }
+                if ui.button("Paste design").clicked() {
+                    match host
+                        .clipboard_text()
+                        .and_then(|t| serde_json::from_str::<RingDesign>(&t).ok())
+                    {
+                        Some(d) => {
+                            self.design = d;
+                            let lib = Arc::make_mut(&mut self.lib);
+                            self.design.bake_all(lib);
+                            self.thumbs.clear();
+                            self.picked_alpha = None;
+                            self.status = "design pasted".into();
+                            self.mark_dirty();
+                            host.haptic(Haptic::Success);
+                        }
+                        None => {
+                            self.status = "clipboard is not a design".into();
+                            host.haptic(Haptic::Error);
+                        }
+                    }
+                }
+            });
+            crate::theme::up_menu(ui, "\u{1F48D} New", |ui| {
+                if ui.button("Blank band").clicked() {
+                    self.load_template_design(RingDesign::default(), "new blank design");
+                }
+                ui.separator();
+                for t in ringdesign_core::templates::all() {
+                    if ui.button(t.name).on_hover_text(t.blurb).clicked() {
+                        self.load_template_design(t.design(), t.name);
+                    }
+                }
+            });
+            crate::theme::up_menu(ui, "\u{1F4E4} Export", |ui| {
+                if ui.button("STL — the pattern to cut").clicked() {
+                    let _ = std::fs::create_dir_all(&exports);
+                    let path = exports.join(format!("{}.stl", slug(&self.design.name)));
+                    self.export_mesh(host, path, false);
+                }
+                if ui.button("3MF — units stated").clicked() {
+                    let _ = std::fs::create_dir_all(&exports);
+                    let path = exports.join(format!("{}.3mf", slug(&self.design.name)));
+                    self.export_mesh(host, path, true);
+                }
+                if ui
+                    .button("GLB — AR and web viewers")
+                    .on_hover_text("glTF binary, metre-scaled")
+                    .clicked()
+                {
+                    let _ = std::fs::create_dir_all(&exports);
+                    let path = exports.join(format!("{}.glb", slug(&self.design.name)));
+                    self.share_glb(host, path);
+                }
+            });
+            crate::theme::up_menu(ui, "\u{2728} Share", |ui| {
+                if ui.button("Casting sheet").clicked() {
+                    let _ = std::fs::create_dir_all(&exports);
+                    let path = exports.join(format!("{}_sheet.html", slug(&self.design.name)));
+                    self.share_spec(host, path);
+                }
+                if ui.button("Render photo").clicked() {
+                    let _ = std::fs::create_dir_all(&exports);
+                    let path = exports.join(format!("{}.png", slug(&self.design.name)));
+                    self.share_render(host, path);
+                }
+                if ui
+                    .button("Turntable spin")
+                    .on_hover_text("A looping 36-frame GIF")
+                    .clicked()
+                {
+                    let _ = std::fs::create_dir_all(&exports);
+                    let path = exports.join(format!("{}.gif", slug(&self.design.name)));
+                    self.share_turntable(host, path);
+                }
+            });
             {
                 use ringdesign_core::metal::METALS;
                 let current = self
@@ -1296,45 +1426,6 @@ impl RingApp {
                             );
                         }
                     });
-            }
-            if ui.button("Copy design").clicked() {
-                if let Ok(json) = serde_json::to_string_pretty(&self.design) {
-                    host.copy_text(json);
-                    self.status = "design copied as JSON".into();
-                    host.haptic(Haptic::Success);
-                }
-            }
-            if ui.button("Paste design").clicked() {
-                match host.clipboard_text().and_then(|t| serde_json::from_str::<RingDesign>(&t).ok())
-                {
-                    Some(d) => {
-                        self.design = d;
-                        let lib = Arc::make_mut(&mut self.lib);
-                        self.design.bake_all(lib);
-                        self.thumbs.clear();
-                        self.picked_alpha = None;
-                        self.status = "design pasted".into();
-                        self.mark_dirty();
-                        host.haptic(Haptic::Success);
-                    }
-                    None => {
-                        self.status = "clipboard is not a design".into();
-                        host.haptic(Haptic::Error);
-                    }
-                }
-            }
-        });
-
-        ui.separator();
-        ui.label(egui::RichText::new("start fresh").weak());
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("New blank").clicked() {
-                self.load_template_design(RingDesign::default(), "new blank design");
-            }
-            for t in ringdesign_core::templates::all() {
-                if ui.button(t.name).on_hover_text(t.blurb).clicked() {
-                    self.load_template_design(t.design(), t.name);
-                }
             }
         });
 
@@ -1711,12 +1802,7 @@ impl RingApp {
 
 impl EguiApp for RingApp {
     fn theme(&self, ctx: &egui::Context) {
-        ctx.set_visuals(egui::Visuals::dark());
-        ctx.all_styles_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(6.0, 6.0);
-            s.spacing.button_padding = egui::vec2(10.0, 8.0);
-            s.spacing.scroll.bar_width = 14.0;
-        });
+        crate::theme::apply(ctx);
     }
 
     fn on_start(&mut self, ctx: &egui::Context, host: &Host) {
@@ -1762,34 +1848,76 @@ impl EguiApp for RingApp {
         self.poll_sync(host);
         self.tick(ui.ctx());
 
-        egui::Panel::bottom(egui::Id::new("tabs")).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for tab in Tab::ALL {
-                    if ui.selectable_label(self.tab == *tab, tab.label()).clicked() {
-                        self.tab = *tab;
-                    }
-                }
+        // Order is load-bearing: ambience lights the page, then the frost
+        // grabs what is already in the framebuffer, then chrome paints on top.
+        crate::theme::ambience(ui.ctx());
+        crate::frost::frost_chrome(ui);
+
+        // Chrome collapses while typing (focus leads the keyboard slide-in
+        // and the inset trails slide-out; the union avoids flicker).
+        let kb_editing = host.keyboard_height() > 1.0 || ui.ctx().text_edit_focused();
+        let mut chrome: Option<egui::Rect> = None;
+        let mut grow = |r: egui::Rect| {
+            chrome = Some(match chrome {
+                Some(c) => c.union(r),
+                None => r,
+            })
+        };
+
+        let mut nav_open = !kb_editing;
+        let bar = egui::Panel::bottom(egui::Id::new("tabs"))
+            .frame(crate::theme::bar())
+            .drag_to_open(false)
+            .show_collapsible(ui, &mut nav_open, |ui| {
+                self.nav_bar(ui, host);
             });
-        });
+        if let Some(bar) = &bar {
+            grow(bar.response.rect);
+        }
 
-        egui::Panel::bottom(egui::Id::new("status")).show(ui, |ui| {
-            // While painting, what the pen is doing beats what the mesh last cost.
-            let line = match (self.tab, self.readout.as_ref()) {
-                (Tab::Band | Tab::Tile, Some(r)) => r.as_str(),
-                _ => self.status.as_str(),
-            };
-            ui.label(egui::RichText::new(line).small().weak());
-        });
+        let line = match (self.tab, self.readout.as_ref()) {
+            (Tab::Band | Tab::Tile, Some(r)) => r.clone(),
+            _ => self.status.clone(),
+        };
+        let status = egui::Panel::bottom(egui::Id::new("status"))
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 3)))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(line).small().color(crate::theme::INK_DIM),
+                );
+            });
+        grow(status.response.rect);
 
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Ring => self.ring_tab(ui),
-            Tab::Design => self.design_tab(ui),
-            Tab::Band => self.paint_tab(ui, host, Domain::Band),
-            Tab::Tile => self.paint_tab(ui, host, Domain::Tile),
-            Tab::Alphas => self.alphas_tab(ui, host),
-            Tab::Files => self.files_tab(ui, host),
-            Tab::Bench => self.bench_tab(ui, host),
-        });
+        // The design sheet slides up over the live ring, so every slider is
+        // seen on the mesh without leaving the view.
+        let mut sheet_open = self.design_open && !kb_editing;
+        let sheet = egui::Panel::bottom(egui::Id::new("design-sheet"))
+            .frame(crate::theme::bar())
+            .drag_to_open(false)
+            .show_collapsible(ui, &mut sheet_open, |ui| {
+                let cap = ui.ctx().content_rect().height() * 0.44;
+                crate::theme::scroll_vertical().max_height(cap).show(ui, |ui| {
+                    self.design_tab(ui);
+                });
+            });
+        if let Some(sheet) = &sheet {
+            grow(sheet.response.rect);
+        }
+
+        if let Some(chrome) = chrome {
+            crate::frost::remember(ui.ctx(), chrome);
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(ui.style()).inner_margin(6))
+            .show(ui, |ui| match self.tab {
+                Tab::Ring => self.ring_tab(ui),
+                Tab::Band => self.paint_tab(ui, host, Domain::Band),
+                Tab::Tile => self.paint_tab(ui, host, Domain::Tile),
+                Tab::Alphas => self.alphas_tab(ui, host),
+                Tab::Files => self.files_tab(ui, host),
+                Tab::Bench => self.bench_tab(ui, host),
+            });
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "ringdesigner_android"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 publish = false
 
@@ -75,3 +75,6 @@ name = "android.permission.READ_EXTERNAL_STORAGE"
 max_sdk_version = 32
 [[package.metadata.android.uses_permission]]
 name = "android.permission.VIBRATE"
+
+[target.'cfg(target_os = "android")'.dependencies]
+backdrop-blur-egui = { path = "../../patches/backdrop-blur/crates/backdrop-blur-egui", default-features = false, features = ["grab-pass"] }

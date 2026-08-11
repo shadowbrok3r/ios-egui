@@ -10,6 +10,7 @@
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
 pub mod bench;
+pub mod theme;
 pub mod canvas;
 pub mod library;
 pub mod paint;
@@ -17,6 +18,8 @@ pub mod camera;
 pub mod ring;
 pub mod util;
 pub mod viewport;
+
+pub mod frost;
 
 #[cfg(target_os = "android")]
 mod app;

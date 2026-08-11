@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0
+
+- **The galactic glass look.** The app now wears the same theme as the rest of the family: an
+  AMOLED-black page lit by soft colour pools, violet-glass surfaces with real backdrop blur
+  behind the bottom chrome, hot pink for what's chosen and aqua for what's ready.
+- **A bottom bar that fits.** Ring, Band and Tile stay labelled, the rarer tabs become icon
+  squares, and nothing runs off the edge of the screen any more.
+- **Design slides up over the ring.** The design controls are a collapsible sheet now — tap
+  Design and the sliders rise over the live 3D view, so every change shows on the mesh as you
+  drag instead of after a tab-switch. Tap again to tuck it away.
+- **Menus instead of button walls.** Files now offers File / New / Export / Share menus that
+  open upward (never under the gesture bar), with the templates tucked into New.
+
 ## 0.7.0
 
 - **Keyframed shanks.** The new Keyframes shape in Design hands you the band itself: set width,
