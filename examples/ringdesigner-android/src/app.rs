@@ -772,6 +772,11 @@ impl RingApp {
                 let path = exports.join(format!("{}.3mf", slug(&self.design.name)));
                 self.export_mesh(host, path, true);
             }
+            if ui.button("Casting sheet").clicked() {
+                let _ = std::fs::create_dir_all(&exports);
+                let path = exports.join(format!("{}_sheet.html", slug(&self.design.name)));
+                self.share_spec(host, path);
+            }
             {
                 use ringdesign_core::metal::METALS;
                 let current = self
@@ -1002,6 +1007,41 @@ impl RingApp {
     /// Measured at 226 ms end to end on this device, so it runs inline rather than on the worker;
     /// the part that actually stalls is `share_media`, which reads the whole file and copies it
     /// into a Java byte array on the render thread.
+    /// The printable tech sheet, straight to the share sheet — the thing to
+    /// send a caster from the couch.
+    fn share_spec(&mut self, host: &Host, path: std::path::PathBuf) {
+        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
+        let field = ringdesign_core::castability::attributed_field_report(
+            &self.design,
+            &self.lib,
+            &self.design.draft,
+            160,
+            112,
+        );
+        let stones = ringdesign_core::stones::report(&self.design, field.parting_z_mm);
+        let dfm = ringdesign_core::dfm::findings(&self.design);
+        let page = ringdesign_core::spec::html(
+            &self.design,
+            &out.report,
+            &field,
+            stones.as_ref(),
+            &dfm,
+            concat!("RingDesigner Android ", env!("CARGO_PKG_VERSION")),
+        );
+        match std::fs::write(&path, page) {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "sheet.html".into());
+                host.share_media(path.to_string_lossy().into_owned(), name, "text/html");
+                self.status = "casting sheet shared".into();
+                host.haptic(Haptic::Success);
+            }
+            Err(e) => self.status = format!("sheet failed: {e}"),
+        }
+    }
+
     fn export_mesh(&mut self, host: &Host, path: std::path::PathBuf, as_3mf: bool) {
         use ringdesign_core::metal;
         let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
