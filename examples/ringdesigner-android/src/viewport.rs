@@ -24,8 +24,8 @@ use glow::HasContext;
 use ringdesign_core::castability::CastReport;
 use ringdesign_core::mesh::{Mesh, Vec3};
 
-/// Floats per vertex: position(3), normal(3), colour(3).
-const FLOATS_PER_VERTEX: usize = 9;
+/// Floats per vertex: position(3), normal(3), draft colour(3), wall colour(3).
+const FLOATS_PER_VERTEX: usize = 12;
 
 /// Wireframe line half-width, in fragments.
 const WIRE_PX: f32 = 0.6;
@@ -34,18 +34,21 @@ const VERTEX_BODY: &str = r#"
 layout(location = 0) in vec3 a_position;
 layout(location = 1) in vec3 a_normal;
 layout(location = 2) in vec3 a_color;
+layout(location = 3) in vec3 a_wall;
 
 uniform mat4 u_mvp;
 uniform mat3 u_normal_matrix;
 
 out vec3 v_normal;
 out vec3 v_color;
+out vec3 v_wall;
 out vec3 v_bary;
 
 void main() {
     gl_Position = u_mvp * vec4(a_position, 1.0);
     v_normal = u_normal_matrix * a_normal;
     v_color = a_color;
+    v_wall = a_wall;
     // Non-indexed triangles, so the corner index is the vertex index mod 3 and the
     // barycentric coordinate costs nothing to carry.
     int corner = gl_VertexID % 3;
@@ -56,6 +59,7 @@ void main() {
 const FRAGMENT_BODY: &str = r#"
 in vec3 v_normal;
 in vec3 v_color;
+in vec3 v_wall;
 in vec3 v_bary;
 
 uniform int u_mode;
@@ -76,7 +80,10 @@ void main() {
     vec3 l = normalize(u_light_dir);
     vec3 color;
 
-    if (u_mode == 2) {
+    if (u_mode == 3) {
+        float lambert = max(dot(n, l), 0.0);
+        color = v_wall * (0.74 + 0.26 * lambert);
+    } else if (u_mode == 2) {
         color = n * 0.5 + 0.5;
     } else if (u_mode == 1) {
         float lambert = max(dot(n, l), 0.0);
@@ -131,6 +138,8 @@ struct GpuResources {
     program: glow::NativeProgram,
     vao: glow::NativeVertexArray,
     vbo: glow::NativeBuffer,
+    gem_vao: glow::NativeVertexArray,
+    gem_vbo: glow::NativeBuffer,
     uniforms: Uniforms,
 }
 
@@ -138,7 +147,9 @@ struct GpuResources {
 pub struct GpuMeshRenderer {
     resources: Option<GpuResources>,
     vertex_count: i32,
+    gem_count: i32,
     pending: Option<Vec<f32>>,
+    pending_gems: Option<Vec<f32>>,
     depth_checked: bool,
     /// Set once if the shaders will not build, so the pane can say so instead of drawing nothing.
     pub failed: Option<String>,
@@ -152,7 +163,10 @@ impl GpuMeshRenderer {
     /// Flatten the mesh into an interleaved vertex buffer awaiting upload. Runs on the build
     /// worker, not the UI thread — at Preview resolution this fills ~12 MB, which is more than a
     /// frame's budget.
-    pub fn stage(mesh: &Mesh, cast: Option<&CastReport>) -> Vec<f32> {
+    /// `wall` is `(inner_radius_mm, min_section_mm)`, baked alongside the
+    /// draft colours so switching shade modes never re-uploads.
+    pub fn stage(mesh: &Mesh, cast: Option<&CastReport>, wall: (f64, f64)) -> Vec<f32> {
+        let (inner_r, min_section) = wall;
         let mut data: Vec<f32> = Vec::with_capacity(mesh.faces.len() * 3 * FLOATS_PER_VERTEX);
 
         'faces: for (i, face) in mesh.faces.iter().enumerate() {
@@ -169,7 +183,18 @@ impl GpuMeshRenderer {
                     Some(n) if n.is_finite() => *n,
                     _ => Vec3(0.0, 0.0, 1.0),
                 };
-                tri[k] = [p.0, p.1, p.2, n.0, n.1, n.2, rgb[0], rgb[1], rgb[2]];
+                // Radial metal under this vertex; the bore itself (facing
+                // inward) is not a wall and sits out in neutral grey.
+                let r = (p.0 as f64).hypot(p.1 as f64);
+                let inward = (n.0 as f64 * p.0 as f64 + n.1 as f64 * p.1 as f64) < 0.0;
+                let w = if inward {
+                    WALL_NEUTRAL
+                } else {
+                    wall_color(r - inner_r, min_section)
+                };
+                tri[k] = [
+                    p.0, p.1, p.2, n.0, n.1, n.2, rgb[0], rgb[1], rgb[2], w[0], w[1], w[2],
+                ];
             }
             for v in &tri {
                 data.extend_from_slice(v);
@@ -181,6 +206,11 @@ impl GpuMeshRenderer {
     /// Hand the renderer a buffer built by [`stage`](Self::stage) on the worker.
     pub fn set_pending(&mut self, verts: Vec<f32>) {
         self.pending = Some(verts);
+    }
+
+    /// Queue stone-preview triangles in the same layout. Empty clears them.
+    pub fn set_pending_gems(&mut self, verts: Vec<f32>) {
+        self.pending_gems = Some(verts);
     }
 
     pub fn has_mesh(&self) -> bool {
@@ -207,6 +237,14 @@ impl GpuMeshRenderer {
             self.vertex_count = (verts.len() / FLOATS_PER_VERTEX) as i32;
             unsafe {
                 gl.bind_buffer(glow::ARRAY_BUFFER, Some(res.vbo));
+                gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_u8_slice(&verts), glow::STATIC_DRAW);
+                gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            }
+        }
+        if let Some(verts) = self.pending_gems.take() {
+            self.gem_count = (verts.len() / FLOATS_PER_VERTEX) as i32;
+            unsafe {
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(res.gem_vbo));
                 gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_u8_slice(&verts), glow::STATIC_DRAW);
                 gl.bind_buffer(glow::ARRAY_BUFFER, None);
             }
@@ -244,6 +282,20 @@ impl GpuMeshRenderer {
             gl.uniform_1_f32(u.wire_px.as_ref(), if wireframe { WIRE_PX } else { 0.0 });
 
             gl.draw_arrays(glow::TRIANGLES, 0, self.vertex_count);
+
+            // Stones ride in a second buffer with the same program: metal
+            // shading, their own tint, whatever the ring's mode is.
+            if self.gem_count > 0 {
+                gl.uniform_1_i32(u.mode.as_ref(), 0);
+                gl.uniform_3_f32(
+                    u.base_color.as_ref(),
+                    ringdesign_core::gems::GEM_TINT[0],
+                    ringdesign_core::gems::GEM_TINT[1],
+                    ringdesign_core::gems::GEM_TINT[2],
+                );
+                gl.bind_vertex_array(Some(res.gem_vao));
+                gl.draw_arrays(glow::TRIANGLES, 0, self.gem_count);
+            }
 
             gl.bind_vertex_array(None);
             gl.use_program(None);
@@ -313,9 +365,12 @@ impl GpuMeshRenderer {
             }
         };
 
-        let (Some(vao), Some(vbo)) =
-            (unsafe { gl.create_vertex_array() }.ok(), unsafe { gl.create_buffer() }.ok())
-        else {
+        let (Some(vao), Some(vbo), Some(gem_vao), Some(gem_vbo)) = (
+            unsafe { gl.create_vertex_array() }.ok(),
+            unsafe { gl.create_buffer() }.ok(),
+            unsafe { gl.create_vertex_array() }.ok(),
+            unsafe { gl.create_buffer() }.ok(),
+        ) else {
             self.failed = Some("could not create VAO/VBO".into());
             return;
         };
@@ -334,19 +389,21 @@ impl GpuMeshRenderer {
         };
 
         unsafe {
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             let f = std::mem::size_of::<f32>() as i32;
             let stride = FLOATS_PER_VERTEX as i32 * f;
-            for (loc, offset) in [(0, 0), (1, 3 * f), (2, 6 * f)] {
-                gl.enable_vertex_attrib_array(loc);
-                gl.vertex_attrib_pointer_f32(loc, 3, glow::FLOAT, false, stride, offset);
+            for (va, vb) in [(vao, vbo), (gem_vao, gem_vbo)] {
+                gl.bind_vertex_array(Some(va));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vb));
+                for (loc, offset) in [(0, 0), (1, 3 * f), (2, 6 * f), (3, 9 * f)] {
+                    gl.enable_vertex_attrib_array(loc);
+                    gl.vertex_attrib_pointer_f32(loc, 3, glow::FLOAT, false, stride, offset);
+                }
+                gl.bind_vertex_array(None);
+                gl.bind_buffer(glow::ARRAY_BUFFER, None);
             }
-            gl.bind_vertex_array(None);
-            gl.bind_buffer(glow::ARRAY_BUFFER, None);
         }
 
-        self.resources = Some(GpuResources { program, vao, vbo, uniforms });
+        self.resources = Some(GpuResources { program, vao, vbo, gem_vao, gem_vbo, uniforms });
     }
 }
 
@@ -408,16 +465,19 @@ pub enum ShadeMode {
     #[default]
     Metal,
     Draft,
+    Wall,
     Normals,
 }
 
 impl ShadeMode {
-    pub const ALL: &'static [ShadeMode] = &[ShadeMode::Metal, ShadeMode::Draft, ShadeMode::Normals];
+    pub const ALL: &'static [ShadeMode] =
+        &[ShadeMode::Metal, ShadeMode::Draft, ShadeMode::Wall, ShadeMode::Normals];
 
     pub fn label(self) -> &'static str {
         match self {
             ShadeMode::Metal => "Metal",
             ShadeMode::Draft => "Draft",
+            ShadeMode::Wall => "Wall",
             ShadeMode::Normals => "Normals",
         }
     }
@@ -427,9 +487,38 @@ impl ShadeMode {
             ShadeMode::Metal => 0,
             ShadeMode::Draft => 1,
             ShadeMode::Normals => 2,
+            ShadeMode::Wall => 3,
         }
     }
 }
+
+/// Wall-heatmap colour for a radial thickness, linear RGB — the desktop's
+/// ramp: red at the minimum fill section, amber to twice it, green beyond,
+/// easing into blue-grey for comfortably thick metal.
+pub fn wall_color(thickness_mm: f64, min_section_mm: f64) -> [f32; 3] {
+    let m = min_section_mm.max(0.05);
+    let t = (thickness_mm / m).max(0.0);
+    let lerp3 = |a: [f32; 3], b: [f32; 3], k: f64| {
+        let k = k.clamp(0.0, 1.0) as f32;
+        [a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k, a[2] + (b[2] - a[2]) * k]
+    };
+    const RED: [f32; 3] = [0.93, 0.27, 0.36];
+    const AMBER: [f32; 3] = [0.95, 0.76, 0.24];
+    const GREEN: [f32; 3] = [0.32, 0.78, 0.45];
+    const THICK: [f32; 3] = [0.36, 0.55, 0.72];
+    if t <= 1.0 {
+        RED
+    } else if t <= 2.0 {
+        lerp3(RED, AMBER, t - 1.0)
+    } else if t <= 3.5 {
+        lerp3(AMBER, GREEN, (t - 2.0) / 1.5)
+    } else {
+        lerp3(GREEN, THICK, (t - 3.5) / 2.5)
+    }
+}
+
+/// Bore and inward faces sit out of the heatmap in a neutral grey.
+pub const WALL_NEUTRAL: [f32; 3] = [0.42, 0.42, 0.45];
 
 /// Queue the mesh draw as an egui paint callback covering `rect`.
 ///
@@ -471,7 +560,7 @@ mod tests {
     #[test]
     fn shade_modes_have_distinct_codes() {
         let codes: Vec<i32> = ShadeMode::ALL.iter().map(|m| m.code()).collect();
-        assert_eq!(codes, vec![0, 1, 2]);
+        assert_eq!(codes, vec![0, 1, 3, 2]);
     }
 
     #[test]
@@ -481,7 +570,7 @@ mod tests {
             normals: vec![Vec3(0.0, 0.0, 1.0); 3],
             faces: vec![[0, 1, 2]],
         };
-        let data = GpuMeshRenderer::stage(&mesh, None);
+        let data = GpuMeshRenderer::stage(&mesh, None, (8.5, 0.8));
         assert_eq!(data.len(), 3 * FLOATS_PER_VERTEX);
         // Position of the second vertex.
         assert_eq!(data[FLOATS_PER_VERTEX], 1.0);
@@ -496,6 +585,6 @@ mod tests {
             normals: vec![Vec3(0.0, 0.0, 1.0)],
             faces: vec![[0, 9, 9]],
         };
-        assert!(GpuMeshRenderer::stage(&mesh, None).is_empty());
+        assert!(GpuMeshRenderer::stage(&mesh, None, (8.5, 0.8)).is_empty());
     }
 }

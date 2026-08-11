@@ -133,6 +133,36 @@ impl OrbitCamera {
         self.radius * 1.15 / self.zoom.max(1e-3)
     }
 
+    /// World-space ray under a screen position: the orthographic unproject.
+    /// Origin sits on the eye plane, direction is the view forward.
+    pub fn ray(&self, rect: egui::Rect, pos: egui::Pos2) -> ([f32; 3], [f32; 3]) {
+        let eye = self.eye();
+        let up = if self.pitch.abs() > std::f32::consts::FRAC_PI_2 - 0.02 {
+            [-self.yaw.cos(), -self.yaw.sin(), 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        let f = normalize(sub(self.target, eye));
+        let s = normalize(cross(f, up));
+        let u = cross(s, f);
+
+        let centre = rect.center();
+        let half = rect.size() * 0.5;
+        let x_ndc = (pos.x - centre.x) / half.x.max(1.0);
+        let y_ndc = -(pos.y - centre.y) / half.y.max(1.0);
+        let aspect = (rect.width() / rect.height().max(1.0)).max(1e-3);
+        let hh = self.half_extent();
+        let vx = self.pan[0] + x_ndc * hh * aspect;
+        let vy = self.pan[1] + y_ndc * hh;
+
+        let origin = [
+            eye[0] + s[0] * vx + u[0] * vy,
+            eye[1] + s[1] * vx + u[1] * vy,
+            eye[2] + s[2] * vx + u[2] * vy,
+        ];
+        (origin, f)
+    }
+
     fn eye(&self) -> [f32; 3] {
         let d = self.radius * 4.0;
         let (sp, cp) = self.pitch.sin_cos();

@@ -42,6 +42,9 @@ pub const EXPORT: BuildParams = BuildParams {
     soften_mm: 0.0,
 };
 
+/// The viewport's polished-metal tint, reused by every shared render.
+pub const METAL_TINT: [f32; 3] = [0.86, 0.80, 0.62];
+
 pub struct RingPane {
     pub camera: OrbitCamera,
     pub shade: ShadeMode,
@@ -62,17 +65,18 @@ impl Default for RingPane {
 }
 
 impl RingPane {
-    /// Draw the pane. Returns true if the camera moved, so the caller can keep repainting.
+    /// Draw the pane. Returns whether the camera moved (keep repainting) and
+    /// the world ray under a long-press, for the tap probe.
     pub fn ui(
         &mut self,
         ui: &mut egui::Ui,
         renderer: &Arc<Mutex<GpuMeshRenderer>>,
         px_per_mm: Option<f32>,
-    ) -> bool {
+    ) -> (bool, Option<([f32; 3], [f32; 3])>) {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         if !ui.is_rect_visible(rect) {
-            return false;
+            return (false, None);
         }
 
         ui.painter().rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 18, 20));
@@ -86,7 +90,7 @@ impl RingPane {
                     egui::FontId::monospace(12.0),
                     egui::Color32::from_rgb(240, 120, 120),
                 );
-                return false;
+                return (false, None);
             }
             if !r.has_mesh() {
                 ui.painter().text(
@@ -96,11 +100,16 @@ impl RingPane {
                     egui::FontId::proportional(14.0),
                     egui::Color32::GRAY,
                 );
-                return false;
+                return (false, None);
             }
         }
 
         let moved = self.handle_touch(ui, &response, rect);
+        let probe_ray = response
+            .long_touched()
+            .then(|| response.interact_pointer_pos())
+            .flatten()
+            .map(|pos| self.camera.ray(rect, pos));
 
         // True scale: the camera is orthographic and already in millimetres, so physical size is
         // one zoom value rather than a different render path.
@@ -119,11 +128,11 @@ impl RingPane {
             mvp,
             normal_matrix,
             self.shade,
-            [0.86, 0.80, 0.62],
+            METAL_TINT,
             self.wireframe,
             [0.10, 0.10, 0.12],
         );
-        moved
+        (moved, probe_ray)
     }
 
     /// One finger orbits, two pinch-zoom and pan. Returns whether anything changed.
@@ -159,6 +168,10 @@ impl RingPane {
 pub struct Done {
     pub generation: u64,
     pub verts: Vec<f32>,
+    /// Stone-preview triangles, empty when the toggle is off.
+    pub gems: Vec<f32>,
+    /// The built mesh, kept for the tap probe's raycast.
+    pub mesh: Arc<ringdesign_core::mesh::Mesh>,
     pub bounds: Option<(Vec3, Vec3)>,
     pub triangles: usize,
     pub volume_mm3: f64,
@@ -178,6 +191,7 @@ struct Job {
     lib: Arc<AlphaLibrary>,
     params: BuildParams,
     analyze: bool,
+    gems: bool,
 }
 
 pub struct Worker {
@@ -214,11 +228,23 @@ impl Worker {
                             112,
                         )
                     });
-                    let verts = GpuMeshRenderer::stage(&out.mesh, cast.as_ref());
+                    let verts = GpuMeshRenderer::stage(
+                        &out.mesh,
+                        cast.as_ref(),
+                        (job.design.inner_radius_mm(), job.design.draft.min_section_mm),
+                    );
+                    let gems = if job.gems {
+                        ringdesign_core::gems::preview_vertices(&job.design, &job.lib)
+                    } else {
+                        Vec::new()
+                    };
+                    let mesh = Arc::new(out.mesh);
                     let done = Done {
                         generation: job.generation,
                         verts,
-                        bounds: out.mesh.bounds(),
+                        gems,
+                        bounds: mesh.bounds(),
+                        mesh: mesh.clone(),
                         triangles: out.report.validation.triangle_count,
                         volume_mm3: out.report.volume_mm3,
                         build_ms: out.report.build_ms,
@@ -235,6 +261,7 @@ impl Worker {
         Self { jobs: jobs_tx, done: done_rx }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
         generation: u64,
@@ -242,6 +269,7 @@ impl Worker {
         lib: &Arc<AlphaLibrary>,
         params: BuildParams,
         analyze: bool,
+        gems: bool,
     ) -> bool {
         self.jobs
             .send(Job {
@@ -250,6 +278,7 @@ impl Worker {
                 lib: lib.clone(),
                 params,
                 analyze,
+                gems,
             })
             .is_ok()
     }
@@ -274,9 +303,10 @@ mod tests {
     }
 
     #[test]
-    fn export_stays_under_the_memory_ceiling() {
-        // 36 bytes a vertex, three vertices a triangle. Maximum (1536x448) would be 149 MB.
-        let bytes = EXPORT.triangle_estimate() * 3 * 36;
+    fn the_staged_preview_buffer_stays_under_the_memory_ceiling() {
+        // 48 bytes a vertex, three a triangle. Only PREVIEW is ever staged —
+        // exports build inline and write files without touching the GPU.
+        let bytes = PREVIEW.triangle_estimate() * 3 * 48;
         assert!(bytes < 80 * 1024 * 1024, "{bytes} bytes is too much to re-upload");
     }
 

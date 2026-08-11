@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0
+
+- **A real design editor.** The new Design tab edits the whole ring on the phone: US size,
+  profile style and dimensions, every shank shape — including Wave, Twist, Split and Signet with
+  its head controls — a second head for a toi et moi, and one-tap stock generators for pavé and
+  channel setting. Templates in Files start a design worth editing.
+- **Wall heatmap.** A fourth shade mode colours the ring by metal under the surface: red where
+  the sand will not fill, through amber and green to blue-grey where it is heavy, with the legend
+  in the toolbar. Same ramp as the desktop.
+- **Touch the ring, get answers.** Long-press the 3D view and a chip reads back where you landed
+  (angle and position across the band), the relief height, the wall thickness, the draft class,
+  and which layer put metal there.
+- **Stones on their seats.** The viewer now shows faceted preview stones sitting on seat pads and
+  eternity rows — display only, never in the mesh, exactly as the desktop draws them. The stones
+  chip counts them and carries every bench warning; a DFM chip flags detail the sand cannot hold.
+- **Share it moving.** Three new shares: a polished PNG render, a looping turntable GIF, and a
+  GLB — glTF in real metres, which AR viewers and web viewers open as a ring-sized ring.
+
 ## 0.5.0
 
 - **The honest verdict.** Castability now comes off the surface itself rather than the preview

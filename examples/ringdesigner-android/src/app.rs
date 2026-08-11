@@ -49,6 +49,7 @@ const TILE_EDGE: u32 = 512;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Ring,
+    Design,
     Band,
     Tile,
     Alphas,
@@ -57,12 +58,20 @@ enum Tab {
 }
 
 impl Tab {
-    const ALL: &'static [Tab] =
-        &[Tab::Ring, Tab::Band, Tab::Tile, Tab::Alphas, Tab::Files, Tab::Bench];
+    const ALL: &'static [Tab] = &[
+        Tab::Ring,
+        Tab::Design,
+        Tab::Band,
+        Tab::Tile,
+        Tab::Alphas,
+        Tab::Files,
+        Tab::Bench,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Tab::Ring => "Ring",
+            Tab::Design => "Design",
             Tab::Band => "Band",
             Tab::Tile => "Tile",
             Tab::Alphas => "Alphas",
@@ -71,6 +80,8 @@ impl Tab {
         }
     }
 }
+
+use crate::ring::METAL_TINT;
 
 /// Name of the layer a library alpha lands on, so picking a second one replaces the first rather
 /// than stacking two textures nobody asked for.
@@ -104,6 +115,13 @@ pub struct RingApp {
 
     cast: Option<CastReport>,
     field: Option<ringdesign_core::castability::FieldReport>,
+    stones: Option<ringdesign_core::stones::StonesReport>,
+    dfm: Vec<ringdesign_core::dfm::DfmFinding>,
+    /// The settled preview mesh, kept for the tap probe's raycast.
+    preview_mesh: Option<std::sync::Arc<ringdesign_core::mesh::Mesh>>,
+    /// Last long-press readout, shown as a chip until dismissed.
+    probe_info: Option<String>,
+    show_gems: bool,
     /// Soften the preview at the sand's detail radius — see the pour early.
     as_cast: bool,
     /// Cut exports oversize for this metal's shrink; None is nominal.
@@ -163,6 +181,11 @@ impl RingApp {
             tab: Tab::Ring,
             cast: None,
             field: None,
+            stones: None,
+            dfm: Vec::new(),
+            preview_mesh: None,
+            probe_info: None,
+            show_gems: true,
             as_cast: false,
             shrink_metal: None,
             status: "starting".into(),
@@ -213,7 +236,7 @@ impl RingApp {
         if self.as_cast {
             params.soften_mm = self.design.draft.min_detail_mm;
         }
-        if !worker.dispatch(self.generation, &self.design, &self.lib, params, analyze) {
+        if !worker.dispatch(self.generation, &self.design, &self.lib, params, analyze, self.show_gems) {
             self.status = "build worker stopped".into();
         }
     }
@@ -227,7 +250,9 @@ impl RingApp {
                 self.pane.camera.fit(done.bounds);
                 if let Ok(mut r) = self.renderer.lock() {
                     r.set_pending(done.verts);
+                    r.set_pending_gems(done.gems);
                 }
+                self.preview_mesh = Some(done.mesh);
                 if let Some(cast) = done.cast {
                     let verdict = done
                         .field
@@ -242,6 +267,11 @@ impl RingApp {
                         verdict.label()
                     );
                     self.cast = Some(cast);
+                    self.stones = done
+                        .field
+                        .as_ref()
+                        .and_then(|f| ringdesign_core::stones::report(&self.design, f.parting_z_mm));
+                    self.dfm = ringdesign_core::dfm::findings(&self.design);
                     self.field = done.field;
                 } else {
                     self.status =
@@ -277,6 +307,13 @@ impl RingApp {
                 ui.separator();
                 ui.toggle_value(&mut self.pane.wireframe, "Wire");
                 if ui
+                    .toggle_value(&mut self.show_gems, "Stones")
+                    .on_hover_text("Preview stones on their seats — display only, never cast.")
+                    .changed()
+                {
+                    self.mark_dirty();
+                }
+                if ui
                     .toggle_value(&mut self.as_cast, "As-cast")
                     .on_hover_text("Soften the preview at the sand's detail radius — the pour, early.")
                     .changed()
@@ -287,6 +324,39 @@ impl RingApp {
                     ui.separator();
                     let (tint, text) = field_chip(f);
                     ui.colored_label(tint, text).on_hover_text(f.notes.join("\n"));
+                    if let Some(s) = self.stones.as_ref() {
+                        let warns: Vec<&str> = s
+                            .seats
+                            .iter()
+                            .flat_map(|seat| seat.warnings.iter().map(String::as_str))
+                            .collect();
+                        let tint = if warns.is_empty() {
+                            egui::Color32::from_rgb(150, 190, 150)
+                        } else {
+                            egui::Color32::from_rgb(220, 170, 90)
+                        };
+                        ui.colored_label(
+                            tint,
+                            format!("{} stones · {:.2} ct", s.stone_count, s.total_carats),
+                        )
+                        .on_hover_text(if warns.is_empty() {
+                            "Every seat checks out at the bench.".to_string()
+                        } else {
+                            warns.join("\n")
+                        });
+                    }
+                    if !self.dfm.is_empty() {
+                        let text: Vec<String> = self
+                            .dfm
+                            .iter()
+                            .map(|w| format!("{}: {}", w.label, w.message))
+                            .collect();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 170, 90),
+                            format!("DFM {}", self.dfm.len()),
+                        )
+                        .on_hover_text(text.join("\n"));
+                    }
                 } else if let Some(cast) = self.cast.as_ref() {
                     ui.separator();
                     let (tint, text) = verdict_chip(cast);
@@ -296,6 +366,25 @@ impl RingApp {
                     ui.toggle_value(&mut self.pane.actual_size, "1:1");
                 }
             });
+            if self.pane.shade == ShadeMode::Wall {
+                ui.horizontal_wrapped(|ui| {
+                    let min = self.design.draft.min_section_mm;
+                    let chip = |ui: &mut egui::Ui, rgb: [f32; 3], label: String| {
+                        let c = egui::Color32::from_rgb(
+                            (rgb[0] * 255.0) as u8,
+                            (rgb[1] * 255.0) as u8,
+                            (rgb[2] * 255.0) as u8,
+                        );
+                        ui.colored_label(c, label);
+                    };
+                    use crate::viewport::{wall_color, WALL_NEUTRAL};
+                    chip(ui, wall_color(min * 0.5, min), format!("< {min:.1} mm won't fill"));
+                    chip(ui, wall_color(min * 1.5, min), format!("to {:.1}", min * 2.0));
+                    chip(ui, wall_color(min * 2.7, min), "healthy".into());
+                    chip(ui, wall_color(min * 6.0, min), "heavy".into());
+                    chip(ui, WALL_NEUTRAL, "bore".into());
+                });
+            }
             ui.horizontal_wrapped(|ui| {
                 for view in crate::camera::StandardView::ALL {
                     if ui.button(view.label()).clicked() {
@@ -310,11 +399,334 @@ impl RingApp {
             });
         });
 
+        if let Some(text) = self.probe_info.clone() {
+            egui::Panel::top(egui::Id::new("probe_info")).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(text).small());
+                    if ui.small_button("x").clicked() {
+                        self.probe_info = None;
+                    }
+                });
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| {
-            if self.pane.ui(ui, &self.renderer, self.px_per_mm) {
+            let (moved, ray) = self.pane.ui(ui, &self.renderer, self.px_per_mm);
+            if moved {
                 ui.ctx().request_repaint();
             }
+            if let Some((origin, dir)) = ray {
+                self.probe(origin, dir);
+            }
         });
+    }
+
+    /// Long-press readout: where on the band the touch landed, what stands
+    /// there, and how much metal is under it.
+    fn probe(&mut self, origin: [f32; 3], dir: [f32; 3]) {
+        use ringdesign_core::field::Uv;
+        let Some(mesh) = self.preview_mesh.clone() else { return };
+        let Some((fi, world)) = raycast(&mesh, origin, dir) else {
+            self.probe_info = None;
+            return;
+        };
+        let theta = (world[1] as f64).atan2(world[0] as f64).to_degrees().rem_euclid(360.0);
+        let r = (world[0] as f64).hypot(world[1] as f64);
+        let inner_r = self.design.inner_radius_mm();
+        let ctx = self.design.field_context();
+        let section = ringdesign_core::castability::section_at(&self.design, &self.lib, theta, 160);
+        let surface: Vec<_> = section.points.iter().filter(|p| p.surface).collect();
+        let mut v_mm = 0.0;
+        if surface.len() >= 2 {
+            let total: f64 = surface
+                .windows(2)
+                .map(|w| ((w[1].r - w[0].r).powi(2) + (w[1].z - w[0].z).powi(2)).sqrt())
+                .sum();
+            let mut acc = 0.0;
+            let mut best_d = f64::MAX;
+            let mut at = 0.0;
+            for w in surface.windows(2) {
+                let seg = ((w[1].r - w[0].r).powi(2) + (w[1].z - w[0].z).powi(2)).sqrt();
+                acc += seg;
+                let d = (w[1].r - r).powi(2) + (w[1].z - world[2] as f64).powi(2);
+                if d < best_d {
+                    best_d = d;
+                    at = acc;
+                }
+            }
+            v_mm = at / total.max(1e-9) * ctx.band_v_len_mm;
+        }
+        let uv = Uv { u: ctx.u_of_theta(theta), v: v_mm };
+        let h = self.design.layers.height(uv, &ctx, &self.lib);
+        let class = self
+            .cast
+            .as_ref()
+            .and_then(|c| c.classes.get(fi))
+            .map(|k| k.label())
+            .unwrap_or("-");
+        let mut named = None;
+        for e in self.design.layers.layers.iter().rev() {
+            if !e.enabled {
+                continue;
+            }
+            let m = e.window.mask(uv, &ctx) * e.opacity.max(0.0);
+            if m <= 1e-4 {
+                continue;
+            }
+            if e.layer.height(uv, &ctx, &self.lib).abs() * m > 5e-3 {
+                named = Some(e.name.clone());
+                break;
+            }
+        }
+        self.probe_info = Some(format!(
+            "{:.0} deg · v {:.2} · relief {:+.2} mm · wall {:.2} mm · {}{}",
+            theta,
+            v_mm,
+            h,
+            r - inner_r,
+            class,
+            named.map(|n| format!(" · {n}")).unwrap_or_default()
+        ));
+    }
+
+    /// The whole design editor: size, profile, shank, head, and the stock
+    /// generators. Every control writes straight into the design and marks
+    /// dirty, so the Ring tab shows the result on the next settled build.
+    fn design_tab(&mut self, ui: &mut egui::Ui) {
+        use ringdesign_core::field::SignetOutline;
+        use ringdesign_core::profile::TOP_DEG;
+        use ringdesign_core::{ProfileStyle, RingSize, ShankKind};
+
+        let mut dirty = false;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(egui::RichText::new("ring").weak());
+            let mut size = self.design.size.0;
+            if ui
+                .add(egui::Slider::new(&mut size, 3.0..=13.0).step_by(0.25).text("US size"))
+                .changed()
+            {
+                self.design.size = RingSize::new(size);
+                dirty = true;
+            }
+
+            ui.separator();
+            ui.label(egui::RichText::new("profile").weak());
+            let current = self.design.profile.style;
+            egui::ComboBox::from_label("style")
+                .selected_text(current.label())
+                .show_ui(ui, |ui| {
+                    for &style in ProfileStyle::ALL {
+                        if ui.selectable_label(current == style, style.label()).clicked()
+                            && current != style
+                        {
+                            self.design.profile.apply_style(style);
+                            dirty = true;
+                        }
+                    }
+                });
+            dirty |= ui
+                .add(egui::Slider::new(&mut self.design.profile.width_mm, 2.0..=18.0).text("width mm"))
+                .changed();
+            dirty |= ui
+                .add(
+                    egui::Slider::new(&mut self.design.profile.thickness_mm, 1.0..=5.0)
+                        .text("thickness mm"),
+                )
+                .changed();
+            dirty |= ui
+                .add(
+                    egui::Slider::new(&mut self.design.profile.comfort_fit_mm, 0.0..=0.6)
+                        .text("comfort fit mm"),
+                )
+                .changed();
+            if ui
+                .button("Square the sides")
+                .on_hover_text(
+                    "Drop the side draft and shrink the edge fillet — squared sides are the                      castable ground for deep relief.",
+                )
+                .clicked()
+            {
+                self.design.profile.flatten_sides();
+                dirty = true;
+            }
+
+            ui.separator();
+            ui.label(egui::RichText::new("shank").weak());
+            let was = self.design.shank.kind;
+            egui::ComboBox::from_label("shape")
+                .selected_text(format!("{:?}", was))
+                .show_ui(ui, |ui| {
+                    for &kind in ShankKind::ALL {
+                        if ui
+                            .selectable_label(self.design.shank.kind == kind, format!("{kind:?}"))
+                            .clicked()
+                            && self.design.shank.kind != kind
+                        {
+                            self.design.shank.kind = kind;
+                            if kind == ShankKind::Signet {
+                                let w = self.design.profile.width_mm;
+                                self.design.shank.apply_signet(w);
+                            }
+                            dirty = true;
+                        }
+                    }
+                });
+            dirty |= ui
+                .add(egui::Slider::new(&mut self.design.shank.amount, 0.0..=1.0).text("amount"))
+                .changed();
+            if matches!(self.design.shank.kind, ShankKind::Wave | ShankKind::Twist) {
+                let mut waves = self.design.shank.waves as i32;
+                if ui.add(egui::Slider::new(&mut waves, 1..=6).text("waves")).changed() {
+                    self.design.shank.waves = waves.max(1) as u32;
+                    dirty = true;
+                }
+            }
+
+            if self.design.shank.kind == ShankKind::Signet {
+                ui.separator();
+                ui.label(egui::RichText::new("head").weak());
+                let cur = self.design.shank.head.outline;
+                egui::ComboBox::from_label("outline")
+                    .selected_text(cur.label())
+                    .show_ui(ui, |ui| {
+                        for &o in SignetOutline::ALL {
+                            if ui.selectable_label(cur == o, o.label()).clicked() && cur != o {
+                                self.design.shank.head.outline = o;
+                                dirty = true;
+                            }
+                        }
+                    });
+                dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut self.design.shank.head.length_mm, 6.0..=20.0)
+                            .text("face length mm"),
+                    )
+                    .changed();
+                dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut self.design.shank.head.rise_mm, 0.0..=2.2)
+                            .text("rise mm"),
+                    )
+                    .changed();
+                dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut self.design.shank.head.rim_round_mm, 0.0..=2.0)
+                            .text("rim round mm"),
+                    )
+                    .changed();
+                dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut self.design.shank.head.table_dome_mm, 0.0..=3.0)
+                            .text("table dome mm"),
+                    )
+                    .changed();
+
+                let mut second = !self.design.shank.extra_heads.is_empty();
+                if ui.checkbox(&mut second, "second head (toi et moi)").changed() {
+                    if second {
+                        let mut h = self.design.shank.head.clone();
+                        h.outline = SignetOutline::Heart;
+                        h.length_mm = (h.length_mm * 0.8).max(6.0);
+                        h.theta_deg = TOP_DEG + 26.0;
+                        self.design.shank.head.theta_deg = TOP_DEG - 26.0;
+                        self.design.shank.extra_heads.push(h);
+                    } else {
+                        self.design.shank.extra_heads.clear();
+                        self.design.shank.head.theta_deg = TOP_DEG;
+                    }
+                    dirty = true;
+                }
+                if let Some(h) = self.design.shank.extra_heads.first_mut() {
+                    let cur = h.outline;
+                    egui::ComboBox::from_label("second outline")
+                        .selected_text(cur.label())
+                        .show_ui(ui, |ui| {
+                            for &o in SignetOutline::ALL {
+                                if ui.selectable_label(cur == o, o.label()).clicked() && cur != o {
+                                    h.outline = o;
+                                    dirty = true;
+                                }
+                            }
+                        });
+                    dirty |= ui
+                        .add(
+                            egui::Slider::new(&mut h.length_mm, 5.0..=16.0)
+                                .text("second face mm"),
+                        )
+                        .changed();
+                    let mut sep = h.theta_deg - self.design.shank.head.theta_deg;
+                    if ui
+                        .add(egui::Slider::new(&mut sep, 24.0..=110.0).text("separation deg"))
+                        .changed()
+                    {
+                        self.design.shank.head.theta_deg = TOP_DEG - sep * 0.5;
+                        h.theta_deg = TOP_DEG + sep * 0.5;
+                        dirty = true;
+                    }
+                }
+            }
+
+            ui.separator();
+            ui.label(egui::RichText::new("stock generators").weak());
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button("Auto pavé")
+                    .on_hover_text(
+                        "Pack the wider side face with gypsy seats for 1.5 mm melee — an                          editable group, rows wrap-exact around the ring.",
+                    )
+                    .clicked()
+                {
+                    match ringdesign_core::pave::fill(
+                        &self.design,
+                        &ringdesign_core::pave::PaveSpec::default(),
+                    ) {
+                        Some((entry, out)) => {
+                            self.design.layers.layers.push(entry);
+                            self.status = match out.note {
+                                Some(n) => format!("pavé: {} seats · {n}", out.seats),
+                                None => format!("pavé: {} seats in {} rows", out.seats, out.rows),
+                            };
+                            dirty = true;
+                        }
+                        None => {
+                            self.status =
+                                "no side face to fill — square the sides first".into();
+                        }
+                    }
+                }
+                if ui
+                    .button("Channel set")
+                    .on_hover_text(
+                        "Rails and a recessed channel on the wider side face. Wants a thick                          squared band: a 1.5 mm stone needs ~3 mm of face.",
+                    )
+                    .clicked()
+                {
+                    let gem = ringdesign_core::gem::Gem::calibrated(
+                        ringdesign_core::gem::GemCut::Round,
+                        1.5,
+                    );
+                    match ringdesign_core::pave::channel_set(&self.design, gem, 0.6) {
+                        Some(entry) => {
+                            self.design.layers.layers.push(entry);
+                            self.status = "channel set added".into();
+                            dirty = true;
+                        }
+                        None => {
+                            self.status = "side face too narrow — square and thicken the band".into();
+                        }
+                    }
+                }
+                if ui.button("Clear layers").on_hover_text("Remove every layer, keep the band").clicked()
+                    && !self.design.layers.layers.is_empty()
+                {
+                    self.design.layers.layers.clear();
+                    self.status = "layers cleared".into();
+                    dirty = true;
+                }
+            });
+        });
+        if dirty {
+            self.mark_dirty();
+        }
     }
 
     /// Index of a drawing by name, creating it (and the layer that shows it) on first use.
@@ -777,6 +1189,21 @@ impl RingApp {
                 let path = exports.join(format!("{}_sheet.html", slug(&self.design.name)));
                 self.share_spec(host, path);
             }
+            if ui.button("Share render").clicked() {
+                let _ = std::fs::create_dir_all(&exports);
+                let path = exports.join(format!("{}.png", slug(&self.design.name)));
+                self.share_render(host, path);
+            }
+            if ui.button("Share spin").on_hover_text("A looping 36-frame turntable GIF").clicked() {
+                let _ = std::fs::create_dir_all(&exports);
+                let path = exports.join(format!("{}.gif", slug(&self.design.name)));
+                self.share_turntable(host, path);
+            }
+            if ui.button("Share GLB").on_hover_text("glTF binary for AR and web viewers, metre-scaled").clicked() {
+                let _ = std::fs::create_dir_all(&exports);
+                let path = exports.join(format!("{}.glb", slug(&self.design.name)));
+                self.share_glb(host, path);
+            }
             {
                 use ringdesign_core::metal::METALS;
                 let current = self
@@ -821,6 +1248,19 @@ impl RingApp {
                         self.status = "clipboard is not a design".into();
                         host.haptic(Haptic::Error);
                     }
+                }
+            }
+        });
+
+        ui.separator();
+        ui.label(egui::RichText::new("start fresh").weak());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("New blank").clicked() {
+                self.load_template_design(RingDesign::default(), "new blank design");
+            }
+            for t in ringdesign_core::templates::all() {
+                if ui.button(t.name).on_hover_text(t.blurb).clicked() {
+                    self.load_template_design(t.design(), t.name);
                 }
             }
         });
@@ -1009,6 +1449,68 @@ impl RingApp {
     /// into a Java byte array on the render thread.
     /// The printable tech sheet, straight to the share sheet — the thing to
     /// send a caster from the couch.
+    fn load_template_design(&mut self, d: RingDesign, what: &str) {
+        self.design = d;
+        let lib = Arc::make_mut(&mut self.lib);
+        self.design.bake_drawn(lib);
+        self.design.bake_texts(lib);
+        self.design.bake_svgs(lib);
+        self.thumbs.clear();
+        self.picked_alpha = None;
+        self.status = format!("started from {what}");
+        self.mark_dirty();
+    }
+
+    fn share_render(&mut self, host: &Host, path: std::path::PathBuf) {
+        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
+        match ringdesign_core::render::write_png(&path, &out.mesh, 0.55, 1.12, 1280, METAL_TINT) {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "ring.png".into());
+                host.share_media(path.to_string_lossy().into_owned(), name, "image/png");
+                self.status = "render shared".into();
+                host.haptic(Haptic::Success);
+            }
+            Err(e) => self.status = format!("render failed: {e}"),
+        }
+    }
+
+    fn share_turntable(&mut self, host: &Host, path: std::path::PathBuf) {
+        // The preview mesh: 36 software-rastered frames of 655k export
+        // triangles is seconds of spinner for no visible gain at 480 px.
+        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::PREVIEW);
+        match ringdesign_core::render::write_turntable_gif(&path, &out.mesh, 36, 480, METAL_TINT) {
+            Ok(()) => {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "ring.gif".into());
+                host.share_media(path.to_string_lossy().into_owned(), name, "image/gif");
+                self.status = "turntable shared".into();
+                host.haptic(Haptic::Success);
+            }
+            Err(e) => self.status = format!("turntable failed: {e}"),
+        }
+    }
+
+    fn share_glb(&mut self, host: &Host, path: std::path::PathBuf) {
+        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
+        match ringdesign_core::gltf::write_glb(&path, &out.mesh, &self.design.name, METAL_TINT) {
+            Ok(bytes) => {
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "ring.glb".into());
+                host.share_media(path.to_string_lossy().into_owned(), name, "model/gltf-binary");
+                self.status = format!("GLB shared · {:.1} MB", bytes as f64 / 1048576.0);
+                host.haptic(Haptic::Success);
+            }
+            Err(e) => self.status = format!("GLB failed: {e}"),
+        }
+    }
+
     fn share_spec(&mut self, host: &Host, path: std::path::PathBuf) {
         let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
         let field = ringdesign_core::castability::attributed_field_report(
@@ -1210,6 +1712,7 @@ impl EguiApp for RingApp {
 
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Ring => self.ring_tab(ui),
+            Tab::Design => self.design_tab(ui),
             Tab::Band => self.paint_tab(ui, host, Domain::Band),
             Tab::Tile => self.paint_tab(ui, host, Domain::Tile),
             Tab::Alphas => self.alphas_tab(ui, host),
@@ -1224,6 +1727,61 @@ enum SyncResult {
     Pulled(Box<RingDesign>),
     Pushed(String),
     Failed(String),
+}
+
+/// Nearest triangle of the mesh under the ray — every face tested on a tap,
+/// which is a millisecond at preview resolution and needs no BVH.
+fn raycast(
+    mesh: &ringdesign_core::mesh::Mesh,
+    origin: [f32; 3],
+    dir: [f32; 3],
+) -> Option<(usize, [f32; 3])> {
+    let o = [origin[0] as f64, origin[1] as f64, origin[2] as f64];
+    let d = [dir[0] as f64, dir[1] as f64, dir[2] as f64];
+    let mut best: Option<(usize, f64)> = None;
+    for (fi, f) in mesh.faces.iter().enumerate() {
+        let Some((a, b, c)) = mesh.triangle(f) else { continue };
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let p = [
+            d[1] * e2[2] - d[2] * e2[1],
+            d[2] * e2[0] - d[0] * e2[2],
+            d[0] * e2[1] - d[1] * e2[0],
+        ];
+        let det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+        if det.abs() < 1e-12 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let t_vec = [o[0] - a[0], o[1] - a[1], o[2] - a[2]];
+        let u = (t_vec[0] * p[0] + t_vec[1] * p[1] + t_vec[2] * p[2]) * inv;
+        if !(0.0..=1.0).contains(&u) {
+            continue;
+        }
+        let q = [
+            t_vec[1] * e1[2] - t_vec[2] * e1[1],
+            t_vec[2] * e1[0] - t_vec[0] * e1[2],
+            t_vec[0] * e1[1] - t_vec[1] * e1[0],
+        ];
+        let v = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) * inv;
+        if v < 0.0 || u + v > 1.0 {
+            continue;
+        }
+        let t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * inv;
+        if t > 1e-6 && best.map_or(true, |(_, bt)| t < bt) {
+            best = Some((fi, t));
+        }
+    }
+    best.map(|(fi, t)| {
+        (
+            fi,
+            [
+                (o[0] + d[0] * t) as f32,
+                (o[1] + d[1] * t) as f32,
+                (o[2] + d[2] * t) as f32,
+            ],
+        )
+    })
 }
 
 /// Verdict colour and text for the toolbar chip. The undercut fraction is the number that decides
