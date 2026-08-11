@@ -665,6 +665,79 @@ impl RingApp {
                 }
             }
 
+            if self.design.shank.kind == ShankKind::Keyframes {
+                ui.separator();
+                ui.label(egui::RichText::new("stations").weak());
+                let keys = &mut self.design.shank.keys;
+                let mut remove: Option<usize> = None;
+                for (i, k) in keys.iter_mut().enumerate() {
+                    ui.push_id(i, |ui| {
+                        ui.horizontal(|ui| {
+                            dirty |= ui
+                                .add(
+                                    egui::DragValue::new(&mut k.theta_deg)
+                                        .speed(0.5)
+                                        .range(0.0..=360.0)
+                                        .suffix(" deg"),
+                                )
+                                .changed();
+                            dirty |= ui
+                                .add(
+                                    egui::DragValue::new(&mut k.width_scale)
+                                        .speed(0.01)
+                                        .range(0.3..=3.0)
+                                        .prefix("w "),
+                                )
+                                .changed();
+                            dirty |= ui
+                                .add(
+                                    egui::DragValue::new(&mut k.thickness_scale)
+                                        .speed(0.01)
+                                        .range(0.3..=3.0)
+                                        .prefix("t "),
+                                )
+                                .changed();
+                            dirty |= ui
+                                .add(
+                                    egui::DragValue::new(&mut k.crown_scale)
+                                        .speed(0.01)
+                                        .range(0.0..=2.5)
+                                        .prefix("c "),
+                                )
+                                .changed();
+                            if ui.small_button("x").clicked() {
+                                remove = Some(i);
+                            }
+                        });
+                    });
+                }
+                if let Some(i) = remove {
+                    keys.remove(i);
+                    dirty = true;
+                }
+                if keys.len() < 16 && ui.button("Add station").clicked() {
+                    let presets = [90.0, 270.0, 0.0, 180.0, 45.0, 135.0, 225.0, 315.0];
+                    let taken: Vec<f64> = keys.iter().map(|k| k.theta_deg).collect();
+                    let theta = presets
+                        .iter()
+                        .copied()
+                        .find(|p| taken.iter().all(|t| (t - p).abs() > 1.0))
+                        .unwrap_or(90.0);
+                    keys.push(ringdesign_core::profile::ShankKey {
+                        theta_deg: theta,
+                        ..Default::default()
+                    });
+                    dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "Width, thickness and crown per station, blended smoothly round the ring.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            }
+
             ui.separator();
             ui.label(egui::RichText::new("stock generators").weak());
             ui.horizontal_wrapped(|ui| {
@@ -969,7 +1042,7 @@ impl RingApp {
                         liblib::regenerate_builtins(Arc::make_mut(&mut self.lib), size);
                         // The design's own drawings are not procedural; put them back on top.
                         let lib = Arc::make_mut(&mut self.lib);
-                        self.design.bake_drawn(lib);
+                        self.design.bake_all(lib);
                         self.thumbs.clear();
                         self.mark_dirty();
                         host.haptic(Haptic::Light);
@@ -1237,7 +1310,7 @@ impl RingApp {
                     Some(d) => {
                         self.design = d;
                         let lib = Arc::make_mut(&mut self.lib);
-                        self.design.bake_drawn(lib);
+                        self.design.bake_all(lib);
                         self.thumbs.clear();
                         self.picked_alpha = None;
                         self.status = "design pasted".into();
@@ -1332,7 +1405,7 @@ impl RingApp {
                             Ok(d) => {
                                 self.design = d;
                                 let lib = Arc::make_mut(&mut self.lib);
-                                self.design.bake_drawn(lib);
+                                self.design.bake_all(lib);
                                 self.thumbs.clear();
                                 self.picked_alpha = None;
                                 self.status = format!("opened {label}");
@@ -1424,7 +1497,7 @@ impl RingApp {
             SyncResult::Pulled(d) => {
                 self.design = *d;
                 let lib = Arc::make_mut(&mut self.lib);
-                self.design.bake_drawn(lib);
+                self.design.bake_all(lib);
                 self.thumbs.clear();
                 self.picked_alpha = None;
                 self.status = "pulled from desktop".into();
@@ -1452,9 +1525,7 @@ impl RingApp {
     fn load_template_design(&mut self, d: RingDesign, what: &str) {
         self.design = d;
         let lib = Arc::make_mut(&mut self.lib);
-        self.design.bake_drawn(lib);
-        self.design.bake_texts(lib);
-        self.design.bake_svgs(lib);
+        self.design.bake_all(lib);
         self.thumbs.clear();
         self.picked_alpha = None;
         self.status = format!("started from {what}");
@@ -1678,7 +1749,7 @@ impl EguiApp for RingApp {
         // Strokes are the source of truth; the raster is derived, so bake before the first build.
         {
             let lib = Arc::make_mut(&mut self.lib);
-            self.design.bake_drawn(lib);
+            self.design.bake_all(lib);
         }
         self.worker = Some(Worker::spawn(ctx.clone()));
         self.mark_dirty();

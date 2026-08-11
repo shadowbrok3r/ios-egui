@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+- **Keyframed shanks.** The new Keyframes shape in Design hands you the band itself: set width,
+  thickness and crown at your own stations round the ring and they blend smoothly, closing on
+  themselves. Taper, pinch, bombé — or something nobody named yet.
+- **The engine underneath grew too.** Crisp mm-true pattern edges, openwork carving with a floor
+  over the finger hole, pattern rows that flow along a drawn wave, and export meshes that spend a
+  third fewer triangles for the same accuracy — designs made on the desktop with these open here
+  and preview correctly.
+
 ## 0.6.0
 
 - **A real design editor.** The new Design tab edits the whole ring on the phone: US size,
