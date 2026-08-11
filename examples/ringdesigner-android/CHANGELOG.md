@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.0
+
+- **The honest verdict.** Castability now comes off the surface itself rather than the preview
+  mesh, so facet noise can never fake an undercut: the chip shows the field verdict, the undercut
+  share, and the thinnest wall over the finger hole — and when something does undercut, the note
+  names the arc and the layer to blame ("caused by \"Flat boss\"; muting it clears it").
+- **As-cast.** A toggle softens the preview at the sand's own detail radius, so beads merge and
+  fine cells mush on screen the way they will in the pour. Display only — exports stay exact.
+- **3MF export and pattern shrink.** Share as 3MF (the file states its units, so nothing downstream
+  guesses mm vs inches), and cut either export oversize for a chosen alloy's shrink — the file is
+  renamed as a pattern so it cannot be poured as nominal by mistake.
+- **One brush, both devices.** The pressure-to-millimetres math and the band-layer convention now
+  live in the shared core, and the desktop's unrolled editor paints with them too: a band painted
+  here opens on the desktop as the same layer, and vice versa.
+
 ## 0.4.0
 
 - **Sync with the desktop.** Files gained a host and token; Pull takes whatever the desktop app is

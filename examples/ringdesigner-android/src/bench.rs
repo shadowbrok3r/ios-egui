@@ -116,7 +116,7 @@ pub fn row(label: &str, design: &RingDesign, lib: &AlphaLibrary, theta: usize, p
     let (_, analyze_ms) = time(|| {
         castability::analyze(&out.mesh, &design.draft, design.inner_radius_mm())
     });
-    let (bytes, stl_ms) = time(|| ringdesign_core::stl::to_stl_binary(&out.mesh));
+    let (bytes, stl_ms) = time(|| ringdesign_core::stl::to_stl_binary(&out.mesh, "bench"));
 
     Row {
         label: label.to_owned(),

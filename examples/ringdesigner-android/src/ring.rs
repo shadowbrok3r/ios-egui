@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use egui_mobile::egui;
 use ringdesign_core::alpha::AlphaLibrary;
-use ringdesign_core::castability::{self, CastReport};
+use ringdesign_core::castability::{self, CastReport, FieldReport};
 use ringdesign_core::mesh::{BuildParams, Vec3};
 use ringdesign_core::RingDesign;
 
@@ -24,11 +24,23 @@ use crate::viewport::{GpuMeshRenderer, ShadeMode, paint_callback};
 
 /// Measured on an S26 Ultra: 34 ms build + 14 ms analyze at 384x144. The desktop's own Preview
 /// resolution is interactive on the phone, so there is no scrub tier.
-pub const PREVIEW: BuildParams =
-    BuildParams { theta_steps: 384, profile_steps: 144, min_wall_mm: 0.5, adaptive: false, refine: None };
+pub const PREVIEW: BuildParams = BuildParams {
+    theta_steps: 384,
+    profile_steps: 144,
+    min_wall_mm: 0.5,
+    adaptive: false,
+    refine: None,
+    soften_mm: 0.0,
+};
 /// 655k triangles, 226 ms end to end on device. The ceiling — 1536x448 is a 149 MB vertex buffer.
-pub const EXPORT: BuildParams =
-    BuildParams { theta_steps: 1024, profile_steps: 320, min_wall_mm: 0.5, adaptive: false, refine: None };
+pub const EXPORT: BuildParams = BuildParams {
+    theta_steps: 1024,
+    profile_steps: 320,
+    min_wall_mm: 0.5,
+    adaptive: false,
+    refine: None,
+    soften_mm: 0.0,
+};
 
 pub struct RingPane {
     pub camera: OrbitCamera,
@@ -154,6 +166,10 @@ pub struct Done {
     /// Only present on a settled build — analyze is ~30% of the worker and is not worth paying
     /// while a slider is still moving.
     pub cast: Option<CastReport>,
+    /// The authoritative verdict, sampled off the surface itself: no facet
+    /// phantoms, undercuts arrive located and blamed, and the thinnest wall
+    /// rides along. Settled builds only, like `cast`.
+    pub field: Option<FieldReport>,
 }
 
 struct Job {
@@ -189,6 +205,15 @@ impl Worker {
                             job.design.inner_radius_mm(),
                         )
                     });
+                    let field = job.analyze.then(|| {
+                        castability::attributed_field_report(
+                            &job.design,
+                            &job.lib,
+                            &job.design.draft,
+                            160,
+                            112,
+                        )
+                    });
                     let verts = GpuMeshRenderer::stage(&out.mesh, cast.as_ref());
                     let done = Done {
                         generation: job.generation,
@@ -198,6 +223,7 @@ impl Worker {
                         volume_mm3: out.report.volume_mm3,
                         build_ms: out.report.build_ms,
                         cast,
+                        field,
                     };
                     if done_tx.send(done).is_err() {
                         break;

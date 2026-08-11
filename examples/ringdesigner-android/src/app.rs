@@ -103,6 +103,11 @@ pub struct RingApp {
     tab: Tab,
 
     cast: Option<CastReport>,
+    field: Option<ringdesign_core::castability::FieldReport>,
+    /// Soften the preview at the sand's detail radius — see the pour early.
+    as_cast: bool,
+    /// Cut exports oversize for this metal's shrink; None is nominal.
+    shrink_metal: Option<usize>,
     status: String,
     dirty_at: Option<Instant>,
     generation: u64,
@@ -157,6 +162,9 @@ impl RingApp {
             worker: None,
             tab: Tab::Ring,
             cast: None,
+            field: None,
+            as_cast: false,
+            shrink_metal: None,
             status: "starting".into(),
             dirty_at: None,
             generation: 0,
@@ -201,7 +209,11 @@ impl RingApp {
     fn dispatch(&mut self, analyze: bool) {
         let Some(worker) = self.worker.as_ref() else { return };
         self.generation += 1;
-        if !worker.dispatch(self.generation, &self.design, &self.lib, ring::PREVIEW, analyze) {
+        let mut params = ring::PREVIEW;
+        if self.as_cast {
+            params.soften_mm = self.design.draft.min_detail_mm;
+        }
+        if !worker.dispatch(self.generation, &self.design, &self.lib, params, analyze) {
             self.status = "build worker stopped".into();
         }
     }
@@ -217,14 +229,20 @@ impl RingApp {
                     r.set_pending(done.verts);
                 }
                 if let Some(cast) = done.cast {
+                    let verdict = done
+                        .field
+                        .as_ref()
+                        .map(|f| f.verdict)
+                        .unwrap_or(cast.verdict);
                     self.status = format!(
                         "{} tris · {:.1} mm³ · {} ms · {}",
                         done.triangles,
                         done.volume_mm3,
                         done.build_ms,
-                        cast.verdict.label()
+                        verdict.label()
                     );
                     self.cast = Some(cast);
+                    self.field = done.field;
                 } else {
                     self.status =
                         format!("{} tris · {} ms", done.triangles, done.build_ms);
@@ -258,7 +276,18 @@ impl RingApp {
                 }
                 ui.separator();
                 ui.toggle_value(&mut self.pane.wireframe, "Wire");
-                if let Some(cast) = self.cast.as_ref() {
+                if ui
+                    .toggle_value(&mut self.as_cast, "As-cast")
+                    .on_hover_text("Soften the preview at the sand's detail radius — the pour, early.")
+                    .changed()
+                {
+                    self.mark_dirty();
+                }
+                if let Some(f) = self.field.as_ref() {
+                    ui.separator();
+                    let (tint, text) = field_chip(f);
+                    ui.colored_label(tint, text).on_hover_text(f.notes.join("\n"));
+                } else if let Some(cast) = self.cast.as_ref() {
                     ui.separator();
                     let (tint, text) = verdict_chip(cast);
                     ui.colored_label(tint, text);
@@ -294,6 +323,17 @@ impl RingApp {
     /// shared file is self-contained, and the layer is an ordinary `TilingLayer` so every existing
     /// blend, window and lattice control applies and the desktop opens it unchanged.
     fn ensure_drawing(&mut self, name: &str, w: u32, h: u32, wrap_y: bool, repeats: u32) -> usize {
+        // The band is the shared convention: one seam-wrapped cell over the
+        // whole band, identical to the desktop's paint mode, so files
+        // roundtrip between devices.
+        if name == paint::BAND_ALPHA && repeats <= 1 {
+            let created = !self.design.drawn.iter().any(|d| d.name == name);
+            let index = ringdesign_core::paint::ensure_band_layer(&mut self.design);
+            if created {
+                self.mark_dirty();
+            }
+            return index;
+        }
         if let Some(i) = self.design.drawn.iter().position(|d| d.name == name) {
             return i;
         }
@@ -725,7 +765,32 @@ impl RingApp {
             if ui.button("Export STL").clicked() {
                 let _ = std::fs::create_dir_all(&exports);
                 let path = exports.join(format!("{}.stl", slug(&self.design.name)));
-                self.export_stl(host, path);
+                self.export_mesh(host, path, false);
+            }
+            if ui.button("Export 3MF").clicked() {
+                let _ = std::fs::create_dir_all(&exports);
+                let path = exports.join(format!("{}.3mf", slug(&self.design.name)));
+                self.export_mesh(host, path, true);
+            }
+            {
+                use ringdesign_core::metal::METALS;
+                let current = self
+                    .shrink_metal
+                    .and_then(|i| METALS.get(i))
+                    .map(|m| format!("{} +{:.1}%", m.name, m.shrink_pct))
+                    .unwrap_or_else(|| "nominal".into());
+                egui::ComboBox::from_id_salt("shrink_metal")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.shrink_metal, None, "nominal");
+                        for (i, m) in METALS.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.shrink_metal,
+                                Some(i),
+                                format!("{} +{:.1}%", m.name, m.shrink_pct),
+                            );
+                        }
+                    });
             }
             if ui.button("Copy design").clicked() {
                 if let Ok(json) = serde_json::to_string_pretty(&self.design) {
@@ -937,9 +1002,24 @@ impl RingApp {
     /// Measured at 226 ms end to end on this device, so it runs inline rather than on the worker;
     /// the part that actually stalls is `share_media`, which reads the whole file and copies it
     /// into a Java byte array on the render thread.
-    fn export_stl(&mut self, host: &Host, path: std::path::PathBuf) {
+    fn export_mesh(&mut self, host: &Host, path: std::path::PathBuf, as_3mf: bool) {
+        use ringdesign_core::metal;
         let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
-        match ringdesign_core::stl::write_stl(&path, &out.mesh) {
+        // The patternmaker's shrink: cut oversize and *named* as a pattern,
+        // so an oversize file cannot be poured as nominal by mistake.
+        let (mesh, name) = match self.shrink_metal.and_then(|i| metal::METALS.get(i)) {
+            Some(m) => (
+                out.mesh.scaled(metal::pattern_scale(m.shrink_pct)),
+                format!("{} [pattern +{:.1}% for {}]", self.design.name, m.shrink_pct, m.name),
+            ),
+            None => (out.mesh.clone(), self.design.name.clone()),
+        };
+        let written = if as_3mf {
+            ringdesign_core::threemf::write_3mf(&path, &mesh, &name, &self.design.size.display())
+        } else {
+            ringdesign_core::stl::write_stl(&path, &mesh, &name)
+        };
+        match written {
             Ok(bytes) => {
                 self.status = format!(
                     "{} tris · {:.1} MB",
@@ -950,10 +1030,15 @@ impl RingApp {
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "ring.stl".into());
+                let _ = &name;
                 // An explicit MIME: `share_file` has no `stl` entry and would fall through to
                 // application/octet-stream, and MediaProvider renames a file whose extension
                 // disagrees with its type.
-                host.share_media(path.to_string_lossy().into_owned(), name, "model/stl");
+                host.share_media(
+                    path.to_string_lossy().into_owned(),
+                    name,
+                    if as_3mf { "model/3mf" } else { "model/stl" },
+                );
                 host.haptic(Haptic::Success);
             }
             Err(e) => {
@@ -1103,6 +1188,24 @@ enum SyncResult {
 
 /// Verdict colour and text for the toolbar chip. The undercut fraction is the number that decides
 /// it, so it is shown rather than the label alone.
+fn field_chip(f: &ringdesign_core::castability::FieldReport) -> (egui::Color32, String) {
+    use ringdesign_core::castability::Verdict;
+    let tint = match f.verdict {
+        Verdict::Castable => egui::Color32::from_rgb(82, 199, 115),
+        Verdict::Marginal => egui::Color32::from_rgb(242, 194, 61),
+        Verdict::NotCastable => egui::Color32::from_rgb(240, 105, 120),
+    };
+    (
+        tint,
+        format!(
+            "{} · {:.2}% · wall {:.2} mm",
+            f.verdict.label(),
+            f.undercut_fraction() * 100.0,
+            f.thinnest_wall_mm
+        ),
+    )
+}
+
 fn verdict_chip(cast: &CastReport) -> (egui::Color32, String) {
     use ringdesign_core::castability::Verdict;
     let tint = match cast.verdict {
