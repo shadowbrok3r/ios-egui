@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1
+
+- **Cope and drag.** A fifth shade mode splits the ring into its two mould halves — cope in blue,
+  drag in sand — with the parting line glowing bright between them, so where the sand splits is
+  visible at a glance.
+
 ## 0.8.0
 
 - **The galactic glass look.** The app now wears the same theme as the rest of the family: an

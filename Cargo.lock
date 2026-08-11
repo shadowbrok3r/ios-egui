@@ -6170,7 +6170,7 @@ dependencies = [
 
 [[package]]
 name = "ringdesigner_android"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "backdrop-blur-egui",
  "egui",

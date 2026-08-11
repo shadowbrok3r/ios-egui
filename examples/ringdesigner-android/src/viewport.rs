@@ -43,12 +43,14 @@ out vec3 v_normal;
 out vec3 v_color;
 out vec3 v_wall;
 out vec3 v_bary;
+out float v_obj_nz;
 
 void main() {
     gl_Position = u_mvp * vec4(a_position, 1.0);
     v_normal = u_normal_matrix * a_normal;
     v_color = a_color;
     v_wall = a_wall;
+    v_obj_nz = a_normal.z;
     // Non-indexed triangles, so the corner index is the vertex index mod 3 and the
     // barycentric coordinate costs nothing to carry.
     int corner = gl_VertexID % 3;
@@ -61,6 +63,7 @@ in vec3 v_normal;
 in vec3 v_color;
 in vec3 v_wall;
 in vec3 v_bary;
+in float v_obj_nz;
 
 uniform int u_mode;
 uniform vec3 u_light_dir;
@@ -80,7 +83,12 @@ void main() {
     vec3 l = normalize(u_light_dir);
     vec3 color;
 
-    if (u_mode == 3) {
+    if (u_mode == 4) {
+        float lambert = max(dot(n, l), 0.0);
+        vec3 half_c = v_obj_nz > 0.0 ? vec3(0.42, 0.62, 0.82) : vec3(0.80, 0.62, 0.38);
+        float band = 1.0 - smoothstep(0.035, 0.09, abs(v_obj_nz));
+        color = mix(half_c, vec3(1.0, 0.92, 0.25), band) * (0.72 + 0.28 * lambert);
+    } else if (u_mode == 3) {
         float lambert = max(dot(n, l), 0.0);
         color = v_wall * (0.74 + 0.26 * lambert);
     } else if (u_mode == 2) {
@@ -466,18 +474,25 @@ pub enum ShadeMode {
     Metal,
     Draft,
     Wall,
+    Halves,
     Normals,
 }
 
 impl ShadeMode {
-    pub const ALL: &'static [ShadeMode] =
-        &[ShadeMode::Metal, ShadeMode::Draft, ShadeMode::Wall, ShadeMode::Normals];
+    pub const ALL: &'static [ShadeMode] = &[
+        ShadeMode::Metal,
+        ShadeMode::Draft,
+        ShadeMode::Wall,
+        ShadeMode::Halves,
+        ShadeMode::Normals,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             ShadeMode::Metal => "Metal",
             ShadeMode::Draft => "Draft",
             ShadeMode::Wall => "Wall",
+            ShadeMode::Halves => "Halves",
             ShadeMode::Normals => "Normals",
         }
     }
@@ -488,6 +503,7 @@ impl ShadeMode {
             ShadeMode::Draft => 1,
             ShadeMode::Normals => 2,
             ShadeMode::Wall => 3,
+            ShadeMode::Halves => 4,
         }
     }
 }
@@ -560,7 +576,7 @@ mod tests {
     #[test]
     fn shade_modes_have_distinct_codes() {
         let codes: Vec<i32> = ShadeMode::ALL.iter().map(|m| m.code()).collect();
-        assert_eq!(codes, vec![0, 1, 3, 2]);
+        assert_eq!(codes, vec![0, 1, 3, 4, 2]);
     }
 
     #[test]
