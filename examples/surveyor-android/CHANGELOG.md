@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.8 — 2026-08-13
+
+New micro-motion instrument on the Live tab: a scrolling 60 GHz strip-chart
+from the A121 presence bridge — breathing-band trace in aqua, fast motion in
+pink, presence tinting the background, with distance and score readouts. Only
+appears once the channel speaks, so setups without an XM125 see no dead chrome.
+
 ## v0.1.7 — 2026-08-06
 
 Shortens the radar afterglow from 8 seconds to under 3. The live dot was

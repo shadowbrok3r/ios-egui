@@ -11,7 +11,8 @@ use egui_mobile::{app, CreateContext, EguiApp, Haptic, Host};
 
 use crate::config::{AppConfig, NodePos};
 use crate::net::{self, HttpCall, HttpOutcome, WsEvent};
-use crate::proto::{MmwaveSnapshot, SensingSnapshot, WsMsg};
+use crate::pulsecard::{self, PulseTrace};
+use crate::proto::{A121Snapshot, MmwaveSnapshot, SensingSnapshot, WsMsg};
 use crate::roommap::{self, MapInputs, Trails};
 use crate::{frost, theme};
 
@@ -38,6 +39,8 @@ struct SurveyorApp {
 
     latest_sensing: Option<(SensingSnapshot, Instant)>,
     latest_mmwave: Option<(MmwaveSnapshot, Instant)>,
+    latest_a121: Option<(A121Snapshot, Instant)>,
+    a121_trace: PulseTrace,
     trails: Trails,
 
     http_rx: Receiver<HttpOutcome>,
@@ -80,6 +83,8 @@ impl SurveyorApp {
             link_note: String::new(),
             latest_sensing: None,
             latest_mmwave: None,
+            latest_a121: None,
+            a121_trace: PulseTrace::default(),
             trails: Trails::default(),
             http_rx,
             http_tx,
@@ -126,6 +131,8 @@ impl SurveyorApp {
         self.trails.clear();
         self.latest_sensing = None;
         self.latest_mmwave = None;
+        self.latest_a121 = None;
+        self.a121_trace.clear();
         let (tx, rx) = std::sync::mpsc::sync_channel(256);
         let stop = net::spawn_ws(self.cfg.server.clone(), tx.clone(), ctx.clone());
         self.ws_rx = Some(rx);
@@ -168,6 +175,11 @@ impl SurveyorApp {
                             self.trails.push_radar(x, y);
                         }
                         self.latest_mmwave = Some((m, Instant::now()));
+                        self.connected = true;
+                    }
+                    WsEvent::Msg(WsMsg::A121(a)) => {
+                        self.a121_trace.push(&a);
+                        self.latest_a121 = Some((a, Instant::now()));
                         self.connected = true;
                     }
                     WsEvent::Msg(WsMsg::Other(_)) => {}
@@ -217,6 +229,13 @@ impl SurveyorApp {
             .as_ref()
             .filter(|(_, at)| at.elapsed() < STALE_AFTER)
             .map(|(m, _)| m)
+    }
+
+    fn a121_fresh(&self) -> Option<&A121Snapshot> {
+        self.latest_a121
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < STALE_AFTER)
+            .map(|(a, _)| a)
     }
 
     fn http(&self, ctx: &egui::Context, label: &str, call: HttpCall) {
@@ -311,6 +330,12 @@ impl SurveyorApp {
             live,
         };
         roommap::paint(ui, &self.cfg, &inputs);
+        // A121 micro-motion strip: only rendered once the channel has ever
+        // spoken, so setups without an XM125 see no dead chrome.
+        if !self.a121_trace.is_empty() {
+            ui.add_space(6.0);
+            pulsecard::paint(ui, &self.a121_trace, self.a121_fresh());
+        }
     }
 
     fn record_tab(&mut self, ui: &mut egui::Ui, host: &Host) {

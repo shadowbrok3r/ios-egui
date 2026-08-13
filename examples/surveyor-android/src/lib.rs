@@ -15,6 +15,7 @@ pub mod frost;
 pub mod mount;
 pub mod net;
 pub mod proto;
+pub mod pulsecard;
 pub mod roommap;
 pub mod theme;
 

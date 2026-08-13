@@ -35,10 +35,22 @@ pub struct MmwaveSnapshot {
     pub targets: Vec<RadarTargetM>,
 }
 
+/// A121 60 GHz presence packet: 1D micro-motion, no angle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct A121Snapshot {
+    pub node_id: u8,
+    pub presence: bool,
+    pub distance_m: f64,
+    pub inter_score: f64,
+    pub intra_score: f64,
+    pub breathing_bpm: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WsMsg {
     Sensing(SensingSnapshot),
     Mmwave(MmwaveSnapshot),
+    A121(A121Snapshot),
     /// Recognized JSON with some other `type` tag — surfaced for the log view.
     Other(String),
 }
@@ -93,6 +105,14 @@ pub fn parse(text: &str) -> Option<WsMsg> {
                 .unwrap_or_default();
             Some(WsMsg::Mmwave(MmwaveSnapshot { node_id, targets }))
         }
+        "a121_presence" => Some(WsMsg::A121(A121Snapshot {
+            node_id: v.get("node_id").and_then(|n| n.as_u64()).unwrap_or(0) as u8,
+            presence: v.get("presence").and_then(|p| p.as_bool()).unwrap_or(false),
+            distance_m: v.get("distance_m").and_then(|d| d.as_f64()).unwrap_or(0.0),
+            inter_score: v.get("inter_score").and_then(|d| d.as_f64()).unwrap_or(0.0),
+            intra_score: v.get("intra_score").and_then(|d| d.as_f64()).unwrap_or(0.0),
+            breathing_bpm: v.get("breathing_bpm").and_then(|d| d.as_f64()),
+        })),
         other => Some(WsMsg::Other(other.to_owned())),
     }
 }
@@ -119,6 +139,24 @@ mod tests {
         let Some(WsMsg::Sensing(s)) = parse(msg) else { panic!() };
         assert!(s.localization.is_none());
         assert_eq!(s.node_count, 0);
+    }
+
+    #[test]
+    fn parses_a121_presence() {
+        let msg = r#"{"type":"a121_presence","node_id":9,"presence":true,"distance_m":0.54,"inter_score":8.5,"intra_score":1.4,"breathing_bpm":null,"seq":12,"ts_us":5}"#;
+        let Some(WsMsg::A121(a)) = parse(msg) else { panic!("expected a121") };
+        assert!(a.presence);
+        assert_eq!(a.node_id, 9);
+        assert!((a.distance_m - 0.54).abs() < 1e-9);
+        assert!((a.inter_score - 8.5).abs() < 1e-9);
+        assert_eq!(a.breathing_bpm, None);
+    }
+
+    #[test]
+    fn a121_missing_fields_default_sane() {
+        let Some(WsMsg::A121(a)) = parse(r#"{"type":"a121_presence"}"#) else { panic!() };
+        assert!(!a.presence);
+        assert_eq!(a.distance_m, 0.0);
     }
 
     #[test]

@@ -29,6 +29,7 @@ fn probe_live_server() {
     }
 
     let (mut sensing, mut mmwave, mut other, mut unparsed) = (0u32, 0u32, 0u32, 0u32);
+    let mut a121 = 0u32;
     let mut last_radar = String::new();
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
@@ -52,6 +53,12 @@ fn probe_live_server() {
                         println!("first mmwave_targets: node {} [{last_radar}]", m.node_id);
                     }
                 }
+                Some(WsMsg::A121(a)) => {
+                    a121 += 1;
+                    if a121 == 1 {
+                        println!("first a121_presence: presence={} dist={:.2}m inter={:.1}", a.presence, a.distance_m, a.inter_score);
+                    }
+                }
                 Some(WsMsg::Other(_)) => other += 1,
                 None => unparsed += 1,
             },
@@ -65,7 +72,7 @@ fn probe_live_server() {
         }
     }
 
-    println!("\n{secs}s summary: sensing={sensing} mmwave={mmwave} other={other} unparsed={unparsed}");
+    println!("\n{secs}s summary: sensing={sensing} mmwave={mmwave} a121={a121} other={other} unparsed={unparsed}");
     if !last_radar.is_empty() {
         println!("last radar frame: {last_radar}");
     }
