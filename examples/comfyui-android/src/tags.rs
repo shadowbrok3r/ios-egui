@@ -393,6 +393,15 @@ pub fn bump_weight(text: &str, idx: usize, delta: f32) -> String {
     splice(text, chip.range.clone(), &render_chip(&chip.tag, new_w))
 }
 
+/// Replace chip `idx`'s tag with `new_tag`, keeping its weight wrapper.
+pub fn replace_chip_tag(text: &str, idx: usize, new_tag: &str) -> String {
+    let chips = parse_chips(text);
+    let Some(chip) = chips.get(idx) else {
+        return text.to_string();
+    };
+    splice(text, chip.range.clone(), &render_chip(new_tag, chip.weight))
+}
+
 /// Remove chip `idx` along with one adjoining `, ` (trailing preferred, else leading).
 pub fn remove_chip(text: &str, idx: usize) -> String {
     let chips = parse_chips(text);
@@ -637,6 +646,14 @@ mod tests {
         // bumping back to 1.0 strips the wrapper entirely.
         let restored = bump_weight(&bumped, 1, -0.2);
         assert_eq!(restored, text);
+
+        // replace keeps the weight wrapper on the new tag.
+        assert_eq!(
+            replace_chip_tag("1girl, (long hair:1.2), detailed", 1, "short hair"),
+            "1girl, (short hair:1.2), detailed"
+        );
+        assert_eq!(replace_chip_tag(text, 2, "sketch"), "1girl, long hair, sketch");
+        assert_eq!(replace_chip_tag(text, 9, "x"), text);
 
         // remove eats the adjoining comma+space.
         assert_eq!(remove_chip(text, 1), "1girl, detailed");

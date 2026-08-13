@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2
+
+- Cut dome slider on the signet head: the face cut from a swollen dome
+  instead of the prism construction — no pinched corners, no prism walls.
+- Diamond and Cross face outlines.
+
 ## 0.8.1
 
 - **Cope and drag.** A fifth shade mode splits the ring into its two mould halves — cope in blue,

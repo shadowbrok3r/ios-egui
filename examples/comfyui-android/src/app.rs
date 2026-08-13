@@ -1157,6 +1157,7 @@ struct ComfyApp {
     active_main_looks: Vec<AppliedMainLook>,
     /// Open global-look manager window, filtered to this kind (from a combobox's Manage entry).
     looks_window: Option<LookKind>,
+    extract_sheet: Option<ExtractSheet>,
     /// Per-character denied gallery keys (persisted), keyed by card name; never re-surfaced.
     character_denied: std::collections::BTreeMap<String, Vec<String>>,
     /// Per-character pending match suggestions (persisted, capped), keyed by card name.
@@ -1803,6 +1804,23 @@ struct ChipDrag {
     idx: usize,
 }
 
+/// One detected appearance chip in the extract sheet: its slot, verbatim span (weight wrapper
+/// intact), peeled tag, and include toggle.
+struct ExtractItem {
+    slot: crate::appearance::AttrSlot,
+    text: String,
+    tag: String,
+    on: bool,
+}
+
+/// Transient state of the extract-appearance sheet.
+struct ExtractSheet {
+    name: String,
+    items: Vec<ExtractItem>,
+    /// File the saved look under the active character instead of the global list.
+    to_character: bool,
+}
+
 /// A pack dir's root: ("app files", wiped=true) under the app external files dir, ("/sdcard/ComfyUI",
 /// false) under the durable dir, else the parent path.
 #[cfg(feature = "local-npu")]
@@ -1906,6 +1924,7 @@ impl ComfyApp {
             builtin_looks: crate::types::builtin_looks(),
             active_main_looks: Vec::new(),
             looks_window: None,
+            extract_sheet: None,
             character_denied: std::collections::BTreeMap::new(),
             character_suggestions: std::collections::BTreeMap::new(),
             character_approved: std::collections::BTreeMap::new(),
@@ -7402,6 +7421,32 @@ impl ComfyApp {
                     }
                 }
                 egui::Popup::menu(&resp).show(|ui| {
+                    // Swap strip: same-family alternatives for a recognized appearance tag
+                    // (hair/eye/nail colors, breast ladder, …), replacing in place with the
+                    // weight wrapper kept. Flat rows — a nested menu would dismiss itself.
+                    if let Some(varis) = crate::appearance::variants(&chip.tag) {
+                        ui.weak("Swap");
+                        crate::theme::scroll_vertical()
+                            .max_height(160.0)
+                            .id_salt(("chip_swap", disc, i))
+                            .show(ui, |ui| {
+                                ui.set_max_width(240.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    let cur = tags::fold(&chip.tag);
+                                    for v in varis {
+                                        let sel = cur == *v;
+                                        let btn = egui::Button::new(sanitize_ui_text(ui, v))
+                                            .small()
+                                            .selected(sel);
+                                        if ui.add(btn).clicked() && !sel {
+                                            new_text = Some(tags::replace_chip_tag(&text, i, v));
+                                            ui.close();
+                                        }
+                                    }
+                                });
+                            });
+                        ui.separator();
+                    }
                     if ui.button("Weight +").clicked() {
                         new_text = Some(tags::bump_weight(&text, i, 0.05));
                     }
@@ -15424,10 +15469,125 @@ impl ComfyApp {
         }
     }
 
+    /// Scan the positive for appearance chips and open the extract sheet over them.
+    fn open_extract_sheet(&mut self) {
+        let found = crate::appearance::extract(&self.params.positive);
+        let name = crate::appearance::suggest_name(&found);
+        let items = found
+            .into_iter()
+            .map(|e| ExtractItem { slot: e.slot, text: e.text, tag: e.tag, on: true })
+            .collect();
+        self.extract_sheet = Some(ExtractSheet { name, items, to_character: false });
+    }
+
+    /// The extract-appearance window: detected chips grouped by slot with include toggles. Save
+    /// pulls the checked chips out of the positive into an Appearance look and applies it, so the
+    /// submitted prompt is unchanged while the tags become a swappable combobox pick.
+    fn extract_sheet_ui(&mut self, ctx: &egui::Context) {
+        let Some(mut sheet) = self.extract_sheet.take() else { return };
+        let mut open = true;
+        let mut save = false;
+        centered(ctx, egui::Window::new("Extract appearance"))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                if sheet.items.is_empty() {
+                    ui.label("No appearance tags found in the prompt.");
+                    ui.weak("Recognized: hair color/style, eyes, nails, toenails, skin, body.");
+                    return;
+                }
+                ui.weak("Pull these out of the prompt into a swappable Appearance preset.");
+                ui.add_space(4.0);
+                crate::theme::scroll_vertical().max_height(300.0).id_salt("extract_sheet").show(
+                    ui,
+                    |ui| {
+                        for &slot in crate::appearance::AttrSlot::ALL {
+                            if !sheet.items.iter().any(|it| it.slot == slot) {
+                                continue;
+                            }
+                            ui.weak(slot.label());
+                            for it in sheet.items.iter_mut().filter(|it| it.slot == slot) {
+                                ui.checkbox(&mut it.on, sanitize_ui_text(ui, &it.text));
+                            }
+                        }
+                    },
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut sheet.name)
+                            .desired_width((ui.available_width() - 4.0).max(120.0)),
+                    );
+                });
+                if let Some(applied) = &self.active_character {
+                    sheet.to_character &= self.characters.iter().any(|c| c.name == applied.name);
+                    let label = format!("Save under {}", elide(&applied.name, 20));
+                    ui.checkbox(&mut sheet.to_character, sanitize_ui_text(ui, &label));
+                }
+                let any_on = sheet.items.iter().any(|it| it.on);
+                let name_ok = !sheet.name.trim().is_empty();
+                ui.add_space(4.0);
+                let btn = egui::Button::new(format!("{} Save & swap in", icons::CHECK));
+                if ui
+                    .add_enabled(any_on && name_ok, btn)
+                    .on_hover_text("Saves the preset, removes these tags from the prompt, and applies it")
+                    .clicked()
+                {
+                    save = true;
+                }
+            });
+        if save {
+            self.save_extract_sheet(&sheet);
+        } else if open {
+            self.extract_sheet = Some(sheet);
+        }
+    }
+
+    /// Save the sheet's checked chips as an Appearance look (global, or under the active character),
+    /// strip them from the positive, and apply the new look. A same-named look is replaced.
+    fn save_extract_sheet(&mut self, sheet: &ExtractSheet) {
+        let on: Vec<&ExtractItem> = sheet.items.iter().filter(|it| it.on).collect();
+        let name = sheet.name.trim().to_string();
+        if on.is_empty() || name.is_empty() {
+            return;
+        }
+        let prompt = on.iter().map(|it| it.text.as_str()).collect::<Vec<_>>().join(", ");
+        let look = CharacterLook {
+            name: name.clone(),
+            prompt,
+            portrait_key: String::new(),
+            kind: LookKind::Appearance,
+        };
+        let mut origin = match (&self.active_character, sheet.to_character) {
+            (Some(a), true) => a.name.clone(),
+            _ => String::new(),
+        };
+        if !origin.is_empty() {
+            match self.characters.iter_mut().find(|c| c.name == origin) {
+                Some(card) => {
+                    card.looks.retain(|l| !(l.kind == LookKind::Appearance && l.name == name));
+                    card.looks.push(look.clone());
+                }
+                None => origin = String::new(),
+            }
+        }
+        if origin.is_empty() {
+            self.global_looks.retain(|l| !(l.kind == LookKind::Appearance && l.name == name));
+            self.global_looks.push(look);
+        }
+        let remove: HashSet<String> = on.iter().map(|it| tags::fold(&it.tag)).collect();
+        self.params.positive = crate::appearance::remove_tags(&self.params.positive, &remove);
+        self.note_prompt_edited();
+        self.set_main_look(LookKind::Appearance, Some((name.clone(), origin)));
+        self.status = format!("Extracted {} tags into {name}", on.len());
+    }
+
     /// The Create-Main single-axis look section: one combobox per [`LookKind::MAIN`]. Opens by
     /// default once a look is applied (baked-in presets are always present regardless).
     fn main_look_combos(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Outfit, pose, camera & scene")
+        egui::CollapsingHeader::new("Appearance, outfit, pose & scene")
             .id_salt("create_main_looks")
             .default_open(!self.active_main_looks.is_empty())
             .show(ui, |ui| {
@@ -15451,6 +15611,7 @@ impl ComfyApp {
         };
         let mut pick: Option<Option<(String, String)>> = None;
         let mut manage = false;
+        let mut extract = false;
         ui.horizontal(|ui| {
             ui.add_sized(egui::vec2(96.0, 20.0), egui::Label::new(kind.label()));
             let combo_w = (ui.available_width() - 4.0).max(120.0);
@@ -15509,6 +15670,11 @@ impl ComfyApp {
                     }
                         });
                     ui.separator();
+                    if kind == LookKind::Appearance
+                        && ui.button(format!("{} Extract from prompt", icons::GENERATE)).clicked()
+                    {
+                        extract = true;
+                    }
                     if ui
                         .button(format!("{} Manage {}", icons::STYLUS, kind.plural().to_lowercase()))
                         .clicked()
@@ -15519,6 +15685,9 @@ impl ComfyApp {
         });
         if let Some(choice) = pick {
             self.set_main_look(kind, choice);
+        }
+        if extract {
+            self.open_extract_sheet();
         }
         if manage {
             self.looks_window = Some(kind);
@@ -24188,6 +24357,7 @@ impl EguiApp for ComfyApp {
         self.dup_run_window(ui.ctx(), host);
         self.dup_create_window(ui.ctx(), host);
         self.looks_window(ui.ctx());
+        self.extract_sheet_ui(ui.ctx());
         self.error_modal_window(ui.ctx(), host);
 
         // Keep the server-wide queue in view even when jobs were started on the website. Poll faster

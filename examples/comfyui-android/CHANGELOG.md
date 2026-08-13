@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.9.0 — 2026-08-13
+
+Character appearance is now hot-swappable. **Appearance** joins the Create-tab look comboboxes: a named bundle of the tags that describe who you're drawing — hair color and style, eyes, nails, toenails, skin, body — applied and removed as one unit, so trying the same subject across checkpoints stops meaning hand-editing hair and toenail color every time. **Extract from prompt**, inside that dropdown, reads those tags out of the prompt you already wrote, shows them grouped with a checkbox each, and moves the checked ones into a named preset — the effective prompt is unchanged, but the appearance is now a dropdown pick. Presets save globally or under the active character, and swapping to another (or to None) removes exactly what the old one injected, weights included.
+
+For one-off fiddling, tap a recognized appearance chip in the prompt's chip view: a new Swap strip offers the tag's whole family — every hair color, the breast-size ladder, nail and toenail polish colors, skin tones — and replaces it in place, keeping any `(tag:1.2)` weight wrapper.
+
 ## v0.8.0 — 2026-08-11
 
 Graph editor: nodes copy between workflow tabs. Long-press a node → **Copy** (or **Copy with inputs**, which brings the whole upstream chain), then long-press the canvas in any tab → **Paste nodes**. The pack rides the system clipboard, so it survives closing tabs and can travel between phones; classes the target server lacks are reported by name instead of silently dropped.

@@ -694,6 +694,16 @@ impl RingApp {
                             .text("table dome mm"),
                     )
                     .changed();
+                dirty |= ui
+                    .add(
+                        egui::Slider::new(&mut self.design.shank.head.dome, 0.0..=1.0)
+                            .text("cut dome"),
+                    )
+                    .on_hover_text(
+                        "1 cuts the face from a swollen dome: no pinched corners, no \
+                         prism walls. Concave outlines (heart, shield) soften there.",
+                    )
+                    .changed();
 
                 let mut second = !self.design.shank.extra_heads.is_empty();
                 if ui.checkbox(&mut second, "second head (toi et moi)").changed() {

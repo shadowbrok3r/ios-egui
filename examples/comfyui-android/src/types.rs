@@ -717,6 +717,7 @@ impl LoraPack {
 pub enum LookKind {
     #[default]
     Look,
+    Appearance,
     Outfit,
     Pose,
     CameraAngle,
@@ -727,6 +728,7 @@ impl LookKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Look => "Look",
+            Self::Appearance => "Appearance",
             Self::Outfit => "Outfit",
             Self::Pose => "Pose",
             Self::CameraAngle => "Camera angle",
@@ -737,6 +739,7 @@ impl LookKind {
     pub fn plural(self) -> &'static str {
         match self {
             Self::Look => "Looks",
+            Self::Appearance => "Appearances",
             Self::Outfit => "Outfits",
             Self::Pose => "Poses",
             Self::CameraAngle => "Camera angles",
@@ -747,6 +750,7 @@ impl LookKind {
     pub fn hint(self) -> &'static str {
         match self {
             Self::Look => "school uniform, hand on hip",
+            Self::Appearance => "silver hair, red eyes, black nails",
             Self::Outfit => "school uniform, thigh-highs",
             Self::Pose => "hand on hip, looking back",
             Self::CameraAngle => "low angle, from below, wide shot",
@@ -755,7 +759,8 @@ impl LookKind {
     }
 
     /// The single-axis kinds surfaced as Create-Main comboboxes (not the combined `Look`).
-    pub const MAIN: &'static [Self] = &[Self::Outfit, Self::Pose, Self::CameraAngle, Self::Environment];
+    pub const MAIN: &'static [Self] =
+        &[Self::Appearance, Self::Outfit, Self::Pose, Self::CameraAngle, Self::Environment];
 }
 
 /// A swappable "look" for a character: a named prompt fragment (outfit, accessories, pose, scene)

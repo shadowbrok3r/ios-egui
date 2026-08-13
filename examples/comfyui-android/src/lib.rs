@@ -10,6 +10,7 @@
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
+pub mod appearance;
 mod apps;
 mod backup;
 mod cooc;
