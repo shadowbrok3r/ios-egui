@@ -275,6 +275,7 @@ impl SurveyorApp {
                 );
             }
         });
+        ui.spacing_mut().item_spacing.y = 2.0;
         ui.horizontal_wrapped(|ui| {
             let mono = |t: String, c: egui::Color32| egui::RichText::new(t).monospace().size(12.0).color(c);
             if let Some(s) = self.sensing_fresh() {
@@ -307,6 +308,13 @@ impl SurveyorApp {
                 }
             }
         });
+        // A121 micro-motion strip lives up here with the status text — putting
+        // it below the map starved the bottom nav bar of room. Rendered only
+        // once the channel has ever spoken, so setups without an XM125 see no
+        // dead chrome.
+        if !self.a121_trace.is_empty() {
+            pulsecard::paint(ui, &self.a121_trace, self.a121_fresh());
+        }
         ui.add_space(4.0);
 
         let radar_room: Vec<(f64, f64, f64)> = self
@@ -330,12 +338,6 @@ impl SurveyorApp {
             live,
         };
         roommap::paint(ui, &self.cfg, &inputs);
-        // A121 micro-motion strip: only rendered once the channel has ever
-        // spoken, so setups without an XM125 see no dead chrome.
-        if !self.a121_trace.is_empty() {
-            ui.add_space(6.0);
-            pulsecard::paint(ui, &self.a121_trace, self.a121_fresh());
-        }
     }
 
     fn record_tab(&mut self, ui: &mut egui::Ui, host: &Host) {

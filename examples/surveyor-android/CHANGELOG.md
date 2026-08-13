@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.9 — 2026-08-13
+
+Live tab layout: the micro-motion strip moves to the top beside the status
+text (which now sits tight under the LIVE row), and the map takes exactly the
+remaining height — the strip no longer crowds the bottom nav buttons.
+
 ## v0.1.8 — 2026-08-13
 
 New micro-motion instrument on the Live tab: a scrolling 60 GHz strip-chart
