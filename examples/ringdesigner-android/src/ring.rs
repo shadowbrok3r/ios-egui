@@ -183,6 +183,8 @@ pub struct Done {
     /// phantoms, undercuts arrive located and blamed, and the thinnest wall
     /// rides along. Settled builds only, like `cast`.
     pub field: Option<FieldReport>,
+    /// The graph's evaluation, when the design carries one.
+    pub graph: Option<crate::graph::GraphDone>,
 }
 
 struct Job {
@@ -206,11 +208,21 @@ impl Worker {
         std::thread::Builder::new()
             .name("ring-build".into())
             .spawn(move || {
+                let mut runner = crate::graph::GraphRunner::new();
                 while let Ok(mut job) = jobs_rx.recv() {
                     // Skip stale work: only the newest queued job matters.
                     while let Ok(newer) = jobs_rx.try_recv() {
                         job = newer;
                     }
+                    // A graph-driven design is evaluated first; a failed
+                    // evaluation builds the last good design instead.
+                    let mut graph = runner.run(&job.design, &job.lib);
+                    if let Some(g) = &graph {
+                        if g.ok {
+                            job.design = g.design.clone();
+                        }
+                    }
+                    let field_from_graph = graph.as_mut().and_then(|g| g.field.take());
                     let out = ringdesign_core::mesh::build(&job.design, &job.lib, job.params);
                     let cast = job.analyze.then(|| {
                         castability::analyze(
@@ -220,13 +232,15 @@ impl Worker {
                         )
                     });
                     let field = job.analyze.then(|| {
-                        castability::attributed_field_report(
-                            &job.design,
-                            &job.lib,
-                            &job.design.draft,
-                            160,
-                            112,
-                        )
+                        field_from_graph.unwrap_or_else(|| {
+                            castability::attributed_field_report(
+                                &job.design,
+                                &job.lib,
+                                &job.design.draft,
+                                160,
+                                112,
+                            )
+                        })
                     });
                     let verts = GpuMeshRenderer::stage(
                         &out.mesh,
@@ -250,6 +264,7 @@ impl Worker {
                         build_ms: out.report.build_ms,
                         cast,
                         field,
+                        graph,
                     };
                     if done_tx.send(done).is_err() {
                         break;

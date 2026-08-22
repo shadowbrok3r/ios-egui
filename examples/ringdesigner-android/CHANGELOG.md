@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0
+
+- **Graph tab.** The design's recipe graph, edited on the phone: convert the
+  current design to nodes, or start from the simple or a template graph; drag
+  to pan, pinch to zoom, long-press for the node and background menus, drag
+  pins to wire; Arrange, Fit, Lock and Bake. A graph arriving with a pulled
+  design shows up the same way. The build worker evaluates the graph before
+  every build, and the editing tabs say "driven by the graph" with a Bake
+  button while one is in charge.
+
 ## 0.8.2
 
 - Cut dome slider on the signet head: the face cut from a swollen dome

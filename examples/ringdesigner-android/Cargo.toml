@@ -1,6 +1,6 @@
 [package]
 name = "ringdesigner_android"
-version = "0.8.2"
+version = "0.9.0"
 edition = "2024"
 publish = false
 
@@ -22,6 +22,11 @@ minreq = "3"
 # The geometry, unchanged. Lives in another workspace; cargo resolves its own
 # `.workspace = true` inheritance from its own root, so a plain path dep is enough.
 ringdesign-core = { path = "../../../../JewelryProjects/RingDesigner/crates/ringdesign-core" }
+# The recipe graph: runtime, the snarl editor (through this workspace's own
+# egui-snarl patch, byte-identical to RingDesigner's), and the rhai nodes.
+ringdesign-graph = { path = "../../../../JewelryProjects/RingDesigner/crates/ringdesign-graph" }
+ringdesign-graph-ui = { path = "../../../../JewelryProjects/RingDesigner/crates/ringdesign-graph-ui" }
+ringdesign-script = { path = "../../../../JewelryProjects/RingDesigner/crates/ringdesign-script" }
 
 # cargo-apk2 reads this to generate the APK manifest.
 [package.metadata.android]

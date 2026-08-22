@@ -24,6 +24,7 @@ use ringdesign_core::tiling::TilingLayer;
 
 use crate::bench;
 use crate::canvas::{self, CanvasInput, Domain, View};
+use crate::graph::GraphDone;
 use crate::library as liblib;
 use crate::paint;
 use crate::util::{slug, sync_base};
@@ -51,6 +52,7 @@ enum Tab {
     Ring,
     Band,
     Tile,
+    Graph,
     Alphas,
     Files,
     Bench,
@@ -63,6 +65,7 @@ impl Tab {
         (Tab::Ring, "", "Ring"),
         (Tab::Band, "", "Band"),
         (Tab::Tile, "", "Tile"),
+        (Tab::Graph, "\u{1F517}", ""),
         (Tab::Alphas, "\u{1F3A8}", ""),
         (Tab::Files, "\u{1F4C1}", ""),
         (Tab::Bench, "\u{26A1}", ""),
@@ -73,6 +76,7 @@ impl Tab {
             Tab::Ring => "Ring",
             Tab::Band => "Band",
             Tab::Tile => "Tile",
+            Tab::Graph => "Graph",
             Tab::Alphas => "Alphas",
             Tab::Files => "Files",
             Tab::Bench => "Bench",
@@ -162,6 +166,8 @@ pub struct RingApp {
     probe: (u8, Option<(f32, f32)>, u32),
 
     bench: BenchState,
+    /// The design's graph, when it has one: the editor and its evaluation.
+    graph: crate::graph::GraphState,
 }
 
 #[derive(Default)]
@@ -215,6 +221,7 @@ impl RingApp {
             readout: None,
             probe: (0, None, 0),
             bench: BenchState::default(),
+            graph: crate::graph::GraphState::new(),
         }
     }
 
@@ -248,6 +255,12 @@ impl RingApp {
             while let Some(done) = worker.poll() {
                 if done.generation != self.generation {
                     continue;
+                }
+                if let Some(g) = done.graph {
+                    if g.ok {
+                        self.design = g.design;
+                    }
+                    self.graph.apply(&GraphDone { design: RingDesign::default(), ..g });
                 }
                 self.pane.camera.fit(done.bounds);
                 if let Ok(mut r) = self.renderer.lock() {
@@ -571,6 +584,9 @@ impl RingApp {
         use ringdesign_core::profile::TOP_DEG;
         use ringdesign_core::{ProfileStyle, RingSize, ShankKind};
 
+        if self.driven_banner(ui) {
+            return;
+        }
         let mut dirty = false;
         ui.scope(|ui| {
             ui.label(egui::RichText::new("ring").weak());
@@ -946,7 +962,172 @@ impl RingApp {
         Arc::make_mut(&mut self.lib).insert(baked);
     }
 
+    /// While a graph drives the design, the editing tabs say so and offer
+    /// the way out instead of edits the next evaluation would overwrite.
+    fn driven_banner(&mut self, ui: &mut egui::Ui) -> bool {
+        if !self.graph.is_driven() {
+            return false;
+        }
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .corner_radius(6.0)
+            .stroke(egui::Stroke::new(1.0, crate::theme::INK_DIM))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Driven by the graph").strong());
+                ui.label(
+                    egui::RichText::new("Edit the nodes in the Graph tab, or bake the graph to edit here.")
+                        .small()
+                        .color(crate::theme::INK_DIM),
+                );
+                ui.horizontal(|ui| {
+                    if ui.button("Open graph").clicked() {
+                        self.tab = Tab::Graph;
+                    }
+                    if ui.button("Bake").clicked() && self.graph.bake(&mut self.design) {
+                        self.status = "baked: the graph is gone and the design is yours".into();
+                        self.mark_dirty();
+                    }
+                });
+            });
+        true
+    }
+
+    /// The node editor over the design's graph.
+    fn graph_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
+        use ringdesign_graph::templates;
+        if !self.graph.is_driven() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("No graph behind this design yet").size(16.0));
+                ui.label(
+                    egui::RichText::new("Turn the design into nodes you can rewire, or start from a graph.")
+                        .small()
+                        .color(crate::theme::INK_DIM),
+                );
+                ui.add_space(12.0);
+                if ui.button("Convert this design to a graph").clicked() {
+                    match self.graph.convert(&mut self.design, &self.lib) {
+                        Ok(()) => {
+                            self.status = "converted: the graph drives the design now".into();
+                            self.mark_dirty();
+                            host.haptic(Haptic::Success);
+                        }
+                        Err(e) => {
+                            self.status = format!("could not convert: {e}");
+                            host.haptic(Haptic::Error);
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+                if ui.button("Start from the simple graph").clicked() {
+                    self.graph.open(&mut self.design, templates::simple());
+                    self.mark_dirty();
+                }
+                ui.add_space(12.0);
+                ui.label(egui::RichText::new("template graphs").weak());
+                for (name, g) in templates::all() {
+                    if ui.button(name).clicked() {
+                        self.graph.open(&mut self.design, g);
+                        self.status = format!("started from the {name} graph");
+                        self.mark_dirty();
+                    }
+                }
+            });
+            return;
+        }
+        enum Act {
+            Arrange,
+            Fit,
+            Lock(bool),
+            Bake,
+        }
+        let mut act = None;
+        let nodes = self.graph.ed.as_ref().map(|e| e.graph().nodes.len()).unwrap_or(0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Arrange").clicked() {
+                act = Some(Act::Arrange);
+            }
+            if ui.button("Fit").clicked() {
+                act = Some(Act::Fit);
+            }
+            let locked = self.graph.locked;
+            if ui.selectable_label(locked, if locked { "Locked" } else { "Lock" }).clicked() {
+                act = Some(Act::Lock(!locked));
+            }
+            if ui.button("Bake").clicked() {
+                act = Some(Act::Bake);
+            }
+            ui.label(egui::RichText::new(format!("{nodes} nodes")).small().color(crate::theme::INK_DIM));
+        });
+        if !self.graph.errors.is_empty() {
+            ui.label(
+                egui::RichText::new(self.graph.errors.join("; "))
+                    .small()
+                    .color(egui::Color32::from_rgb(230, 190, 90)),
+            );
+        }
+        match act {
+            Some(Act::Arrange) => {
+                let reg = self.graph.reg.clone();
+                if let Some(ed) = &mut self.graph.ed {
+                    ed.arrange(&reg);
+                }
+                if self.graph.changed(&mut self.design) {
+                    self.mark_dirty();
+                }
+            }
+            Some(Act::Fit) => {
+                if let Some(ed) = &mut self.graph.ed {
+                    ed.fit();
+                }
+            }
+            Some(Act::Lock(l)) => {
+                self.graph.set_locked(l);
+                host.haptic(Haptic::Light);
+            }
+            Some(Act::Bake) => {
+                if self.graph.bake(&mut self.design) {
+                    self.status = "baked: the graph is gone and the design is yours".into();
+                    self.mark_dirty();
+                }
+                return;
+            }
+            None => {}
+        }
+        ui.label(
+            egui::RichText::new("drag to pan · pinch to zoom · long-press for menus · drag pins to wire")
+                .small()
+                .color(crate::theme::INK_DIM),
+        );
+        let reg = self.graph.reg.clone();
+        let Some(mut ed) = self.graph.ed.take() else { return };
+        let resp = egui::Frame::new()
+            .fill(egui::Color32::from_rgb(18, 18, 20))
+            .corner_radius(8.0)
+            .show(ui, |ui| ed.show(&reg, ui, "phone-graph"))
+            .inner;
+        self.graph.ed = Some(ed);
+        if let Some(r) = resp.refused {
+            self.status = format!("wire refused: {r}");
+            host.haptic(Haptic::Error);
+        }
+        if let Some(id) = resp.selected {
+            if let Some(n) = self.graph.ed.as_ref().and_then(|e| e.node(id)) {
+                self.status = match &n.label {
+                    Some(l) => format!("{l} ({})", n.kind),
+                    None => n.kind.clone(),
+                };
+            }
+        }
+        if resp.changed && self.graph.changed(&mut self.design) {
+            self.mark_dirty();
+        }
+    }
+
     fn paint_tab(&mut self, ui: &mut egui::Ui, host: &Host, domain: Domain) {
+        if self.driven_banner(ui) {
+            return;
+        }
         let (name, w, h, wrap_y, repeats) = match domain {
             Domain::Band => (BAND_ALPHA, BAND_W, BAND_H, false, 1),
             Domain::Tile => (TILE_ALPHA, TILE_EDGE, TILE_EDGE, true, self.tile_repeats),
@@ -1093,6 +1274,9 @@ impl RingApp {
     }
 
     fn alphas_tab(&mut self, ui: &mut egui::Ui, host: &Host) {
+        if self.driven_banner(ui) {
+            return;
+        }
         egui::Panel::top(egui::Id::new("alpha_tools")).show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("find");
@@ -1857,6 +2041,7 @@ impl EguiApp for RingApp {
         self.probe = host.stylus_probe();
         self.poll_sync(host);
         self.tick(ui.ctx());
+        self.graph.sync(&self.design);
 
         // Order is load-bearing: ambience lights the page, then the frost
         // grabs what is already in the framebuffer, then chrome paints on top.
@@ -1924,6 +2109,7 @@ impl EguiApp for RingApp {
                 Tab::Ring => self.ring_tab(ui),
                 Tab::Band => self.paint_tab(ui, host, Domain::Band),
                 Tab::Tile => self.paint_tab(ui, host, Domain::Tile),
+                Tab::Graph => self.graph_tab(ui, host),
                 Tab::Alphas => self.alphas_tab(ui, host),
                 Tab::Files => self.files_tab(ui, host),
                 Tab::Bench => self.bench_tab(ui, host),
