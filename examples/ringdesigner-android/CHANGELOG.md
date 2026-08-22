@@ -9,6 +9,12 @@
   design shows up the same way. The build worker evaluates the graph before
   every build, and the editing tabs say "driven by the graph" with a Bake
   button while one is in charge.
+- **Exports off the UI thread.** STL, 3MF, GLB, the casting sheet, the render
+  and the turntable each build on their own thread and open the share sheet
+  when the file lands; several can run at once and none is dropped behind a
+  preview build.
+- **Save a copy to Downloads.** The design file into shared storage through
+  MediaStore, where it survives uninstalling the app.
 
 ## 0.8.2
 

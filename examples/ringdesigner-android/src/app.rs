@@ -24,6 +24,7 @@ use ringdesign_core::tiling::TilingLayer;
 
 use crate::bench;
 use crate::canvas::{self, CanvasInput, Domain, View};
+use crate::export::{self, ExportDone, ExportKind};
 use crate::graph::GraphDone;
 use crate::library as liblib;
 use crate::paint;
@@ -84,7 +85,6 @@ impl Tab {
     }
 }
 
-use crate::ring::METAL_TINT;
 
 /// Name of the layer a library alpha lands on, so picking a second one replaces the first rather
 /// than stacking two textures nobody asked for.
@@ -168,6 +168,8 @@ pub struct RingApp {
     bench: BenchState,
     /// The design's graph, when it has one: the editor and its evaluation.
     graph: crate::graph::GraphState,
+    /// Exports in flight, one thread each; none is ever dropped as stale.
+    exports: Vec<std::sync::mpsc::Receiver<ExportDone>>,
 }
 
 #[derive(Default)]
@@ -222,6 +224,7 @@ impl RingApp {
             probe: (0, None, 0),
             bench: BenchState::default(),
             graph: crate::graph::GraphState::new(),
+            exports: Vec::new(),
         }
     }
 
@@ -1519,6 +1522,23 @@ impl RingApp {
                     };
                     host.haptic(Haptic::Success);
                 }
+                if ui
+                    .button("Save a copy to Downloads")
+                    .on_hover_text("A copy in shared storage that survives uninstalling the app")
+                    .clicked()
+                {
+                    let name = format!("{}.ring.json", slug(&self.design.name));
+                    let path = designs.join(&name);
+                    let _ = std::fs::create_dir_all(&designs);
+                    self.status = match library::save_design(&path, &self.design) {
+                        Ok(()) => match host.save_to_gallery(path.to_string_lossy().into_owned(), name, "application/json") {
+                            Some(folder) => format!("copy saved to {folder}"),
+                            None => "could not write to Downloads".into(),
+                        },
+                        Err(e) => format!("save failed: {e}"),
+                    };
+                    host.haptic(Haptic::Success);
+                }
                 if ui.button("Copy design as JSON").clicked() {
                     if let Ok(json) = serde_json::to_string_pretty(&self.design) {
                         host.copy_text(json);
@@ -1561,44 +1581,32 @@ impl RingApp {
             });
             crate::theme::up_menu(ui, "\u{1F4E4} Export", |ui| {
                 if ui.button("STL — the pattern to cut").clicked() {
-                    let _ = std::fs::create_dir_all(&exports);
-                    let path = exports.join(format!("{}.stl", slug(&self.design.name)));
-                    self.export_mesh(host, path, false);
+                    self.export(ExportKind::Stl, &exports, ui.ctx());
                 }
                 if ui.button("3MF — units stated").clicked() {
-                    let _ = std::fs::create_dir_all(&exports);
-                    let path = exports.join(format!("{}.3mf", slug(&self.design.name)));
-                    self.export_mesh(host, path, true);
+                    self.export(ExportKind::ThreeMf, &exports, ui.ctx());
                 }
                 if ui
                     .button("GLB — AR and web viewers")
                     .on_hover_text("glTF binary, metre-scaled")
                     .clicked()
                 {
-                    let _ = std::fs::create_dir_all(&exports);
-                    let path = exports.join(format!("{}.glb", slug(&self.design.name)));
-                    self.share_glb(host, path);
+                    self.export(ExportKind::Glb, &exports, ui.ctx());
                 }
             });
             crate::theme::up_menu(ui, "\u{2728} Share", |ui| {
                 if ui.button("Casting sheet").clicked() {
-                    let _ = std::fs::create_dir_all(&exports);
-                    let path = exports.join(format!("{}_sheet.html", slug(&self.design.name)));
-                    self.share_spec(host, path);
+                    self.export(ExportKind::Sheet, &exports, ui.ctx());
                 }
                 if ui.button("Render photo").clicked() {
-                    let _ = std::fs::create_dir_all(&exports);
-                    let path = exports.join(format!("{}.png", slug(&self.design.name)));
-                    self.share_render(host, path);
+                    self.export(ExportKind::Render, &exports, ui.ctx());
                 }
                 if ui
                     .button("Turntable spin")
                     .on_hover_text("A looping 36-frame GIF")
                     .clicked()
                 {
-                    let _ = std::fs::create_dir_all(&exports);
-                    let path = exports.join(format!("{}.gif", slug(&self.design.name)));
-                    self.share_turntable(host, path);
+                    self.export(ExportKind::Turntable, &exports, ui.ctx());
                 }
             });
             {
@@ -1622,6 +1630,14 @@ impl RingApp {
                     });
             }
         });
+
+        if !self.exports.is_empty() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(egui::RichText::new(format!("exporting {}…", self.exports.len())).small().weak());
+            });
+            ui.ctx().request_repaint_after(Duration::from_millis(200));
+        }
 
         ui.separator();
         ui.label(egui::RichText::new("desktop").weak());
@@ -1800,13 +1816,6 @@ impl RingApp {
         }
     }
 
-    /// Build at export resolution and hand the file to the system share sheet.
-    ///
-    /// Measured at 226 ms end to end on this device, so it runs inline rather than on the worker;
-    /// the part that actually stalls is `share_media`, which reads the whole file and copies it
-    /// into a Java byte array on the render thread.
-    /// The printable tech sheet, straight to the share sheet — the thing to
-    /// send a caster from the couch.
     fn load_template_design(&mut self, d: RingDesign, what: &str) {
         self.design = d;
         let lib = Arc::make_mut(&mut self.lib);
@@ -1817,130 +1826,50 @@ impl RingApp {
         self.mark_dirty();
     }
 
-    fn share_render(&mut self, host: &Host, path: std::path::PathBuf) {
-        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
-        match ringdesign_core::render::write_png(&path, &out.mesh, 0.55, 1.12, 1280, METAL_TINT) {
-            Ok(()) => {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "ring.png".into());
-                host.share_media(path.to_string_lossy().into_owned(), name, "image/png");
-                self.status = "render shared".into();
-                host.haptic(Haptic::Success);
-            }
-            Err(e) => self.status = format!("render failed: {e}"),
-        }
-    }
-
-    fn share_turntable(&mut self, host: &Host, path: std::path::PathBuf) {
-        // The preview mesh: 36 software-rastered frames of 655k export
-        // triangles is seconds of spinner for no visible gain at 480 px.
-        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::PREVIEW);
-        match ringdesign_core::render::write_turntable_gif(&path, &out.mesh, 36, 480, METAL_TINT) {
-            Ok(()) => {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "ring.gif".into());
-                host.share_media(path.to_string_lossy().into_owned(), name, "image/gif");
-                self.status = "turntable shared".into();
-                host.haptic(Haptic::Success);
-            }
-            Err(e) => self.status = format!("turntable failed: {e}"),
-        }
-    }
-
-    fn share_glb(&mut self, host: &Host, path: std::path::PathBuf) {
-        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
-        match ringdesign_core::gltf::write_glb(&path, &out.mesh, &self.design.name, METAL_TINT) {
-            Ok(bytes) => {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "ring.glb".into());
-                host.share_media(path.to_string_lossy().into_owned(), name, "model/gltf-binary");
-                self.status = format!("GLB shared · {:.1} MB", bytes as f64 / 1048576.0);
-                host.haptic(Haptic::Success);
-            }
-            Err(e) => self.status = format!("GLB failed: {e}"),
-        }
-    }
-
-    fn share_spec(&mut self, host: &Host, path: std::path::PathBuf) {
-        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
-        let field = ringdesign_core::castability::attributed_field_report(
-            &self.design,
-            &self.lib,
-            &self.design.draft,
-            160,
-            112,
-        );
-        let stones = ringdesign_core::stones::report(&self.design, field.parting_z_mm);
-        let dfm = ringdesign_core::dfm::findings(&self.design);
-        let page = ringdesign_core::spec::html(
-            &self.design,
-            &out.report,
-            &field,
-            stones.as_ref(),
-            &dfm,
-            concat!("RingDesigner Android ", env!("CARGO_PKG_VERSION")),
-        );
-        match std::fs::write(&path, page) {
-            Ok(()) => {
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "sheet.html".into());
-                host.share_media(path.to_string_lossy().into_owned(), name, "text/html");
-                self.status = "casting sheet shared".into();
-                host.haptic(Haptic::Success);
-            }
-            Err(e) => self.status = format!("sheet failed: {e}"),
-        }
-    }
-
-    fn export_mesh(&mut self, host: &Host, path: std::path::PathBuf, as_3mf: bool) {
+    /// Builds and writes an export on its own thread; the share sheet opens
+    /// from `poll_exports` when the file lands.
+    fn export(&mut self, kind: ExportKind, dir: &std::path::Path, ctx: &egui::Context) {
         use ringdesign_core::metal;
-        let out = ringdesign_core::mesh::build(&self.design, &self.lib, ring::EXPORT);
-        // The patternmaker's shrink: cut oversize and *named* as a pattern,
-        // so an oversize file cannot be poured as nominal by mistake.
-        let (mesh, name) = match self.shrink_metal.and_then(|i| metal::METALS.get(i)) {
-            Some(m) => (
-                out.mesh.scaled(metal::pattern_scale(m.shrink_pct)),
-                format!("{} [pattern +{:.1}% for {}]", self.design.name, m.shrink_pct, m.name),
-            ),
-            None => (out.mesh.clone(), self.design.name.clone()),
+        // The preview mesh for the spin: 36 software-rastered frames of the
+        // export mesh is seconds of spinner for no visible gain at 480 px.
+        let params = if kind == ExportKind::Turntable { ring::PREVIEW } else { ring::EXPORT };
+        let shrink = match kind {
+            ExportKind::Stl | ExportKind::ThreeMf => self
+                .shrink_metal
+                .and_then(|i| metal::METALS.get(i))
+                .map(|m| (m.shrink_pct, m.name.to_string())),
+            _ => None,
         };
-        let written = if as_3mf {
-            ringdesign_core::threemf::write_3mf(&path, &mesh, &name, &self.design.size.display())
-        } else {
-            ringdesign_core::stl::write_stl(&path, &mesh, &name)
+        let job = export::ExportJob {
+            kind,
+            path: dir.join(format!("{}{}", slug(&self.design.name), kind.ext())),
+            design: self.design.clone(),
+            lib: self.lib.clone(),
+            params,
+            shrink,
+            generator: concat!("RingDesigner Android ", env!("CARGO_PKG_VERSION")).into(),
         };
-        match written {
-            Ok(bytes) => {
-                self.status = format!(
-                    "{} tris · {:.1} MB",
-                    out.report.validation.triangle_count,
-                    bytes as f64 / 1048576.0
-                );
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "ring.stl".into());
-                let _ = &name;
-                // An explicit MIME: `share_file` has no `stl` entry and would fall through to
-                // application/octet-stream, and MediaProvider renames a file whose extension
-                // disagrees with its type.
-                host.share_media(
-                    path.to_string_lossy().into_owned(),
-                    name,
-                    if as_3mf { "model/3mf" } else { "model/stl" },
-                );
-                host.haptic(Haptic::Success);
+        self.status = format!("{} export started", kind.label());
+        self.exports.push(export::spawn(job, ctx.clone()));
+    }
+
+    fn poll_exports(&mut self, host: &Host) {
+        let mut landed = Vec::new();
+        self.exports.retain(|rx| match rx.try_recv() {
+            Ok(done) => {
+                landed.push(done);
+                false
             }
-            Err(e) => {
-                self.status = format!("export failed: {e}");
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for done in landed {
+            if done.ok {
+                host.share_media(done.path.to_string_lossy().into_owned(), done.name, done.kind.mime());
+                self.status = format!("{} · shared", done.status);
+                host.haptic(Haptic::Success);
+            } else {
+                self.status = done.status;
                 host.haptic(Haptic::Error);
             }
         }
@@ -2042,6 +1971,7 @@ impl EguiApp for RingApp {
         self.poll_sync(host);
         self.tick(ui.ctx());
         self.graph.sync(&self.design);
+        self.poll_exports(host);
 
         // Order is load-bearing: ambience lights the page, then the frost
         // grabs what is already in the framebuffer, then chrome paints on top.
