@@ -21,11 +21,13 @@ pub enum ExportKind {
     Sheet,
     Render,
     Turntable,
+    StoneMap,
 }
 
 impl ExportKind {
     pub fn ext(self) -> &'static str {
         match self {
+            ExportKind::StoneMap => "_stones.svg",
             ExportKind::Stl => ".stl",
             ExportKind::ThreeMf => ".3mf",
             ExportKind::Glb => ".glb",
@@ -39,6 +41,7 @@ impl ExportKind {
     /// with its type, and the generic table has no `stl` entry.
     pub fn mime(self) -> &'static str {
         match self {
+            ExportKind::StoneMap => "image/svg+xml",
             ExportKind::Stl => "model/stl",
             ExportKind::ThreeMf => "model/3mf",
             ExportKind::Glb => "model/gltf-binary",
@@ -50,6 +53,7 @@ impl ExportKind {
 
     pub fn label(self) -> &'static str {
         match self {
+            ExportKind::StoneMap => "stone map",
             ExportKind::Stl => "STL",
             ExportKind::ThreeMf => "3MF",
             ExportKind::Glb => "GLB",
@@ -145,6 +149,12 @@ fn write(job: &ExportJob) -> Result<String, Box<dyn std::error::Error>> {
             ringdesign_core::render::write_turntable_gif(&job.path, &out.mesh, 36, 480, METAL_TINT)?;
             "turntable".into()
         }
+        ExportKind::StoneMap => {
+            let field = ringdesign_core::castability::analyze_field(&job.design, &job.lib, &job.design.draft, 96, 64);
+            let stones = ringdesign_core::stones::report(&job.design, field.parting_z_mm);
+            ringdesign_core::stonemap::write_stone_map_svg(&job.path, &job.design, stones.as_ref())?;
+            "stone map".into()
+        }
     })
 }
 
@@ -168,7 +178,7 @@ mod tests {
 
     #[test]
     fn kinds_name_their_files_and_types() {
-        let all = [ExportKind::Stl, ExportKind::ThreeMf, ExportKind::Glb, ExportKind::Sheet, ExportKind::Render, ExportKind::Turntable];
+        let all = [ExportKind::Stl, ExportKind::ThreeMf, ExportKind::Glb, ExportKind::Sheet, ExportKind::Render, ExportKind::Turntable, ExportKind::StoneMap];
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a.ext(), b.ext());

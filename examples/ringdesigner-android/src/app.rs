@@ -1598,6 +1598,13 @@ impl RingApp {
                 if ui.button("Casting sheet").clicked() {
                     self.export(ExportKind::Sheet, &exports, ui.ctx());
                 }
+                if ui
+                    .button("Stone map")
+                    .on_hover_text("Every stone to scale with the tight gaps drawn: the setter's map")
+                    .clicked()
+                {
+                    self.export(ExportKind::StoneMap, &exports, ui.ctx());
+                }
                 if ui.button("Render photo").clicked() {
                     self.export(ExportKind::Render, &exports, ui.ctx());
                 }
