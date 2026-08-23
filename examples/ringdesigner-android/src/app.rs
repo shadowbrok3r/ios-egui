@@ -289,7 +289,7 @@ impl RingApp {
                         .field
                         .as_ref()
                         .and_then(|f| ringdesign_core::stones::report(&self.design, f.parting_z_mm));
-                    self.dfm = ringdesign_core::dfm::findings(&self.design);
+                    self.dfm = ringdesign_core::dfm::findings_in(&self.design, &self.lib);
                     self.field = done.field;
                 } else {
                     self.status =

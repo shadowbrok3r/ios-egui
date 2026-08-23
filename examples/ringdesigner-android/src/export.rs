@@ -132,7 +132,7 @@ fn write(job: &ExportJob) -> Result<String, Box<dyn std::error::Error>> {
                 112,
             );
             let stones = ringdesign_core::stones::report(&job.design, field.parting_z_mm);
-            let dfm = ringdesign_core::dfm::findings(&job.design);
+            let dfm = ringdesign_core::dfm::findings_in(&job.design, &job.lib);
             let page = ringdesign_core::spec::html(&job.design, &out.report, &field, stones.as_ref(), &dfm, &job.generator);
             std::fs::write(&job.path, page)?;
             "casting sheet".into()
