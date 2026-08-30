@@ -176,6 +176,10 @@ pub struct Done {
     pub triangles: usize,
     pub volume_mm3: f64,
     pub build_ms: u128,
+    /// The build's own report — dimensions, volume, mesh quality. The worker
+    /// used to destructure three numbers out of it and drop the rest, so the
+    /// Report sheet had to rebuild what was already in hand.
+    pub report: ringdesign_core::mesh::Report,
     /// Only present on a settled build — analyze is ~30% of the worker and is not worth paying
     /// while a slider is still moving.
     pub cast: Option<CastReport>,
@@ -262,6 +266,7 @@ impl Worker {
                         triangles: out.report.validation.triangle_count,
                         volume_mm3: out.report.volume_mm3,
                         build_ms: out.report.build_ms,
+                        report: out.report.clone(),
                         cast,
                         field,
                         graph,

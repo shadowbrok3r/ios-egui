@@ -12,10 +12,18 @@
 pub mod bench;
 pub mod theme;
 pub mod canvas;
+pub mod casting;
+pub mod layers;
 pub mod library;
+pub mod npu;
 pub mod paint;
+pub mod prefs;
+pub mod report;
 pub mod camera;
 pub mod ring;
+pub mod similar;
+pub mod sketch;
+pub mod stones;
 pub mod util;
 pub mod viewport;
 

@@ -1,12 +1,21 @@
 [package]
 name = "ringdesigner_android"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 publish = false
 
 # rlib as well as cdylib so the pure modules stay host-testable with `cargo test`.
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# On-device Qualcomm HTP NPU: CLIP for library search, SD 1.5 for pattern generation.
+# Off by default and nothing in a default build links a `local-*` crate — the QNN runtime libs are
+# gitignored and staged by scripts/qnn-stage-libs.sh, so a half-enabled build would ship an APK
+# whose NPU features fail with nothing readable on screen.
+# Build with `cargo ndk ... --features local-npu`.
+local-npu = ["dep:local-clip", "dep:local-sd"]
 
 [dependencies]
 egui-mobile = { path = "../../crates/egui-mobile" }
@@ -16,9 +25,15 @@ egui = "0.36"
 # symptom is a blank viewport and one `Unsupported render callback` warning.
 egui_glow = "0.36"
 log = "0.4"
+# Prefs are a plain serde struct; core already pulls serde in, this makes the derive reachable.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Plain HTTP to the desktop over Tailscale; no TLS on purpose, the tailnet is the boundary.
 minreq = "3"
+# On-device models, behind `local-npu`. Their device paths compile on the host and only fail at
+# runtime without an NPU, so they need no target gate — the feature is the gate.
+local-clip = { path = "../../crates/local-clip", optional = true }
+local-sd = { path = "../../crates/local-sd", optional = true }
 # The geometry, unchanged. Lives in another workspace; cargo resolves its own
 # `.workspace = true` inheritance from its own root, so a plain path dep is enough.
 ringdesign-core = { path = "../../../../JewelryProjects/RingDesigner/crates/ringdesign-core" }
@@ -80,6 +95,7 @@ name = "android.permission.READ_EXTERNAL_STORAGE"
 max_sdk_version = 32
 [[package.metadata.android.uses_permission]]
 name = "android.permission.VIBRATE"
+
 
 [target.'cfg(target_os = "android")'.dependencies]
 backdrop-blur-egui = { path = "../../patches/backdrop-blur/crates/backdrop-blur-egui", default-features = false, features = ["grab-pass"] }

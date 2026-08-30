@@ -59,6 +59,36 @@ impl Tool {
 
 /// Stylus button bits from `stylus_probe`: primary `0x20`, secondary `0x40`.
 pub const STYLUS_BUTTONS: u32 = 0x60;
+const BARREL_PRIMARY: u32 = 0x20;
+const BARREL_SECONDARY: u32 = 0x40;
+
+/// What a held barrel button means.
+///
+/// It used to mean "erase", which is what the flipped tip already does and what
+/// the on-screen Carve toggle already does — three ways to say one thing, on a
+/// device where every modifier is otherwise a permanent piece of screen. The
+/// pen has a dedicated eraser at the other end, so the button is free for the
+/// gesture that is actually repeated: panning a 7:1 strip without putting the
+/// pen down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Barrel {
+    /// Held: pan and zoom without starting a stroke. Tapped: sample the depth
+    /// under the tip into the brush.
+    Primary,
+    /// Tapped: step undo.
+    Secondary,
+}
+
+/// Which barrel button is held, if any. Primary wins when both are.
+pub fn barrel(buttons: u32) -> Option<Barrel> {
+    if buttons & BARREL_PRIMARY != 0 {
+        Some(Barrel::Primary)
+    } else if buttons & BARREL_SECONDARY != 0 {
+        Some(Barrel::Secondary)
+    } else {
+        None
+    }
+}
 
 /// Whether a contact from `tool` should draw.
 ///
@@ -72,9 +102,11 @@ pub fn accepts(tool: Tool, stylus_only: bool) -> bool {
     !matches!(tool, Tool::Finger | Tool::Palm)
 }
 
-/// Whether this contact is erasing: the flipped tip, or a barrel button held.
-pub fn erasing(tool: Tool, buttons: u32, toggle: bool) -> bool {
-    toggle || tool == Tool::Eraser || (buttons & STYLUS_BUTTONS) != 0
+/// Whether this contact is erasing: the flipped tip, or the on-screen toggle.
+///
+/// Deliberately *not* the barrel button any more — see [`Barrel`].
+pub fn erasing(tool: Tool, toggle: bool) -> bool {
+    toggle || tool == Tool::Eraser
 }
 
 #[cfg(test)]
@@ -112,12 +144,19 @@ mod tests {
     }
 
     #[test]
-    fn the_barrel_button_and_the_flipped_tip_both_erase() {
-        assert!(erasing(Tool::Stylus, 0x20, false));
-        assert!(erasing(Tool::Stylus, 0x40, false));
-        assert!(erasing(Tool::Eraser, 0, false));
-        assert!(erasing(Tool::Stylus, 0, true), "the on-screen toggle still works");
-        assert!(!erasing(Tool::Stylus, 0, false));
+    fn the_flipped_tip_and_the_toggle_erase_but_the_barrel_does_not() {
+        assert!(erasing(Tool::Eraser, false), "the pen's own back end");
+        assert!(erasing(Tool::Stylus, true), "the on-screen toggle");
+        assert!(!erasing(Tool::Stylus, false));
+    }
+
+    #[test]
+    fn the_barrel_buttons_are_told_apart() {
+        assert_eq!(barrel(0x20), Some(Barrel::Primary));
+        assert_eq!(barrel(0x40), Some(Barrel::Secondary));
+        assert_eq!(barrel(0), None);
+        // Both down is a grip, not a third verb — primary wins.
+        assert_eq!(barrel(0x60), Some(Barrel::Primary));
     }
 
     #[test]

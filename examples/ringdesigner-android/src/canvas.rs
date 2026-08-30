@@ -102,8 +102,15 @@ pub struct CanvasInput<'a> {
     pub depth_scale: f64,
     pub erase_toggle: bool,
     pub stylus_only: bool,
-    /// `(tool code, hover position in physical px, button bitfield)` from `HostExt::stylus_probe`.
-    pub probe: (u8, Option<(f32, f32)>, u32),
+    /// Live pointer state from `HostExt::stylus_probe` — tool, hover, buttons,
+    /// and the pen's own geometry.
+    pub probe: egui_mobile::StylusProbe,
+    /// The contact that owns the stroke in progress, held across frames so a
+    /// palm landing mid-stroke cannot take it over.
+    pub active_touch: &'a mut Option<egui::TouchId>,
+    /// The sand's detail floor, mm — what the hover preview judges the brush
+    /// width against. 0 disables the check.
+    pub floor_mm: f64,
 }
 
 /// What the canvas did this frame.
@@ -116,7 +123,21 @@ pub struct CanvasOutput {
     /// Live readout for the status line.
     pub readout: Option<String>,
     pub wants_repaint: bool,
+    /// The ceiling refused some of the depth asked for, this frame.
+    pub clamped: bool,
+    /// Which castability zone the last sample landed in.
+    pub zone: Option<&'static str>,
+    /// Barrel-tap eyedropper: the depth scale sampled under the tip.
+    pub pick_depth: Option<f64>,
+    /// Barrel-tap on the secondary button: step undo once.
+    pub undo_step: bool,
 }
+
+/// Hover distance at which the pre-flight preview has faded out entirely.
+///
+/// `Axis::Distance` has no documented unit — it is whatever the digitiser
+/// reports — so this is a display constant, not a measurement.
+const HOVER_FADE_UNITS: f32 = 1.0;
 
 /// Cached composited height field, rebuilt when the stack or the size changes.
 #[derive(Clone)]
@@ -145,6 +166,8 @@ pub fn show(ui: &mut egui::Ui, input: CanvasInput<'_>) -> CanvasOutput {
         depth_scale,
         erase_toggle,
         stylus_only,
+        active_touch,
+        floor_mm,
         probe,
     } = input;
 
@@ -212,36 +235,114 @@ pub fn show(ui: &mut egui::Ui, input: CanvasInput<'_>) -> CanvasOutput {
     }
 
     // --- Paint ---------------------------------------------------------------------------------
-    let tool = Tool::from_code(probe.0);
-    let buttons = probe.2;
-    let erase = paint::erasing(tool, buttons, erase_toggle);
+    let tool = Tool::from_code(probe.tool);
+    let buttons = probe.buttons;
+    let erase = paint::erasing(tool, erase_toggle);
     let accepted = paint::accepts(tool, stylus_only);
+    // A held barrel button is a modifier, not a second eraser: it takes the
+    // gesture away from the brush entirely so the pen can pan without lifting.
+    let held = paint::barrel(buttons);
+
+    // Barrel held: pan and pinch, and on a press that never moved, act.
+    if held.is_some() && multi.is_none() {
+        if response.dragged() {
+            let delta = egui::vec2(
+                response.drag_delta().x / plot.width().max(1.0) / view.zoom,
+                response.drag_delta().y / plot.height().max(1.0) / view.zoom,
+            );
+            *view = view.pan(delta);
+            out.wants_repaint = true;
+        }
+        // A press that ends without a drag is a tap: primary samples the depth
+        // under the tip into the brush, secondary steps undo.
+        if response.drag_stopped() && response.drag_delta().length() < 2.0 {
+            match held {
+                Some(paint::Barrel::Primary) => {
+                    if let Some(p) = response.interact_pointer_pos().filter(|p| plot.contains(*p)) {
+                        let n = to_norm(plot, view, p);
+                        let uv = ringdesign_core::field::Uv {
+                            u: n.x as f64 * ctx.circumference_mm,
+                            v: n.y as f64 * ctx.band_v_len_mm,
+                        };
+                        let h = layers.height(uv, ctx, lib);
+                        out.pick_depth = Some((h / paint::MAX_RELIEF_MM).clamp(0.05, 1.0));
+                    }
+                }
+                Some(paint::Barrel::Secondary) => out.undo_step = true,
+                None => {}
+            }
+        }
+        return out;
+    }
 
     if let Some(d) = target.as_deref_mut() {
         if multi.is_none() && accepted {
-            let force = ui.input(|i| {
-                i.events.iter().rev().find_map(|e| match e {
-                    egui::Event::Touch { force, .. } => *force,
-                    _ => None,
-                })
-            });
-            // A mouse or an unknown tool has no pressure; treat a click as a firm press rather
-            // than as nothing.
-            let pressure = force.unwrap_or(0.85);
-
             if response.drag_started() {
                 d.strokes.push(Stroke::new(brush_frac, soft, erase));
                 out.painted = true;
+                *active_touch = None;
             }
-            if response.dragged() {
-                if let Some(p) = response.interact_pointer_pos() {
-                    let n = to_norm(plot, view, p);
-                    if let Some(s) = d.strokes.last_mut() {
-                        let v_mm = n.y as f64 * ctx.band_v_len_mm;
-                        let b = bite_for(domain, ctx, v_mm, pressure, depth_scale);
-                        s.push(n.x, n.y, b.alpha_value());
-                        out.painted = true;
-                        out.readout = Some(readout(&b, tool, pressure));
+
+            // Every touch sample this frame, in order, each carrying its *own*
+            // force. The old path took one position from `interact_pointer_pos`
+            // and paired it with the last force found anywhere in the event
+            // list — so a resting finger's pressure was applied to the pen's
+            // coordinate, and at 120-240 Hz against a 60 fps loop three of every
+            // four samples were dropped and a fast arc landed as a polygon.
+            let samples: Vec<(egui::TouchId, egui::Pos2, f32)> = ui.input(|i| {
+                i.events
+                    .iter()
+                    .filter_map(|e| match e {
+                        egui::Event::Touch { id, pos, force, phase, .. } if *phase != egui::TouchPhase::Cancel => {
+                            Some((*id, *pos, force.unwrap_or(0.85)))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            });
+            // The first id seen this stroke owns it; a second contact is a palm.
+            if active_touch.is_none() {
+                *active_touch = samples.first().map(|(id, _, _)| *id);
+            }
+            let owner = *active_touch;
+
+            let mut fed = 0usize;
+            if response.dragged() || response.drag_started() {
+                for (id, pos, force) in samples.iter().copied().filter(|(id, _, _)| {
+                    owner.is_none_or(|o| o == *id)
+                }) {
+                    if !plot.contains(pos) {
+                        continue;
+                    }
+                    let n = to_norm(plot, view, pos);
+                    let Some(st) = d.strokes.last_mut() else { break };
+                    let v_mm = n.y as f64 * ctx.band_v_len_mm;
+                    let b = bite_for(domain, ctx, v_mm, force, depth_scale);
+                    // How the pen is held shapes the stamp; pressure still sets
+                    // the depth. A device that reports no tilt sends 0, which
+                    // rasterises as the round disc it always was.
+                    st.push_held(n.x, n.y, b.alpha_value(), probe.tilt, probe.azimuth);
+                    out.painted = true;
+                    out.clamped = out.clamped || b.clamped();
+                    out.readout = Some(readout(&b, tool, force));
+                    out.zone = Some(zone_name(ctx, v_mm));
+                    fed += 1;
+                    let _ = id;
+                }
+                // A mouse or an unknown tool emits no Touch events at all, so
+                // fall back to the pointer position at a firm press.
+                if fed == 0 {
+                    if let Some(p) = response.interact_pointer_pos() {
+                        let n = to_norm(plot, view, p);
+                        if let Some(st) = d.strokes.last_mut() {
+                            let v_mm = n.y as f64 * ctx.band_v_len_mm;
+                            let b = bite_for(domain, ctx, v_mm, 0.85, depth_scale);
+                            st.push_held(n.x, n.y, b.alpha_value(), probe.tilt, probe.azimuth);
+                            out.painted = true;
+                            out.clamped = out.clamped || b.clamped();
+                            out.readout = Some(readout(&b, tool, 0.85));
+                            out.zone = Some(zone_name(ctx, v_mm));
+                        }
                     }
                 }
             }
@@ -250,6 +351,7 @@ pub fn show(ui: &mut egui::Ui, input: CanvasInput<'_>) -> CanvasOutput {
                     d.strokes.pop();
                 }
                 out.stroke_ended = true;
+                *active_touch = None;
             }
         } else if multi.is_none() && !accepted && response.dragged() {
             // A finger under stylus-only pans instead of drawing, so the hand still works.
@@ -264,7 +366,7 @@ pub fn show(ui: &mut egui::Ui, input: CanvasInput<'_>) -> CanvasOutput {
 
     // --- Hover: the pen is a depth gauge before it is a brush -----------------------------------
     let ppp = ui.ctx().pixels_per_point();
-    let hover_pt = probe.1.map(|(x, y)| egui::pos2(x / ppp, y / ppp));
+    let hover_pt = probe.hover.map(|(x, y)| egui::pos2(x / ppp, y / ppp));
     let cursor = response
         .interact_pointer_pos()
         .or_else(|| ui.input(|i| i.pointer.hover_pos()))
@@ -276,15 +378,60 @@ pub fn show(ui: &mut egui::Ui, input: CanvasInput<'_>) -> CanvasOutput {
             Domain::Band => paint::ceiling_mm(ctx, v_mm),
             Domain::Tile => paint::MAX_RELIEF_MM,
         };
-        let r_px = brush_frac * plot.width() * view.zoom;
-        painter.circle_stroke(
-            p,
-            r_px.clamp(3.0, 240.0),
-            egui::Stroke::new(1.5, if erase { WARN } else { ACCENT }),
-        );
+        // What a full-pressure press would ask for here, against what the local
+        // draft will actually allow. `bite` already answers both; until now the
+        // answer only arrived after the stroke landed.
+        let b = bite_for(domain, ctx, v_mm, 1.0, depth_scale);
+        let wanted = paint::wanted_mm(1.0, depth_scale).max(1e-6);
+        let allowed = (b.depth_mm / wanted).clamp(0.0, 1.0) as f32;
+
+        let r_px = (brush_frac * plot.width() * view.zoom).clamp(3.0, 240.0);
+        // Fade the preview in as the tip approaches. `Axis::Distance` is in
+        // device units and simply absent on hardware that does not report it,
+        // where 0 reads as "in contact" and the preview is always on — which is
+        // the behaviour before this existed.
+        let near = if probe.distance > 0.0 {
+            (1.0 - (probe.distance / HOVER_FADE_UNITS)).clamp(0.15, 1.0)
+        } else {
+            1.0
+        };
+        let tint = (if erase { WARN } else { ACCENT }).gamma_multiply(near);
+
+        // Two rings: the depth the surface will take, and the part it refuses.
+        // A pen laid on a crest sees the inner ring collapse before it commits.
+        if allowed > 0.001 {
+            painter.circle_stroke(p, r_px * allowed.max(0.05), egui::Stroke::new(2.0, tint));
+        }
+        if b.clamped() {
+            painter.circle_stroke(
+                p,
+                r_px,
+                egui::Stroke::new(1.0, WARN.gamma_multiply(0.45 * near)),
+            );
+        } else {
+            painter.circle_stroke(p, r_px, egui::Stroke::new(1.0, tint.gamma_multiply(0.35)));
+        }
+
+        // A brush finer than the sand's own detail floor casts as mush whatever
+        // depth it is given, so mark it before any metal is committed.
+        let brush_mm = (brush_frac as f64 * 2.0) * ctx.circumference_mm;
+        if floor_mm > 0.0 && brush_mm < floor_mm {
+            painter.circle_stroke(p, r_px + 3.0, egui::Stroke::new(1.0, WARN.gamma_multiply(near)));
+        }
+
         if out.readout.is_none() {
             out.readout = Some(match domain {
-                Domain::Band => format!("max {ceiling:.2} mm here · {}", zone_name(ctx, v_mm)),
+                Domain::Band => {
+                    let mush = if floor_mm > 0.0 && brush_mm < floor_mm {
+                        format!(" · brush {brush_mm:.2} mm is under the {floor_mm:.2} mm floor")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "max {ceiling:.2} mm here · {}{mush}",
+                        zone_name(ctx, v_mm)
+                    )
+                }
                 Domain::Tile => format!("tile · max {ceiling:.2} mm"),
             });
         }
