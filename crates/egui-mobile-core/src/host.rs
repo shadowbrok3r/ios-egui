@@ -28,6 +28,29 @@ pub enum Permission {
     Microphone = 1,
 }
 
+/// What the pointer is doing right now, beyond what winit forwards.
+///
+/// Lives here rather than in the Android backend because it is plain data and
+/// the apps that read it — canvases, brushes — are cross-platform and must
+/// compile on the host for their tests. The Android host fills it; every other
+/// platform leaves it at [`Default`], which reads as "a finger, upright".
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StylusProbe {
+    /// 0 unknown / 1 finger / 2 stylus / 3 mouse / 4 eraser / 5 palm.
+    pub tool: u8,
+    /// Hover position in window physical pixels — pen near, not touching.
+    pub hover: Option<(f32, f32)>,
+    /// Raw button-state bitfield: stylus-primary `0x20`, stylus-secondary `0x40`.
+    pub buttons: u32,
+    /// Angle from vertical, radians. 0 is upright, and is also what a device
+    /// that does not report tilt returns — treat it as "upright or unknown".
+    pub tilt: f32,
+    /// Direction the pen leans, radians clockwise from screen-up.
+    pub azimuth: f32,
+    /// Tip-to-glass distance while hovering; 0 in contact or unreported.
+    pub distance: f32,
+}
+
 /// Safe-area insets in points, pushed in by the platform host on layout.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Insets {

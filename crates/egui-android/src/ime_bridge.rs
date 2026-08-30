@@ -71,6 +71,18 @@ pub extern "system" fn Java_com_github_egui_1mobile_EguiNativeActivity_nativeIme
     }
 }
 
+/// Wake the render loop from any thread, if a context has been installed.
+///
+/// The loop sleeps when nothing moves, so anything arriving off a Java callback — typed text, a
+/// lifecycle transition — has to ask for a frame or it sits unseen.
+pub fn wake() {
+    if let Ok(g) = WAKE_CTX.lock() {
+        if let Some(ctx) = g.as_ref() {
+            ctx.request_repaint();
+        }
+    }
+}
+
 /// Register `nativeImeWake` on the activity class. NativeActivity dlopens the native lib, so
 /// ART's dynamic symbol resolution never finds it even though the symbol is exported; explicit
 /// RegisterNatives works regardless of how the lib was loaded.

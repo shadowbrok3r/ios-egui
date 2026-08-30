@@ -77,7 +77,22 @@ impl eframe::App for Adapter {
         if !self.started {
             self.started = true;
             crate::host::init_documents_dir(&self.host);
+            crate::host::register_lifecycle_natives();
             self.app.on_start(ui.ctx(), &self.host);
+        }
+        // The activity's onPause/onResume arrive on the Android UI thread and are picked up here;
+        // the JNI side asks for a frame, so a pause still reaches the app before the OS may reap
+        // the process. `drv_set_active` returns the previous value, so a repeated event is not a
+        // second callback.
+        if let Some(active) = crate::host::take_active_change() {
+            let was = self.host.drv_set_active(active);
+            if was != active {
+                if active {
+                    self.app.on_resume(&self.host);
+                } else {
+                    self.app.on_pause(&self.host);
+                }
+            }
         }
         self.frame += 1;
         // While a tap is on the bar, disable click-away focus surrender so the focused text
@@ -697,7 +712,7 @@ pub mod host;
 pub mod ime_bridge;
 pub mod video;
 pub mod vpn;
-pub use host::{HostExt, ScreenOrientation, device_orientation_deg};
+pub use host::{HostExt, ScreenOrientation, StylusProbe, device_orientation_deg};
 
 #[cfg(feature = "plugins")]
 pub mod plugins;

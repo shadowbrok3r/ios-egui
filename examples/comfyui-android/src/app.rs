@@ -4909,7 +4909,8 @@ impl ComfyApp {
             st.dbg_saw_touch = saw_touch;
             // Live S-Pen state from the android-activity input side channel (tool type, hover, and
             // buttons that winit drops); hover px converts to egui points.
-            let (tool_u8, hover_px, buttons) = host.stylus_probe();
+            let sp = host.stylus_probe();
+            let (tool_u8, hover_px, buttons) = (sp.tool, sp.hover, sp.buttons);
             let kind = match tool_u8 {
                 1 => mask::PointerKind::Finger,
                 2 => mask::PointerKind::Stylus,

@@ -30,6 +30,13 @@ pub struct Text2ImgParams {
     pub latent_w: usize,
     /// Emit a cheap latent preview every N steps (None = never).
     pub preview_every: Option<usize>,
+    /// Roll the latent by a random offset between steps so the result tiles.
+    ///
+    /// The UNet sees a torus rather than a rectangle: every part of the image
+    /// gets denoised in the middle of the frame at some point, so the wrap seam
+    /// is never a boundary the model has to invent an edge for. Costs two
+    /// shifts per step and nothing else.
+    pub seamless: bool,
 }
 
 impl Default for Text2ImgParams {
@@ -43,6 +50,7 @@ impl Default for Text2ImgParams {
             latent_h: 64,
             latent_w: 64,
             preview_every: None,
+            seamless: false,
         }
     }
 }
@@ -53,6 +61,47 @@ impl Text2ImgParams {
     }
     fn image_wh(&self) -> (u32, u32) {
         ((self.latent_w * 8) as u32, (self.latent_h * 8) as u32)
+    }
+}
+
+/// Two shift amounts from a noise draw, in `0..w` and `0..h`.
+fn roll_offsets(noise: &[f32], w: usize, h: usize) -> (usize, usize) {
+    let unit = |v: f32| {
+        // Standard normal to 0..1 without a second distribution: the fractional
+        // part is uniform enough to frame a tile from, and this keeps the roll
+        // tied to the same seeded stream.
+        let f = v.abs().fract();
+        if f.is_finite() { f } else { 0.0 }
+    };
+    let a = noise.first().copied().unwrap_or(0.0);
+    let b = noise.get(1).copied().unwrap_or(0.0);
+    (
+        ((unit(a) * w as f32) as usize).min(w.saturating_sub(1)),
+        ((unit(b) * h as f32) as usize).min(h.saturating_sub(1)),
+    )
+}
+
+/// Circularly shift a CHW latent by `(dx, dy)` cells.
+///
+/// Per-channel and wrapping in both axes, so the tensor stays exactly the shape
+/// the UNet expects — this moves what is in the middle, it does not resize.
+fn roll(latent: &mut [f32], c: usize, h: usize, w: usize, dx: usize, dy: usize) {
+    if (dx % w == 0 && dy % h == 0) || w == 0 || h == 0 {
+        return;
+    }
+    let plane = h * w;
+    let mut tmp = vec![0.0f32; plane];
+    for ch in 0..c {
+        let base = ch * plane;
+        let Some(src) = latent.get(base..base + plane) else { return };
+        for y in 0..h {
+            let ny = (y + dy) % h;
+            for x in 0..w {
+                let nx = (x + dx) % w;
+                tmp[ny * w + nx] = src[y * w + x];
+            }
+        }
+        latent[base..base + plane].copy_from_slice(&tmp);
     }
 }
 
@@ -202,6 +251,16 @@ where
 
         let noise = randn(latent_elems, &mut rng);
         scheduler.step(&eps, step, &mut latent, &noise);
+        if params.seamless {
+            // Roll after the step, so the shift the UNet saw and the latent it
+            // produced agree; rolling before would denoise one framing and
+            // integrate into another.
+            // Offsets from the step's own noise draw rather than a second
+            // stream: it is already seeded from `params.seed`, so a seamless
+            // run stays as reproducible as a plain one.
+            let (dx, dy) = roll_offsets(&noise, params.latent_w, params.latent_h);
+            roll(&mut latent, params.latent_channels, params.latent_h, params.latent_w, dx, dy);
+        }
         progress(step + 1, total, preview.as_ref());
     }
 
@@ -233,6 +292,45 @@ mod tests {
     #[test]
     fn cfg_scale_one_returns_cond() {
         assert_eq!(apply_cfg(&[3.0], &[5.0], 1.0), vec![5.0]);
+    }
+
+    /// A roll must move content, not lose it — the multiset of values is the
+    /// same before and after, per channel.
+    #[test]
+    fn rolling_permutes_the_latent_without_losing_anything() {
+        let (c, h, w) = (2usize, 4usize, 4usize);
+        let mut v: Vec<f32> = (0..(c * h * w)).map(|i| i as f32).collect();
+        let before = v.clone();
+        roll(&mut v, c, h, w, 1, 2);
+        assert_ne!(v, before, "nothing moved");
+        let mut a = before.clone();
+        let mut b = v.clone();
+        a.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        b.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_eq!(a, b, "a roll is a permutation");
+    }
+
+    /// Rolling the full width and height is the identity, which is what makes
+    /// the modulo guard correct rather than merely cheap.
+    #[test]
+    fn a_full_turn_is_the_identity() {
+        let (c, h, w) = (1usize, 3usize, 5usize);
+        let mut v: Vec<f32> = (0..(h * w)).map(|i| i as f32).collect();
+        let before = v.clone();
+        roll(&mut v, c, h, w, w, h);
+        assert_eq!(v, before);
+    }
+
+    /// Channels must not bleed into each other — a shared temp buffer written
+    /// per channel is exactly the mistake that would.
+    #[test]
+    fn channels_roll_independently() {
+        let (c, h, w) = (2usize, 2usize, 2usize);
+        // Channel 0 all zeroes, channel 1 all ones.
+        let mut v = vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+        roll(&mut v, c, h, w, 1, 1);
+        assert!(v[..4].iter().all(|&x| x == 0.0), "{v:?}");
+        assert!(v[4..].iter().all(|&x| x == 1.0), "{v:?}");
     }
 
     #[test]
