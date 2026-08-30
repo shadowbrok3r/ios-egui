@@ -437,18 +437,110 @@ fn share_text(text: &str) {
     });
 }
 
+/// Foreground transitions posted by the activity, drained once per frame.
+///
+/// `-1` nothing pending, `0` paused, `1` resumed. An atomic rather than a callback because the
+/// activity's `onPause` arrives on the Android UI thread while the app lives on the render thread;
+/// the transition is picked up on the next frame, which [`crate::ime_bridge::wake`] asks for
+/// immediately so `on_pause` still runs before the process can be reaped.
+static PENDING_ACTIVE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// JNI: `EguiNativeActivity.nativeSetActive(boolean)`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_github_egui_1mobile_EguiNativeActivity_nativeSetActive(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+    active: jni::sys::jboolean,
+) {
+    PENDING_ACTIVE.store(i8::from(active != 0), std::sync::atomic::Ordering::Relaxed);
+    crate::ime_bridge::wake();
+}
+
+/// Register `nativeSetActive` on the activity class, the same way the IME wake is registered —
+/// NativeActivity dlopens the native lib, so ART never resolves the symbol on its own.
+pub fn register_lifecycle_natives() {
+    let ok = with_native_activity(|env, activity| {
+        let cls = env.get_object_class(activity)?;
+        let method = jni::NativeMethod {
+            name: jni::strings::JNIString::from("nativeSetActive"),
+            sig: jni::strings::JNIString::from("(Z)V"),
+            fn_ptr: Java_com_github_egui_1mobile_EguiNativeActivity_nativeSetActive
+                as *mut std::ffi::c_void,
+        };
+        env.register_native_methods(&cls, &[method])?;
+        Ok(true)
+    })
+    .unwrap_or(false);
+    log::info!("egui-android lifecycle: register_natives(nativeSetActive) ok={ok}");
+}
+
+/// Take a pending foreground transition, if one arrived since the last call.
+pub fn take_active_change() -> Option<bool> {
+    match PENDING_ACTIVE.swap(-1, std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
+}
+
+/// The app's own launcher label, sanitized for use as a MediaStore folder.
+///
+/// The album used to be the string `ComfyUI` regardless of which app was running, so every other
+/// app in this workspace filed its renders under that one's gallery folder. Taking it from the
+/// running app's label fixes that without changing a single signature — and leaves ComfyUI itself
+/// on exactly the path it had, because its label *is* `ComfyUI`.
+fn album_name() -> &'static str {
+    static ALBUM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ALBUM.get_or_init(|| jni_app_label().as_deref().map_or_else(|| "Android".to_string(), sanitize_album))
+}
+
+/// A MediaStore `relative_path` segment: no separators, no leading dots, never empty.
+///
+/// MediaProvider takes the path literally, so a label carrying a slash would silently nest a
+/// folder, and one starting with a dot would hide the album from the gallery.
+fn sanitize_album(label: &str) -> String {
+    let cleaned: String = label
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let trimmed = cleaned.trim().trim_start_matches('.').trim();
+    if trimmed.is_empty() { "Android".to_string() } else { trimmed.to_string() }
+}
+
+fn jni_app_label() -> Option<String> {
+    with_activity(|env, activity| {
+        let pm = env
+            .call_method(activity, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])?
+            .l()?;
+        let app_info = env
+            .call_method(activity, "getApplicationInfo", "()Landroid/content/pm/ApplicationInfo;", &[])?
+            .l()?;
+        let label = env
+            .call_method(
+                &app_info,
+                "loadLabel",
+                "(Landroid/content/pm/PackageManager;)Ljava/lang/CharSequence;",
+                &[(&pm).into()],
+            )?
+            .l()?;
+        let s = env.call_method(&label, "toString", "()Ljava/lang/String;", &[])?.l()?;
+        let s: JString = s.into();
+        Ok(env.get_string(&s)?.into())
+    })
+}
+
 /// MediaStore collection and relative path for a MIME.
 ///
 /// The images collection rejects anything that is not `image/*` — MediaProvider throws
 /// `IllegalArgumentException` — so a certificate, a log or a backup has to go to Downloads, which
 /// accepts any type. Everything non-media used to be inserted as an image and failed silently.
-fn media_target(mime: &str) -> (&'static str, &'static str) {
+fn media_target(mime: &str) -> (&'static str, String) {
     if mime.starts_with("image/") {
-        ("android/provider/MediaStore$Images$Media", "Pictures/ComfyUI")
+        ("android/provider/MediaStore$Images$Media", format!("Pictures/{}", album_name()))
     } else if mime.starts_with("video/") {
-        ("android/provider/MediaStore$Video$Media", "Movies/ComfyUI")
+        ("android/provider/MediaStore$Video$Media", format!("Movies/{}", album_name()))
     } else {
-        ("android/provider/MediaStore$Downloads", "Download")
+        ("android/provider/MediaStore$Downloads", "Download".to_string())
     }
 }
 
@@ -477,7 +569,7 @@ fn insert_into_media_store<'l>(
 
     let values = env.new_object("android/content/ContentValues", "()V", &[])?;
     for (key, val) in
-        [("_display_name", name), ("mime_type", mime), ("relative_path", relative_path)]
+        [("_display_name", name), ("mime_type", mime), ("relative_path", relative_path.as_str())]
     {
         let k = env.new_string(key)?;
         let v = env.new_string(val)?;
@@ -561,7 +653,7 @@ fn save_to_gallery(path: &str, name: &str, mime: &str) -> Option<String> {
     match ok {
         Some(true) => {
             log::info!("save_to_gallery: {name} -> {folder}");
-            Some(folder.to_string())
+            Some(folder)
         }
         Some(false) => None,
         None => {
@@ -1993,14 +2085,13 @@ pub trait HostExt {
         None
     }
     /// Live pointer probe from the android-activity input side channel, sampled at motion-event
-    /// dispatch (winit drops tool type + hover). Returns `(tool, hover_px, buttons)`: `tool` is
-    /// 0 unknown / 1 finger / 2 stylus / 3 mouse / 4 eraser / 5 palm; `hover_px` is the hover
-    /// position in window physical pixels (pen near, not touching); `buttons` is the raw
-    /// button-state bitfield (stylus-primary `0x20`, stylus-secondary `0x40`).
-    fn stylus_probe(&self) -> (u8, Option<(f32, f32)>, u32) {
-        (0, None, 0)
+    /// dispatch (winit drops tool type, hover and the pen's geometry).
+    fn stylus_probe(&self) -> StylusProbe {
+        StylusProbe::default()
     }
 }
+
+pub use egui_mobile_core::StylusProbe;
 
 impl HostExt for Host {
     fn set_screen_orientation(&self, o: ScreenOrientation) {
@@ -2108,7 +2199,7 @@ impl HostExt for Host {
     fn native_lib_dir(&self) -> Option<String> {
         jni_native_lib_dir()
     }
-    fn stylus_probe(&self) -> (u8, Option<(f32, f32)>, u32) {
+    fn stylus_probe(&self) -> StylusProbe {
         let p = android_activity::input::pointer_probe();
         let tool = match p.tool {
             android_activity::input::PointerTool::Finger => 1,
@@ -2118,6 +2209,13 @@ impl HostExt for Host {
             android_activity::input::PointerTool::Palm => 5,
             android_activity::input::PointerTool::Unknown => 0,
         };
-        (tool, p.hover, p.buttons)
+        StylusProbe {
+            tool,
+            hover: p.hover,
+            buttons: p.buttons,
+            tilt: p.tilt,
+            azimuth: p.azimuth,
+            distance: p.distance,
+        }
     }
 }

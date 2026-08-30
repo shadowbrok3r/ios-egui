@@ -1158,6 +1158,22 @@ struct ComfyApp {
     /// Open global-look manager window, filtered to this kind (from a combobox's Manage entry).
     looks_window: Option<LookKind>,
     extract_sheet: Option<ExtractSheet>,
+    sweep_open: bool,
+    /// Sweep across axis presets instead of checkpoints.
+    sweep_presets_mode: bool,
+    sweep_kind: LookKind,
+    sweep_models: HashSet<String>,
+    /// Selected presets as (name, origin) pairs for `sweep_kind`.
+    sweep_picks: HashSet<(String, String)>,
+    /// Active sweep capture: (album name, jobs still to report).
+    pending_sweep: Option<(String, u32)>,
+    /// Axis picks last used with each model, keyed by loader filename.
+    model_looks: BTreeMap<String, Vec<AppliedMainLook>>,
+    look_book_open: bool,
+    builder: Option<BuilderState>,
+    /// Gallery key of the image whose WD14 tags fed the sheet (its look photo on save).
+    #[cfg(feature = "local-npu")]
+    wd14_sheet_key: Option<String>,
     /// Per-character denied gallery keys (persisted), keyed by card name; never re-surfaced.
     character_denied: std::collections::BTreeMap<String, Vec<String>>,
     /// Per-character pending match suggestions (persisted, capped), keyed by card name.
@@ -1669,6 +1685,13 @@ struct ComfyApp {
     cache_prefetch: bool,
     /// Resolved `gallery_full` directory (durable or app files); filled on first Settings/update.
     full_cache_root: Option<String>,
+    /// On-device renders, newest first. They exist nowhere but this phone, so the gallery merges
+    /// them into every unfiltered server listing rather than waiting for a fetch to carry them.
+    local_items: Vec<GalleryItem>,
+    /// Whether [`Self::local_items`] has been read off disk yet this session.
+    local_items_loaded: bool,
+    /// An on-device render was filed since the last finished run; drives the Done status line.
+    local_saved: bool,
     /// Key of the full-image prefetch currently in flight.
     prefetch_pending: Option<String>,
     /// Prefetch failures this session; skipped until restart.
@@ -1804,21 +1827,34 @@ struct ChipDrag {
     idx: usize,
 }
 
-/// One detected appearance chip in the extract sheet: its slot, verbatim span (weight wrapper
-/// intact), peeled tag, and include toggle.
+/// One classified chip in the extract sheet: its axis, verbatim span (weight wrapper intact),
+/// peeled tag, and include toggle.
 struct ExtractItem {
-    slot: crate::appearance::AttrSlot,
+    kind: LookKind,
     text: String,
     tag: String,
     on: bool,
 }
 
-/// Transient state of the extract-appearance sheet.
+/// Guided from-scratch prompt builder: step 0 = model (by sample renders), 1 = subject, then one
+/// step per look axis, ending on a review step.
+struct BuilderState {
+    step: usize,
+    /// Free-text subject tags typed but not yet committed with Add.
+    subject: String,
+}
+
+/// Transient state of the extract sheet: detected chips plus one preset name per axis with hits.
 struct ExtractSheet {
-    name: String,
+    names: Vec<(LookKind, String)>,
     items: Vec<ExtractItem>,
-    /// File the saved look under the active character instead of the global list.
+    /// File the saved looks under the active character instead of the global list.
     to_character: bool,
+    /// Chips came from an image's WD14 tags, not the prompt: save presets only — nothing is
+    /// removed from or applied to the prompt.
+    from_image: bool,
+    /// Gallery key stamped as `portrait_key` on every look this sheet creates; empty = none.
+    portrait: String,
 }
 
 /// A pack dir's root: ("app files", wiped=true) under the app external files dir, ("/sdcard/ComfyUI",
@@ -1925,6 +1961,17 @@ impl ComfyApp {
             active_main_looks: Vec::new(),
             looks_window: None,
             extract_sheet: None,
+            sweep_open: false,
+            sweep_presets_mode: false,
+            sweep_kind: LookKind::Appearance,
+            sweep_models: HashSet::new(),
+            sweep_picks: HashSet::new(),
+            pending_sweep: None,
+            model_looks: BTreeMap::new(),
+            look_book_open: false,
+            builder: None,
+            #[cfg(feature = "local-npu")]
+            wd14_sheet_key: None,
             character_denied: std::collections::BTreeMap::new(),
             character_suggestions: std::collections::BTreeMap::new(),
             character_approved: std::collections::BTreeMap::new(),
@@ -2204,6 +2251,9 @@ impl ComfyApp {
             auto_tag: false,
             cache_prefetch: true,
             full_cache_root: None,
+            local_items: Vec::new(),
+            local_items_loaded: false,
+            local_saved: false,
             prefetch_pending: None,
             prefetch_failed: HashSet::new(),
             prefetch_cached: HashSet::new(),
@@ -3083,10 +3133,15 @@ impl ComfyApp {
             Msg::Preview(ci) => {
                 self.preview = Some(ctx.load_texture("preview", ci, egui::TextureOptions::LINEAR));
             }
-            Msg::Result { image, bytes, label } => {
+            Msg::Result { image, bytes, label, local } => {
                 self.result_seq = self.result_seq.wrapping_add(1);
                 let name = format!("result-{}", self.result_seq);
                 let tex = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+                // An on-device render has no server copy, so nothing would ever list it: file it
+                // into the gallery here or the only image is the texture in this frame.
+                if local {
+                    self.file_local_result(host, &bytes);
+                }
                 // Taste-test images belong to the wizard's blind grid. If the wizard closed
                 // mid-run they fall through and show up like a normal run.
                 if self.wizard_take_test_image(&label, &tex) {
@@ -3150,10 +3205,13 @@ impl ComfyApp {
                         t.pending = 0;
                     }
                     self.running = false;
+                    let local_saved = std::mem::take(&mut self.local_saved);
                     self.status = if taste {
                         "Taste test done — tap the images you like".into()
                     } else if self.params.mode == Mode::Video {
                         "Done — video saved to the Gallery".into()
+                    } else if local_saved {
+                        "Done — saved to the Gallery on this device".into()
                     } else {
                         "Done".into()
                     };
@@ -3217,6 +3275,7 @@ impl ComfyApp {
                 // A cancelled character run produced nothing to file; drop the pending capture so a
                 // later unrelated run's outputs don't inherit it.
                 self.pending_album_character = None;
+                self.pending_sweep = None;
                 // A cancelled run left no completed cache entry — an identical retry genuinely
                 // re-generates, so it must not trip the duplicate guard.
                 self.last_graph_fp = None;
@@ -3248,6 +3307,7 @@ impl ComfyApp {
                     // Nothing landed; drop any character auto-album capture so it can't attach to a
                     // later run.
                     self.pending_album_character = None;
+                    self.pending_sweep = None;
                     // A failed overnight batch used to die silently — the finish notification
                     // exists, so its failure counterpart must too. Once per drain, not per job.
                     host.notify("ComfyUI", &format!("Generation failed: {}", elide(&e, 90)));
@@ -3344,6 +3404,7 @@ impl ComfyApp {
                 }
                 if page.offset == 0 {
                     self.gallery = fresh;
+                    self.merge_local_items();
                 } else {
                     // Tombstone-shrunk pages shift server offsets; drop rows already listed.
                     let seen: HashSet<(String, String)> = self
@@ -3372,9 +3433,12 @@ impl ComfyApp {
                         } else {
                             self.pending_album_character = None;
                         }
+                        self.autoadd_untriaged_to_sweep_album();
                     } else if self.triage_collect == 0 {
                         // Gave up finding new outputs; drop the capture rather than misfile later.
                         self.pending_album_character = None;
+                        // The sweep counter still drains — an empty job must not stall the album.
+                        self.autoadd_untriaged_to_sweep_album();
                     }
                 }
                 self.gallery_status.clear();
@@ -4909,7 +4973,8 @@ impl ComfyApp {
             st.dbg_saw_touch = saw_touch;
             // Live S-Pen state from the android-activity input side channel (tool type, hover, and
             // buttons that winit drops); hover px converts to egui points.
-            let (tool_u8, hover_px, buttons) = host.stylus_probe();
+            let sp = host.stylus_probe();
+            let (tool_u8, hover_px, buttons) = (sp.tool, sp.hover, sp.buttons);
             let kind = match tool_u8 {
                 1 => mask::PointerKind::Finger,
                 2 => mask::PointerKind::Stylus,
@@ -5162,6 +5227,7 @@ impl ComfyApp {
             wizard_custom_tags: self.wizard_custom_tags.clone(),
             global_looks: self.global_looks.clone(),
             active_main_looks: self.active_main_looks.clone(),
+            model_looks: self.model_looks.clone(),
             rewrite_engine: self.rewrite_engine,
             variation_count: self.variation_count,
             variation_strength: self.variation_strength,
@@ -5247,6 +5313,7 @@ impl ComfyApp {
         self.wizard_custom_tags = saved.wizard_custom_tags;
         self.global_looks = saved.global_looks;
         self.active_main_looks = saved.active_main_looks;
+        self.model_looks = saved.model_looks;
         self.character_centroids.clear();
         self.checkpoint_sort = saved.checkpoint_sort;
         self.checkpoint_favorites = saved.checkpoint_favorites;
@@ -7390,7 +7457,13 @@ impl ComfyApp {
                 };
                 let mut btn = egui::Button::new(sanitize_ui_text(ui, &label))
                     .sense(egui::Sense::click_and_drag());
-                if let Some(fill) = self.tag_category(&chip.tag).and_then(crate::theme::tag_category_fill) {
+                // Axis hue first — the swappable look tags read as their category at a glance;
+                // danbooru category fills cover the rest (artist/character/meta).
+                if let Some(kind) = crate::appearance::classify_axis(&chip.tag) {
+                    btn = btn.fill(crate::theme::axis_fill(kind));
+                } else if let Some(fill) =
+                    self.tag_category(&chip.tag).and_then(crate::theme::tag_category_fill)
+                {
                     btn = btn.fill(fill);
                 }
                 let resp = ui.add(btn);
@@ -7835,6 +7908,16 @@ impl ComfyApp {
                 stepper_u32(ui, "Variants", &mut variants, 1..=8, 1);
                 self.queue_variants = variants as usize;
             });
+        });
+        ui.add_space(4.0);
+        ui.vertical_centered(|ui| {
+            if ui
+                .button(format!("{} Sweep", icons::MODEL))
+                .on_hover_text("Queue the same prompt and seed across several checkpoints or presets")
+                .clicked()
+            {
+                self.sweep_open = true;
+            }
         });
         if self.params.model_kind == ModelKind::Checkpoint {
             ui.add_space(4.0);
@@ -8861,7 +8944,14 @@ impl ComfyApp {
 
         self.checkpoints_force_collapse = false;
         if let Some((file, kind)) = pick {
+            // The look follows the model: capture picks under the outgoing model, and after the
+            // switch re-apply whatever was last used with the incoming one (if it was recorded).
+            let changed = self.params.model_file() != file;
+            self.remember_model_looks();
             self.select_model(&file, Some(kind));
+            if changed {
+                self.restore_model_looks();
+            }
         }
         if let Some(file) = toggle_fav {
             self.toggle_checkpoint_favorite(&file);
@@ -9112,7 +9202,8 @@ impl ComfyApp {
                     ui.add_space(2.0);
                     ui.horizontal_wrapped(|ui| {
                         let person = CharacterLook { name: "Person".into(), ..Default::default() };
-                        if self.look_chip(ui, &person, is_active && active_look.is_none()) {
+                        if self.look_chip(ui, &person, is_active && active_look.is_none()).clicked()
+                        {
                             act = Some(Act::Apply(i, None));
                         }
                         for (li, look) in
@@ -9120,7 +9211,7 @@ impl ComfyApp {
                         {
                             let on =
                                 is_active && active_look.as_deref() == Some(look.name.as_str());
-                            if self.look_chip(ui, look, on) {
+                            if self.look_chip(ui, look, on).clicked() {
                                 act = Some(Act::Apply(i, Some(li)));
                             }
                         }
@@ -15290,7 +15381,7 @@ impl ComfyApp {
 
     /// A tappable look chip: the look's photo (or a placeholder icon), its name below, a pink ring
     /// when it's the applied look. Returns true when tapped.
-    fn look_chip(&mut self, ui: &mut egui::Ui, look: &CharacterLook, active: bool) -> bool {
+    fn look_chip(&mut self, ui: &mut egui::Ui, look: &CharacterLook, active: bool) -> egui::Response {
         let img = 46.0;
         let (rect, resp) =
             ui.allocate_exact_size(egui::vec2(img, img + 15.0), egui::Sense::click());
@@ -15325,7 +15416,7 @@ impl ComfyApp {
             egui::FontId::proportional(10.0),
             color,
         );
-        resp.clicked()
+        resp
     }
 
     /// Confirmed-set keys for a character's CLIP centroid, strongest signal first: members of the
@@ -15459,6 +15550,44 @@ impl ComfyApp {
             }
         }
         self.selected_preset.clear();
+        self.remember_model_looks();
+    }
+
+    /// Record the current axis picks under the selected model, so re-picking that model can
+    /// restore them. Sweep jobs cycle picks programmatically and are excluded.
+    fn remember_model_looks(&mut self) {
+        if self.pending_sweep.is_some() {
+            return;
+        }
+        let file = self.params.model_file().to_string();
+        if file.is_empty() {
+            return;
+        }
+        let picks = self
+            .active_main_looks
+            .iter()
+            .map(|a| AppliedMainLook {
+                kind: a.kind,
+                name: a.name.clone(),
+                origin: a.origin.clone(),
+                injected: String::new(),
+            })
+            .collect();
+        self.model_looks.insert(file, picks);
+    }
+
+    /// Re-apply the axis picks last recorded for the newly selected model. Models never seen
+    /// before keep the current picks; a recorded model swaps every axis to its saved state.
+    fn restore_model_looks(&mut self) {
+        let file = self.params.model_file().to_string();
+        let Some(saved) = self.model_looks.get(&file).cloned() else { return };
+        for &kind in LookKind::MAIN {
+            let pick = saved
+                .iter()
+                .find(|a| a.kind == kind)
+                .map(|a| (a.name.clone(), a.origin.clone()));
+            self.set_main_look(kind, pick);
+        }
     }
 
     /// Reverse every active Create-Main look off the current positive, then clear the records. Used
@@ -15469,72 +15598,166 @@ impl ComfyApp {
         }
     }
 
-    /// Scan the positive for appearance chips and open the extract sheet over them.
-    fn open_extract_sheet(&mut self) {
-        let found = crate::appearance::extract(&self.params.positive);
-        let name = crate::appearance::suggest_name(&found);
-        let items = found
-            .into_iter()
-            .map(|e| ExtractItem { slot: e.slot, text: e.text, tag: e.tag, on: true })
-            .collect();
-        self.extract_sheet = Some(ExtractSheet { name, items, to_character: false });
+    /// Scan the positive and open the extract sheet over the hits — every axis, or just `only`.
+    fn open_extract_sheet(&mut self, only: Option<LookKind>) {
+        self.open_extract_sheet_over(&self.params.positive.clone(), false, String::new(), only);
     }
 
-    /// The extract-appearance window: detected chips grouped by slot with include toggles. Save
-    /// pulls the checked chips out of the positive into an Appearance look and applies it, so the
-    /// submitted prompt is unchanged while the tags become a swappable combobox pick.
+    /// Open the extract sheet over an image's WD14 tag list: same grouping and toggles, but
+    /// saving only creates presets — each stamped with the source image as its photo.
+    #[cfg(feature = "local-npu")]
+    fn open_extract_sheet_from_tags(&mut self, tags: &[String], portrait: String) {
+        self.open_extract_sheet_over(&tags.join(", "), true, portrait, None);
+    }
+
+    fn open_extract_sheet_over(
+        &mut self,
+        text: &str,
+        from_image: bool,
+        portrait: String,
+        only: Option<LookKind>,
+    ) {
+        let found: Vec<crate::appearance::Extracted> = crate::appearance::extract(text)
+            .into_iter()
+            .filter(|e| only.is_none_or(|k| e.kind == k))
+            .collect();
+        let names = LookKind::MAIN
+            .iter()
+            .filter(|&&k| found.iter().any(|e| e.kind == k))
+            .map(|&k| (k, crate::appearance::axis_name(k, &found)))
+            .collect();
+        let items = found
+            .into_iter()
+            .map(|e| ExtractItem { kind: e.kind, text: e.text, tag: e.tag, on: true })
+            .collect();
+        self.extract_sheet =
+            Some(ExtractSheet { names, items, to_character: false, from_image, portrait });
+    }
+
+    /// An existing look of `kind` — global, any character's, or built-in — whose folded tag set
+    /// equals `tags`, as (name, origin). Lets the extract sheet reuse instead of duplicating.
+    fn matching_look(&self, kind: LookKind, tags: &HashSet<String>) -> Option<(String, String)> {
+        let set_of = |prompt: &str| -> HashSet<String> {
+            tags::parse_chips(prompt).iter().map(|c| tags::fold(&c.tag)).collect()
+        };
+        let global =
+            self.global_looks.iter().filter(|l| l.kind == kind).map(|l| (l, String::new()));
+        let chars = self.characters.iter().flat_map(|c| {
+            c.looks.iter().filter(|l| l.kind == kind).map(move |l| (l, c.name.clone()))
+        });
+        let builtin = self
+            .builtin_looks
+            .iter()
+            .filter(|l| l.kind == kind)
+            .map(|l| (l, BUILTIN_ORIGIN.to_string()));
+        global
+            .chain(chars)
+            .chain(builtin)
+            .find(|(l, _)| &set_of(&l.prompt) == tags)
+            .map(|(l, o)| (l.name.clone(), o))
+    }
+
+    /// The extract window: detected chips grouped per axis with a name field each, shown as
+    /// tap-to-toggle chips. Save splits the toggled-on chips out of the positive into one preset
+    /// per axis and applies them all, so the submitted prompt is unchanged while each group
+    /// becomes a swappable combobox pick.
     fn extract_sheet_ui(&mut self, ctx: &egui::Context) {
         let Some(mut sheet) = self.extract_sheet.take() else { return };
         let mut open = true;
         let mut save = false;
-        centered(ctx, egui::Window::new("Extract appearance"))
+        centered(ctx, egui::Window::new("Extract from prompt"))
             .collapsible(false)
             .open(&mut open)
             .default_width(340.0)
             .show(ctx, |ui| {
                 if sheet.items.is_empty() {
-                    ui.label("No appearance tags found in the prompt.");
-                    ui.weak("Recognized: hair color/style, eyes, nails, toenails, skin, body.");
+                    ui.label(if sheet.from_image {
+                        "No look tags found in this image's tags."
+                    } else {
+                        "No look tags found in the prompt."
+                    });
+                    ui.weak(
+                        "Recognized: appearance (hair, eyes, nails, skin, body), expression, \
+                         outfit, pose, camera and environment tags.",
+                    );
                     return;
                 }
-                ui.weak("Pull these out of the prompt into a swappable Appearance preset.");
+                ui.weak(if sheet.from_image {
+                    "Save this image's look as presets. Tap a tag to skip it."
+                } else {
+                    "Split these into swappable presets. Tap a tag to leave it in the prompt."
+                });
                 ui.add_space(4.0);
-                crate::theme::scroll_vertical().max_height(300.0).id_salt("extract_sheet").show(
+                crate::theme::scroll_vertical().max_height(340.0).id_salt("extract_sheet").show(
                     ui,
                     |ui| {
-                        for &slot in crate::appearance::AttrSlot::ALL {
-                            if !sheet.items.iter().any(|it| it.slot == slot) {
+                        for &kind in LookKind::MAIN {
+                            if !sheet.items.iter().any(|it| it.kind == kind) {
                                 continue;
                             }
-                            ui.weak(slot.label());
-                            for it in sheet.items.iter_mut().filter(|it| it.slot == slot) {
-                                ui.checkbox(&mut it.on, sanitize_ui_text(ui, &it.text));
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                let label = egui::RichText::new(kind.label())
+                                    .color(crate::theme::axis_color(kind));
+                                ui.add_sized(egui::vec2(96.0, 20.0), egui::Label::new(label));
+                                if let Some((_, name)) =
+                                    sheet.names.iter_mut().find(|(k, _)| *k == kind)
+                                {
+                                    ui.add(
+                                        egui::TextEdit::singleline(name)
+                                            .hint_text("preset name")
+                                            .desired_width((ui.available_width() - 4.0).max(80.0)),
+                                    );
+                                }
+                            });
+                            // Same tag set as a saved preset: reuse it instead of duplicating.
+                            let on_set: HashSet<String> = sheet
+                                .items
+                                .iter()
+                                .filter(|it| it.kind == kind && it.on)
+                                .map(|it| tags::fold(&it.tag))
+                                .collect();
+                            if !on_set.is_empty()
+                                && let Some((name, _)) = self.matching_look(kind, &on_set)
+                            {
+                                let note = format!("Matches saved preset {name} — it will be used");
+                                ui.weak(sanitize_ui_text(ui, &elide(&note, 52)));
                             }
+                            ui.horizontal_wrapped(|ui| {
+                                for it in sheet.items.iter_mut().filter(|it| it.kind == kind) {
+                                    let label = sanitize_ui_text(ui, &elide(&it.text, 40));
+                                    let mut btn = egui::Button::new(label).small().selected(it.on);
+                                    // Off-toggled chips keep the axis hue; on-toggled use the
+                                    // selection color so the include state stays readable.
+                                    if !it.on {
+                                        btn = btn.fill(crate::theme::axis_fill(kind));
+                                    }
+                                    if ui.add(btn).clicked() {
+                                        it.on = !it.on;
+                                    }
+                                }
+                            });
                         }
                     },
                 );
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut sheet.name)
-                            .desired_width((ui.available_width() - 4.0).max(120.0)),
-                    );
-                });
                 if let Some(applied) = &self.active_character {
                     sheet.to_character &= self.characters.iter().any(|c| c.name == applied.name);
                     let label = format!("Save under {}", elide(&applied.name, 20));
                     ui.checkbox(&mut sheet.to_character, sanitize_ui_text(ui, &label));
                 }
                 let any_on = sheet.items.iter().any(|it| it.on);
-                let name_ok = !sheet.name.trim().is_empty();
                 ui.add_space(4.0);
-                let btn = egui::Button::new(format!("{} Save & swap in", icons::CHECK));
-                if ui
-                    .add_enabled(any_on && name_ok, btn)
-                    .on_hover_text("Saves the preset, removes these tags from the prompt, and applies it")
-                    .clicked()
-                {
+                let (label, hover) = if sheet.from_image {
+                    (format!("{} Save presets", icons::CHECK), "Saves one preset per axis")
+                } else {
+                    (
+                        format!("{} Save & swap in", icons::CHECK),
+                        "Saves one preset per axis, removes those tags from the prompt, and \
+                         applies the presets",
+                    )
+                };
+                if ui.add_enabled(any_on, egui::Button::new(label)).on_hover_text(hover).clicked() {
                     save = true;
                 }
             });
@@ -15545,43 +15768,660 @@ impl ComfyApp {
         }
     }
 
-    /// Save the sheet's checked chips as an Appearance look (global, or under the active character),
-    /// strip them from the positive, and apply the new look. A same-named look is replaced.
-    fn save_extract_sheet(&mut self, sheet: &ExtractSheet) {
-        let on: Vec<&ExtractItem> = sheet.items.iter().filter(|it| it.on).collect();
-        let name = sheet.name.trim().to_string();
-        if on.is_empty() || name.is_empty() {
+    /// The sweep window: pick 2+ checkpoints (or 2+ presets of one axis) and queue one job per
+    /// pick at a shared seed; outputs collect into a numbered "Sweep N" album as each job lands.
+    fn sweep_window(&mut self, ctx: &egui::Context, host: &Host) {
+        if !self.sweep_open {
             return;
         }
-        let prompt = on.iter().map(|it| it.text.as_str()).collect::<Vec<_>>().join(", ");
-        let look = CharacterLook {
-            name: name.clone(),
-            prompt,
-            portrait_key: String::new(),
-            kind: LookKind::Appearance,
+        let mut open = true;
+        let mut start = false;
+        centered(ctx, egui::Window::new("Sweep"))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                ui.weak("One job per pick — same prompt and seed — collected into a sweep album.");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if crate::theme::selectable_label(ui, !self.sweep_presets_mode, "Checkpoints")
+                        .clicked()
+                    {
+                        self.sweep_presets_mode = false;
+                    }
+                    if crate::theme::selectable_label(ui, self.sweep_presets_mode, "Presets")
+                        .clicked()
+                    {
+                        self.sweep_presets_mode = true;
+                    }
+                });
+                ui.add_space(4.0);
+                if !self.sweep_presets_mode {
+                    let files: Vec<String> =
+                        self.checkpoints.iter().chain(self.unets.iter()).cloned().collect();
+                    crate::theme::scroll_vertical().max_height(300.0).id_salt("sweep_models").show(
+                        ui,
+                        |ui| {
+                            // Pin the row width to the window and truncate: a long model name
+                            // must not widen the window past the screen.
+                            ui.set_min_width(296.0);
+                            ui.set_max_width(296.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            for file in files {
+                                let on = self.sweep_models.contains(&file);
+                                let label = sanitize_ui_text(ui, &model_label(&file));
+                                if ui.selectable_label(on, label).clicked() {
+                                    if on {
+                                        self.sweep_models.remove(&file);
+                                    } else {
+                                        self.sweep_models.insert(file);
+                                    }
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    // Flat axis row, deliberately not a ComboBox: `centered()` windows sit at
+                    // Order::Tooltip, above the Foreground layer popups render on, so a dropdown
+                    // here paints underneath the window and can't be tapped.
+                    ui.horizontal_wrapped(|ui| {
+                        for &k in LookKind::MAIN {
+                            let text = egui::RichText::new(k.label())
+                                .color(crate::theme::axis_color(k));
+                            if crate::theme::selectable_label(ui, self.sweep_kind == k, text)
+                                .clicked()
+                                && self.sweep_kind != k
+                            {
+                                self.sweep_kind = k;
+                                self.sweep_picks.clear();
+                            }
+                        }
+                    });
+                    let kind = self.sweep_kind;
+                    let mut rows: Vec<(String, String, String)> = Vec::new();
+                    for l in self.builtin_looks.iter().filter(|l| l.kind == kind) {
+                        rows.push((l.name.clone(), BUILTIN_ORIGIN.to_string(), l.name.clone()));
+                    }
+                    for l in self.global_looks.iter().filter(|l| l.kind == kind) {
+                        rows.push((l.name.clone(), String::new(), l.name.clone()));
+                    }
+                    for c in &self.characters {
+                        for l in c.looks.iter().filter(|l| l.kind == kind) {
+                            rows.push((
+                                l.name.clone(),
+                                c.name.clone(),
+                                format!("{} - {}", c.name, l.name),
+                            ));
+                        }
+                    }
+                    crate::theme::scroll_vertical().max_height(280.0).id_salt("sweep_picks").show(
+                        ui,
+                        |ui| {
+                            ui.set_min_width(296.0);
+                            ui.set_max_width(296.0);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            for (name, origin, display) in rows {
+                                let key = (name, origin);
+                                let on = self.sweep_picks.contains(&key);
+                                let label = sanitize_ui_text(ui, &display);
+                                if ui.selectable_label(on, label).clicked() {
+                                    if on {
+                                        self.sweep_picks.remove(&key);
+                                    } else {
+                                        self.sweep_picks.insert(key);
+                                    }
+                                }
+                            }
+                        },
+                    );
+                }
+                let n = if self.sweep_presets_mode {
+                    self.sweep_picks.len()
+                } else {
+                    self.sweep_models.len()
+                };
+                ui.add_space(4.0);
+                if ui
+                    .add_enabled(n >= 2, egui::Button::new(format!("{} Queue {n} jobs", icons::RUN)))
+                    .on_hover_text("Queues one generation per pick at a fixed seed")
+                    .clicked()
+                {
+                    start = true;
+                }
+            });
+        if start {
+            self.start_sweep(ctx, host);
+        }
+        if !open {
+            self.sweep_open = false;
+        }
+    }
+
+    /// Queue the sweep: one Create job per pick at a shared seed, restoring the user's params and
+    /// look picks afterwards. Outputs are filed by [`Self::autoadd_untriaged_to_sweep_album`].
+    fn start_sweep(&mut self, ctx: &egui::Context, host: &Host) {
+        if let Err(e) = self.can_queue_create() {
+            self.status = e.into();
+            host.haptic(Haptic::Warning);
+            return;
+        }
+        let n =
+            if self.sweep_presets_mode { self.sweep_picks.len() } else { self.sweep_models.len() };
+        if n < 2 {
+            return;
+        }
+        let seed = if self.params.randomize_seed { random_seed() } else { self.params.seed };
+        let snapshot = self.params.clone();
+        let looks = self.active_main_looks.clone();
+        let album = {
+            let next = self
+                .albums
+                .iter()
+                .filter_map(|a| a.name.strip_prefix("Sweep ")?.parse::<u32>().ok())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            format!("Sweep {next}")
         };
+        self.pending_album_character = self.active_character.as_ref().map(|a| a.name.clone());
+        self.pending_sweep = Some((album.clone(), n as u32));
+        if self.sweep_presets_mode {
+            let kind = self.sweep_kind;
+            let mut picks: Vec<(String, String)> = self.sweep_picks.iter().cloned().collect();
+            picks.sort();
+            for (name, origin) in picks {
+                self.set_main_look(kind, Some((name, origin)));
+                self.params.randomize_seed = false;
+                self.params.seed = seed;
+                self.start_generation(ctx, host);
+            }
+        } else {
+            let mut files: Vec<String> = self.sweep_models.iter().cloned().collect();
+            files.sort();
+            for file in files {
+                self.select_model(&file, None);
+                self.params.randomize_seed = false;
+                self.params.seed = seed;
+                self.start_generation(ctx, host);
+            }
+        }
+        self.params = snapshot;
+        self.active_main_looks = looks;
+        self.sweep_open = false;
+        self.status = format!("Sweep: {n} jobs queued into album {album}");
+    }
+
+    /// File the finished job's outputs into the sweep album (created on first use) and drain the
+    /// job counter; runs even when a job produced nothing so the capture always converges.
+    fn autoadd_untriaged_to_sweep_album(&mut self) {
+        let Some((album, remaining)) = self.pending_sweep.take() else { return };
+        let fresh: HashSet<String> = self.untriaged.iter().cloned().collect();
+        let items: Vec<(String, String)> = self
+            .gallery
+            .iter()
+            .filter(|it| !it.is_video && fresh.contains(&it.key()))
+            .map(|it| (it.subfolder.clone(), it.filename.clone()))
+            .collect();
+        if !items.is_empty() {
+            if let Some(id) = self.albums.iter().find(|a| a.name == album).map(|a| a.id) {
+                self.engine.as_ref().unwrap().album_add(id, items);
+            } else if let Some(t) = self.album_pending_add.as_mut().filter(|t| t.0 == album) {
+                t.1.extend(items);
+            } else {
+                self.engine.as_ref().unwrap().album_create(album.clone());
+                self.album_pending_add = Some((album.clone(), items));
+            }
+        }
+        let remaining = remaining.saturating_sub(1);
+        if remaining > 0 {
+            self.pending_sweep = Some((album, remaining));
+        } else {
+            self.status = format!("Sweep complete — see album {album}");
+        }
+    }
+
+    /// Every preset of `kind` as (look, origin) rows: global, then characters, then built-in —
+    /// photographed presets sorted to the front.
+    fn looks_of(&self, kind: LookKind) -> Vec<(CharacterLook, String)> {
+        let mut rows: Vec<(CharacterLook, String)> = Vec::new();
+        for l in self.global_looks.iter().filter(|l| l.kind == kind) {
+            rows.push((l.clone(), String::new()));
+        }
+        for c in &self.characters {
+            for l in c.looks.iter().filter(|l| l.kind == kind) {
+                rows.push((l.clone(), c.name.clone()));
+            }
+        }
+        for l in self.builtin_looks.iter().filter(|l| l.kind == kind) {
+            rows.push((l.clone(), BUILTIN_ORIGIN.to_string()));
+        }
+        rows.sort_by_key(|(l, _)| l.portrait_key.is_empty());
+        rows
+    }
+
+    /// A wrapped row of preset tiles for `kind`. Tap returns the new pick (`Some(None)` clears);
+    /// long-press jumps to the preset's example album when it has one.
+    fn look_tile_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        kind: LookKind,
+        rows: &[(CharacterLook, String)],
+    ) -> Option<Option<(String, String)>> {
+        let cur = self
+            .active_main_looks
+            .iter()
+            .find(|a| a.kind == kind)
+            .map(|a| (a.name.clone(), a.origin.clone()));
+        let mut pick = None;
+        let mut album = None;
+        ui.horizontal_wrapped(|ui| {
+            for (look, origin) in rows {
+                let active = cur.as_ref().is_some_and(|(n, o)| n == &look.name && o == origin);
+                let resp = self.look_chip(ui, look, active);
+                if resp.clicked() {
+                    pick =
+                        Some((!active).then(|| (look.name.clone(), origin.clone())));
+                }
+                if resp.long_touched() && look.album_id != 0 {
+                    album = Some(look.album_id);
+                }
+            }
+        });
+        if let Some(id) = album {
+            self.open_look_album(id);
+        }
+        pick
+    }
+
+    /// Jump to the Gallery tab filtered to a preset's example album, closing the browse windows
+    /// (they would float over the gallery otherwise).
+    fn open_look_album(&mut self, album_id: i64) {
+        if album_id == 0 {
+            return;
+        }
+        self.gallery_view.album = Some(album_id);
+        self.look_book_open = false;
+        self.builder = None;
+        self.tab = Tab::Gallery;
+        self.refresh_gallery();
+    }
+
+    /// Visual preset browser: per-axis tiles (photo, name, active ring) for every global,
+    /// character, and built-in preset; tapping applies that axis pick, tapping the active tile
+    /// clears it. Stays open for browsing across axes.
+    fn look_book_window(&mut self, ctx: &egui::Context) {
+        if !self.look_book_open {
+            return;
+        }
+        let mut open = true;
+        let mut pick: Option<(LookKind, Option<(String, String)>)> = None;
+        let max_h = (ctx.content_rect().height() * 0.6).clamp(240.0, 560.0);
+        centered(ctx, egui::Window::new(format!("{} Look book", icons::GALLERY)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.weak("Tap a tile to apply it; tap the active tile to clear that axis.");
+                ui.weak("Long-press a tile to browse its example album.");
+                ui.add_space(4.0);
+                crate::theme::scroll_vertical().max_height(max_h).id_salt("look_book").show(
+                    ui,
+                    |ui| {
+                        for &kind in LookKind::MAIN {
+                            let rows = self.looks_of(kind);
+                            if rows.is_empty() {
+                                continue;
+                            }
+                            let has_cur =
+                                self.active_main_looks.iter().any(|a| a.kind == kind);
+                            let head =
+                                egui::RichText::new(format!("{} ({})", kind.label(), rows.len()))
+                                    .color(crate::theme::axis_color(kind));
+                            egui::CollapsingHeader::new(head)
+                                .id_salt(("look_book", kind))
+                            .default_open(has_cur || kind == LookKind::Appearance)
+                            .show(ui, |ui| {
+                                if let Some(choice) = self.look_tile_row(ui, kind, &rows) {
+                                    pick = Some((kind, choice));
+                                }
+                            });
+                        }
+                    },
+                );
+            });
+        if let Some((kind, choice)) = pick {
+            self.set_main_look(kind, choice);
+        }
+        if !open {
+            self.look_book_open = false;
+        }
+    }
+
+    /// The from-scratch prompt builder: pick a model from its own gallery renders, add a subject,
+    /// then walk the look axes as tile grids. Every choice applies to the live params, so closing
+    /// at any step keeps what's built; Review can queue a generation directly.
+    fn builder_window(&mut self, ctx: &egui::Context, host: &Host) {
+        let (mut step, mut subject) = match &self.builder {
+            Some(b) => (b.step, b.subject.clone()),
+            None => return,
+        };
+        let axes = LookKind::MAIN.len();
+        let last = 2 + axes;
+        let mut open = true;
+        let mut pick: Option<(LookKind, Option<(String, String)>)> = None;
+        let mut generate = false;
+        let max_h = (ctx.content_rect().height() * 0.55).clamp(220.0, 520.0);
+        let title = match step {
+            0 => "Model".to_string(),
+            1 => "Subject".to_string(),
+            s if s < last => LookKind::MAIN[s - 2].label().to_string(),
+            _ => "Review".to_string(),
+        };
+        centered(ctx, egui::Window::new(format!("{} Build a prompt", icons::MODEL)))
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let mut head = egui::RichText::new(sanitize_ui_text(ui, &title)).strong();
+                    if step >= 2 && step < last {
+                        head = head.color(crate::theme::axis_color(LookKind::MAIN[step - 2]));
+                    }
+                    ui.label(head);
+                    ui.weak(format!("step {}/{}", step + 1, last + 1));
+                });
+                ui.add_space(4.0);
+                match step {
+                    0 => {
+                        ui.weak("Pick the model — tiles show your newest render from each.");
+                        // Newest non-video sample per model file (the gallery is newest-first).
+                        let mut samples: HashMap<String, String> = HashMap::new();
+                        for it in self.gallery.iter().filter(|it| !it.is_video) {
+                            for m in &it.models {
+                                samples.entry(m.clone()).or_insert_with(|| it.key());
+                            }
+                        }
+                        let files: Vec<String> =
+                            self.checkpoints.iter().chain(self.unets.iter()).cloned().collect();
+                        let current = self.params.model_file().to_string();
+                        let mut chosen: Option<String> = None;
+                        crate::theme::scroll_vertical()
+                            .max_height(max_h)
+                            .id_salt("builder_models")
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for file in files.iter().filter(|f| samples.contains_key(*f)) {
+                                        let key = samples[file].clone();
+                                        let img = 72.0;
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(img, img + 15.0),
+                                            egui::Sense::click(),
+                                        );
+                                        let img_rect = egui::Rect::from_min_size(
+                                            rect.min,
+                                            egui::vec2(img, img),
+                                        );
+                                        self.portrait_thumb_rect(ui, &key, img_rect);
+                                        let cur = *file == current;
+                                        if cur {
+                                            ui.painter().rect_stroke(
+                                                img_rect,
+                                                4.0,
+                                                egui::Stroke::new(2.0, crate::theme::PINK),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                        }
+                                        let name =
+                                            sanitize_ui_text(ui, &elide(&model_label(file), 13));
+                                        let color = if cur {
+                                            crate::theme::PINK_BRIGHT
+                                        } else {
+                                            ui.visuals().text_color()
+                                        };
+                                        ui.painter().text(
+                                            egui::pos2(rect.center().x, img_rect.bottom() + 2.0),
+                                            egui::Align2::CENTER_TOP,
+                                            name,
+                                            egui::FontId::proportional(10.0),
+                                            color,
+                                        );
+                                        if resp.clicked() {
+                                            chosen = Some(file.clone());
+                                        }
+                                    }
+                                });
+                                let rest: Vec<String> = files
+                                    .iter()
+                                    .filter(|f| !samples.contains_key(*f))
+                                    .cloned()
+                                    .collect();
+                                if !rest.is_empty() {
+                                    egui::CollapsingHeader::new(format!(
+                                        "No renders yet ({})",
+                                        rest.len()
+                                    ))
+                                    .id_salt("builder_models_rest")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        ui.style_mut().wrap_mode =
+                                            Some(egui::TextWrapMode::Truncate);
+                                        for file in rest {
+                                            let sel = file == current;
+                                            let label =
+                                                sanitize_ui_text(ui, &model_label(&file));
+                                            if ui.selectable_label(sel, label).clicked() {
+                                                chosen = Some(file);
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        if let Some(file) = chosen {
+                            let changed = self.params.model_file() != file;
+                            self.remember_model_looks();
+                            self.select_model(&file, None);
+                            if changed {
+                                self.restore_model_looks();
+                            }
+                        }
+                    }
+                    1 => {
+                        ui.weak("Who's in the image? Tap to toggle, or add your own tags.");
+                        let present: HashSet<String> = tags::parse_chips(&self.params.positive)
+                            .iter()
+                            .map(|c| tags::fold(&c.tag))
+                            .collect();
+                        let mut toggle: Option<(String, bool)> = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for s in ["1girl", "1boy", "2girls", "solo"] {
+                                let on = present.contains(s);
+                                if ui.add(egui::Button::new(s).small().selected(on)).clicked() {
+                                    toggle = Some((s.to_string(), on));
+                                }
+                            }
+                        });
+                        if let Some((tag, on)) = toggle {
+                            self.note_prompt_edited();
+                            if on {
+                                if let Some(i) = tags::parse_chips(&self.params.positive)
+                                    .iter()
+                                    .position(|c| tags::fold(&c.tag) == tag)
+                                {
+                                    self.params.positive =
+                                        tags::remove_chip(&self.params.positive, i);
+                                }
+                            } else {
+                                self.params.positive =
+                                    tags::push_chip(&self.params.positive, &tag);
+                            }
+                        }
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut subject)
+                                    .hint_text("anything else (added as tags)")
+                                    .desired_width((ui.available_width() - 64.0).max(80.0)),
+                            );
+                            if ui.button(format!("{} Add", icons::ADD)).clicked()
+                                && !subject.trim().is_empty()
+                            {
+                                self.note_prompt_edited();
+                                self.params.positive =
+                                    tags::push_chip(&self.params.positive, subject.trim());
+                                subject.clear();
+                            }
+                        });
+                    }
+                    s if s < last => {
+                        let kind = LookKind::MAIN[s - 2];
+                        let rows = self.looks_of(kind);
+                        if rows.is_empty() {
+                            ui.weak(
+                                "No presets on this axis yet — Extract from a prompt or an \
+                                 image to add some.",
+                            );
+                        } else {
+                            ui.weak("Tap to apply; tap again to clear. Long-press for examples.");
+                            crate::theme::scroll_vertical()
+                                .max_height(max_h)
+                                .id_salt(("builder_axis", kind))
+                                .show(ui, |ui| {
+                                    if let Some(choice) = self.look_tile_row(ui, kind, &rows) {
+                                        pick = Some((kind, choice));
+                                    }
+                                });
+                        }
+                    }
+                    _ => {
+                        ui.weak("The prompt so far:");
+                        let preview = self.params.combined_positive();
+                        ui.label(sanitize_ui_text(ui, &elide(&preview, 400)));
+                        ui.add_space(4.0);
+                        if ui.button(format!("{} Generate", icons::GENERATE)).clicked() {
+                            generate = true;
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(step > 0, egui::Button::new(format!("{} Back", icons::BACK)))
+                        .clicked()
+                    {
+                        step -= 1;
+                    }
+                    if step < last && ui.button(format!("Next {}", icons::FORWARD)).clicked() {
+                        // Leaving Subject commits typed-but-unadded tags.
+                        if step == 1 && !subject.trim().is_empty() {
+                            self.note_prompt_edited();
+                            self.params.positive =
+                                tags::push_chip(&self.params.positive, subject.trim());
+                            subject.clear();
+                        }
+                        step += 1;
+                    }
+                });
+            });
+        if let Some((kind, choice)) = pick {
+            self.set_main_look(kind, choice);
+        }
+        if generate {
+            self.queue_create_variants(ctx, host);
+            open = false;
+        }
+        if !open {
+            self.builder = None;
+        } else if let Some(b) = self.builder.as_mut() {
+            // A long-press album jump cleared the state mid-frame; only a live builder persists.
+            b.step = step;
+            b.subject = subject;
+        }
+    }
+
+    /// Save the sheet's toggled-on chips as one look per axis (global, or under the active
+    /// character), strip them from the positive, and apply each look. Same-named looks are
+    /// replaced; a blanked name falls back to the axis' first two tags.
+    fn save_extract_sheet(&mut self, sheet: &ExtractSheet) {
         let mut origin = match (&self.active_character, sheet.to_character) {
             (Some(a), true) => a.name.clone(),
             _ => String::new(),
         };
-        if !origin.is_empty() {
-            match self.characters.iter_mut().find(|c| c.name == origin) {
-                Some(card) => {
-                    card.looks.retain(|l| !(l.kind == LookKind::Appearance && l.name == name));
-                    card.looks.push(look.clone());
+        if !origin.is_empty() && !self.characters.iter().any(|c| c.name == origin) {
+            origin = String::new();
+        }
+        let mut saved = 0usize;
+        let mut reused = 0usize;
+        let mut removed = 0usize;
+        for &kind in LookKind::MAIN {
+            let on: Vec<&ExtractItem> =
+                sheet.items.iter().filter(|it| it.kind == kind && it.on).collect();
+            if on.is_empty() {
+                continue;
+            }
+            let on_set: HashSet<String> = on.iter().map(|it| tags::fold(&it.tag)).collect();
+            // A saved preset with this exact tag set is applied instead of duplicated.
+            let (name, look_origin) = match self.matching_look(kind, &on_set) {
+                Some((name, o)) => {
+                    reused += 1;
+                    (name, o)
                 }
-                None => origin = String::new(),
+                None => {
+                    let mut name = sheet
+                        .names
+                        .iter()
+                        .find(|(k, _)| *k == kind)
+                        .map(|(_, n)| n.trim().to_string())
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        name = on
+                            .iter()
+                            .take(2)
+                            .map(|it| it.tag.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                    }
+                    let look = CharacterLook {
+                        name: name.clone(),
+                        prompt: on.iter().map(|it| it.text.as_str()).collect::<Vec<_>>().join(", "),
+                        portrait_key: sheet.portrait.clone(),
+                        kind,
+                        album_id: 0,
+                    };
+                    if origin.is_empty() {
+                        self.global_looks.retain(|l| !(l.kind == kind && l.name == name));
+                        self.global_looks.push(look);
+                    } else if let Some(card) =
+                        self.characters.iter_mut().find(|c| c.name == origin)
+                    {
+                        card.looks.retain(|l| !(l.kind == kind && l.name == name));
+                        card.looks.push(look);
+                    }
+                    saved += 1;
+                    (name, origin.clone())
+                }
+            };
+            if !sheet.from_image {
+                self.params.positive =
+                    crate::appearance::remove_tags(&self.params.positive, &on_set);
+                removed += on.len();
+                self.set_main_look(kind, Some((name, look_origin)));
             }
         }
-        if origin.is_empty() {
-            self.global_looks.retain(|l| !(l.kind == LookKind::Appearance && l.name == name));
-            self.global_looks.push(look);
+        let total = saved + reused;
+        if total == 0 {
+            return;
         }
-        let remove: HashSet<String> = on.iter().map(|it| tags::fold(&it.tag)).collect();
-        self.params.positive = crate::appearance::remove_tags(&self.params.positive, &remove);
-        self.note_prompt_edited();
-        self.set_main_look(LookKind::Appearance, Some((name.clone(), origin)));
-        self.status = format!("Extracted {} tags into {name}", on.len());
+        let plural = if total == 1 { "" } else { "s" };
+        let reuse_note =
+            if reused > 0 { format!(" ({reused} already saved)") } else { String::new() };
+        if sheet.from_image {
+            self.status = format!("Saved {total} preset{plural} from the image's tags{reuse_note}");
+        } else {
+            self.note_prompt_edited();
+            self.status =
+                format!("Extracted {removed} tags into {total} preset{plural}{reuse_note}");
+        }
     }
 
     /// The Create-Main single-axis look section: one combobox per [`LookKind::MAIN`]. Opens by
@@ -15591,6 +16431,28 @@ impl ComfyApp {
             .id_salt("create_main_looks")
             .default_open(!self.active_main_looks.is_empty())
             .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(format!("{} Extract from prompt", icons::GENERATE)).clicked() {
+                        self.open_extract_sheet(None);
+                    }
+                    if ui
+                        .button(format!("{} Look book", icons::GALLERY))
+                        .on_hover_text("Browse presets visually by their photos")
+                        .clicked()
+                    {
+                        self.look_book_open = true;
+                    }
+                    if ui
+                        .button(format!("{} Build", icons::MODEL))
+                        .on_hover_text(
+                            "Build a prompt from scratch: model by sample renders, subject, \
+                             then each look axis",
+                        )
+                        .clicked()
+                    {
+                        self.builder = Some(BuilderState { step: 0, subject: String::new() });
+                    }
+                });
                 for &kind in LookKind::MAIN {
                     self.main_look_combo(ui, kind);
                 }
@@ -15613,7 +16475,9 @@ impl ComfyApp {
         let mut manage = false;
         let mut extract = false;
         ui.horizontal(|ui| {
-            ui.add_sized(egui::vec2(96.0, 20.0), egui::Label::new(kind.label()));
+            let label =
+                egui::RichText::new(kind.label()).color(crate::theme::axis_color(kind));
+            ui.add_sized(egui::vec2(96.0, 20.0), egui::Label::new(label));
             let combo_w = (ui.available_width() - 4.0).max(120.0);
             egui::ComboBox::from_id_salt(("main_look", kind))
                 .selected_text(sanitize_ui_text(ui, &sel_text))
@@ -15622,56 +16486,92 @@ impl ComfyApp {
                     if ui.selectable_label(cur.is_none(), "None").clicked() {
                         pick = Some(None);
                     }
+                    // Sections: the user's own Global presets first (open), then each character,
+                    // then the long built-in list — all collapsible so nothing needs a deep
+                    // scroll. A section holding the current selection starts open.
                     crate::theme::scroll_vertical()
                         .max_height(320.0)
                         .id_salt(("main_look_scroll", kind))
                         .show(ui, |ui| {
-                    let mut first_builtin = true;
-                    for l in self.builtin_looks.iter().filter(|l| l.kind == kind) {
-                        if first_builtin {
-                            ui.weak("Presets");
-                            first_builtin = false;
-                        }
-                        let is_sel =
-                            cur.as_ref().is_some_and(|(n, o)| o == BUILTIN_ORIGIN && n == &l.name);
-                        let label = sanitize_ui_text(ui, &elide(&l.name, 30));
-                        if ui.selectable_label(is_sel, label).clicked() {
-                            pick = Some(Some((l.name.clone(), BUILTIN_ORIGIN.to_string())));
-                        }
-                    }
-                    let mut first_global = true;
-                    for l in self.global_looks.iter().filter(|l| l.kind == kind) {
-                        if first_global {
-                            ui.separator();
-                            ui.weak("Global");
-                            first_global = false;
-                        }
-                        let is_sel = cur.as_ref().is_some_and(|(n, o)| o.is_empty() && n == &l.name);
-                        let label = sanitize_ui_text(ui, &elide(&l.name, 30));
-                        if ui.selectable_label(is_sel, label).clicked() {
-                            pick = Some(Some((l.name.clone(), String::new())));
-                        }
-                    }
-                    for card in &self.characters {
-                        let mut first = true;
-                        for l in card.looks.iter().filter(|l| l.kind == kind) {
-                            if first {
-                                ui.separator();
-                                ui.weak(sanitize_ui_text(ui, &elide(&card.name, 24)));
-                                first = false;
+                            let mut section =
+                                |ui: &mut egui::Ui,
+                                 title: String,
+                                 salt: (&str, LookKind, &str),
+                                 open: bool,
+                                 rows: Vec<(String, String)>| {
+                                    if rows.is_empty() {
+                                        return;
+                                    }
+                                    egui::CollapsingHeader::new(sanitize_ui_text(ui, &title))
+                                        .id_salt(salt)
+                                        .default_open(open)
+                                        .show(ui, |ui| {
+                                            for (name, origin) in rows {
+                                                let is_sel = cur
+                                                    .as_ref()
+                                                    .is_some_and(|(n, o)| *o == origin && *n == name);
+                                                let label =
+                                                    sanitize_ui_text(ui, &elide(&name, 30));
+                                                if ui.selectable_label(is_sel, label).clicked() {
+                                                    pick = Some(Some((name, origin)));
+                                                }
+                                            }
+                                        });
+                                };
+                            let globals: Vec<(String, String)> = self
+                                .global_looks
+                                .iter()
+                                .filter(|l| l.kind == kind)
+                                .map(|l| (l.name.clone(), String::new()))
+                                .collect();
+                            section(
+                                ui,
+                                format!("Global ({})", globals.len()),
+                                ("mlk_global", kind, ""),
+                                true,
+                                globals,
+                            );
+                            for card in &self.characters {
+                                let rows: Vec<(String, String)> = card
+                                    .looks
+                                    .iter()
+                                    .filter(|l| l.kind == kind)
+                                    .map(|l| (l.name.clone(), card.name.clone()))
+                                    .collect();
+                                let n = rows.len();
+                                let open =
+                                    cur.as_ref().is_some_and(|(_, o)| o == &card.name);
+                                section(
+                                    ui,
+                                    format!("{} ({n})", elide(&card.name, 22)),
+                                    ("mlk_char", kind, card.name.as_str()),
+                                    open,
+                                    rows,
+                                );
                             }
-                            let is_sel =
-                                cur.as_ref().is_some_and(|(n, o)| o == &card.name && n == &l.name);
-                            let label = sanitize_ui_text(ui, &elide(&l.name, 30));
-                            if ui.selectable_label(is_sel, label).clicked() {
-                                pick = Some(Some((l.name.clone(), card.name.clone())));
-                            }
-                        }
-                    }
+                            let builtins: Vec<(String, String)> = self
+                                .builtin_looks
+                                .iter()
+                                .filter(|l| l.kind == kind)
+                                .map(|l| (l.name.clone(), BUILTIN_ORIGIN.to_string()))
+                                .collect();
+                            let open =
+                                cur.as_ref().is_some_and(|(_, o)| o == BUILTIN_ORIGIN);
+                            section(
+                                ui,
+                                format!("Built-in ({})", builtins.len()),
+                                ("mlk_builtin", kind, ""),
+                                open,
+                                builtins,
+                            );
                         });
                     ui.separator();
-                    if kind == LookKind::Appearance
-                        && ui.button(format!("{} Extract from prompt", icons::GENERATE)).clicked()
+                    let ex_label =
+                        format!("{} Extract {}", icons::GENERATE, kind.label().to_lowercase());
+                    if ui
+                        .button(ex_label)
+                        .on_hover_text("Pull only this axis' tags out of the prompt")
+                        .clicked()
                     {
                         extract = true;
                     }
@@ -15687,7 +16587,7 @@ impl ComfyApp {
             self.set_main_look(kind, choice);
         }
         if extract {
-            self.open_extract_sheet();
+            self.open_extract_sheet(Some(kind));
         }
         if manage {
             self.looks_window = Some(kind);
@@ -15706,7 +16606,8 @@ impl ComfyApp {
                 ui.weak("Global presets — available in every character's combobox for this axis.");
                 ui.add_space(4.0);
                 crate::theme::scroll_vertical().max_height(360.0).show(ui, |ui| {
-                    look_list_editor(ui, &mut self.global_looks, kind, 320.0, "looks_win");
+                    let albums = self.albums.clone();
+                    look_list_editor(ui, &mut self.global_looks, kind, 320.0, "looks_win", &albums);
                 });
             });
         if !open {
@@ -19357,7 +20258,105 @@ impl ComfyApp {
                 }
             }
         }
+        // The listing merge needs these before the first server page lands, and this is the one
+        // call every gallery path already makes.
+        if !self.local_items_loaded
+            && let Some(root) = self.full_cache_root.clone()
+        {
+            self.ensure_local_items(&root);
+        }
         self.full_cache_root.as_deref()
+    }
+
+    /// Load the on-device renders off disk, once per session.
+    fn ensure_local_items(&mut self, root: &str) {
+        if self.local_items_loaded {
+            return;
+        }
+        self.local_items_loaded = true;
+        self.local_items = gallery::local_items(root);
+        if !self.local_items.is_empty() {
+            self.log.info(format!("gallery: {} on-device render(s)", self.local_items.len()));
+        }
+    }
+
+    /// File a finished on-device render into the gallery.
+    ///
+    /// Nothing else ever will: the server never saw it, so it appears in no listing and a refresh
+    /// would drop it. The bytes go into the full-image cache — where the thumb and viewer paths
+    /// already read from first — and the row goes straight into the listing on screen.
+    fn file_local_result(&mut self, host: &Host, bytes: &[u8]) {
+        let Some(root) = self.ensure_full_cache_root(host).map(str::to_string) else {
+            self.gallery_status = "No storage available — the on-device render wasn't saved".into();
+            self.log.error("local result: no gallery cache root");
+            return;
+        };
+        let at = unix_now();
+        let filename = format!("local-{}-{}.png", (at * 1000.0) as u64, self.result_seq);
+        let Some(key) = gallery::write_local_image(&root, &filename, bytes) else {
+            self.gallery_status = format!("Couldn't save the on-device render under {root}");
+            self.log.error(format!("local result: write failed under {root}"));
+            return;
+        };
+        let item = GalleryItem {
+            subfolder: gallery::LOCAL_SUBFOLDER.to_string(),
+            filename,
+            size: bytes.len() as u64,
+            is_video: false,
+            has_workflow: false,
+            models: self.local_result_models(),
+            mtime: Some(at),
+        };
+        self.local_items.insert(0, item);
+        self.merge_local_items();
+        self.gallery_unseen.insert(key.clone());
+        self.local_saved = true;
+        self.log.info(format!("local result saved: {root}/{key} ({} bytes)", bytes.len()));
+    }
+
+    /// Model label carried by an on-device render, so it groups and filters like a server image.
+    fn local_result_models(&self) -> Vec<String> {
+        #[cfg(feature = "local-npu")]
+        {
+            if !self.local_pack.is_empty() {
+                return vec![self.local_pack.clone()];
+            }
+        }
+        Vec::new()
+    }
+
+    /// Splice the on-device renders into a freshly listed page, newest-first across both.
+    ///
+    /// Only on the default view: under a server-answered filter these are rows the server was
+    /// never asked about, and showing them would claim they matched.
+    fn merge_local_items(&mut self) {
+        if self.local_items.is_empty() || self.gallery_filters_active() {
+            return;
+        }
+        let listed: HashSet<String> = self.gallery.iter().map(|it| it.key()).collect();
+        let fresh: Vec<GalleryItem> =
+            self.local_items.iter().filter(|it| !listed.contains(&it.key())).cloned().collect();
+        if fresh.is_empty() {
+            return;
+        }
+        self.gallery_total += fresh.len() as u64;
+        // Both sides are already newest-first, so one merge pass keeps the whole page ordered.
+        let mut out = Vec::with_capacity(fresh.len() + self.gallery.len());
+        let mut local = fresh.into_iter().peekable();
+        let mut server = std::mem::take(&mut self.gallery).into_iter().peekable();
+        loop {
+            let take_local = match (local.peek(), server.peek()) {
+                (Some(l), Some(s)) => l.mtime.unwrap_or(0.0) >= s.mtime.unwrap_or(0.0),
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            match if take_local { local.next() } else { server.next() } {
+                Some(it) => out.push(it),
+                None => break,
+            }
+        }
+        self.gallery = out;
     }
 
     fn format_bytes(n: u64) -> String {
@@ -20580,7 +21579,7 @@ impl ComfyApp {
             self.select_mode = false;
             host.haptic(Haptic::Light);
         } else if delete {
-            self.request_delete_images(items);
+            self.request_delete_images(items, host);
             host.haptic(Haptic::Warning);
         } else if triage_sel {
             // Grade-pass exactly the selection (doesn't touch the post-burst `untriaged` set).
@@ -20628,20 +21627,44 @@ impl ComfyApp {
     }
 
     /// Queue a gallery delete, optionally after a confirmation dialog.
-    fn request_delete_images(&mut self, items: Vec<(String, String)>) {
+    fn request_delete_images(&mut self, items: Vec<(String, String)>, host: &Host) {
         if items.is_empty() {
             return;
         }
         if self.confirm_gallery_delete {
             self.delete_confirm = Some((items, false));
         } else {
-            self.send_delete_images(items);
+            self.send_delete_images(items, host);
         }
     }
 
     /// Tombstone the keys, then send the delete: a listing the server indexed mid-delete can
     /// still carry these rows, and the tombstones keep them out of the grid until it settles.
-    fn send_delete_images(&mut self, items: Vec<(String, String)>) {
+    fn send_delete_images(&mut self, items: Vec<(String, String)>, host: &Host) {
+        let root = self.full_cache_root.clone();
+        // An on-device render lives only in the cache, so deleting it IS the local file — no
+        // server call, no tombstone, and it works offline where a server delete cannot.
+        let (local, items): (Vec<_>, Vec<_>) =
+            items.into_iter().partition(|(sub, _)| sub == gallery::LOCAL_SUBFOLDER);
+        for (sub, file) in &local {
+            let key = format!("{sub}/{file}");
+            if let Some(root) = root.as_deref() {
+                gallery::forget_full_cache(root, &key);
+            }
+            self.thumbs.forget(&key);
+            self.gallery_unseen.remove(&key);
+            self.local_items.retain(|it| it.key() != key);
+            self.gallery.retain(|it| it.key() != key);
+            self.gallery_total = self.gallery_total.saturating_sub(1);
+        }
+        if items.is_empty() {
+            // No server round trip means no listing to reopen the viewer over: do it here, or a
+            // viewer stays parked on the image it just deleted.
+            if !local.is_empty() {
+                self.resume_viewer_after_delete(host);
+            }
+            return;
+        }
         // Offline this would tombstone the rows locally — hiding them for the tombstone's whole
         // TTL — while the server never hears about it and still holds every file. Refuse instead
         // of pretending it worked.
@@ -20650,7 +21673,6 @@ impl ComfyApp {
             return;
         }
         let at = unix_now();
-        let root = self.full_cache_root.clone();
         // Sizes come from the listing, and tell a resurrected row apart from a new image that was
         // handed the same filename.
         let sized: Vec<((String, String), u64)> = items
@@ -20889,7 +21911,7 @@ impl ComfyApp {
                 self.confirm_gallery_delete = false;
             }
             self.delete_confirm = None;
-            self.send_delete_images(items);
+            self.send_delete_images(items, host);
             host.haptic(Haptic::Warning);
         }
     }
@@ -21614,7 +22636,7 @@ impl ComfyApp {
                     let items = self.items_for_keys(&t.trash);
                     if !items.is_empty() {
                         let n = items.len();
-                        self.send_delete_images(items);
+                        self.send_delete_images(items, host);
                         self.gallery_status = format!("Triage: moved {n} to trash");
                         host.haptic(Haptic::Warning);
                     }
@@ -22074,6 +23096,7 @@ impl ComfyApp {
             AlbumCreate,
             SetPortrait(String),
             SetLookPhoto(String, usize),
+            SetGlobalLookPhoto(usize),
             Delete,
             Show(usize),
             #[cfg(feature = "local-npu")]
@@ -22313,6 +23336,25 @@ impl ComfyApp {
                                 }
                             });
                         }
+                        if !self.global_looks.is_empty() {
+                            ui.menu_button(format!("{} Set as preset photo", icons::STAR), |ui| {
+                                crate::theme::scroll_vertical()
+                                    .max_height(280.0)
+                                    .id_salt("set_preset_photo")
+                                    .show(ui, |ui| {
+                                        for (i, l) in self.global_looks.iter().enumerate() {
+                                            let text =
+                                                format!("{} — {}", l.kind.label(), l.name);
+                                            let label =
+                                                sanitize_ui_text(ui, &elide(&text, 34));
+                                            if ui.button(label).clicked() {
+                                                act = Some(Act::SetGlobalLookPhoto(i));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                            });
+                        }
                         if ui.button(format!("{} Use as img2img input", icons::IMAGE)).clicked() {
                             act = Some(Act::UseAsInput);
                             ui.close();
@@ -22547,11 +23589,19 @@ impl ComfyApp {
                     host.haptic(Haptic::Light);
                 }
             }
+            Some(Act::SetGlobalLookPhoto(i)) => {
+                let key = self.viewer.as_ref().map(|v| v.item.key());
+                if let (Some(key), Some(look)) = (key, self.global_looks.get_mut(i)) {
+                    look.portrait_key = key;
+                    self.gallery_status = format!("Photo set for {}", elide(&look.name, 20));
+                    host.haptic(Haptic::Light);
+                }
+            }
             Some(Act::Delete) => {
                 self.remember_viewer_neighbor_after_delete();
                 let v = self.viewer.as_ref().unwrap();
                 let items = vec![(v.item.subfolder.clone(), v.item.filename.clone())];
-                self.request_delete_images(items);
+                self.request_delete_images(items, host);
                 host.haptic(Haptic::Warning);
             }
             Some(Act::Save) => {
@@ -22659,6 +23709,7 @@ impl ComfyApp {
             #[cfg(feature = "local-npu")]
             Some(Act::ReadTags) => {
                 if let Some(bytes) = self.viewer.as_ref().and_then(|v| v.bytes.clone()) {
+                    self.wd14_sheet_key = self.viewer.as_ref().map(|v| v.item.key());
                     self.start_wd14(ui.ctx(), host, bytes);
                 }
             }
@@ -23451,6 +24502,7 @@ impl ComfyApp {
         enum WAct {
             Add(String),
             AddTop(usize),
+            Extract,
             Close,
         }
         let mut open = true;
@@ -23469,6 +24521,13 @@ impl ComfyApp {
                     ui.label(format!("{} general tags", result.general.len()));
                     if ui.button(format!("{} Add top 10", icons::ADD)).clicked() {
                         act = Some(WAct::AddTop(10));
+                    }
+                    if ui
+                        .button(format!("{} Extract presets", icons::GENERATE))
+                        .on_hover_text("Turn this image's look tags into swappable presets")
+                        .clicked()
+                    {
+                        act = Some(WAct::Extract);
                     }
                 });
                 ui.weak("Tap a tag to add it to the prompt.");
@@ -23515,6 +24574,17 @@ impl ComfyApp {
                     self.params.positive = tags::push_chip(&self.params.positive, &tag);
                 }
                 host.haptic(Haptic::Light);
+                self.wd14_sheet = None;
+            }
+            Some(WAct::Extract) => {
+                let tags: Vec<String> = result
+                    .character
+                    .iter()
+                    .chain(result.general.iter())
+                    .map(|t| t.insert_text())
+                    .collect();
+                let portrait = self.wd14_sheet_key.clone().unwrap_or_default();
+                self.open_extract_sheet_from_tags(&tags, portrait);
                 self.wd14_sheet = None;
             }
             Some(WAct::Close) => self.wd14_sheet = None,
@@ -24358,6 +25428,9 @@ impl EguiApp for ComfyApp {
         self.dup_create_window(ui.ctx(), host);
         self.looks_window(ui.ctx());
         self.extract_sheet_ui(ui.ctx());
+        self.sweep_window(ui.ctx(), host);
+        self.look_book_window(ui.ctx());
+        self.builder_window(ui.ctx(), host);
         self.error_modal_window(ui.ctx(), host);
 
         // Keep the server-wide queue in view even when jobs were started on the website. Poll faster
@@ -25457,6 +26530,7 @@ fn look_list_editor(
     only: LookKind,
     width: f32,
     id_scope: &str,
+    albums: &[Album],
 ) {
     if ui.button(format!("{} Add {}", icons::ADD, only.label().to_lowercase())).clicked() {
         let name = unique_look_name(list);
@@ -25491,6 +26565,27 @@ fn look_list_editor(
                         .desired_rows(2)
                         .desired_width(width),
                 );
+                // A flat list, not a ComboBox: this editor lives in a `centered()` window
+                // (Order::Tooltip), which sits above the layer dropdown popups paint on.
+                let sel = albums
+                    .iter()
+                    .find(|a| a.id == list[i].album_id)
+                    .map(|a| elide(&a.name, 18))
+                    .unwrap_or_else(|| "None".into());
+                egui::CollapsingHeader::new(sanitize_ui_text(ui, &format!("Example album: {sel}")))
+                    .id_salt((id_scope, "look_album", i))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        if ui.selectable_label(list[i].album_id == 0, "None").clicked() {
+                            list[i].album_id = 0;
+                        }
+                        for a in albums {
+                            let label = sanitize_ui_text(ui, &elide(&a.name, 24));
+                            if ui.selectable_label(list[i].album_id == a.id, label).clicked() {
+                                list[i].album_id = a.id;
+                            }
+                        }
+                    });
                 if ui.button(format!("{} Delete", icons::TRASH)).clicked() {
                     del = Some(i);
                 }

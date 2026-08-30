@@ -2,7 +2,7 @@
 
 use crate::tags;
 use crate::types::{
-    ActiveLora, CheckpointEntry, LoraEntry, Params, append_negatives, file_basename,
+    ActiveLora, CheckpointEntry, LoraEntry, Mode, Params, append_negatives, file_basename,
     merge_triggers, split_triggers,
 };
 
@@ -230,6 +230,51 @@ pub fn lint(
         });
     }
 
+    // 6. Unknown positive tags with a confident dictionary correction (typos like "tonails").
+    // Only tags that are foreign to the dictionary, the axis classifier, AND the LoRA trigger
+    // set are candidates, and only a close edit-distance neighbour flags — so trigger tokens
+    // and deliberate oddities stay silent. Tag-mode prompts only; video prompts are prose.
+    if params.mode != Mode::Video {
+        let mut known_triggers: std::collections::HashSet<String> =
+            tags::parse_chips(params.active_lora_triggers()).iter().map(|c| fold(&c.tag)).collect();
+        for (al, entry) in loras {
+            if let Some(e) = entry {
+                known_triggers.extend(e.trigger_words.iter().map(|t| fold(t)));
+            }
+            known_triggers.extend(split_triggers(&al.injected).iter().map(|t| fold(t)));
+        }
+        let meta_ok = |t: &str| {
+            t.starts_with("score ")
+                || t.ends_with(" quality")
+                || matches!(t, "newest" | "oldest" | "safe" | "anime" | "source anime")
+        };
+        let dict = tags::TagDict::bundled();
+        let mut flagged = 0;
+        for (i, chip) in tags::parse_chips(&params.positive).iter().enumerate() {
+            if flagged >= 3 {
+                break;
+            }
+            let t = fold(&chip.tag);
+            if t.chars().count() < 4
+                || t.split_whitespace().count() > 5
+                || meta_ok(&t)
+                || known_triggers.contains(&t)
+                || crate::appearance::classify_axis(&t).is_some()
+                || dict.lookup(&t).is_some()
+            {
+                continue;
+            }
+            let Some(m) = dict.close_match(&t) else { continue };
+            let fixed = tags::replace_chip_tag(&params.positive, i, &m.insert_text());
+            issues.push(LintIssue {
+                severity: Severity::Warn,
+                msg: format!("Unknown tag '{}' — did you mean '{}'?", chip.tag, m.insert_text()),
+                fix: Some(Fix::SetPositive(fixed)),
+            });
+            flagged += 1;
+        }
+    }
+
     issues
 }
 
@@ -336,6 +381,42 @@ mod tests {
         // Escaped parens are not counted.
         let ok = Params { positive: "\\(a cat\\)".into(), ..Default::default() };
         assert!(!lint(&ok, None, &[]).iter().any(|i| i.msg.contains("Unbalanced")));
+    }
+
+    #[test]
+    fn unknown_tags_get_did_you_mean_fixes() {
+        let params = Params {
+            positive: "1girl, tonails, fjcump, skindention".into(),
+            ..Default::default()
+        };
+        let issues = lint(&params, None, &[]);
+        let ton = issues.iter().find(|i| i.msg.contains("tonails")).expect("tonails flagged");
+        assert!(ton.msg.contains("toenails"), "{}", ton.msg);
+        assert!(matches!(&ton.fix,
+            Some(Fix::SetPositive(s)) if s == "1girl, toenails, fjcump, skindention"));
+        // A trigger-looking token with no close dictionary neighbour stays silent.
+        assert!(!issues.iter().any(|i| i.msg.contains("fjcump")));
+        // Distance-2 correction on a long single-word tag.
+        let skin = issues.iter().find(|i| i.msg.contains("skindention")).expect("skindention");
+        assert!(skin.msg.contains("skindentation"), "{}", skin.msg);
+
+        // LoRA trigger words are exempt even when the dictionary has a close neighbour.
+        let al = active("style.safetensors");
+        let entry = lora_entry("style.safetensors", &["glow"]);
+        let params = Params { positive: "glow, 1girl".into(), ..Default::default() };
+        assert!(
+            !lint(&params, None, &[(&al, Some(&entry))])
+                .iter()
+                .any(|i| i.msg.contains("Unknown"))
+        );
+
+        // Video prompts are prose; the rule stays out entirely.
+        let video = Params {
+            positive: "a woman in a tonails necklace walks away".into(),
+            mode: Mode::Video,
+            ..Default::default()
+        };
+        assert!(!lint(&video, None, &[]).iter().any(|i| i.msg.contains("Unknown")));
     }
 
     #[test]

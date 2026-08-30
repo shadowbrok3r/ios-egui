@@ -194,6 +194,76 @@ pub fn suggest(prefix: &str, limit: usize) -> Vec<&'static TagEntry> {
     TagDict::bundled().suggest(prefix, limit)
 }
 
+/// Bounded Levenshtein distance between `a` and `b`; `None` once it must exceed `max`.
+fn edit_distance_within(a: &str, b: &str, max: usize) -> Option<usize> {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.len().abs_diff(b.len()) > max {
+        return None;
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        let mut row_min = cur[0];
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            row_min = row_min.min(cur[j]);
+        }
+        if row_min > max {
+            return None;
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    (prev[b.len()] <= max).then_some(prev[b.len()])
+}
+
+impl TagDict {
+    /// The best dictionary tag near `tag`: same first character, count at least 50, edit
+    /// distance 1 — or 2 when the word counts match and the tag is 6+ chars (else "a cat"
+    /// suggests "ascot"). Smaller distance then higher count wins; aliases resolve to canonical.
+    /// `None` for tags the dictionary already knows, or with no confident correction.
+    pub fn close_match(&self, tag: &str) -> Option<&TagEntry> {
+        let q = fold(tag);
+        if q.chars().count() < 4 || self.lookup(&q).is_some() {
+            return None;
+        }
+        let q_words = q.split_whitespace().count();
+        let q_long = q.chars().count() >= 6;
+        let first = q.as_bytes()[0].to_ascii_lowercase();
+        let mut best: Option<(usize, &TagEntry)> = None;
+        for e in &self.entries {
+            if e.count < 50 {
+                continue;
+            }
+            let nb = e.name.as_bytes();
+            if nb.is_empty()
+                || nb[0].to_ascii_lowercase() != first
+                || nb.len().abs_diff(q.len()) > 2
+            {
+                continue;
+            }
+            let name = fold(&e.name);
+            let Some(d) = edit_distance_within(&q, &name, 2) else { continue };
+            if d == 2 && !(q_long && name.split_whitespace().count() == q_words) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((bd, be)) => d < bd || (d == bd && e.count > be.count),
+            };
+            if better {
+                best = Some((d, e));
+            }
+        }
+        best.map(|(_, e)| match e.canonical {
+            Some(ci) => &self.entries[ci as usize],
+            None => e,
+        })
+    }
+}
+
 /// The partial tag under `cursor_byte`: from the last `,` / newline / `(` back-scan to the cursor,
 /// trimmed and stripped of any trailing `:weight`. Multibyte-safe; returns its byte range and slice.
 pub fn token_at(text: &str, cursor_byte: usize) -> (Range<usize>, &str) {

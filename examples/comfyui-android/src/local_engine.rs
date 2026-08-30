@@ -445,7 +445,7 @@ fn run_sd15(
             image.height,
             png.len()
         ));
-        send(Msg::Result { image: ci, bytes: png, label: "Local NPU".into() });
+        send(Msg::Result { image: ci, bytes: png, label: "Local NPU".into(), local: true });
         Ok(())
     })();
 
@@ -580,7 +580,7 @@ fn run_anima(
             image.height,
             png.len()
         ));
-        send(Msg::Result { image: ci, bytes: png, label: "Local Anima".into() });
+        send(Msg::Result { image: ci, bytes: png, label: "Local Anima".into(), local: true });
         Ok(())
     })();
 

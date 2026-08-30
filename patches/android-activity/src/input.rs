@@ -1327,6 +1327,12 @@ static POINTER_BUTTONS: AtomicU32 = AtomicU32::new(0);
 static POINTER_HOVERING: AtomicBool = AtomicBool::new(false);
 static POINTER_HOVER_X: AtomicU32 = AtomicU32::new(0);
 static POINTER_HOVER_Y: AtomicU32 = AtomicU32::new(0);
+/// Stylus geometry, as f32 bits. Reported on every sample by a pen that has
+/// them and simply absent on one that does not, so a zero here means "upright
+/// or unknown" rather than an error.
+static POINTER_TILT: AtomicU32 = AtomicU32::new(0);
+static POINTER_AZIMUTH: AtomicU32 = AtomicU32::new(0);
+static POINTER_DISTANCE: AtomicU32 = AtomicU32::new(0);
 
 /// Pointer tool from the most recent motion event (Android `getToolType`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1347,6 +1353,12 @@ pub struct PointerProbe {
     pub buttons: u32,
     /// Hover position in window physical pixels when the pointer hovers without contact.
     pub hover: Option<(f32, f32)>,
+    /// Angle from vertical, radians. 0 is a pen held upright.
+    pub tilt: f32,
+    /// Direction the pen is leaning, radians, clockwise from screen-up.
+    pub azimuth: f32,
+    /// Tip-to-glass distance in device units while hovering; 0 in contact.
+    pub distance: f32,
 }
 
 fn tool_to_u8(t: ToolType) -> u8 {
@@ -1376,7 +1388,15 @@ pub fn pointer_probe() -> PointerProbe {
             f32::from_bits(POINTER_HOVER_Y.load(Ordering::Relaxed)),
         )
     });
-    PointerProbe { tool, buttons: POINTER_BUTTONS.load(Ordering::Relaxed), hover }
+    let bits = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
+    PointerProbe {
+        tool,
+        buttons: POINTER_BUTTONS.load(Ordering::Relaxed),
+        hover,
+        tilt: bits(&POINTER_TILT),
+        azimuth: bits(&POINTER_AZIMUTH),
+        distance: bits(&POINTER_DISTANCE),
+    }
 }
 
 // Record tool type / hover / buttons from a motion event without consuming it.
@@ -1398,6 +1418,11 @@ fn record_pointer_from_event(event: &crate::activity_impl::input::InputEvent) {
     let p = m.pointer_at_index(idx);
     POINTER_TOOL.store(tool_to_u8(p.tool_type()), Ordering::Relaxed);
     POINTER_BUTTONS.store(m.button_state().0, Ordering::Relaxed);
+    // Tilt and azimuth arrive on every sample from a pen that reports them and
+    // are simply 0 from one that does not, so there is nothing to gate on.
+    POINTER_TILT.store(p.axis_value(Axis::Tilt).to_bits(), Ordering::Relaxed);
+    POINTER_AZIMUTH.store(p.orientation().to_bits(), Ordering::Relaxed);
+    POINTER_DISTANCE.store(p.axis_value(Axis::Distance).to_bits(), Ordering::Relaxed);
     match action {
         MotionAction::HoverEnter | MotionAction::HoverMove => {
             POINTER_HOVER_X.store(p.x().to_bits(), Ordering::Relaxed);

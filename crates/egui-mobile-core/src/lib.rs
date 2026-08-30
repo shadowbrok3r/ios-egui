@@ -8,4 +8,4 @@ mod app;
 mod host;
 
 pub use app::{CreateContext, EguiApp};
-pub use host::{Haptic, Host, HostRequest, Insets, Permission};
+pub use host::{Haptic, Host, HostRequest, Insets, Permission, StylusProbe};

@@ -785,6 +785,10 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 /// Durable gallery tree (same root as model packs). Full images live in `gallery_full/`.
 pub const DURABLE_GALLERY_ROOT: &str = "/storage/emulated/0/ComfyUI";
 
+/// Subfolder every on-device render is filed under. The server never lists these — the cache
+/// holds their only copy — so they are exempt from eviction and from the manual cache wipe.
+pub const LOCAL_SUBFOLDER: &str = "on-device";
+
 /// Keeps Android's media scanner from indexing a directory tree into the phone's Photos app.
 const NOMEDIA: &str = ".nomedia";
 
@@ -839,6 +843,70 @@ fn full_cache_key_path(dir: &Path, key: &str) -> PathBuf {
 fn is_full_cache_meta(name: &std::ffi::OsStr) -> bool {
     let s = name.to_string_lossy();
     s == ".write_test" || s == NOMEDIA || s.ends_with(".key")
+}
+
+/// True for a cache filename that [`full_cache_path`] flattened out of a local key.
+fn is_local_cache_file(name: &std::ffi::OsStr) -> bool {
+    name.to_string_lossy().strip_prefix(LOCAL_SUBFOLDER).is_some_and(|r| r.starts_with('_'))
+}
+
+/// Store an on-device render under `LOCAL_SUBFOLDER/filename` and return its gallery key.
+///
+/// Deliberately not [`write_full_cache`]: that evicts to a byte budget, and these files have no
+/// server copy to re-download.
+pub fn write_local_image(root: &str, filename: &str, bytes: &[u8]) -> Option<String> {
+    let dir = Path::new(root);
+    std::fs::create_dir_all(dir).ok()?;
+    let key = format!("{LOCAL_SUBFOLDER}/{filename}");
+    std::fs::write(full_cache_path(dir, &key), bytes).ok()?;
+    std::fs::write(full_cache_key_path(dir, &key), key.as_bytes()).ok()?;
+    Some(key)
+}
+
+/// On-device renders in `root`, newest first — the rows a server listing can never carry.
+///
+/// Narrowed to the local prefix before touching anything, rather than filtering [`offline_items`]:
+/// this runs on the first gallery frame, and reading a sidecar per file over a cache holding
+/// thousands of server images is the stall the prefetch scan already budgets around.
+pub fn local_items(root: &str) -> Vec<crate::types::GalleryItem> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut items: Vec<crate::types::GalleryItem> = Vec::new();
+    for ent in rd.flatten() {
+        let sidecar = ent.file_name();
+        let name = sidecar.to_string_lossy();
+        if !is_local_cache_file(&sidecar) || !name.ends_with(".key") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(ent.path()) else { continue };
+        let Some(filename) = raw.trim().strip_prefix(LOCAL_SUBFOLDER).and_then(|f| f.strip_prefix('/'))
+        else {
+            continue;
+        };
+        let Ok(meta) = std::fs::metadata(Path::new(root).join(name.trim_end_matches(".key")))
+        else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() == 0 {
+            continue;
+        }
+        items.push(crate::types::GalleryItem {
+            size: meta.len(),
+            mtime: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs_f64()),
+            is_video: crate::graphview::is_pick_video(filename),
+            has_workflow: false,
+            models: Vec::new(),
+            subfolder: LOCAL_SUBFOLDER.to_string(),
+            filename: filename.to_string(),
+        });
+    }
+    items.sort_by(|a, b| b.mtime.unwrap_or(0.0).total_cmp(&a.mtime.unwrap_or(0.0)));
+    items
 }
 
 /// What a delete's tombstone should do with a listing row carrying its name.
@@ -992,8 +1060,9 @@ pub fn offline_items(root: &str) -> Vec<crate::types::GalleryItem> {
                     .map(|d| d.as_secs_f64()),
                 is_video,
                 // A video's graph lives in its container and is only readable from the bytes we
-                // already hold; a still's is in the PNG. Either way it is worth offering.
-                has_workflow: true,
+                // already hold; a still's is in the PNG. Either way it is worth offering — except
+                // for on-device renders, which are encoded here with no metadata at all.
+                has_workflow: subfolder != LOCAL_SUBFOLDER,
                 models: Vec::new(),
                 subfolder,
                 filename,
@@ -1046,7 +1115,8 @@ pub fn clear_full_cache(root: &str) -> Result<usize, String> {
     for ent in rd.flatten() {
         let path = ent.path();
         // `.nomedia` stays: removing it re-publishes the tree to Photos on the next scan.
-        if ent.file_name() == NOMEDIA {
+        // On-device renders stay too — this wipe frees re-downloadable copies, not originals.
+        if ent.file_name() == NOMEDIA || is_local_cache_file(&ent.file_name()) {
             continue;
         }
         if path.is_file() && std::fs::remove_file(&path).is_ok() {
@@ -1062,7 +1132,10 @@ fn evict_full_cache(dir: &Path) {
     let mut total = 0u64;
     for ent in rd.flatten() {
         let Ok(meta) = ent.metadata() else { continue };
-        if !meta.is_file() || is_full_cache_meta(&ent.file_name()) {
+        // On-device renders are neither counted nor evicted: nothing could re-download them, and
+        // counting them would make an over-budget local library evict the whole server cache.
+        let name = ent.file_name();
+        if !meta.is_file() || is_full_cache_meta(&name) || is_local_cache_file(&name) {
             continue;
         }
         let len = meta.len();
@@ -1527,6 +1600,40 @@ mod tests {
         assert!(!full_cache_has(&dir, "u1/a/1.png"));
         assert!(full_cache_keys(&dir).iter().all(|k| k != "u1/a/1.png"));
         assert!(full_cache_has(&dir, "u1/a/2.png"), "siblings survive");
+    }
+
+    /// An on-device render is the only copy there is: the eviction pass and the manual cache wipe
+    /// must both leave it alone, however far over budget the directory runs.
+    #[test]
+    fn an_on_device_render_survives_eviction_and_the_cache_wipe() {
+        let dir = temp_dir("local-durable");
+        ensure_nomedia(&dir);
+        let key = write_local_image(&dir, "local-1.png", b"png").unwrap();
+        assert_eq!(key, "on-device/local-1.png");
+        write_full_cache(&dir, "u1/a/1.png", b"png");
+        // write_full_cache runs the eviction pass; a budget-sized library would too.
+        evict_full_cache(Path::new(&dir));
+        assert!(full_cache_has(&dir, &key));
+        clear_full_cache(&dir).unwrap();
+        assert!(!full_cache_has(&dir, "u1/a/1.png"), "the server copy is re-downloadable");
+        assert!(full_cache_has(&dir, &key), "the on-device render is not");
+        assert_eq!(read_full_cache(&dir, &key).as_deref(), Some(&b"png"[..]));
+    }
+
+    /// The offline listing is how on-device renders reach the grid with no server, so they have to
+    /// come back addressable — and without claiming a workflow they were never encoded with.
+    #[test]
+    fn on_device_renders_list_themselves_apart_from_cached_server_images() {
+        let dir = temp_dir("local-items");
+        write_local_image(&dir, "local-1.png", b"png").unwrap();
+        write_full_cache(&dir, "u1/a/1.png", b"png");
+        let local = local_items(&dir);
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].subfolder, LOCAL_SUBFOLDER);
+        assert_eq!(local[0].filename, "local-1.png");
+        assert_eq!(local[0].key(), "on-device/local-1.png");
+        assert!(!local[0].has_workflow);
+        assert_eq!(offline_items(&dir).len(), 2, "cached server images still list");
     }
 
     fn item(sub: &str, file: &str, models: &[&str]) -> GalleryItem {

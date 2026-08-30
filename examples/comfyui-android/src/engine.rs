@@ -94,7 +94,8 @@ pub enum Msg {
     /// One finished output image. `label` is the submitting job's display label, so consumers
     /// that fan several jobs out at once (the character taste test) can attribute each image
     /// to its job — arrival order alone lies when the server runs jobs out of submission order.
-    Result { image: egui::ColorImage, bytes: Vec<u8>, label: String },
+    /// `local` marks an on-device render: there is no server copy, so the UI has to file it.
+    Result { image: egui::ColorImage, bytes: Vec<u8>, label: String, local: bool },
     /// A node started executing (`None` = prompt finished). WebSocket transport only today.
     NodeExecuting(Option<u32>),
     /// A node finished and produced images (raw encoded bytes, for graph-node display).
@@ -3166,7 +3167,7 @@ async fn stream_execution(
                 send!(Msg::NodeExecuted { node: node.0, images: images.clone() });
                 for bytes in images {
                     if let Some(ci) = decode(&bytes) {
-                        send!(Msg::Result { image: ci, bytes, label: label.clone() });
+                        send!(Msg::Result { image: ci, bytes, label: label.clone(), local: false });
                     }
                 }
             }
@@ -3285,8 +3286,12 @@ async fn reconcile_from_history(
                     let _ = tx.send(Msg::NodeExecuted { node: node.0, images: images.clone() });
                     for bytes in images {
                         if let Some(ci) = decode(&bytes) {
-                            let _ =
-                                tx.send(Msg::Result { image: ci, bytes, label: label.to_string() });
+                            let _ = tx.send(Msg::Result {
+                                image: ci,
+                                bytes,
+                                label: label.to_string(),
+                                local: false,
+                            });
                         }
                     }
                     ctx.request_repaint();

@@ -66,6 +66,31 @@ public class EguiNativeActivity extends NativeActivity {
         registerInstallReceiver();
     }
 
+    /** The activity is leaving the foreground. Rust turns this into `EguiApp::on_pause`, which is
+     * an app's last chance to flush work before the OS may reap the process. */
+    @Override
+    protected void onPause() {
+        super.onPause();
+        reportActive(false);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        reportActive(true);
+    }
+
+    private void reportActive(boolean active) {
+        if (nativeLifecycleBroken) return;
+        try {
+            nativeSetActive(active);
+        } catch (Throwable t) {
+            // Older native lib without the export — the app simply gets no pause callback.
+            nativeLifecycleBroken = true;
+            Log.i("EguiLifecycle", "nativeSetActive unavailable: " + t);
+        }
+    }
+
     @Override
     protected void onDestroy() {
         if (installReceiver != null) {
@@ -712,4 +737,10 @@ public class EguiNativeActivity extends NativeActivity {
     private static native void nativeImeWake();
 
     private static volatile boolean nativeWakeBroken;
+
+    /** Foreground transitions, so Rust can fire `on_pause` / `on_resume`. Implemented in
+     * egui-android's host. */
+    private static native void nativeSetActive(boolean active);
+
+    private static volatile boolean nativeLifecycleBroken;
 }

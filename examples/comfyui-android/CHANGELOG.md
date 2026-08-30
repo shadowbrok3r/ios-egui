@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.14.1 — 2026-08-25
+
+**Fixed: images generated on the device went nowhere.** A Local NPU / Local Anima render finished, logged its size, and then existed only as the texture in that one frame — the Create pane deliberately stays quiet on a finished result because results belong in the Gallery, but nothing had ever put an on-device render *into* the Gallery, and the server that lists it never saw it.
+
+On-device renders now file themselves. Each one is written into the phone's image store under an **on-device** folder and spliced into the gallery listing newest-first among the server's rows, so it shows up in the grid, lights the Gallery nav badge, and opens in the viewer like anything else — with no server involved at all, since thumbnails, the full-screen image and delete all read the local file. They survive both cache eviction and Settings → Clear cache: unlike a cached server image there is no copy to re-download, so nothing is allowed to reclaim them. Renders from earlier sessions are picked up too.
+
+## v0.14.0 — 2026-08-14
+
+**Every look axis now has a color**, used everywhere the axis appears: the combobox labels, the extract sheet's headers and tag chips, the Look book and builder section titles, and — most usefully — the prompt's chip view, where a tag that belongs to an axis wears that axis' hue (appearance pink, expression amber, outfit azure, pose green, camera orange, environment aqua). One glance at the prompt now shows which pieces are swappable and where they'd go.
+
+**Per-axis extract.** Each axis dropdown's entry is now "Extract appearance" / "Extract outfit" / etc., pulling only that axis' tags into the sheet; the standing Extract from prompt button still does all axes at once.
+
+**Fixed: the Sweep window's axis dropdown was unusable** — its popup opened underneath the window (these centered windows sit on a layer above the one dropdown popups render on), so nothing in it could be tapped. The axis choice is now a flat color-coded row of buttons, and the Manage editor's new album picker — which had the same latent bug — became an inline expandable list.
+
+## v0.13.0 — 2026-08-13
+
+**Build a prompt** — the from-scratch flow, next to Look book. Step one picks the model *visually*: a tile grid where every checkpoint shows your newest render made with it (models without renders wait in a collapsed list), and picking one brings its recommended settings and its remembered look along. Step two sets the subject (tap-toggle 1girl/1boy/2girls/solo, plus free tags), then one Look-book step per axis — appearance, expression, outfit, pose, camera, scene — and a review step that shows the assembled prompt and can queue a generation on the spot. Every choice applies live, so closing the builder at any step keeps what you've built.
+
+**Example albums for presets.** A preset can now point at a gallery album that showcases it: assign one in Manage (each preset row grew an "Example album" picker), then long-press that preset's tile — in the Look book or the builder — to jump straight into the album and see many examples instead of one photo.
+
+## v0.12.0 — 2026-08-13
+
+**Look book** — a visual preset browser next to Extract. Every preset is a tile: its photo when it has one, name underneath, a pink ring on the active pick, grouped per axis; tap to apply, tap the active tile to clear, and the window stays open so you can dress a whole prompt visually. Presets created by Extract from a gallery image photograph themselves automatically with that image; anything else gets a picture from the gallery viewer's new **Set as preset photo** menu (character looks already had theirs). Photographed presets sort to the front.
+
+The look comboboxes reorganize around your own material: **Global presets now sit first and open**, while each character and the long built-in list fold into collapsible sections — the section holding the current pick starts open, so nothing lives at the bottom of a deep scroll. The extract sheet also **recognizes tag sets you already saved**: an axis whose toggled tags exactly match an existing preset says so and swaps that preset in instead of minting a duplicate.
+
+Also: the Sweep window's checkpoint and preset lists truncate long names instead of pushing the window past the right edge of the screen.
+
+## v0.11.0 — 2026-08-13
+
+**Sweep** (Create tab, under the Batch/Variants steppers): pick two or more checkpoints — or two or more presets on one look axis — and queue the same prompt at the same fixed seed across all of them, each job running at its model's recommended settings. Results collect into a numbered "Sweep N" album as they land, so comparing models side by side becomes one tap and a gallery visit instead of an evening of manual switching. Your own model, seed and look picks are restored the moment the jobs are queued.
+
+**Expression** joins the look axes: a new combobox with 22 built-in presets (Smile through Ahegao), full extract support, and tap-to-swap between expressions on a prompt chip. The gallery corpus run showed expressions were the most-used tags that had no axis to live on.
+
+The prompt lint now catches typos: a tag unknown to the tag dictionary, the axis classifier, and your LoRA triggers — but within an edit or two of a real tag — gets a "did you mean" warning whose fix replaces it in place. It would have caught the `tonails` (54 images) and `skindention` (17) lurking in a long-standing template prompt. LoRA trigger words, quality tags, and video prose are exempt, so nothing legitimate gets nagged.
+
+**The look follows the model.** Picking a checkpoint in the Models pane now restores the axis picks you last used with it — appearance, expression, outfit, everything — captured automatically every time you change a pick. Switch from your Illustrious setup to the Anima one and each comes back wearing its own look; models you've never dressed keep whatever is currently applied. Programmatic switches (sweeps, character cards, remixes) deliberately don't touch this memory.
+
+**Presets from an image** (NPU builds): the WD14 tag sheet grew an **Extract presets** button — the tagger's read of any gallery image flows through the same classifier into the extract sheet, so a render you like becomes appearance/expression/outfit/scene presets (or additions to a character) without retyping a single tag. Saving from an image only creates presets; your prompt is untouched.
+
+## v0.10.0 — 2026-08-13
+
+Extraction now covers every look axis, not just appearance. **Extract from prompt** (a button atop the Appearance/Outfit/Pose/Camera/Environment section, and an entry in each of those dropdowns) splits your whole prompt in one pass: detected tags appear as tap-to-toggle chips grouped per axis, each group with its own editable preset name, and one save turns them all into swappable combobox picks — the effective prompt unchanged. Outfit catches accessories by their last word, so `black choker`, `hair ornament` and `toe ring` classify without an exhaustive list; poses, camera framing and scenery tags work the same way.
+
+The appearance classifier also learned from the first field test: compound hair tags (`long straight hair`), the full toenail color range (`aqua toenails`), skin finishes (`soft skin`, `wet skin`), and non-human features by last word (`cat ears`, `fox tail`, `demon horns`). Every tag inside the ~140 built-in look presets now classifies to its own axis under test, so the extractor can round-trip anything the preset system can inject.
+
+The vocabulary was then tuned against the real gallery on comfy-gate — every prompt from 2,241 generated images. The high-frequency tags that slipped through now classify (body descriptors, toe/knee poses, `point of view` / `full body view` framing, mood lighting), sentence-style video prose is excluded outright (tags longer than five words never extract, so a Wan prompt can't be shredded), and what deliberately stays in the prompt is exactly the non-look material: quality tags, character names, LoRA trigger words, and expressions.
+
 ## v0.9.0 — 2026-08-13
 
 Character appearance is now hot-swappable. **Appearance** joins the Create-tab look comboboxes: a named bundle of the tags that describe who you're drawing — hair color and style, eyes, nails, toenails, skin, body — applied and removed as one unit, so trying the same subject across checkpoints stops meaning hand-editing hair and toenail color every time. **Extract from prompt**, inside that dropdown, reads those tags out of the prompt you already wrote, shows them grouped with a checkbox each, and moves the checked ones into a named preset — the effective prompt is unchanged, but the appearance is now a dropdown pick. Presets save globally or under the active character, and swapping to another (or to None) removes exactly what the old one injected, weights included.

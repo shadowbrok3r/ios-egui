@@ -718,6 +718,7 @@ pub enum LookKind {
     #[default]
     Look,
     Appearance,
+    Expression,
     Outfit,
     Pose,
     CameraAngle,
@@ -729,6 +730,7 @@ impl LookKind {
         match self {
             Self::Look => "Look",
             Self::Appearance => "Appearance",
+            Self::Expression => "Expression",
             Self::Outfit => "Outfit",
             Self::Pose => "Pose",
             Self::CameraAngle => "Camera angle",
@@ -740,6 +742,7 @@ impl LookKind {
         match self {
             Self::Look => "Looks",
             Self::Appearance => "Appearances",
+            Self::Expression => "Expressions",
             Self::Outfit => "Outfits",
             Self::Pose => "Poses",
             Self::CameraAngle => "Camera angles",
@@ -751,6 +754,7 @@ impl LookKind {
         match self {
             Self::Look => "school uniform, hand on hip",
             Self::Appearance => "silver hair, red eyes, black nails",
+            Self::Expression => "smirk, blush, half-closed eyes",
             Self::Outfit => "school uniform, thigh-highs",
             Self::Pose => "hand on hip, looking back",
             Self::CameraAngle => "low angle, from below, wide shot",
@@ -759,8 +763,14 @@ impl LookKind {
     }
 
     /// The single-axis kinds surfaced as Create-Main comboboxes (not the combined `Look`).
-    pub const MAIN: &'static [Self] =
-        &[Self::Appearance, Self::Outfit, Self::Pose, Self::CameraAngle, Self::Environment];
+    pub const MAIN: &'static [Self] = &[
+        Self::Appearance,
+        Self::Expression,
+        Self::Outfit,
+        Self::Pose,
+        Self::CameraAngle,
+        Self::Environment,
+    ];
 }
 
 /// A swappable "look" for a character: a named prompt fragment (outfit, accessories, pose, scene)
@@ -778,6 +788,10 @@ pub struct CharacterLook {
     /// Which axis this look feeds. Defaults to the combined `Look` for cards from before categories.
     #[serde(default)]
     pub kind: LookKind,
+    /// Server album showcasing this look's example images; 0 = none. Long-pressing the look's
+    /// tile opens it.
+    #[serde(default)]
+    pub album_id: i64,
 }
 
 /// The current Create-Main combobox selection for one single-axis [`LookKind`], with the undo record
@@ -799,6 +813,29 @@ pub struct AppliedMainLook {
 /// comboboxes on top of any the user creates. Names must stay unique within a kind.
 pub fn builtin_looks() -> Vec<CharacterLook> {
     const DATA: &[(LookKind, &str, &str)] = &[
+        // ---- Expressions ----
+        (LookKind::Expression, "Smile", "smile"),
+        (LookKind::Expression, "Grin", "grin"),
+        (LookKind::Expression, "Smirk", "smirk"),
+        (LookKind::Expression, "Smug", "smug"),
+        (LookKind::Expression, "Neutral", "neutral expression"),
+        (LookKind::Expression, "Serious", "serious"),
+        (LookKind::Expression, "Expressionless", "expressionless"),
+        (LookKind::Expression, "Blush", "blush"),
+        (LookKind::Expression, "Shy", "shy, blush, looking away"),
+        (LookKind::Expression, "Embarrassed", "embarrassed, blush"),
+        (LookKind::Expression, "Angry", "angry, frown"),
+        (LookKind::Expression, "Annoyed", "annoyed"),
+        (LookKind::Expression, "Pout", "pout"),
+        (LookKind::Expression, "Sad", "sad"),
+        (LookKind::Expression, "Crying", "crying, tears"),
+        (LookKind::Expression, "Laughing", "laughing, open mouth, smile"),
+        (LookKind::Expression, "Surprised", "surprised, open mouth"),
+        (LookKind::Expression, "Sleepy", "sleepy, half-closed eyes"),
+        (LookKind::Expression, "Wink", "one eye closed, smile"),
+        (LookKind::Expression, "Tongue out", "tongue out"),
+        (LookKind::Expression, "Seductive", "seductive expression, half-closed eyes"),
+        (LookKind::Expression, "Ahegao", "ahegao, tongue out, half-closed eyes"),
         // ---- Outfits ----
         (LookKind::Outfit, "School uniform", "school uniform, pleated skirt, necktie"),
         (LookKind::Outfit, "Sailor uniform", "serafuku, sailor collar, pleated skirt"),
@@ -948,6 +985,7 @@ pub fn builtin_looks() -> Vec<CharacterLook> {
             prompt: prompt.to_string(),
             portrait_key: String::new(),
             kind,
+            album_id: 0,
         })
         .collect()
 }
@@ -2665,6 +2703,10 @@ pub struct Settings {
     /// Current Create-Main combobox selections (at most one per single-axis kind), with undo records.
     #[serde(default)]
     pub active_main_looks: Vec<AppliedMainLook>,
+    /// Axis picks last used with each model (keyed by loader filename, `injected` left empty),
+    /// re-applied when that model is picked again.
+    #[serde(default)]
+    pub model_looks: std::collections::BTreeMap<String, Vec<AppliedMainLook>>,
     /// Which engine the Create prompt rewrite button uses (server `/api/expand` vs on-device pack).
     #[serde(default)]
     pub rewrite_engine: RewriteEngine,
@@ -4056,12 +4098,14 @@ mod tests {
                     prompt: "hoodie, jeans, standing".into(),
                     portrait_key: "user_x/Mia/casual.png".into(),
                     kind: LookKind::Look,
+                    album_id: 0,
                 },
                 CharacterLook {
                     name: "from below".into(),
                     prompt: "low angle, from below".into(),
                     portrait_key: String::new(),
                     kind: LookKind::CameraAngle,
+                    album_id: 0,
                 },
             ],
             portrait_key: "user_x/Mia/portrait.png".into(),

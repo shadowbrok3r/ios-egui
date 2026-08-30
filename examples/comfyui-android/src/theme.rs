@@ -253,6 +253,28 @@ fn light_pool(
 
 /// Subtle dark fill tinting a tag chip/suggestion by Danbooru category, or `None` for unknown.
 /// 0 general, 1 artist, 3 copyright, 4 character, 5 meta; light text stays readable on each.
+/// Look-axis identity color: label ink for one axis, used consistently across the comboboxes,
+/// prompt chips, extract sheet, Look book, builder, and sweep.
+pub fn axis_color(kind: crate::types::LookKind) -> Color32 {
+    use crate::types::LookKind as K;
+    match kind {
+        K::Appearance => PINK_BRIGHT,
+        K::Expression => Color32::from_rgb(255, 202, 92),
+        K::Outfit => Color32::from_rgb(110, 174, 255),
+        K::Pose => Color32::from_rgb(126, 226, 148),
+        K::CameraAngle => Color32::from_rgb(255, 152, 96),
+        K::Environment => AQUA_BRIGHT,
+        K::Look => VIOLET,
+    }
+}
+
+/// A dim chip fill carrying the axis hue at surface luminance (the axis-tag analogue of
+/// [`tag_category_fill`]).
+pub fn axis_fill(kind: crate::types::LookKind) -> Color32 {
+    let c = axis_color(kind);
+    Color32::from_rgb(c.r() / 5 + 14, c.g() / 5 + 14, c.b() / 5 + 14)
+}
+
 pub fn tag_category_fill(cat: u8) -> Option<Color32> {
     match cat {
         0 => Some(rgb(28, 40, 60)),
