@@ -11,7 +11,7 @@ pub mod plugin_cmd;
 pub mod store;
 
 // Embedded so a `cargo install`ed binary is fully self-contained.
-const TPL_CARGO: &str = include_str!("../../../template/Cargo.toml");
+const TPL_CARGO: &str = include_str!("../../../template/Cargo.toml.tpl");
 const TPL_LIB: &str = include_str!("../../../template/lib.rs");
 const TPL_PACKAGE: &str = include_str!("../../../template/Package.swift");
 const TPL_APP: &str = include_str!("../../../template/App.swift");

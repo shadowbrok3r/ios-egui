@@ -13,7 +13,7 @@ use clap::{Args, Subcommand};
 
 const WASM_TRIPLE: &str = "wasm32-wasip1";
 
-const TPL_CARGO: &str = include_str!("../../../template-plugin/Cargo.toml");
+const TPL_CARGO: &str = include_str!("../../../template-plugin/Cargo.toml.tpl");
 const TPL_LIB: &str = include_str!("../../../template-plugin/lib.rs");
 const TPL_MANIFEST: &str = include_str!("../../../template-plugin/manifest.toml");
 const TPL_GITIGNORE: &str = include_str!("../../../template-plugin/gitignore");
