@@ -2,7 +2,7 @@
 import PackageDescription
 
 // This repository is both a Cargo workspace (Cargo.toml) and the EguiKit Swift package.
-// Apps depend on it with: .package(url: "https://github.com/shadowbrok3r/egui-ios", branch: "main")
+// Apps depend on it with: .package(url: "https://github.com/shadowbrok3r/ios-egui", branch: "master")
 // and link their Rust staticlib via the -L flag emitted by `cargo egui-ios`.
 let package = Package(
     name: "egui-ios",

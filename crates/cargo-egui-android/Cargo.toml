@@ -9,6 +9,9 @@ repository.workspace = true
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Reads the app manifest's `java_sources` and `cargo metadata` to sync the Java bridge.
+serde_json = "1"
+toml.workspace = true
 
 [[bin]]
 name = "cargo-egui-android"

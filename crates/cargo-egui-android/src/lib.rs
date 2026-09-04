@@ -430,10 +430,91 @@ fn detect_kotlin_home() -> Option<PathBuf> {
     None
 }
 
+/// Refresh the app's copy of egui-android's Java bridge from the egui-android crate this build
+/// resolves. The Java classes and the Rust JNI side change together, so a copy taken when the app
+/// was scaffolded drifts as soon as the git dependency moves; syncing before every package keeps
+/// both at one revision. An in-tree app whose `java_sources` is the crate's own directory already
+/// has them.
+fn sync_java_sources() -> Result<()> {
+    let manifest = fs::read_to_string("Cargo.toml").context("reading Cargo.toml")?;
+    let manifest: toml::Table = toml::from_str(&manifest).context("parsing Cargo.toml")?;
+    let Some(java_sources) = manifest
+        .get("package")
+        .and_then(|v| v.get("metadata"))
+        .and_then(|v| v.get("android"))
+        .and_then(|v| v.get("java_sources"))
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(());
+    };
+    let Some(src) = egui_android_java_dir()? else {
+        return Ok(());
+    };
+    let dest = PathBuf::from(java_sources);
+    if dest.is_dir() && fs::canonicalize(&dest)? == fs::canonicalize(&src)? {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    collect_java(&src, &src, &mut files)?;
+    for rel in files {
+        let bytes = fs::read(src.join(&rel))?;
+        let to = dest.join(&rel);
+        if fs::read(&to).is_ok_and(|cur| cur == bytes) {
+            continue;
+        }
+        write_bytes(&to, &bytes)?;
+        println!("synced {} from egui-android", to.display());
+    }
+    Ok(())
+}
+
+fn collect_java(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_java(root, &path, out)?;
+        } else if path.extension().is_some_and(|e| e == "java") {
+            out.push(path.strip_prefix(root)?.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(p) = path.parent() {
+        fs::create_dir_all(p)?;
+    }
+    fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+}
+
+/// `<egui-android>/java` for the egui-android in this app's dependency graph, wherever cargo
+/// checked it out; `None` when the app does not depend on it.
+fn egui_android_java_dir() -> Result<Option<PathBuf>> {
+    let out = Command::new("cargo")
+        .args(["metadata", "--format-version", "1"])
+        .output()
+        .context("running cargo metadata")?;
+    if !out.status.success() {
+        bail!("cargo metadata failed:\n{}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let meta: serde_json::Value =
+        serde_json::from_slice(&out.stdout).context("parsing cargo metadata")?;
+    let dir = meta["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["name"] == "egui-android")
+        .and_then(|p| p["manifest_path"].as_str())
+        .and_then(|m| Path::new(m).parent())
+        .map(|d| d.join("java"));
+    Ok(dir.filter(|d| d.is_dir()))
+}
+
 fn cmd_apk(sub: &str, args: &BuildArgs, device: Option<&str>) -> Result<()> {
     if !PathBuf::from("Cargo.toml").exists() {
         bail!("run from an egui-android app directory (no Cargo.toml here)");
     }
+    sync_java_sources()?;
     let mut cmd = Command::new("cargo");
     cmd.arg("apk2").arg(sub).arg("--target").arg("aarch64-linux-android");
     if args.release {

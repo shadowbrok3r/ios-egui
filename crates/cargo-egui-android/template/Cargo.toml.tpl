@@ -9,14 +9,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Git (default); use a local path for development against a clone:
-#   egui-mobile = { path = "../ios-egui/crates/egui-mobile" }
-egui-mobile = { git = "https://github.com/shadowbrok3r/egui-ios" }
-egui = "0.35"
+#   egui-mobile = { path = "../EguiMobile/crates/egui-mobile" }
+egui-mobile = { git = "https://github.com/shadowbrok3r/ios-egui" }
+egui = "0.36"
 
 # cargo-apk2 reads this to generate the APK manifest.
 [package.metadata.android]
 package = "{{package_id}}"
-# Copied from egui-android on `cargo egui-android new` — real InputConnection for Gboard.
+# egui-android's Java bridge (real InputConnection for Gboard). Copied on `new` and re-synced
+# from the resolved egui-android by every `cargo egui-android build`/`run`.
 java_sources = "java"
 
 [package.metadata.android.sdk]

@@ -8,7 +8,7 @@ publish = false
 # Published crate (preferred once released):
 #   egui-ios = "0.1"
 # Git (default):
-egui-ios = { git = "https://github.com/shadowbrok3r/egui-ios" }
+egui-ios = { git = "https://github.com/shadowbrok3r/ios-egui" }
 # Local checkout (uncomment for development against a local clone):
 #   egui-ios = { path = "../ios-egui/crates/egui-ios" }
 egui = "0.36"

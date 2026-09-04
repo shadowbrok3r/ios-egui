@@ -15,7 +15,7 @@ let package = Package(
     ],
     dependencies: [
         // Git (default):
-        .package(url: "https://github.com/shadowbrok3r/egui-ios", branch: "main"),
+        .package(url: "https://github.com/shadowbrok3r/ios-egui", branch: "master"),
         // Local checkout (uncomment for development):
         //   .package(path: "../ios-egui"),
     ],
