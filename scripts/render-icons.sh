@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rasterize an app's launcher SVG into the mipmap densities cargo-apk2 packages.
 #
-#   scripts/render-icons.sh examples/comfyui-android
+#   scripts/render-icons.sh examples/privaxy-android
 #
 # Reads <app>/icon/ic_launcher.svg and writes <app>/res/mipmap-<density>/ic_launcher.png.
 # Re-run after editing the SVG; the PNGs are committed so a build needs no image tooling.

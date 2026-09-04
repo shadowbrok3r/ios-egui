@@ -33,7 +33,7 @@ Both ship `model.onnx` and `selected_tags.csv` (the tag table: `tag_id,name,cate
 ## Run
 
 ```sh
-<qairt-venv>/bin/python scripts/wd14-export/export.py --out ~/wd14 --work ~/wd14-build --sdk ~/Desktop/QNN/qairt/<ver>
+<qairt-venv>/bin/python scripts/wd14-export/export.py --out ~/Documents/Ai/wd14 --work ~/Documents/Ai/wd14-build --sdk ~/Documents/Ai/QNN/qairt/<ver>
 ```
 
 Defaults target an **older-arch V73** HTP build (`--dsp-arch v73 --soc sm8550`). V73
@@ -41,13 +41,13 @@ context binaries run fine on newer HTP (V81 / S26 Ultra); building for the older
 keeps one artifact working across devices. Override for a native V81 build:
 
 ```sh
-python3 scripts/wd14-export/export.py --dsp-arch v81 --soc sm8850 --out ~/wd14
+python3 scripts/wd14-export/export.py --dsp-arch v81 --soc sm8850 --out ~/Documents/Ai/wd14
 ```
 
 Skip already-done stages with `--from` (`download shape convert lib context pack`):
 
 ```sh
-python3 scripts/wd14-export/export.py --from context --out ~/wd14 --work ~/wd14-build
+python3 scripts/wd14-export/export.py --from context --out ~/Documents/Ai/wd14 --work ~/Documents/Ai/wd14-build
 ```
 
 ### Precision
@@ -61,7 +61,7 @@ saturated (many at ~100 %, or garbage), the fp16 activations may be overflowing 
 try the overrides route on a newer SDK:
 
 ```sh
-python3 scripts/wd14-export/export.py --fp32-activations --out ~/wd14
+python3 scripts/wd14-export/export.py --fp32-activations --out ~/Documents/Ai/wd14
 ```
 
 That writes an exhaustive AIMET-style overrides file pinning **every activation to
@@ -82,7 +82,7 @@ Stage 1 (`shape`) prints whether the graph's output is produced by a `Sigmoid`:
 ## Pack layout it emits
 
 ```
-<out>/                 e.g. ~/wd14
+<out>/                 e.g. ~/Documents/Ai/wd14
 ├── WD14               marker file (empty; identifies the pack)
 ├── model.bin          the HTP context binary (the classifier graph)
 └── tags.csv           selected_tags.csv (tag_id,name,category,count), logit order
@@ -91,9 +91,9 @@ Stage 1 (`shape`) prints whether the graph's output is produced by a `Sigmoid`:
 Push it next to the existing anima / sd packs under the app's external files dir:
 
 ```sh
-scripts/qnn-push-model.sh --subdir wd14 ~/wd14
+scripts/qnn-push-model.sh --subdir wd14 ~/Documents/Ai/wd14
 # or durable:
-# scripts/qnn-push-model.sh --durable --subdir wd14 ~/wd14
+# scripts/qnn-push-model.sh --durable --subdir wd14 ~/Documents/Ai/wd14
 ```
 
 On device the app scans that files dir; a `WD14`-marked subdir enables **Read tags** in

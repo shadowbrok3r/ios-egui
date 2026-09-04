@@ -6,9 +6,10 @@ name: Publish to app store
 # the publish step is skipped when the version is already published, so pushing
 # without a version bump is a no-op rather than a failure.
 #
-# Not covered here:
-#   comfyui-android — its QNN runtime libs are gitignored (proprietary QAIRT SDK),
-#                     so a CI build would silently ship an APK without NPU support.
+# comfyui-android and ringdesigner-android live in their own repos now
+# (shadowbrok3r/comfyui-android; RingDesigner/crates/ringdesigner-android) and are
+# published from a machine by hand — comfyui's QNN runtime libs are proprietary and
+# never in git, so a CI build would silently ship an APK without NPU support.
 on:
   push:
     branches: [main, master]

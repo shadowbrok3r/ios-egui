@@ -36,10 +36,10 @@ Loading the .pth needs torch; the stage fails with a clear message if torch is a
 
 Example (from a shell with the SDK on PATH, or pass --sdk):
   source scripts/qnn-env.sh                 # sets QNN_SDK_ROOT + venv, see that file
-  python3 scripts/clip-export/export.py --out ~/clip --work ~/clip-build --aesthetic
+  python3 scripts/clip-export/export.py --out ~/Documents/Ai/clip --work ~/Documents/Ai/clip-build --aesthetic
 
   # older-arch HTP build (default); V73 binaries run fine on newer HTP (V81 / S26 Ultra):
-  python3 scripts/clip-export/export.py --dsp-arch v73 --soc sm8550 --out ~/clip
+  python3 scripts/clip-export/export.py --dsp-arch v73 --soc sm8550 --out ~/Documents/Ai/clip
 """
 
 import argparse
@@ -104,7 +104,7 @@ def sdk_env(sdk: Path | None, python: str | None = None) -> dict:
     if sdk is None:
         return env
     env["PYTHONPATH"] = f"{sdk}/lib/python" + os.pathsep + env.get("PYTHONPATH", "")
-    host_rt = os.environ.get("QAIRT_HOST_RT", str(Path.home() / "Desktop/QNN/host-runtime"))
+    host_rt = os.environ.get("QAIRT_HOST_RT", str(Path.home() / "Documents/Ai/QNN/host-runtime"))
     libs = [host_rt, f"{sdk}/lib/x86_64-linux-clang"]
     if python is not None:
         libs.append(str(Path(os.path.realpath(python)).parent.parent / "lib"))

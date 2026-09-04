@@ -129,7 +129,7 @@ OK on both, `output[1,16,1,128,128]` finite, ~3.1 s per half (~6.2 s per step,
 
 ### Device packaging (cargo-apk2)
 
-See the commented `runtime_libs` block in `examples/comfyui-android/Cargo.toml`.
+See the commented `runtime_libs` block in comfyui-android's `Cargo.toml` (github.com/shadowbrok3r/comfyui-android).
 Ship for `arm64-v8a`: `libQnnHtp.so`, `libQnnSystem.so`, `libQnnHtpV81Stub.so`
 (+ optional `libQnnHtpPrepare.so`), the `hexagon-v81/unsigned/libQnnHtpV81Skel.so`
 skel, and `libc++_shared.so` (QNN links the C++ runtime). Then call

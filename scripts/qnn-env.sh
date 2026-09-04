@@ -5,9 +5,9 @@
 #   qnn-onnx-converter --help
 #   qnn-context-binary-generator --help
 #
-# Defaults expect the SDK at ~/Desktop/QNN/qairt/<ver> (extracted from the full zip,
+# Defaults expect the SDK at ~/Documents/Ai/QNN/qairt/<ver> (extracted from the full zip,
 # including bin/x86_64-linux-clang and lib/python). Host libc++ comes from the NDK
-# (staged under ~/Desktop/QNN/host-runtime). Python deps live in ~/Desktop/QNN/qairt-venv.
+# (staged under ~/Documents/Ai/QNN/host-runtime). Python deps live in ~/Documents/Ai/QNN/qairt-venv.
 #
 # Cursor's AppImage rewrites argv0 when a path contains "3.12"; converters are invoked
 # via scripts/qnn-convert.sh which uses ld-linux to avoid that. Interactive shells can
@@ -19,9 +19,9 @@ if ! (return 0 2>/dev/null); then
   exit 1
 fi
 
-QAIRT_ROOT="${QAIRT_ROOT:-$HOME/Desktop/QNN/qairt/2.48.40.260702}"
-QAIRT_VENV="${QAIRT_VENV:-$HOME/Desktop/QNN/qairt-venv}"
-QAIRT_HOST_RT="${QAIRT_HOST_RT:-$HOME/Desktop/QNN/host-runtime}"
+QAIRT_ROOT="${QAIRT_ROOT:-$HOME/Documents/Ai/QNN/qairt/2.48.40.260702}"
+QAIRT_VENV="${QAIRT_VENV:-$HOME/Documents/Ai/QNN/qairt-venv}"
+QAIRT_HOST_RT="${QAIRT_HOST_RT:-$HOME/Documents/Ai/QNN/host-runtime}"
 ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-}"
 
 if [ ! -d "$QAIRT_ROOT/bin/x86_64-linux-clang" ]; then
@@ -29,7 +29,7 @@ if [ ! -d "$QAIRT_ROOT/bin/x86_64-linux-clang" ]; then
   return 1 2>/dev/null || exit 1
 fi
 if [ ! -x "$QAIRT_VENV/bin/python" ]; then
-  echo "missing $QAIRT_VENV — create with: uv venv --python 3.12 \$HOME/Desktop/QNN/qairt-venv" >&2
+  echo "missing $QAIRT_VENV — create with: uv venv --python 3.12 \$HOME/Documents/Ai/QNN/qairt-venv" >&2
   return 1 2>/dev/null || exit 1
 fi
 

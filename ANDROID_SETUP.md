@@ -48,6 +48,10 @@ keytool -genkeypair -v -keystore ~/.android/debug.keystore \
 > If that 404s, grab the current "Command line tools only" (Linux) link from
 > <https://developer.android.com/studio#command-line-tools-only> and swap the URL.
 
+The apps in their own repos (comfyui-android, RingDesigner's `crates/ringdesigner-android`) use
+this same toolchain plus the `cargo egui-mobile` wrapper installed below; their READMEs carry the
+per-repo `.cargo/config.toml`.
+
 ## In the repo (once per checkout)
 
 ```bash
@@ -75,14 +79,14 @@ EOF
 ## Build & run
 
 ```bash
-cd examples/comfyui-android
+cd examples/appstore-android
 
 # Fast compile-check (no linking, no device)
-cargo ndk -t arm64-v8a check -p comfyui_android --features tls
+cargo ndk -t arm64-v8a check -p appstore_android --features tls
 
 # Package the signed APK  (drop --features tls for the http-only build)
 cargo egui-mobile build -a --release --features tls
-#   -> target/release/apk/comfyui_android.apk   (at the workspace root, not this dir)
+#   -> target/release/apk/appstore_android.apk   (at the workspace root, not this dir)
 
 # …or build, install, and launch on a USB-connected phone (adb debugging on)
 cargo egui-mobile run -a --release --features tls
@@ -133,7 +137,7 @@ also attached. Omitting `--tcp` keeps the usual USB/default adb behavior.
 - No emulator or system images are needed; this only builds for and sideloads to a real device.
 - **Signature mismatch across machines.** Each machine's freshly-generated `debug.keystore` is a
   different key, so a device that already has the app (signed by another machine) rejects the
-  update with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Either `adb uninstall com.example.comfyui`
+  update with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`. Either `adb uninstall <package id>`
   first (loses the app's saved settings), or — better — copy one `~/.android/debug.keystore` to
   every machine (`scp ~/.android/debug.keystore user@host:~/.android/`) so all builds sign
   identically and install over each other. A shared keystore also makes the `keytool` step above

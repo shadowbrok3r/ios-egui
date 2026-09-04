@@ -82,7 +82,7 @@ prediction = amodel(image_features)
 
 ```sh
 <qairt-venv>/bin/python scripts/clip-export/export.py \
-  --out ~/clip --work ~/clip-build --sdk ~/Desktop/QNN/qairt/<ver> --aesthetic --text
+  --out ~/Documents/Ai/clip --work ~/Documents/Ai/clip-build --sdk ~/Documents/Ai/QNN/qairt/<ver> --aesthetic --text
 ```
 
 `--aesthetic` and `--text` are independent add-ons; pass either, both, or neither. `--text`
@@ -94,13 +94,13 @@ context binaries run fine on newer HTP (V81 / S26 Ultra); building for the older
 keeps one artifact working across devices. Override for a native V81 build:
 
 ```sh
-python3 scripts/clip-export/export.py --dsp-arch v81 --soc sm8850 --out ~/clip
+python3 scripts/clip-export/export.py --dsp-arch v81 --soc sm8850 --out ~/Documents/Ai/clip
 ```
 
 Skip already-done stages with `--from` (`download shape convert lib context pack`):
 
 ```sh
-python3 scripts/clip-export/export.py --from context --out ~/clip --work ~/clip-build
+python3 scripts/clip-export/export.py --from context --out ~/Documents/Ai/clip --work ~/Documents/Ai/clip-build
 ```
 
 ### Precision
@@ -124,7 +124,7 @@ converter complains about layout, pass the SDK's flag through, e.g.:
 ## Pack layout it emits
 
 ```
-<out>/                 e.g. ~/clip
+<out>/                 e.g. ~/Documents/Ai/clip
 ├── CLIPV              marker file (empty; identifies the pack)
 ├── model.bin          the HTP context binary (the visual tower graph)
 ├── aesthetic.bin      optional; f32 LE [w0..w511, bias]  (only with --aesthetic)
@@ -136,9 +136,9 @@ Push it next to the existing anima / sd / wd14 packs. The durable location the a
 `/storage/emulated/0/ComfyUI/clip` (survives uninstall); the app's external files dir works too:
 
 ```sh
-scripts/qnn-push-model.sh --durable --subdir clip ~/clip
+scripts/qnn-push-model.sh --durable --subdir clip ~/Documents/Ai/clip
 # or the app-private files dir:
-scripts/qnn-push-model.sh --subdir clip ~/clip
+scripts/qnn-push-model.sh --subdir clip ~/Documents/Ai/clip
 ```
 
 On device the app scans those dirs; a `CLIPV`-marked subdir enables CLIP embeddings (and the

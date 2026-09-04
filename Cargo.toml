@@ -7,11 +7,9 @@ members = [
     "crates/egui-android",
     "examples/android-hello",
     "examples/plugins-android",
-    "examples/comfyui-android",
     "examples/privaxy-android",
     "examples/appstore-android",
     "examples/surveyor-android",
-    "examples/ringdesigner-android",
     "crates/cargo-egui-ios",
     "crates/cargo-egui-android",
     "crates/cargo-egui-mobile",
@@ -37,10 +35,10 @@ exclude = [
     # Its own workspace; consumed by path from privaxy-android.
     "patches/backdrop-blur",
     "patches/egui-json-tree",
-    # Repinned to egui 0.36; reach the graph through [patch.crates-io], not as members.
+    # Repinned to egui 0.36 for plugins/wirelab (path deps) and the app repos' own
+    # [patch.crates-io] tables (git); nothing in this workspace builds them.
     "patches/egui-snarl",
     "patches/egui-scale",
-    "patches/rucomfyui-node-graph",
 ]
 # egui-android only builds for android targets (android-activity/eframe-android), so it is a
 # member (buildable via `cargo ndk -p egui-android`) but excluded from the default host build.
@@ -63,20 +61,15 @@ default-members = [
 edition = "2024"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/shadowbrok3r/egui-ios"
+repository = "https://github.com/shadowbrok3r/ios-egui"
 
 # winit/egui-winit call hide_soft_input(HIDE_IMPLICIT_ONLY) on every IME interrupt; with the
 # egui-android EditText bridge that hide sticks (DecorView show is ignored). Skip implicit-only
 # hides so the bridge owns keyboard dismiss.
+# Apps in their own repos (comfyui-android, RingDesigner's crates/ringdesigner-android) do not
+# inherit this table from the git dependency; each carries a matching entry pointed at this repo.
 [patch.crates-io]
 android-activity = { path = "patches/android-activity" }
-# The comfyui graph editor's stack: all three still pin egui 0.35 upstream, and a second egui in
-# the graph makes their types incompatible with the app's.
-egui-snarl = { path = "patches/egui-snarl" }
-egui-scale = { path = "patches/egui-scale" }
-
-[patch."https://github.com/philpax/rucomfyui"]
-rucomfyui_node_graph = { path = "patches/rucomfyui-node-graph" }
 
 [workspace.dependencies]
 egui = "0.36"

@@ -22,11 +22,14 @@ So the order is always: **bump `version` → build → publish.**
 
 | App | Crate to bump | Store slug |
 |---|---|---|
-| ComfyUI | `examples/comfyui-android/Cargo.toml` | `comfyui-android` |
 | Privaxy | `examples/privaxy-android/Cargo.toml` | `privaxy` |
 | Plugins Android | `examples/plugins-android/Cargo.toml` | `plugins-android` |
 | App Store | `examples/appstore-android/Cargo.toml` | `appstore-android` |
-| RingDesigner | `examples/ringdesigner-android/Cargo.toml` | `ringdesigner-android` |
+
+Two apps built on this framework live in their own repos and ship the same way with a copy of
+`publish-appstore.sh`: **ComfyUI** (`~/Documents/Rust/Mobile/comfyui-android`, slug
+`comfyui-android`) and **RingDesigner** (`crates/ringdesigner-android` in the RingDesigner repo,
+slug `ringdesigner-android`).
 
 ## A brand-new app has to be created first
 
@@ -58,7 +61,6 @@ cargo egui-mobile build -a --release --features tls    # drop --features tls if 
 ```
 
 The APK lands in the workspace-shared `target/release/apk/<crate_name>.apk`.
-(comfyui-android additionally needs `scripts/qnn-stage-libs.sh` run first.)
 
 ## Publish
 
@@ -125,9 +127,10 @@ Repository secrets used (already set): `AS_URL`, `AS_KEY`,
 
 ### Not built by CI
 
-- **comfyui-android** — its QNN runtime libs are gitignored (they come from a
-  proprietary QAIRT SDK), so a CI build would quietly produce an APK without NPU
-  support. Publish it from a machine that has `scripts/qnn-stage-libs.sh` run.
+- **comfyui-android** and **ringdesigner-android** — they are not in this repo, and
+  comfyui's QNN runtime libs come from a proprietary QAIRT SDK that is never in git, so
+  a CI build would quietly produce an APK without NPU support. Both publish from a
+  machine, comfyui after its `scripts/qnn-stage-libs.sh` has run.
 - **AOT `.cwasm` plugin builds** — an AOT artifact only loads in the exact wasmtime
   build that produced it, so it has to be compiled by the host, not by CI. CI ships
   the portable `.wasm`; hosts fall back to it automatically.
@@ -137,7 +140,8 @@ Repository secrets used (already set): `AS_URL`, `AS_KEY`,
 - The store keeps the last 5 builds per app; you can roll back to any of them from
   the AppManager desktop app.
 - Uploads over ~100 MB fail with a Cloudflare `413` before reaching the server.
-  Nothing here is that big today (comfyui is the largest at ~57 MB).
+  Nothing here is that big today (comfyui-android, the largest at ~57 MB, ships from
+  its own repo).
 - `examples/android-hello` is a demo and is not in the store.
 
 ## Publishing plugins straight from the dev loop

@@ -132,6 +132,12 @@ dev-sync, and native `net.http.*`/`net.tcp.*`/`net.udp.*`/`ssh.*` ops on both). 
   wireless hot reload.
 - `examples/desktop-host` — the same plugin host on desktop
   (`cargo run -p desktop-host -- plugins-dist`).
+- Apps that outgrew the examples directory consume this repo as a git dependency from their
+  own repos: **comfyui-android** (`shadowbrok3r/comfyui-android`, a ComfyUI client with
+  on-device NPU models) and **ringdesigner-android** (`crates/ringdesigner-android` in
+  `shadowbrok3r/RingDesigner`). Their `Cargo.toml` is the template for a standalone app —
+  including the `[patch.crates-io]` entries for the forks under `patches/`, which a git
+  dependency does not inherit.
 - `plugins/` — working plugins: terminal (with SSH client), http-client, devices
   (Tailscale), regex-tester, json-viewer, rvim, ratatui-demo, and **wirelab** (live panel
   for WireLab ESP32 boards: discovery, telemetry, GPIO/PWM, behaviors, UART, plus canvas /

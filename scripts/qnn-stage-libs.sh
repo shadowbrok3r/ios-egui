@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage the proprietary QNN/QAIRT HTP libraries for APK bundling (qnn-rs D1).
 # Copies the arm64 device .so from a QAIRT SDK plus the NDK libc++_shared.so into
-# examples/comfyui-android/qnn-runtime-libs/arm64-v8a/, the folder cargo-apk2 bundles when
+# <app-dir>/qnn-runtime-libs/arm64-v8a/, the folder cargo-apk2 bundles when
 # `[package.metadata.android] runtime_libs = "qnn-runtime-libs"` is enabled. The .so must ship in
 # the APK's nativeLibraryDir — pushed .so cannot be dlopen'd (W^X + SELinux on non-rooted API24+).
 #
@@ -9,13 +9,14 @@
 # .gitignore that excludes everything.
 #
 # Usage:
-#   QAIRT_ROOT=~/Desktop/QNN/qairt/2.48.40.260702 ANDROID_NDK_HOME=... scripts/qnn-stage-libs.sh
+#   QAIRT_ROOT=~/Documents/Ai/QNN/qairt/2.48.40.260702 ANDROID_NDK_HOME=... scripts/qnn-stage-libs.sh <app-dir>
 set -euo pipefail
 
-QAIRT_ROOT="${QAIRT_ROOT:-$HOME/Desktop/QNN/qairt/2.48.40.260702}"
+APP="${1:?usage: qnn-stage-libs.sh <app-dir>  (the crate whose APK bundles the libs)}"
+QAIRT_ROOT="${QAIRT_ROOT:-$HOME/Documents/Ai/QNN/qairt/2.48.40.260702}"
 HTP_ARCH="${HTP_ARCH:-hexagon-v81}"
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$HERE/examples/comfyui-android/qnn-runtime-libs/arm64-v8a"
+[ -f "$APP/Cargo.toml" ] || { echo "no Cargo.toml in $APP" >&2; exit 1; }
+DEST="$(cd "$APP" && pwd)/qnn-runtime-libs/arm64-v8a"
 
 AA="$QAIRT_ROOT/lib/aarch64-android"
 SKEL_DIR="$QAIRT_ROOT/lib/$HTP_ARCH/unsigned"
@@ -45,6 +46,6 @@ copy "$AA/libQnnHtpV81Stub.so"
 copy "$SKEL_DIR/libQnnHtpV81Skel.so"
 copy "$LIBCXX"
 
-echo "done. Enable bundling in examples/comfyui-android/Cargo.toml:"
+echo "done. Enable bundling in $APP/Cargo.toml:"
 echo "  [package.metadata.android] runtime_libs = \"qnn-runtime-libs\""
 echo "  [package.metadata.android.application] extract_native_libs = true"

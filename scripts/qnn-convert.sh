@@ -9,11 +9,11 @@
 #
 # Prerequisites (one-time):
 #   - Full QAIRT zip extracted (bin/x86_64-linux-clang + lib/python), see scripts/qnn-env.sh
-#   - Python 3.12 venv at ~/Desktop/QNN/qairt-venv with converter deps (numpy, onnx, …)
+#   - Python 3.12 venv at ~/Documents/Ai/QNN/qairt-venv with converter deps (numpy, onnx, …)
 #   - Android NDK (host libc++ for context-binary-generator)
 #
 # Usage:
-#   scripts/qnn-convert.sh --onnx unet.onnx --name unet --out ~/Desktop/QNN/build/unet
+#   scripts/qnn-convert.sh --onnx unet.onnx --name unet --out ~/Documents/Ai/QNN/build/unet
 #   scripts/qnn-convert.sh --onnx vae.onnx --name vae_decoder --out ... --input-list calib.txt
 #   scripts/qnn-convert.sh --onnx unet.onnx --name unet --out ... --push --tcp HOST:PORT
 #
